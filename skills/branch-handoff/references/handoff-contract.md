@@ -16,6 +16,13 @@ or test surface. Authorized Jira/GitHub content proves what that platform
 reported, not that the described behavior is implemented or validated; label
 its provenance explicitly.
 
+When authorized platform context is available, compare its stated intent and
+acceptance criteria with collector-supported changes in the single synthesis.
+Attribute every platform-derived statement to its platform and target. A ticket
+or PR states expected intent; it does not prove implementation or validation.
+When platform access was declined or unavailable, state that provenance in
+`Known assumptions` and still map every collector cluster under this contract.
+
 ## QA Handoff
 
 ```markdown

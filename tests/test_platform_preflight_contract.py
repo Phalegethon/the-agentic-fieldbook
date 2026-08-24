@@ -34,6 +34,43 @@ class PlatformPreflightContractTest(unittest.TestCase):
             self.skill,
         )
 
+    def test_jira_permission_bundles_connection_and_bounded_read(self) -> None:
+        self.assertIn(
+            "One selection authorizes both connection-status verification and the bounded read",
+            self.platform,
+        )
+        for field in (
+            "key",
+            "summary",
+            "description/acceptance criteria",
+            "type",
+            "status",
+            "priority",
+            "components/labels",
+            "links",
+        ):
+            self.assertIn(field, self.platform)
+        self.assertIn("Comments and attachments remain excluded", self.platform)
+
+    def test_structured_choice_has_a_numbered_fallback(self) -> None:
+        self.assertNotIn("Ask one question at a time", self.platform)
+        self.assertIn("structured question tool", self.platform)
+        self.assertIn("numbered choices", self.platform)
+
+    def test_platform_failure_continues_to_a_complete_local_report(self) -> None:
+        self.assertIn(
+            "Decline, missing adapter, authentication failure, or read failure",
+            self.platform,
+        )
+        self.assertIn("complete diff-only report", self.platform)
+
+    def test_writes_require_exact_target_and_exact_draft(self) -> None:
+        self.assertIn("Post once", self.platform)
+        self.assertIn("Edit draft", self.platform)
+        self.assertIn("Keep local", self.platform)
+        self.assertIn("exact target", self.platform)
+        self.assertIn("exact sanitized draft", self.platform)
+
 
 if __name__ == "__main__":
     unittest.main()
