@@ -1,10 +1,16 @@
 # Optional Jira and GitHub Actions
 
-Load this reference only when the user asks to read Jira/GitHub or publish a
-handoff comment. Local report generation remains the default. Permissions are
-platform-specific, action-specific, and valid only for the current skill
-session. Ask one question at a time; never infer write permission from a read,
-connection, analysis, or general “continue” approval.
+Load this reference when the current request contains an explicit Jira/GitHub
+target or asks to publish a handoff comment. Local report generation remains
+the default. Permissions are platform-specific, action-specific, and valid
+only for the current skill session.
+
+The collector has not run during preflight. Do not start repository or diff work
+until the exact target has either been authorized for a bounded read or declined
+for this session. Use the host's structured question tool for every choice when
+available; otherwise render the same outcomes as numbered choices. Never infer
+write permission from a read, connection, analysis, or general “continue”
+approval.
 
 ## Adapter selection
 
