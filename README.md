@@ -18,39 +18,104 @@ Created and maintained by
 Planned names such as `pr-summary`, `release-risk`, `incident-brief`, and
 `dependency-audit` are roadmap items, not installable packages yet.
 
-## Install one skill
+## Install `branch-handoff`
 
-### Cross-runtime installer
+### Quick install by agent
 
-The `skills` CLI can install only `branch-handoff` from the repository:
+Run one command from the project that should use the skill. These commands use
+the current `skills` CLI and avoid package, agent, scope, confirmation, and
+optional `find-skills` prompts. The flow is verified with CLI version `1.5.23`
+and later.
 
-```bash
-npx skills add Phalegethon/the-agentic-fieldbook --skill branch-handoff
-```
-
-Select the target agent and project/global scope when prompted. For a
-non-interactive Antigravity CLI installation:
+#### Claude Code
 
 ```bash
-npx skills add Phalegethon/the-agentic-fieldbook --skill branch-handoff --agent antigravity-cli --yes
+npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
+  --skill branch-handoff \
+  --agent claude-code \
+  --yes
 ```
 
-### Codex
+Expected project path: `.claude/skills/branch-handoff`.
 
-Ask Codex to install the GitHub path:
+#### Codex
+
+```bash
+npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
+  --skill branch-handoff \
+  --agent codex \
+  --yes
+```
+
+Expected project path: `.agents/skills/branch-handoff`.
+
+#### Antigravity
+
+```bash
+# Antigravity
+npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
+  --skill branch-handoff \
+  --agent antigravity \
+  --yes
+
+# Antigravity CLI
+npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
+  --skill branch-handoff \
+  --agent antigravity-cli \
+  --yes
+```
+
+Expected project path: `.agents/skills/branch-handoff`.
+
+To install for more than one agent, repeat `--agent`. The installer keeps one
+canonical copy when possible and links agent-specific paths to it:
+
+```bash
+npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
+  --skill branch-handoff \
+  --agent claude-code \
+  --agent codex \
+  --yes
+```
+
+The first `--yes` belongs to `npx`; the final `--yes` belongs to the `skills`
+installer. These examples install into the current project. Add `--global`
+only when you intentionally want the skill available across projects.
+
+Project installation creates or updates `skills-lock.json`. Verify the result
+and selected agent paths with:
+
+```bash
+npx --yes skills@latest list --json
+```
+
+### Interactive installation
+
+Use the interactive form when you deliberately want to choose agents and
+scope from menus:
+
+```bash
+npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
+  --skill branch-handoff
+```
+
+Before confirming, check that the selected-agent summary contains only the
+agents you intended. The optional `find-skills` offer is provided by the
+installer and is not part of TAF or required by `branch-handoff`.
+
+### Alternative installation paths
+
+Codex can install the skill directly from its GitHub path:
 
 ```text
 Install branch-handoff from
 https://github.com/Phalegethon/the-agentic-fieldbook/tree/main/skills/branch-handoff
 ```
 
-The equivalent local destination is
-`$CODEX_HOME/skills/branch-handoff`, normally
-`~/.codex/skills/branch-handoff`.
+The Codex user-level destination is `$CODEX_HOME/skills/branch-handoff`,
+normally `~/.codex/skills/branch-handoff`.
 
-### Claude Code marketplace
-
-Add TAF once, then install only the plugin you need:
+Claude Code users may alternatively use the TAF marketplace:
 
 ```text
 /plugin marketplace add Phalegethon/the-agentic-fieldbook
@@ -58,15 +123,9 @@ Add TAF once, then install only the plugin you need:
 /reload-plugins
 ```
 
-The installed plugin command is `/branch-handoff:branch-handoff`. Claude may
-also select it automatically when the request matches its description.
-
-### Manual project installation
-
-Copy `skills/branch-handoff` into the target project's supported skill folder,
-for example `.agents/skills/branch-handoff`. Claude Code also supports
-`.claude/skills/branch-handoff`; use the Codex user destination documented
-above when installing directly for Codex.
+The marketplace command is `/branch-handoff:branch-handoff`. For a manual
+project installation, copy `skills/branch-handoff` into the agent's supported
+project skill directory.
 
 ## Use branch-handoff
 
