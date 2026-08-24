@@ -1,7 +1,7 @@
 {
   "name": "the-agentic-fieldbook",
   "description": "Independently installable Agent Skills for practical software delivery.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "owner": {
     "name": "Gürkan Süerdem",
     "url": "https://github.com/Phalegethon"
@@ -11,7 +11,6 @@
       "name": "branch-handoff",
       "source": "./skills/branch-handoff",
       "description": "Creates local DEV and QA handoffs from a bounded branch diff.",
-      "version": "1.0.0",
       "author": {
         "name": "Gürkan Süerdem",
         "url": "https://github.com/Phalegethon"

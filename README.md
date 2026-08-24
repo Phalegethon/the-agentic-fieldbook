@@ -127,12 +127,42 @@ The marketplace command is `/branch-handoff:branch-handoff`. For a manual
 project installation, copy `skills/branch-handoff` into the agent's supported
 project skill directory.
 
+## Update `branch-handoff`
+
+Copied and project-installed skills cannot receive a universal push
+notification from this repository. Use the matching explicit update command:
+
+```bash
+# Project installation
+npx --yes skills@latest update branch-handoff --project --yes
+
+# Global installation
+npx --yes skills@latest update branch-handoff --global --yes
+```
+
+Subscribe to this repository's GitHub Releases to be notified when a new TAF
+skill version is published.
+
+Claude marketplace users can update manually with
+`/plugin update branch-handoff@the-agentic-fieldbook`, then run
+`/reload-plugins` when prompted. To opt into auto-update, open `/plugin`, choose
+`Marketplaces`, select `the-agentic-fieldbook`, and enable auto-update. TAF
+never enables silent updates or performs a network update check when the skill
+runs.
+
 ## Use branch-handoff
 
 From a Git repository, ask the agent:
 
 ```text
 Compare this branch with main and prepare the DEV and QA handoff.
+```
+
+To include Jira intent and acceptance criteria, supply the exact issue. The
+skill asks for bounded Jira consent before repository or diff analysis:
+
+```text
+Use branch-handoff to compare the current branch with origin/main and prepare the DEV and QA handoff. jira FE-2669
 ```
 
 Defaults and boundaries:

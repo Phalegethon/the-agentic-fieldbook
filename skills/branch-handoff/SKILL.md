@@ -4,7 +4,7 @@ description: Use when a developer needs a DEV and QA handoff from changes betwee
 license: MIT
 metadata:
   author: The Agentic Fieldbook
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Branch Handoff
