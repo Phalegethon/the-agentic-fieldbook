@@ -28,11 +28,33 @@ class PlatformPreflightContractTest(unittest.TestCase):
         self.assertIn("The collector has not run", self.platform)
         self.assertIn("Do not start repository or diff work", self.platform)
 
-    def test_no_platform_signal_preserves_the_local_fast_path(self) -> None:
+    def test_missing_platform_target_discovers_optional_context_before_collection(self) -> None:
         self.assertIn(
-            "With no explicit platform target, perform no adapter lookup, question, or network request",
+            "If neither a platform target nor an explicit local-only choice is present",
             self.skill,
         )
+        self.assertIn("context-discovery", self.platform)
+        self.assertIn("one combined", self.platform)
+
+    def test_context_discovery_is_skipped_for_explicit_target_or_local_only(self) -> None:
+        self.assertIn(
+            "Skip context discovery when the request already supplies a target or explicitly chooses local-only",
+            self.skill,
+        )
+        self.assertIn("Explicit target", self.platform)
+        self.assertIn("Explicit local-only", self.platform)
+
+    def test_discovery_supports_jira_github_both_and_exclusive_local_only(self) -> None:
+        for choice in ("Jira issue", "GitHub PR", "Both Jira and GitHub", "Local only"):
+            self.assertIn(choice, self.platform)
+        self.assertIn("multi-select", self.platform)
+        self.assertIn("mutually exclusive", self.platform)
+
+    def test_selected_platform_resolves_an_exact_target_before_read_consent(self) -> None:
+        self.assertIn("exact Jira key/URL", self.platform)
+        self.assertIn("exact PR number/URL", self.platform)
+        self.assertIn("Find the current branch PR", self.platform)
+        self.assertIn("No adapter or network access occurs during context discovery", self.platform)
 
     def test_jira_permission_bundles_connection_and_bounded_read(self) -> None:
         self.assertIn(

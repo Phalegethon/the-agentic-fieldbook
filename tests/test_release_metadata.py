@@ -8,11 +8,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 SKILL = ROOT / "skills" / "branch-handoff"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 class ReleaseMetadataTest(unittest.TestCase):
-    def test_skill_and_plugin_versions_match_1_1_0(self) -> None:
+    def test_skill_and_plugin_versions_match_1_2_0(self) -> None:
         skill_md = (SKILL / "SKILL.md").read_text(encoding="utf-8")
         match = re.search(r'^  version: "([^"]+)"$', skill_md, re.MULTILINE)
         self.assertIsNotNone(match)
@@ -38,7 +38,8 @@ class ReleaseMetadataTest(unittest.TestCase):
     def test_changelog_and_readme_publish_update_paths(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("## [1.1.0] - 2026-08-24", changelog)
+        self.assertIn("## [1.2.0] - 2026-08-24", changelog)
+        self.assertIn("optional Jira and GitHub context", readme)
         self.assertIn(
             "Re-run the matching agent-specific install command",
             readme,

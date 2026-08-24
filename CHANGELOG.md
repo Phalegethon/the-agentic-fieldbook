@@ -2,6 +2,22 @@
 
 All notable changes to independently released TAF skills are recorded here.
 
+## [1.2.0] - 2026-08-24
+
+### Added
+
+- One structured context-discovery choice when a request omits Jira and GitHub targets.
+- Exact Jira target entry and bounded current-branch PR discovery before target-specific read consent.
+
+### Changed
+
+- Explicit platform targets and explicit local-only requests skip context discovery.
+- Jira and GitHub may be selected together while local-only remains mutually exclusive.
+
+### Security
+
+- Context discovery performs no adapter or network access, and platform reads still require session-scoped consent.
+
 ## [1.1.0] - 2026-08-24
 
 ### Added

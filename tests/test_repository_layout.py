@@ -41,7 +41,7 @@ class RepositoryLayoutTest(unittest.TestCase):
             (SKILL / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
         self.assertEqual("branch-handoff", plugin["name"])
-        self.assertEqual("1.1.0", plugin["version"])
+        self.assertEqual("1.2.0", plugin["version"])
         self.assertEqual("MIT", plugin["license"])
         self.assertEqual("Gürkan Süerdem", plugin["author"]["name"])
         self.assertEqual("https://github.com/Phalegethon", plugin["author"]["url"])

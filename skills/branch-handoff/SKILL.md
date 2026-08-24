@@ -4,14 +4,14 @@ description: Use when a developer needs a DEV and QA handoff from changes betwee
 license: MIT
 metadata:
   author: The Agentic Fieldbook
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # Branch Handoff
 
-Create a complete local handoff from bounded diff evidence, not a review or a validation run.
+Create a complete local handoff from bounded diff evidence, not review or validation.
 
-The collector is the sole code/diff inspection. First inspect only the user's current request. An explicitly supplied Jira issue key/URL or GitHub PR number/URL is a platform target; it triggers an offer to read, not read permission. If present, before any repository or diff work load `<skill-dir>/references/platform-actions.md` and complete its preflight. With no explicit platform target, perform no adapter lookup, question, or network request and continue locally. Do not run `ls`, `find`, `rg --files`, `git ls-files`, or direct source-file reads against the target repository before or for the collector.
+Inspect the request first. An explicitly supplied Jira issue key/URL or GitHub PR number/URL is a platform target and prompts read consent. If neither a platform target nor an explicit local-only choice is present, load `<skill-dir>/references/platform-actions.md` and complete `context-discovery` before any repository or diff work. Skip context discovery when the request already supplies a target or explicitly chooses local-only. Explicit or discovered targets use the reference's preflight; explicit local-only performs no adapter lookup or platform network request. The collector is the sole code/diff inspection. Before it, do not run `ls`, `find`, `rg --files`, `git ls-files`, or direct target-repository source reads.
 
 Let `<skill-dir>` be the directory containing this `SKILL.md`.
 

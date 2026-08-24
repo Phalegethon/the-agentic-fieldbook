@@ -1,7 +1,7 @@
 {
   "name": "branch-handoff",
   "description": "Creates local DEV and QA handoffs from a bounded branch diff.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": {
     "name": "Gürkan Süerdem",
     "url": "https://github.com/Phalegethon"

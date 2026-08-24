@@ -174,6 +174,11 @@ From a Git repository, ask the agent:
 Compare this branch with main and prepare the DEV and QA handoff.
 ```
 
+When the request supplies neither a platform target nor `local only`, the skill
+asks one combined structured question for optional Jira and GitHub context
+before repository or diff analysis. Choose Jira, GitHub, both, or local-only;
+the skill then requests only the selected exact targets and permissions.
+
 To include Jira intent and acceptance criteria, supply the exact issue. The
 skill asks for bounded Jira consent before repository or diff analysis:
 

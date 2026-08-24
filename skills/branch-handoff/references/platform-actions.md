@@ -1,34 +1,58 @@
 # Optional Jira and GitHub Actions
 
 Load this reference when the current request contains an explicit Jira/GitHub
-target or asks to publish a handoff comment. Local reporting remains the
-default. Permissions are platform-, target-, action-, and session-specific.
+target, asks to publish a handoff comment, or needs optional-context discovery.
+Local reporting remains available. Permissions are platform-, target-, action-,
+and session-specific.
 
 The collector has not run during preflight. Do not start repository or diff work
-until the exact target has either been authorized for a bounded read or declined
-for this session. Use the host's structured question tool for every choice when
-available; otherwise render the same outcomes as numbered choices. Never infer
-write permission from a read, connection, analysis, draft, or general
-“continue” approval.
+until context discovery is resolved and every selected target has either been
+authorized for a bounded read or declined for this session. Use the host's
+structured question tool for every choice when available; otherwise render the
+same outcomes as numbered choices. Never infer write permission from a read,
+connection, analysis, draft, or general “continue” approval.
+
+## Context discovery
+
+Route from the current request before any collector, repository, adapter, or
+platform access:
+
+- `Explicit target`: skip discovery and retain the supplied exact target.
+- `Explicit local-only`: skip discovery and continue without platform access.
+- Otherwise, ask one combined optional-context question. Use multi-select when
+  available with `Jira issue`, `GitHub PR`, and `Local only`. Jira and GitHub may
+  be selected together; `Local only` is mutually exclusive. For single-select
+  or numbered fallback, present `Jira issue`, `GitHub PR`,
+  `Both Jira and GitHub`, and `Local only`.
+
+No adapter or network access occurs during context discovery. After `Jira issue`
+is selected, request the exact Jira key/URL. After `GitHub PR` is selected,
+request the exact PR number/URL or offer `Find the current branch PR`. That
+lookup selection authorizes only connection verification and resolving a PR in
+the current repository for the current branch; show the resolved exact PR and
+request target-specific read consent before reading its content. A missing or
+ambiguous PR returns to exact-target entry or local-only without broadening the
+lookup. Resolve both selected platforms independently before collection.
 
 ## Preflight states
 
-1. `target-detected`: retain the exact Jira issue or GitHub PR supplied in the
+1. `context-discovery`: resolve optional Jira/GitHub context or local-only.
+2. `target-detected`: retain the exact Jira issue or GitHub PR supplied in the
    current request.
-2. `choice-required`: use structured choices when available; otherwise use the
+3. `choice-required`: use structured choices when available; otherwise use the
    numbered equivalents.
-3. `local-only`: record that platform context was not read and continue to
+4. `local-only`: record that platform context was not read and continue to
    collection.
-4. `connection-help`: explain or initiate only the supported connector/login
+5. `connection-help`: explain or initiate only the supported connector/login
    flow.
-5. `read-authorized`: verify the selected adapter and read only the approved
+6. `read-authorized`: verify the selected adapter and read only the approved
    fields.
-6. `read-unavailable`: record adapter, target, and a safe error summary; continue
+7. `read-unavailable`: record adapter, target, and a safe error summary; continue
    locally.
-7. `context-ready`: retain normalized provenance for the single synthesis.
-8. `collect-once`: return to `SKILL.md` and invoke the collector exactly once.
-9. `report-complete`: deliver all three local report sections.
-10. `optional-actions`: offer cluster detail or a platform comment draft.
+8. `context-ready`: retain normalized provenance for the single synthesis.
+9. `collect-once`: return to `SKILL.md` and invoke the collector exactly once.
+10. `report-complete`: deliver all three local report sections.
+11. `optional-actions`: offer cluster detail or a platform comment draft.
 
 At `choice-required`, present these outcomes with the first marked recommended:
 
