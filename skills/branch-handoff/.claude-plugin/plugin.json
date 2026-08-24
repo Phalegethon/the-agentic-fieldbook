@@ -1,0 +1,18 @@
+{
+  "name": "branch-handoff",
+  "description": "Creates local DEV and QA handoffs from a bounded branch diff.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Gürkan Süerdem",
+    "url": "https://github.com/Phalegethon"
+  },
+  "homepage": "https://github.com/Phalegethon/the-agentic-fieldbook/tree/main/skills/branch-handoff",
+  "repository": "https://github.com/Phalegethon/the-agentic-fieldbook",
+  "license": "MIT",
+  "keywords": [
+    "branch",
+    "handoff",
+    "qa",
+    "pull-request"
+  ]
+}

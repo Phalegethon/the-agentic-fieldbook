@@ -1,0 +1,33 @@
+name: Skill proposal
+description: Propose a focused, reusable skill for TAF
+title: "[Skill]: "
+labels:
+  - enhancement
+body:
+  - type: input
+    id: name
+    attributes:
+      label: Proposed skill name
+      placeholder: release-risk
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Explain the recurring software-delivery problem, not only a desired implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: trigger
+    attributes:
+      label: When should an agent use it?
+    validations:
+      required: true
+  - type: textarea
+    id: portability
+    attributes:
+      label: Portability and side effects
+      description: Describe runtime tools, platform assumptions, network access, and external mutations.
+    validations:
+      required: true

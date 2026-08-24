@@ -1,0 +1,4 @@
+interface:
+  display_name: "Branch Handoff"
+  short_description: "Create DEV and QA handoffs from a bounded branch diff"
+  default_prompt: "Use $branch-handoff to compare this branch with main and prepare a local DEV and QA handoff without running tests or code review. Keep it local unless I separately authorize Jira or GitHub access."

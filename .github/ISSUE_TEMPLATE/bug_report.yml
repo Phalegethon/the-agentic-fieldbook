@@ -1,0 +1,42 @@
+name: Bug report
+description: Report reproducible incorrect behavior in a released TAF skill
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve The Agentic Fieldbook.
+  - type: input
+    id: skill
+    attributes:
+      label: Skill
+      placeholder: branch-handoff
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Remove credentials, proprietary code, and private repository data.
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent and version
+      placeholder: Codex, Claude Code, or Antigravity version
+    validations:
+      required: true
