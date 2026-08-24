@@ -40,13 +40,13 @@ class ReleaseMetadataTest(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("## [1.1.0] - 2026-08-24", changelog)
         self.assertIn(
-            "npx --yes skills@latest update branch-handoff --project --yes",
+            "Re-run the matching agent-specific install command",
             readme,
         )
-        self.assertIn(
-            "npx --yes skills@latest update branch-handoff --global --yes",
-            readme,
-        )
+        update_section = readme.split("## Update `branch-handoff`", 1)[1]
+        self.assertIn("--agent claude-code", update_section)
+        self.assertIn("--global", update_section)
+        self.assertNotIn("skills@latest update branch-handoff", readme)
         self.assertIn("auto-update", readme.lower())
         self.assertIn("GitHub Release", readme)
 

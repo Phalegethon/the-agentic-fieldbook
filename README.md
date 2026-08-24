@@ -130,15 +130,31 @@ project skill directory.
 ## Update `branch-handoff`
 
 Copied and project-installed skills cannot receive a universal push
-notification from this repository. Use the matching explicit update command:
+notification from this repository. Re-run the matching agent-specific install command
+from the installation section so the selected runtime copy is overwritten.
+For example, Claude Code project and global updates are:
 
 ```bash
-# Project installation
-npx --yes skills@latest update branch-handoff --project --yes
+# Claude Code project installation
+npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
+  --skill branch-handoff \
+  --agent claude-code \
+  --yes
 
-# Global installation
-npx --yes skills@latest update branch-handoff --global --yes
+# Claude Code global installation
+npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
+  --skill branch-handoff \
+  --agent claude-code \
+  --global \
+  --yes
 ```
+
+Codex and Antigravity users should rerun their matching command above with the
+same `--agent` and scope. For agent-targeted installations, do not substitute
+the generic `skills update` command: a TAF release smoke test found that it can
+refresh the canonical `.agents/skills` copy while leaving a runtime-specific
+copy stale. Verify the active path and source afterward with
+`npx --yes skills@latest list --json`.
 
 Subscribe to this repository's GitHub Releases to be notified when a new TAF
 skill version is published.

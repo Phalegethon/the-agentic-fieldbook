@@ -9,7 +9,7 @@ All notable changes to independently released TAF skills are recorded here.
 - Preflight for explicitly supplied Jira issue and GitHub PR targets before diff collection.
 - Structured consent choices when supported, with equivalent numbered fallback.
 - One session-scoped Jira permission for connection verification and bounded issue fields.
-- Manual cross-runtime update commands and Claude marketplace auto-update guidance.
+- Deterministic agent-specific re-install/update commands and Claude marketplace auto-update guidance.
 
 ### Changed
 
