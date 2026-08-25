@@ -12,6 +12,7 @@ from unittest import mock
 from taf_context.git_snapshot import (
     SnapshotError,
     _content_descriptor,
+    _index_gitlinks,
     collect_snapshot,
     manifest_from_snapshot,
 )
@@ -105,6 +106,53 @@ class RepositoryIdentityTests(unittest.TestCase):
 
 
 class DirtyOverlayTests(unittest.TestCase):
+    def test_rename_discovery_disables_similarity_and_never_reads_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = init_repo(Path(directory) / "repo")
+            source = repo / "source.txt"
+            source.write_bytes(b"sensitive oversized payload")
+            commit_all(repo, "track source")
+            run(repo, "git", "config", "diff.renames", "true")
+            run(repo, "git", "mv", "source.txt", "renamed.txt")
+            helper_marker = repo / "external-diff-ran"
+            helper = repo / "external-diff"
+            write(helper, f"#!/bin/sh\ntouch '{helper_marker}'\n")
+            helper.chmod(0o755)
+            run(repo, "git", "config", "diff.external", str(helper))
+            opened_payloads: list[object] = []
+            real_open = os.open
+            real_run = subprocess.run
+            diff_commands: list[tuple[str, ...]] = []
+
+            def recording_open(
+                path: object, flags: int, *args: object, **kwargs: object
+            ) -> int:
+                if path in {"source.txt", "renamed.txt"}:
+                    opened_payloads.append(path)
+                return real_open(path, flags, *args, **kwargs)
+
+            def recording_run(argv: list[str], **kwargs: object):
+                command = tuple(argv[1:])
+                if command and command[0] == "diff":
+                    diff_commands.append(command)
+                return real_run(argv, **kwargs)
+
+            with mock.patch(
+                "taf_context.git_snapshot.os.open", side_effect=recording_open
+            ), mock.patch(
+                "taf_context.git_snapshot.subprocess.run", side_effect=recording_run
+            ):
+                snapshot = collect_snapshot(repo, max_dirty_file_bytes=8)
+
+            self.assertFalse(helper_marker.exists())
+            self.assertEqual(opened_payloads, [])
+            self.assertTrue(diff_commands)
+            self.assertTrue(all("--no-renames" in command for command in diff_commands))
+            self.assertEqual(
+                set(snapshot.staged_paths), {"source.txt", "renamed.txt"}
+            )
+            self.assertIn("dirty-diff-statistics-incomplete", snapshot.warnings)
+
     def test_excluded_dirty_content_uses_metadata_only_and_warns(self) -> None:
         fixtures = {
             "vendor/library.py": b"vendored secret",
@@ -607,6 +655,13 @@ class BoundedGitTests(unittest.TestCase):
             self.assertTrue(environments)
             self.assertTrue(all(env.get("GIT_OPTIONAL_LOCKS") == "0" for env in environments))
             self.assertTrue(all(env.get("GIT_CONFIG_NOSYSTEM") == "1" for env in environments))
+            self.assertTrue(
+                all(
+                    env.get("GIT_CONFIG_KEY_5") == "diff.renames"
+                    and env.get("GIT_CONFIG_VALUE_5") == "false"
+                    for env in environments
+                )
+            )
 
     def test_every_git_command_uses_the_twenty_second_timeout(self) -> None:
         real_run = subprocess.run
@@ -642,8 +697,8 @@ class BoundedGitTests(unittest.TestCase):
             ("rev-list", "--max-parents=0", "HEAD"),
             ("ls-files", "-z"),
             ("ls-files", "--stage", "-z"),
-            ("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--cached", "--name-only", "-z"),
-            ("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--name-only", "-z"),
+            ("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=dirty", "--cached", "--name-only", "-z"),
+            ("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=all", "--name-only", "-z"),
             ("ls-files", "--others", "--exclude-standard", "-z"),
             (
                 "status",
@@ -675,6 +730,7 @@ class BoundedGitTests(unittest.TestCase):
         self.assertFalse(
             any(command[0] in {"fetch", "remote"} for command in invocations)
         )
+
 
     def test_rejects_non_git_input_and_invalid_byte_ceiling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -718,6 +774,44 @@ class BoundedGitTests(unittest.TestCase):
             ):
                 with self.assertRaises(SnapshotError):
                     collect_snapshot(Path(directory))
+
+
+class IndexEntryParserTests(unittest.TestCase):
+    OID = b"1" * 40
+
+    def test_every_index_field_is_validated_before_gitlink_classification(self) -> None:
+        malformed = {
+            "mode syntax": b"10064 " + self.OID + b" 0\tfile.txt\x00",
+            "unsupported mode": b"100600 " + self.OID + b" 0\tfile.txt\x00",
+            "object id": b"100644 " + (b"1" * 39) + b" 0\tfile.txt\x00",
+            "stage": b"100644 " + self.OID + b" 4\tfile.txt\x00",
+            "path": b"100644 " + self.OID + b" 0\t../escape.txt\x00",
+        }
+        for field, raw in malformed.items():
+            with self.subTest(field=field):
+                with self.assertRaises(SnapshotError):
+                    _index_gitlinks(raw)
+
+    def test_gitlink_conflict_stages_are_retained_deterministically(self) -> None:
+        raw = b"".join(
+            b"160000 " + bytes(str(stage), "ascii") * 40 + b" "
+            + bytes(str(stage), "ascii") + b"\tmodules/child\x00"
+            for stage in (3, 1, 2)
+        )
+        regular = b"100644 " + self.OID + b" 0\tregular.txt\x00"
+
+        parsed = _index_gitlinks(regular + raw)
+
+        self.assertEqual(
+            parsed,
+            {
+                "modules/child": (
+                    "160000:" + "1" * 40 + ":1",
+                    "160000:" + "2" * 40 + ":2",
+                    "160000:" + "3" * 40 + ":3",
+                )
+            },
+        )
 
 
 class DeferredEdgeCaseTests(unittest.TestCase):

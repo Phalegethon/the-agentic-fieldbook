@@ -16,6 +16,7 @@ from .models import BackgroundState, ContextManifest, RepositorySnapshot
 _GIT_TIMEOUT_SECONDS = 20
 _HASH_CHUNK_BYTES = 1024 * 1024
 _OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+_INDEX_MODES = {b"100644", b"100755", b"120000", b"160000"}
 
 _GENERATED_OR_VENDORED_SEGMENTS = {
     "vendor",
@@ -114,7 +115,7 @@ def _git_environment() -> dict[str, str]:
             "GIT_ATTR_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_COUNT": "5",
+            "GIT_CONFIG_COUNT": "6",
             "GIT_CONFIG_KEY_0": "core.fsmonitor",
             "GIT_CONFIG_VALUE_0": "false",
             "GIT_CONFIG_KEY_1": "diff.external",
@@ -125,6 +126,8 @@ def _git_environment() -> dict[str, str]:
             "GIT_CONFIG_VALUE_3": "never",
             "GIT_CONFIG_KEY_4": "credential.helper",
             "GIT_CONFIG_VALUE_4": "",
+            "GIT_CONFIG_KEY_5": "diff.renames",
+            "GIT_CONFIG_VALUE_5": "false",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_TERMINAL_PROMPT": "0",
         }
@@ -222,10 +225,11 @@ def _status_paths(raw: bytes | None) -> tuple[dict[str, str], int]:
     return statuses, ignored
 
 
-def _index_gitlinks(raw: bytes | None) -> dict[str, str]:
+def _index_gitlinks(raw: bytes | None) -> dict[str, tuple[str, ...]]:
     if raw is None or (raw and not raw.endswith(b"\x00")):
         raise SnapshotError("malformed Git output: index entries")
-    gitlinks: dict[str, str] = {}
+    gitlinks: dict[str, list[str]] = {}
+    seen_entries: set[tuple[str, bytes]] = set()
     fields = [] if not raw else raw[:-1].split(b"\x00")
     for record in fields:
         header, separator, path_raw = record.partition(b"\t")
@@ -233,8 +237,8 @@ def _index_gitlinks(raw: bytes | None) -> dict[str, str]:
         if not separator or len(parts) != 3:
             raise SnapshotError("malformed Git output: index entries")
         mode, object_id, stage = parts
-        if mode != b"160000" or stage != b"0":
-            continue
+        if mode not in _INDEX_MODES or stage not in {b"0", b"1", b"2", b"3"}:
+            raise SnapshotError("malformed Git output: index entries")
         try:
             value = object_id.decode("ascii")
         except UnicodeDecodeError as exc:
@@ -242,10 +246,18 @@ def _index_gitlinks(raw: bytes | None) -> dict[str, str]:
         if not _OBJECT_ID.fullmatch(value):
             raise SnapshotError("malformed Git output: index entries")
         path = _path_text(path_raw, "index entries")
-        if path in gitlinks:
+        entry_key = (path, stage)
+        if entry_key in seen_entries:
             raise SnapshotError("malformed Git output: index entries")
-        gitlinks[path] = value.lower()
-    return gitlinks
+        seen_entries.add(entry_key)
+        if mode == b"160000":
+            gitlinks.setdefault(path, []).append(
+                f"160000:{value.lower()}:{stage.decode('ascii')}"
+            )
+    return {
+        path: tuple(sorted(entries, key=lambda entry: entry.rsplit(":", 1)[1]))
+        for path, entries in sorted(gitlinks.items())
+    }
 
 
 def _fingerprint(values: tuple[str, ...] | list[str]) -> str:
@@ -513,6 +525,7 @@ def collect_snapshot(
         _git(
             repo,
             "diff",
+            "--no-renames",
             "--ignore-submodules=dirty",
             "--cached",
             "--name-only",
@@ -521,7 +534,14 @@ def collect_snapshot(
         "staged paths",
     )
     unstaged_paths = _z_paths(
-        _git(repo, "diff", "--ignore-submodules=all", "--name-only", "-z"),
+        _git(
+            repo,
+            "diff",
+            "--no-renames",
+            "--ignore-submodules=all",
+            "--name-only",
+            "-z",
+        ),
         "unstaged paths",
     )
     untracked_paths = _z_paths(
@@ -555,7 +575,7 @@ def collect_snapshot(
         if flags is None:
             flags = "??" if path in untracked_paths else "  "
         if path in index_gitlinks and path in staged_paths:
-            descriptor = f"gitlink:{index_gitlinks[path]}"
+            descriptor = "gitlink:" + ",".join(index_gitlinks[path])
             bytes_hashed, binary, complete, warning = 0, False, True, None
         else:
             descriptor, bytes_hashed, binary, complete, warning = _content_descriptor(

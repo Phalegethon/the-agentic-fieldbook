@@ -65,11 +65,11 @@ ALLOWED_GIT_COMMANDS = {
     ("git", "ls-files", "--stage", "-z"),
     (
         "git", "diff", "--no-ext-diff", "--no-textconv",
-        "--ignore-submodules=dirty", "--cached", "--name-only", "-z",
+        "--no-renames", "--ignore-submodules=dirty", "--cached", "--name-only", "-z",
     ),
     (
         "git", "diff", "--no-ext-diff", "--no-textconv",
-        "--ignore-submodules=all", "--name-only", "-z",
+        "--no-renames", "--ignore-submodules=all", "--name-only", "-z",
     ),
     ("git", "ls-files", "--others", "--exclude-standard", "-z"),
     (
