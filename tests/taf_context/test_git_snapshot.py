@@ -24,6 +24,18 @@ from tests.taf_context.repo_factory import (
 
 
 class RepositoryIdentityTests(unittest.TestCase):
+    def test_repository_root_preserves_path_whitespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = init_committed_repo(Path(directory) / " repository ")
+
+            try:
+                snapshot = collect_snapshot(repo)
+            except SnapshotError:
+                self.fail("valid repository-root whitespace must be preserved")
+
+            self.assertEqual(snapshot.canonical_root, str(repo.resolve()))
+            self.assertEqual(snapshot.tracked_paths, ("tracked.txt",))
+
     def test_subdirectory_collection_keeps_repository_relative_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = init_committed_repo(Path(directory) / "repo")
@@ -302,6 +314,26 @@ class InventoryAndManifestTests(unittest.TestCase):
 
 
 class BoundedGitTests(unittest.TestCase):
+    def test_every_git_command_uses_the_twenty_second_timeout(self) -> None:
+        real_run = subprocess.run
+        observed_timeouts: list[object] = []
+
+        def recording_run(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[bytes]:
+            observed_timeouts.append(kwargs.get("timeout"))
+            return real_run(argv, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = init_committed_repo(Path(directory) / "repo")
+            with mock.patch(
+                "taf_context.git_snapshot.subprocess.run", side_effect=recording_run
+            ):
+                collect_snapshot(repo)
+
+        self.assertTrue(observed_timeouts)
+        self.assertEqual(set(observed_timeouts), {20})
+
     def test_collector_uses_only_local_allowlisted_git_commands(self) -> None:
         allowed = {
             ("rev-parse", "--show-toplevel"),

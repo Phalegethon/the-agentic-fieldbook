@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 from .models import BackgroundState, ContextManifest, RepositorySnapshot
 
 
-_GIT_TIMEOUT_SECONDS = 10
+_GIT_TIMEOUT_SECONDS = 20
 _HASH_CHUNK_BYTES = 1024 * 1024
 _OBJECT_ID = re.compile(r"[0-9a-fA-F]{40,64}")
 
@@ -108,13 +108,15 @@ def _git(repo: Path, *args: str, allow_failure: bool = False) -> bytes | None:
 def _text(raw: bytes | None, field: str, *, empty_ok: bool = False) -> str:
     if raw is None:
         raise SnapshotError(f"malformed Git output: {field}")
+    if not raw.endswith(b"\n"):
+        raise SnapshotError(f"malformed Git output: {field}")
     try:
-        value = raw.decode("utf-8").strip()
+        value = raw[:-1].decode("utf-8")
     except UnicodeDecodeError as exc:
         raise SnapshotError(f"malformed Git output: {field}") from exc
     if not value and not empty_ok:
         raise SnapshotError(f"malformed Git output: {field}")
-    if "\x00" in value or "\n" in value or "\r" in value:
+    if "\x00" in value or "\n" in value:
         raise SnapshotError(f"malformed Git output: {field}")
     return value
 
