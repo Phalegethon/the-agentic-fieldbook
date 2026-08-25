@@ -115,7 +115,7 @@ def _git_environment() -> dict[str, str]:
             "GIT_ATTR_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_COUNT": "6",
+            "GIT_CONFIG_COUNT": "7",
             "GIT_CONFIG_KEY_0": "core.fsmonitor",
             "GIT_CONFIG_VALUE_0": "false",
             "GIT_CONFIG_KEY_1": "diff.external",
@@ -128,6 +128,8 @@ def _git_environment() -> dict[str, str]:
             "GIT_CONFIG_VALUE_4": "",
             "GIT_CONFIG_KEY_5": "diff.renames",
             "GIT_CONFIG_VALUE_5": "false",
+            "GIT_CONFIG_KEY_6": "status.renames",
+            "GIT_CONFIG_VALUE_6": "false",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_TERMINAL_PROMPT": "0",
         }
@@ -552,6 +554,7 @@ def collect_snapshot(
         _git(
             repo,
             "status",
+            "--no-renames",
             "--ignore-submodules=all",
             "--porcelain=v1",
             "-z",

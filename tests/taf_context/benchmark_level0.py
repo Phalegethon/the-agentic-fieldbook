@@ -75,6 +75,7 @@ ALLOWED_GIT_COMMANDS = {
     (
         "git",
         "status",
+        "--no-renames",
         "--ignore-submodules=all",
         "--porcelain=v1",
         "-z",

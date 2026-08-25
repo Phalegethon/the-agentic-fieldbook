@@ -113,6 +113,7 @@ class DirtyOverlayTests(unittest.TestCase):
             source.write_bytes(b"sensitive oversized payload")
             commit_all(repo, "track source")
             run(repo, "git", "config", "diff.renames", "true")
+            run(repo, "git", "config", "status.renames", "true")
             run(repo, "git", "mv", "source.txt", "renamed.txt")
             helper_marker = repo / "external-diff-ran"
             helper = repo / "external-diff"
@@ -122,7 +123,7 @@ class DirtyOverlayTests(unittest.TestCase):
             opened_payloads: list[object] = []
             real_open = os.open
             real_run = subprocess.run
-            diff_commands: list[tuple[str, ...]] = []
+            discovery_commands: list[tuple[str, ...]] = []
 
             def recording_open(
                 path: object, flags: int, *args: object, **kwargs: object
@@ -133,8 +134,8 @@ class DirtyOverlayTests(unittest.TestCase):
 
             def recording_run(argv: list[str], **kwargs: object):
                 command = tuple(argv[1:])
-                if command and command[0] == "diff":
-                    diff_commands.append(command)
+                if command and command[0] in {"diff", "status"}:
+                    discovery_commands.append(command)
                 return real_run(argv, **kwargs)
 
             with mock.patch(
@@ -146,8 +147,10 @@ class DirtyOverlayTests(unittest.TestCase):
 
             self.assertFalse(helper_marker.exists())
             self.assertEqual(opened_payloads, [])
-            self.assertTrue(diff_commands)
-            self.assertTrue(all("--no-renames" in command for command in diff_commands))
+            self.assertTrue(discovery_commands)
+            self.assertTrue(
+                all("--no-renames" in command for command in discovery_commands)
+            )
             self.assertEqual(
                 set(snapshot.staged_paths), {"source.txt", "renamed.txt"}
             )
@@ -659,6 +662,8 @@ class BoundedGitTests(unittest.TestCase):
                 all(
                     env.get("GIT_CONFIG_KEY_5") == "diff.renames"
                     and env.get("GIT_CONFIG_VALUE_5") == "false"
+                    and env.get("GIT_CONFIG_KEY_6") == "status.renames"
+                    and env.get("GIT_CONFIG_VALUE_6") == "false"
                     for env in environments
                 )
             )
@@ -702,6 +707,7 @@ class BoundedGitTests(unittest.TestCase):
             ("ls-files", "--others", "--exclude-standard", "-z"),
             (
                 "status",
+                "--no-renames",
                 "--ignore-submodules=all",
                 "--porcelain=v1",
                 "-z",
