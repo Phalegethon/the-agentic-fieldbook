@@ -17,6 +17,7 @@ import unittest
 from unittest import mock
 
 from tests.taf_context import benchmark_level0 as benchmark
+from tests.taf_context import repo_factory
 
 
 class InstrumentationGuardTests(unittest.TestCase):
@@ -129,6 +130,42 @@ class EvidenceSemanticsTests(unittest.TestCase):
         self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(environment["GIT_CONFIG_COUNT"], "2")
+        self.assertEqual(environment["GIT_CONFIG_KEY_0"], "maintenance.auto")
+        self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "0")
+        self.assertEqual(environment["GIT_CONFIG_KEY_1"], "gc.auto")
+        self.assertEqual(environment["GIT_CONFIG_VALUE_1"], "0")
+
+    def test_repo_factory_git_run_disables_automatic_maintenance(self) -> None:
+        completed = subprocess.CompletedProcess(["git", "status"], 0, "", "")
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            repo_factory.run(Path("/fixture"), "git", "status")
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["GIT_CONFIG_COUNT"], "2")
+        self.assertEqual(environment["GIT_CONFIG_KEY_0"], "maintenance.auto")
+        self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "0")
+        self.assertEqual(environment["GIT_CONFIG_KEY_1"], "gc.auto")
+        self.assertEqual(environment["GIT_CONFIG_VALUE_1"], "0")
+
+    def test_fixture_does_not_spawn_automatic_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / "trace.json"
+            with mock.patch.dict(os.environ, {"GIT_TRACE2_EVENT": str(trace)}):
+                benchmark._fixture(Path(directory) / "fixture", 1, 0)
+
+            children = []
+            for line in trace.read_text(encoding="utf-8").splitlines():
+                event = json.loads(line)
+                if event.get("event") == "child_start":
+                    children.append(event.get("argv", []))
+            self.assertFalse(
+                any(
+                    argv[:3] == ["git", "maintenance", "run"]
+                    or argv[:2] == ["git", "gc"]
+                    for argv in children
+                ),
+                children,
+            )
 
     @staticmethod
     def _ok_sample() -> dict:
