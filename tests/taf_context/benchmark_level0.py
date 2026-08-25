@@ -62,9 +62,10 @@ ALLOWED_GIT_COMMANDS = {
     ("git", "rev-list", "--max-parents=0", "HEAD"),
     ("git", "symbolic-ref", "--short", "-q", "HEAD"),
     ("git", "ls-files", "-z"),
+    ("git", "ls-files", "--stage", "-z"),
     (
         "git", "diff", "--no-ext-diff", "--no-textconv",
-        "--ignore-submodules=all", "--cached", "--name-only", "-z",
+        "--ignore-submodules=dirty", "--cached", "--name-only", "-z",
     ),
     (
         "git", "diff", "--no-ext-diff", "--no-textconv",
@@ -79,10 +80,6 @@ ALLOWED_GIT_COMMANDS = {
         "-z",
         "--ignored=matching",
         "--untracked-files=normal",
-    ),
-    (
-        "git", "diff", "--no-ext-diff", "--no-textconv",
-        "--ignore-submodules=all", "--numstat", "-z", "HEAD",
     ),
 }
 NETWORK_GIT_COMMANDS = {

@@ -222,6 +222,32 @@ def _status_paths(raw: bytes | None) -> tuple[dict[str, str], int]:
     return statuses, ignored
 
 
+def _index_gitlinks(raw: bytes | None) -> dict[str, str]:
+    if raw is None or (raw and not raw.endswith(b"\x00")):
+        raise SnapshotError("malformed Git output: index entries")
+    gitlinks: dict[str, str] = {}
+    fields = [] if not raw else raw[:-1].split(b"\x00")
+    for record in fields:
+        header, separator, path_raw = record.partition(b"\t")
+        parts = header.split(b" ")
+        if not separator or len(parts) != 3:
+            raise SnapshotError("malformed Git output: index entries")
+        mode, object_id, stage = parts
+        if mode != b"160000" or stage != b"0":
+            continue
+        try:
+            value = object_id.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SnapshotError("malformed Git output: index entries") from exc
+        if not _OBJECT_ID.fullmatch(value):
+            raise SnapshotError("malformed Git output: index entries")
+        path = _path_text(path_raw, "index entries")
+        if path in gitlinks:
+            raise SnapshotError("malformed Git output: index entries")
+        gitlinks[path] = value.lower()
+    return gitlinks
+
+
 def _fingerprint(values: tuple[str, ...] | list[str]) -> str:
     digest = hashlib.sha256()
     for value in values:
@@ -405,41 +431,6 @@ def _content_descriptor(
     )
 
 
-def _numstat(raw: bytes | None) -> tuple[int, int]:
-    if raw is None or (raw and not raw.endswith(b"\x00")):
-        raise SnapshotError("malformed Git output: numstat")
-    fields = [] if not raw else raw[:-1].split(b"\x00")
-    insertions = 0
-    deletions = 0
-    index = 0
-    while index < len(fields):
-        record = fields[index]
-        index += 1
-        parts = record.split(b"\t", 2)
-        if len(parts) != 3:
-            raise SnapshotError("malformed Git output: numstat")
-        added, removed, path = parts
-        if added != b"-":
-            try:
-                insertions += int(added)
-            except ValueError as exc:
-                raise SnapshotError("malformed Git output: numstat") from exc
-        if removed != b"-":
-            try:
-                deletions += int(removed)
-            except ValueError as exc:
-                raise SnapshotError("malformed Git output: numstat") from exc
-        if path:
-            _path_text(path, "numstat")
-        else:
-            if index + 1 >= len(fields):
-                raise SnapshotError("malformed Git output: numstat")
-            _path_text(fields[index], "numstat")
-            _path_text(fields[index + 1], "numstat")
-            index += 2
-    return insertions, deletions
-
-
 def _language_counts(paths: tuple[str, ...]) -> tuple[tuple[str, int], ...]:
     counts: dict[str, int] = {}
     for path in paths:
@@ -515,11 +506,14 @@ def collect_snapshot(
     branch = None if raw_branch is None else _text(raw_branch, "branch")
 
     tracked_paths = _z_paths(_git(repo, "ls-files", "-z"), "tracked paths")
+    index_gitlinks = _index_gitlinks(
+        _git(repo, "ls-files", "--stage", "-z")
+    )
     staged_paths = _z_paths(
         _git(
             repo,
             "diff",
-            "--ignore-submodules=all",
+            "--ignore-submodules=dirty",
             "--cached",
             "--name-only",
             "-z",
@@ -551,28 +545,27 @@ def collect_snapshot(
     dirty_bytes_hashed = 0
     binary_file_count = 0
     oversized_file_count = 0
-    dirty_complete = True
+    dirty_complete = not bool(index_gitlinks)
     tracked_dirty_paths = set(staged_paths + unstaged_paths)
-    diff_statistics_complete = True
     warnings: set[str] = set()
+    if index_gitlinks:
+        warnings.add("submodule-worktree-state-uninspected")
     for path in dirty_paths:
         flags = statuses.get(path)
         if flags is None:
             flags = "??" if path in untracked_paths else "  "
-        descriptor, bytes_hashed, binary, complete, warning = _content_descriptor(
-            canonical_root, path, max_dirty_file_bytes
-        )
+        if path in index_gitlinks and path in staged_paths:
+            descriptor = f"gitlink:{index_gitlinks[path]}"
+            bytes_hashed, binary, complete, warning = 0, False, True, None
+        else:
+            descriptor, bytes_hashed, binary, complete, warning = _content_descriptor(
+                canonical_root, path, max_dirty_file_bytes
+            )
         dirty_values.extend((path, flags, descriptor))
         dirty_bytes_hashed += bytes_hashed
         binary_file_count += int(binary)
         oversized_file_count += int(descriptor.startswith("oversized:"))
         dirty_complete = dirty_complete and complete
-        if path in tracked_dirty_paths:
-            diff_statistics_complete = (
-                diff_statistics_complete
-                and complete
-                and descriptor.startswith("regular:")
-            )
         if warning is not None:
             warnings.add(warning)
             if warning.startswith("dirty-") and warning.endswith("-content-excluded"):
@@ -592,22 +585,9 @@ def collect_snapshot(
         if path
         in {".taf/context/registration.json", ".taf/context/manifest.json"}
     )
-    if head_sha is None:
-        insertions = deletions = 0
-    elif tracked_dirty_paths and not diff_statistics_complete:
-        insertions = deletions = 0
+    insertions = deletions = 0
+    if tracked_dirty_paths:
         warnings.add("dirty-diff-statistics-incomplete")
-    else:
-        insertions, deletions = _numstat(
-            _git(
-                repo,
-                "diff",
-                "--ignore-submodules=all",
-                "--numstat",
-                "-z",
-                "HEAD",
-            )
-        )
 
     return RepositorySnapshot(
         schema_version="1",

@@ -308,17 +308,29 @@ class DirtyOverlayTests(unittest.TestCase):
                 unstaged_snapshot.dirty_fingerprint,
             )
 
-    def test_numstat_counts_full_worktree_change_against_head(self) -> None:
+    def test_tracked_dirty_state_never_invokes_worktree_numstat(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = init_committed_repo(Path(directory) / "repo")
             write(repo / "tracked.txt", "staged\n")
             run(repo, "git", "add", "tracked.txt")
             write(repo / "tracked.txt", "staged\nunstaged\n")
+            real_run = subprocess.run
+            numstat_invocations: list[tuple[str, ...]] = []
 
-            snapshot = collect_snapshot(repo)
+            def recording_run(argv: list[str], **kwargs: object):
+                command = tuple(argv[1:])
+                if "--numstat" in command:
+                    numstat_invocations.append(command)
+                return real_run(argv, **kwargs)
 
-            self.assertEqual(snapshot.insertions, 2)
-            self.assertEqual(snapshot.deletions, 1)
+            with mock.patch(
+                "taf_context.git_snapshot.subprocess.run", side_effect=recording_run
+            ):
+                snapshot = collect_snapshot(repo)
+
+            self.assertEqual(numstat_invocations, [])
+            self.assertEqual((snapshot.insertions, snapshot.deletions), (0, 0))
+            self.assertIn("dirty-diff-statistics-incomplete", snapshot.warnings)
 
     def test_numstat_is_skipped_for_ineligible_tracked_dirty_content(self) -> None:
         fixtures = {
@@ -518,6 +530,52 @@ class BoundedGitTests(unittest.TestCase):
                 snapshot.tracked_paths,
                 (".gitmodules", "modules/child", "tracked.txt"),
             )
+            self.assertFalse(snapshot.dirty_fingerprint_complete)
+            self.assertIn(
+                "submodule-worktree-state-uninspected", snapshot.warnings
+            )
+
+    def test_staged_gitlink_sha_change_is_fingerprinted_without_nested_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = init_committed_repo(root / "child")
+            first_sha = run(child, "git", "rev-parse", "HEAD").strip()
+            write(child / "tracked.txt", "second child revision\n")
+            commit_all(child, "second child revision")
+            second_sha = run(child, "git", "rev-parse", "HEAD").strip()
+            run(child, "git", "checkout", "--quiet", first_sha)
+
+            repo = init_committed_repo(root / "repo")
+            run(
+                repo,
+                "git",
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                str(child),
+                "modules/child",
+            )
+            commit_all(repo, "add submodule")
+            baseline = collect_snapshot(repo)
+
+            submodule = repo / "modules/child"
+            marker = repo / "nested-helper-ran"
+            helper = repo / "nested-fsmonitor"
+            write(helper, f"#!/bin/sh\ntouch '{marker}'\nprintf '0\\n'\n")
+            helper.chmod(0o755)
+            run(submodule, "git", "config", "core.fsmonitor", str(helper))
+            run(submodule, "git", "checkout", "--quiet", second_sha)
+            run(repo, "git", "add", "modules/child")
+            marker.unlink(missing_ok=True)
+
+            changed = collect_snapshot(repo)
+
+            self.assertFalse(marker.exists())
+            self.assertIn("modules/child", changed.staged_paths)
+            self.assertNotEqual(baseline.dirty_fingerprint, changed.dirty_fingerprint)
+            self.assertIn("dirty-diff-statistics-incomplete", changed.warnings)
 
     def test_git_boundary_disables_optional_locks_and_configured_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -583,7 +641,8 @@ class BoundedGitTests(unittest.TestCase):
             ("symbolic-ref", "--short", "-q", "HEAD"),
             ("rev-list", "--max-parents=0", "HEAD"),
             ("ls-files", "-z"),
-            ("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--cached", "--name-only", "-z"),
+            ("ls-files", "--stage", "-z"),
+            ("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--cached", "--name-only", "-z"),
             ("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--name-only", "-z"),
             ("ls-files", "--others", "--exclude-standard", "-z"),
             (
@@ -594,8 +653,6 @@ class BoundedGitTests(unittest.TestCase):
                 "--ignored=matching",
                 "--untracked-files=normal",
             ),
-            ("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-z", "HEAD"),
-            ("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--cached", "--numstat", "-z", "HEAD"),
         }
         real_run = subprocess.run
         invocations: list[tuple[str, ...]] = []
@@ -715,6 +772,18 @@ class DeferredEdgeCaseTests(unittest.TestCase):
             self.assertEqual(first.repository_identity, second.repository_identity)
             self.assertEqual(first.dirty_fingerprint, second.dirty_fingerprint)
             self.assertEqual(first.tracked_paths, ())
+
+    def test_unborn_staged_state_warns_that_diff_statistics_are_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = init_repo(Path(directory) / "repo")
+            write(repo / "staged.txt", "staged before first commit\n")
+            run(repo, "git", "add", "staged.txt")
+
+            snapshot = collect_snapshot(repo)
+
+            self.assertEqual(snapshot.staged_paths, ("staged.txt",))
+            self.assertEqual((snapshot.insertions, snapshot.deletions), (0, 0))
+            self.assertIn("dirty-diff-statistics-incomplete", snapshot.warnings)
 
 
 if __name__ == "__main__":
