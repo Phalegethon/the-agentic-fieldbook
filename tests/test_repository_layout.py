@@ -76,6 +76,43 @@ class RepositoryLayoutTest(unittest.TestCase):
         self.assertFalse((ROOT / "AGENTS.md").exists())
         self.assertFalse((ROOT / "CLAUDE.md").exists())
 
+    def test_public_layout_contains_taf_context_engine_without_exposure(self) -> None:
+        package = ROOT / "tools" / "taf-context" / "taf_context"
+        package_files = {
+            "__init__.py",
+            "__main__.py",
+            "cli.py",
+            "consent.py",
+            "dossier.py",
+            "freshness.py",
+            "git_snapshot.py",
+            "models.py",
+        }
+        for filename in package_files:
+            self.assertTrue((package / filename).is_file(), filename)
+
+        self.assertFalse((ROOT / "tools" / "taf-context" / "SKILL.md").exists())
+
+        marketplace = json.loads(
+            (ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
+        )
+        marketplace_sources = [plugin["source"] for plugin in marketplace["plugins"]]
+        self.assertNotIn("taf-context", json.dumps(marketplace_sources))
+
+        private_prefixes = (
+            "evals/context-infrastructure",
+            "benchmarks/context-infrastructure",
+            "docs/superpowers",
+        )
+        public_paths = (
+            path.relative_to(ROOT).as_posix()
+            for path in ROOT.rglob("*")
+            if ".git" not in path.relative_to(ROOT).parts
+        )
+        self.assertFalse(
+            any(path.startswith(private_prefixes) for path in public_paths)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
