@@ -125,6 +125,22 @@ class DossierStructureTests(unittest.TestCase):
         self.assertEqual(result.markdown.count("z-staged.py"), 1)
         self.assertEqual(result.markdown.count("- kind="), 4)
 
+    def test_rejects_non_relative_or_traversing_paths_before_rendering(self) -> None:
+        cases = (
+            snapshot(
+                staged_paths=("/secret/fixture-prefix/absolute.py",),
+                candidate_artifacts=(),
+            ),
+            snapshot(
+                candidate_artifacts=("docs/../secret/fixture-prefix/private.md",)
+            ),
+        )
+
+        for source in cases:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(ValueError, "repository-relative"):
+                    build_dossier(source, assessment())
+
 
 class DossierBudgetTests(unittest.TestCase):
     def test_1024_character_budget_is_line_atomic_with_exact_omissions(self) -> None:

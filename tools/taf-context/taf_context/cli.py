@@ -237,10 +237,15 @@ def _validate_output_dir(output_dir: Path, repository_root: Path) -> Path:
 def _install_artifacts(
     output: Path, artifacts: tuple[tuple[str, bytes], ...]
 ) -> None:
+    if not artifacts:
+        raise CLIError("no artifacts to install")
     output.mkdir(parents=True, exist_ok=True)
     temporary_paths: list[Path] = []
+    ready_marker = output / artifacts[-1][0]
+    ready_marker_installed = False
+    ready_marker_durable = False
     try:
-        for name, content in artifacts:
+        for index, (name, content) in enumerate(artifacts):
             descriptor, raw_path = tempfile.mkstemp(
                 prefix=f".{name}.", suffix=".tmp", dir=output
             )
@@ -251,12 +256,36 @@ def _install_artifacts(
                 target.flush()
                 os.fsync(target.fileno())
             os.replace(temporary, output / name)
+            if index == len(artifacts) - 2:
+                _fsync_directory(output)
+            if index == len(artifacts) - 1:
+                ready_marker_installed = True
+                _fsync_directory(output)
+                ready_marker_durable = True
     finally:
+        if ready_marker_installed and not ready_marker_durable:
+            try:
+                ready_marker.unlink()
+            except FileNotFoundError:
+                pass
+            else:
+                try:
+                    _fsync_directory(output)
+                except OSError:
+                    pass
         for temporary in temporary_paths:
             try:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _read_manifest(path: Path) -> ContextManifest:

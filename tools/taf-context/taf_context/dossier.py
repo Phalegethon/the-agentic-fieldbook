@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import PurePosixPath
 
 from .freshness import FreshnessAssessment
 from .models import Freshness, RepositorySnapshot
@@ -40,6 +41,7 @@ def build_dossier(
     ):
         raise ValueError("dossier character budget must be between 1024 and 12000")
 
+    _validate_item_paths(snapshot)
     changed, candidates = _ranked_items(snapshot)
     total_items = len(changed) + len(candidates)
     warning_codes = set(snapshot.warnings)
@@ -127,6 +129,30 @@ def _ranked_items(snapshot: RepositorySnapshot) -> tuple[tuple[str, ...], tuple[
         if path not in seen
     )
     return tuple(changed), candidates
+
+
+def _validate_item_paths(snapshot: RepositorySnapshot) -> None:
+    for paths in (
+        snapshot.staged_paths,
+        snapshot.unstaged_paths,
+        snapshot.untracked_paths,
+        snapshot.candidate_artifacts,
+    ):
+        for value in paths:
+            if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+                raise ValueError(
+                    "dossier path must be normalized and repository-relative"
+                )
+            path = PurePosixPath(value)
+            if (
+                path.is_absolute()
+                or ".." in path.parts
+                or value != path.as_posix()
+                or value == "."
+            ):
+                raise ValueError(
+                    "dossier path must be normalized and repository-relative"
+                )
 
 
 def _item_line(kind: str, path: str) -> str:

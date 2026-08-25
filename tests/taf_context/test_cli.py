@@ -7,6 +7,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -107,14 +108,22 @@ class SnapshotCommandTests(unittest.TestCase):
             repo = init_committed_repo(root / "repo")
             output = root / "empty"
             output.mkdir()
-            replacements: list[str] = []
+            events: list[str] = []
             real_replace = os.replace
+            real_fsync = os.fsync
 
             def recording_replace(source: object, destination: object) -> None:
-                replacements.append(Path(destination).name)
+                events.append(f"replace:{Path(destination).name}")
                 real_replace(source, destination)
 
-            with mock.patch("taf_context.cli.os.replace", side_effect=recording_replace):
+            def recording_fsync(descriptor: int) -> None:
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    events.append("fsync:directory")
+                real_fsync(descriptor)
+
+            with mock.patch(
+                "taf_context.cli.os.replace", side_effect=recording_replace
+            ), mock.patch("taf_context.cli.os.fsync", side_effect=recording_fsync):
                 code, _stdout, stderr = invoke(
                     "snapshot", "--repo", str(repo), "--output-dir", str(output)
                 )
@@ -122,7 +131,14 @@ class SnapshotCommandTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(stderr, "")
             self.assertEqual(
-                replacements, ["snapshot.json", "dossier.md", "manifest.json"]
+                events,
+                [
+                    "replace:snapshot.json",
+                    "replace:dossier.md",
+                    "fsync:directory",
+                    "replace:manifest.json",
+                    "fsync:directory",
+                ],
             )
 
     def test_incomplete_dirty_fingerprint_is_partial_and_warned(self) -> None:
@@ -250,6 +266,35 @@ class SnapshotCommandTests(unittest.TestCase):
                 real_replace(source, destination)
 
             with mock.patch("taf_context.cli.os.replace", side_effect=fail_manifest):
+                code, stdout, stderr = invoke(
+                    "snapshot", "--repo", str(repo), "--output-dir", str(output)
+                )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, "")
+            self.assertEqual(len(stderr.rstrip("\n").splitlines()), 1)
+            self.assertFalse((output / "manifest.json").exists())
+            self.assertFalse(any(path.name.endswith(".tmp") for path in output.iterdir()))
+
+    def test_manifest_directory_sync_failure_removes_the_ready_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            output = root / "artifacts"
+            real_fsync = os.fsync
+            directory_sync_count = 0
+
+            def fail_second_directory_sync(descriptor: int) -> None:
+                nonlocal directory_sync_count
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    directory_sync_count += 1
+                    if directory_sync_count == 2:
+                        raise OSError("simulated directory durability failure")
+                real_fsync(descriptor)
+
+            with mock.patch(
+                "taf_context.cli.os.fsync", side_effect=fail_second_directory_sync
+            ):
                 code, stdout, stderr = invoke(
                     "snapshot", "--repo", str(repo), "--output-dir", str(output)
                 )
