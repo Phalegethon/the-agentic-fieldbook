@@ -38,7 +38,7 @@ _GENERATED_OR_VENDORED_SEGMENTS = {
 _BINARY_SUFFIXES = {
     ".7z", ".bin", ".bz2", ".class", ".dat", ".db", ".dll", ".dylib",
     ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg", ".mov",
-    ".mp3", ".mp4", ".otf", ".pdf", ".png", ".pyc", ".so", ".sqlite",
+    ".mp3", ".mp4", ".otf", ".pdf", ".png", ".pyc", ".so",
     ".tar", ".tgz", ".ttf", ".war", ".webp", ".woff", ".woff2", ".xz",
     ".zip",
 }
