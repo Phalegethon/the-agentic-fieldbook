@@ -78,6 +78,18 @@ class ContextManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ManifestError, "schema_version"):
             ContextManifest.from_dict(invalid)
 
+    def test_head_object_id_is_exactly_sha1_or_sha256_hex(self) -> None:
+        for head in ("a" * 39, "a" * 41, "a" * 63, "a" * 65, "g" * 40):
+            with self.subTest(head=head):
+                invalid = copy.deepcopy(VALID)
+                invalid["head_sha"] = head
+                with self.assertRaisesRegex(ManifestError, "head_sha"):
+                    ContextManifest.from_dict(invalid)
+
+        sha256 = copy.deepcopy(VALID)
+        sha256["head_sha"] = "b" * 64
+        self.assertEqual(ContextManifest.from_dict(sha256).head_sha, "b" * 64)
+
     def test_rejects_non_repository_relative_capability_and_warning(self) -> None:
         for field in ("capabilities", "warnings"):
             with self.subTest(field=field):

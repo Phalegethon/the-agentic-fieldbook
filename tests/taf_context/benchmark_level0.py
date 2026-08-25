@@ -4,7 +4,8 @@
 The public harness creates synthetic Git repositories, but benchmark evidence is
 written only to the path supplied by the caller.  A measured sample is run in a
 fresh Python process: ``cold_*`` includes process startup, while ``warm_*`` is
-the collector interval after imports and argument parsing are complete.
+the guarded interval including guard setup, CLI parsing, collection, and
+artifact emission.
 """
 
 from __future__ import annotations
@@ -45,17 +46,27 @@ FIXED_GIT_ENV = {
     "GIT_AUTHOR_DATE": "2026-08-25T00:00:00Z",
     "GIT_COMMITTER_DATE": "2026-08-25T00:00:00Z",
     "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_TERMINAL_PROMPT": "0",
 }
 ALLOWED_GIT_COMMANDS = {
     ("git", "rev-parse", "--show-toplevel"),
+    (
+        "git", "config", "--local", "--includes", "--name-only", "--get-regexp",
+        r"^filter\..*\.(clean|smudge|process)$",
+    ),
     ("git", "rev-parse", "--absolute-git-dir"),
     ("git", "rev-parse", "--git-common-dir"),
     ("git", "rev-parse", "--verify", "HEAD"),
     ("git", "rev-list", "--max-parents=0", "HEAD"),
     ("git", "symbolic-ref", "--short", "-q", "HEAD"),
     ("git", "ls-files", "-z"),
-    ("git", "diff", "--cached", "--name-only", "-z"),
-    ("git", "diff", "--name-only", "-z"),
+    (
+        "git", "diff", "--no-ext-diff", "--no-textconv", "--cached",
+        "--name-only", "-z",
+    ),
+    ("git", "diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z"),
     ("git", "ls-files", "--others", "--exclude-standard", "-z"),
     (
         "git",
@@ -65,7 +76,10 @@ ALLOWED_GIT_COMMANDS = {
         "--ignored=matching",
         "--untracked-files=normal",
     ),
-    ("git", "diff", "--numstat", "-z", "HEAD"),
+    (
+        "git", "diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z",
+        "HEAD",
+    ),
 }
 NETWORK_GIT_COMMANDS = {
     "archive",
@@ -204,6 +218,7 @@ def _run(
     env: Dict[str, str] = None,
 ) -> subprocess.CompletedProcess:
     merged = os.environ.copy()
+    merged.update(FIXED_GIT_ENV)
     if env:
         merged.update(env)
     return subprocess.run(
@@ -228,7 +243,11 @@ def _fixture(root: Path, tracked_files: int, dirty_files: int) -> Tuple[Path, Li
     root.mkdir(parents=True)
     repo = root / "repo"
     repo.mkdir()
-    _run(repo, ["git", "init", "-q", "-b", "main"])
+    _run(
+        repo,
+        ["git", "init", "--template=", "-q", "-b", "main"],
+        env=FIXED_GIT_ENV,
+    )
     _run(repo, ["git", "config", "user.name", "Level 0 Benchmark Fixture"])
     _run(repo, ["git", "config", "user.email", "fixture@example.invalid"])
     paths = []
@@ -329,6 +348,9 @@ def _guards(repo: Path, dirty_paths: Iterable[str]) -> Iterator[Dict[str, object
         return relative, relative in dirty
 
     def _fd_path(descriptor: int) -> object:
+        tracked = tracked_fds.get(descriptor)
+        if tracked is not None:
+            return repo / tracked[0]
         for prefix in ("/proc/self/fd", "/dev/fd"):
             try:
                 return Path(os.readlink("{}/{}".format(prefix, descriptor)))
@@ -1026,7 +1048,7 @@ def _driver(output: Path) -> int:
         "percentile_method": "nearest-rank",
         "timing_definitions": {
             "cold": "fresh worker process including interpreter and harness startup",
-            "warm": "collector interval after worker imports and argument parsing",
+            "warm": "guarded worker interval including guard setup, CLI parsing, collection, and artifact emission",
         },
         "machine": _machine(),
         "classes": results,

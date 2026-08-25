@@ -9,9 +9,11 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Callable, Sequence, TextIO
 
 from .dossier import build_dossier
@@ -21,7 +23,12 @@ from .freshness import (
     HeadRelation,
     assess_freshness,
 )
-from .git_snapshot import SnapshotError, collect_snapshot, manifest_from_snapshot
+from .git_snapshot import (
+    SnapshotError,
+    _git_environment,
+    collect_snapshot,
+    manifest_from_snapshot,
+)
 from .models import (
     BackgroundState,
     ContextManifest,
@@ -35,7 +42,7 @@ _DEFAULT_MAX_OUTPUT_CHARS = 12000
 _DEFAULT_MAX_DIRTY_FILE_BYTES = 8 * 1024 * 1024
 _MAX_INCREMENTAL_CHANGED_PATHS = 1000
 _GIT_TIMEOUT_SECONDS = 20
-_OBJECT_ID = re.compile(r"[0-9a-fA-F]{40,64}")
+_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 
 
 class CLIError(RuntimeError):
@@ -319,15 +326,14 @@ def _head_relation(
         return HeadRelation.UNKNOWN, None
     result = _local_git(repo, "merge-base", "--is-ancestor", manifest_head, current_head)
     if result.returncode == 0:
-        changed_paths = _local_git(
-            repo, "diff", "--name-only", "-z", manifest_head, current_head, "--"
+        count = _bounded_changed_path_count(
+            repo,
+            manifest_head,
+            current_head,
+            maximum=_MAX_INCREMENTAL_CHANGED_PATHS,
         )
-        if changed_paths.returncode != 0:
+        if count is None:
             return HeadRelation.UNKNOWN, None
-        raw = changed_paths.stdout
-        if raw and not raw.endswith(b"\x00"):
-            return HeadRelation.UNKNOWN, None
-        count = 0 if not raw else len(raw[:-1].split(b"\x00"))
         return HeadRelation.FORWARD, count
     if result.returncode == 1:
         return HeadRelation.DIVERGED, None
@@ -339,6 +345,7 @@ def _local_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
             ["git", *args],
             cwd=repo,
+            env=_git_environment(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -346,6 +353,125 @@ def _local_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CLIError("local Git command failed") from exc
+
+
+def _bounded_changed_path_count(
+    repo: Path,
+    manifest_head: str,
+    current_head: str,
+    *,
+    maximum: int,
+) -> int | None:
+    command = [
+        "git",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--name-only",
+        "-z",
+        manifest_head,
+        current_head,
+        "--",
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=repo,
+            env=_git_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if process.stdout is None:  # pragma: no cover - PIPE guarantees this.
+            raise CLIError("local Git command failed")
+        count = 0
+        pending = b""
+        bounded = False
+        malformed = False
+        deadline = time.monotonic() + _GIT_TIMEOUT_SECONDS
+
+        def consume(chunk: bytes) -> bool:
+            nonlocal count, malformed, pending
+            pending += chunk
+            fields = pending.split(b"\x00")
+            pending = fields.pop()
+            for field in fields:
+                if not field:
+                    malformed = True
+                    return False
+                field.decode("utf-8", "surrogateescape")
+                count += 1
+                if count > maximum:
+                    return False
+            return True
+
+        try:
+            stdout_descriptor = process.stdout.fileno()
+        except (AttributeError, OSError):  # Test doubles have no OS descriptor.
+            while True:
+                chunk = process.stdout.read(8192)
+                if not chunk:
+                    break
+                if not consume(chunk):
+                    bounded = count > maximum
+                    break
+        else:
+            stderr = process.stderr
+            stderr_descriptor = None if stderr is None else stderr.fileno()
+            os.set_blocking(stdout_descriptor, False)
+            if stderr_descriptor is not None:
+                os.set_blocking(stderr_descriptor, False)
+            with selectors.DefaultSelector() as selector:
+                selector.register(stdout_descriptor, selectors.EVENT_READ, "stdout")
+                if stderr_descriptor is not None:
+                    selector.register(stderr_descriptor, selectors.EVENT_READ, "stderr")
+                stdout_open = True
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, _GIT_TIMEOUT_SECONDS)
+                    events = selector.select(remaining)
+                    if not events:
+                        raise subprocess.TimeoutExpired(command, _GIT_TIMEOUT_SECONDS)
+                    for key, _mask in events:
+                        chunk = os.read(key.fd, 8192)
+                        if not chunk:
+                            selector.unregister(key.fd)
+                            if key.data == "stdout":
+                                stdout_open = False
+                            continue
+                        if key.data == "stdout" and not consume(chunk):
+                            bounded = count > maximum
+                            break
+                    if bounded or malformed:
+                        break
+        if malformed:
+            _terminate_process(process)
+            return None
+        if bounded:
+            _terminate_process(process)
+            return maximum + 1
+        remaining = max(0.0, deadline - time.monotonic())
+        _stdout, _stderr = process.communicate(timeout=remaining)
+        if process.returncode != 0 or pending:
+            return None
+        return count
+    except subprocess.TimeoutExpired as exc:
+        if "process" in locals():
+            _terminate_process(process)
+        raise CLIError("local Git command failed") from exc
+    except OSError as exc:
+        raise CLIError("local Git command failed") from exc
+
+
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        process.communicate(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
 
 
 def _rfc3339(value: datetime) -> str:

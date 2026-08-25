@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 
 def run(cwd: Path, *argv: str) -> str:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
     return subprocess.run(
-        list(argv), cwd=cwd, text=True, capture_output=True, check=True
+        list(argv), cwd=cwd, env=environment, text=True, capture_output=True, check=True
     ).stdout.strip()
 
 
@@ -17,7 +27,7 @@ def write(path: Path, content: str) -> None:
 
 def init_repo(path: Path) -> Path:
     path.mkdir(parents=True)
-    run(path, "git", "init", "-b", "main")
+    run(path, "git", "init", "--template=", "-b", "main")
     run(path, "git", "config", "user.email", "fixture@example.invalid")
     run(path, "git", "config", "user.name", "Fixture")
     return path

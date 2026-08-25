@@ -307,6 +307,54 @@ class SnapshotCommandTests(unittest.TestCase):
 
 
 class StatusCommandTests(unittest.TestCase):
+    def test_forward_range_count_stops_after_one_thousand_and_one_paths(self) -> None:
+        from taf_context.cli import _bounded_changed_path_count
+
+        class Stream:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def read(self, amount: int) -> bytes:
+                self.reads += 1
+                if self.reads == 1:
+                    return b"x\0" * 1001
+                raise AssertionError("unbounded diff output read")
+
+        class Process:
+            def __init__(self) -> None:
+                self.stdout = Stream()
+                self.returncode = None
+                self.terminated = False
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def communicate(self, timeout: int | None = None):
+                self.returncode = -15 if self.terminated else 0
+                return b"", b""
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+        process = Process()
+        with mock.patch("taf_context.cli.subprocess.Popen", return_value=process):
+            count = _bounded_changed_path_count(
+                Path("/repo"), "a" * 40, "b" * 40, maximum=1000
+            )
+
+        self.assertEqual(count, 1001)
+        self.assertTrue(process.terminated)
+        self.assertEqual(process.stdout.reads, 1)
+
+    def test_intermediate_length_object_ids_are_rejected_without_git_probe(self) -> None:
+        from taf_context.cli import _head_relation
+
+        with mock.patch("taf_context.cli._local_git") as local_git:
+            relation, count = _head_relation(Path("/repo"), "a" * 41, "b" * 41)
+        self.assertEqual(relation.value, "unknown")
+        self.assertIsNone(count)
+        local_git.assert_not_called()
+
     def _snapshot(self, repo: Path, output: Path) -> Path:
         code, _stdout, stderr = invoke(
             "snapshot", "--repo", str(repo), "--output-dir", str(output)

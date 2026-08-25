@@ -120,6 +120,16 @@ class InstrumentationGuardTests(unittest.TestCase):
 
 
 class EvidenceSemanticsTests(unittest.TestCase):
+    def test_fixture_git_run_uses_hermetic_configuration(self) -> None:
+        completed = subprocess.CompletedProcess(["git", "status"], 0, "", "")
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            benchmark._run(Path("/fixture"), ["git", "status"])
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+
     @staticmethod
     def _ok_sample() -> dict:
         return {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
@@ -14,7 +15,7 @@ from .models import BackgroundState, ContextManifest, RepositorySnapshot
 
 _GIT_TIMEOUT_SECONDS = 20
 _HASH_CHUNK_BYTES = 1024 * 1024
-_OBJECT_ID = re.compile(r"[0-9a-fA-F]{40,64}")
+_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 
 _GENERATED_OR_VENDORED_SEGMENTS = {
     "vendor",
@@ -25,7 +26,27 @@ _GENERATED_OR_VENDORED_SEGMENTS = {
     "build",
     "generated",
     "coverage",
+    "target",
+    "out",
+    ".cache",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "pods",
 }
+
+_BINARY_SUFFIXES = {
+    ".7z", ".bin", ".bz2", ".class", ".dat", ".db", ".dll", ".dylib",
+    ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg", ".mov",
+    ".mp3", ".mp4", ".otf", ".pdf", ".png", ".pyc", ".so", ".sqlite",
+    ".tar", ".tgz", ".ttf", ".war", ".webp", ".woff", ".woff2", ".xz",
+    ".zip",
+}
+_CREDENTIAL_NAMES = {
+    ".env", "credentials", "credentials.json", "id_dsa", "id_ecdsa",
+    "id_ed25519", "id_rsa", "secrets.json",
+}
+_CREDENTIAL_SUFFIXES = {".jks", ".key", ".keystore", ".p12", ".pem", ".pfx"}
 
 _LANGUAGES = {
     ".bash": "Shell",
@@ -86,11 +107,41 @@ class SnapshotError(RuntimeError):
     """Raised when bounded repository metadata cannot be collected safely."""
 
 
+def _git_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "5",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "diff.external",
+            "GIT_CONFIG_VALUE_1": "",
+            "GIT_CONFIG_KEY_2": "core.hooksPath",
+            "GIT_CONFIG_VALUE_2": os.devnull,
+            "GIT_CONFIG_KEY_3": "protocol.allow",
+            "GIT_CONFIG_VALUE_3": "never",
+            "GIT_CONFIG_KEY_4": "credential.helper",
+            "GIT_CONFIG_VALUE_4": "",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    environment.pop("GIT_EXTERNAL_DIFF", None)
+    return environment
+
+
 def _git(repo: Path, *args: str, allow_failure: bool = False) -> bytes | None:
+    command = ["git", *args]
+    if args and args[0] == "diff":
+        command[2:2] = ["--no-ext-diff", "--no-textconv"]
     try:
         result = subprocess.run(
-            ["git", *args],
+            command,
             cwd=repo,
+            env=_git_environment(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -204,6 +255,65 @@ def _resolve_common_dir(git_dir: Path, canonical_root: Path, value: str) -> Path
     return (canonical_root / common).resolve()
 
 
+def _excluded_dirty_category(relative: str) -> str | None:
+    path = PurePosixPath(relative)
+    lowered_parts = tuple(part.lower() for part in path.parts)
+    name = path.name.lower()
+    suffix = path.suffix.lower()
+    if set(lowered_parts) & _GENERATED_OR_VENDORED_SEGMENTS:
+        return "generated-or-vendored"
+    if (
+        name in _CREDENTIAL_NAMES
+        or name.startswith(".env.")
+        or suffix in _CREDENTIAL_SUFFIXES
+    ):
+        return "credential"
+    if suffix in _BINARY_SUFFIXES:
+        return "binary"
+    return None
+
+
+def _metadata_descriptor(prefix: str, metadata: os.stat_result) -> str:
+    return f"{prefix}:{metadata.st_size}:{metadata.st_mtime_ns}"
+
+
+def _open_regular_beneath(root: Path, relative: str) -> tuple[int, list[int]]:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    if nofollow == 0:
+        raise OSError(errno.ENOTSUP, "no-follow opens unavailable")
+    descriptors: list[int] = []
+    try:
+        current = os.open(root, directory_flags)
+        descriptors.append(current)
+        parts = PurePosixPath(relative).parts
+        for component in parts[:-1]:
+            current = os.open(component, directory_flags, dir_fd=current)
+            descriptors.append(current)
+        leaf = os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=current)
+        return leaf, descriptors
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def _same_file_state(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev,
+        left.st_ino,
+        left.st_mode,
+        left.st_size,
+        left.st_mtime_ns,
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        right.st_mode,
+        right.st_size,
+        right.st_mtime_ns,
+    )
+
+
 def _content_descriptor(
     root: Path,
     relative: str,
@@ -226,6 +336,9 @@ def _content_descriptor(
         return f"symlink:{target}", 0, False, True, None
     if not stat.S_ISREG(mode):
         return f"unsupported:{mode:o}", 0, False, True, None
+    excluded = _excluded_dirty_category(relative)
+    if excluded == "binary" and metadata.st_size > max_dirty_file_bytes:
+        excluded = None
     if metadata.st_size > max_dirty_file_bytes:
         return (
             f"oversized:{metadata.st_size}:{metadata.st_mtime_ns}",
@@ -234,24 +347,67 @@ def _content_descriptor(
             False,
             "dirty-fingerprint-incomplete",
         )
+    if excluded is not None:
+        return (
+            _metadata_descriptor(f"excluded:{excluded}", metadata),
+            0,
+            excluded == "binary",
+            False,
+            f"dirty-{excluded}-content-excluded",
+        )
     digest = hashlib.sha256()
     bytes_hashed = 0
-    binary = False
+    descriptor = -1
+    parents: list[int] = []
     try:
-        with path.open("rb") as source:
-            while True:
-                chunk = source.read(_HASH_CHUNK_BYTES)
-                if not chunk:
-                    break
-                digest.update(chunk)
-                bytes_hashed += len(chunk)
-                binary = binary or b"\x00" in chunk
+        descriptor, parents = _open_regular_beneath(root, relative)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or not _same_file_state(metadata, before):
+            return (
+                _metadata_descriptor("unsafe", before),
+                0,
+                False,
+                False,
+                "dirty-path-unsafe",
+            )
+        remaining = max_dirty_file_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(_HASH_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            bytes_hashed += len(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
     except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT, errno.ENOTSUP}:
+            return _metadata_descriptor("unsafe", metadata), 0, False, False, "dirty-path-unsafe"
         raise SnapshotError("dirty path content unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        for parent in reversed(parents):
+            os.close(parent)
+    if not _same_file_state(before, after):
+        return (
+            _metadata_descriptor("changed", after),
+            bytes_hashed,
+            False,
+            False,
+            "dirty-file-changed-during-read",
+        )
+    if bytes_hashed > max_dirty_file_bytes:
+        return (
+            _metadata_descriptor("oversized", after),
+            max_dirty_file_bytes + 1,
+            False,
+            False,
+            "dirty-fingerprint-incomplete",
+        )
     return (
-        f"regular:{metadata.st_size}:sha256:{digest.hexdigest()}",
+        f"regular:{after.st_size}:sha256:{digest.hexdigest()}",
         bytes_hashed,
-        binary,
+        False,
         True,
         None,
     )
@@ -328,6 +484,18 @@ def collect_snapshot(
         _text(_git(repo, "rev-parse", "--show-toplevel"), "repository root")
     ).resolve()
     repo = canonical_root
+    configured_filters = _git(
+        repo,
+        "config",
+        "--local",
+        "--includes",
+        "--name-only",
+        "--get-regexp",
+        r"^filter\..*\.(clean|smudge|process)$",
+        allow_failure=True,
+    )
+    if configured_filters is not None:
+        raise SnapshotError("executable Git filters are not allowed")
     git_dir = Path(
         _text(_git(repo, "rev-parse", "--absolute-git-dir"), "Git directory")
     ).resolve()
@@ -397,6 +565,8 @@ def collect_snapshot(
         dirty_complete = dirty_complete and complete
         if warning is not None:
             warnings.add(warning)
+            if warning.startswith("dirty-") and warning.endswith("-content-excluded"):
+                warnings.add("dirty-content-excluded")
 
     inventory_paths = tuple(sorted(set(tracked_paths + untracked_paths)))
     generated_or_vendored_count = sum(

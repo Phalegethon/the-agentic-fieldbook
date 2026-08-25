@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from unittest import mock
 
 from taf_context.git_snapshot import (
     SnapshotError,
+    _content_descriptor,
     collect_snapshot,
     manifest_from_snapshot,
 )
@@ -103,6 +105,111 @@ class RepositoryIdentityTests(unittest.TestCase):
 
 
 class DirtyOverlayTests(unittest.TestCase):
+    def test_excluded_dirty_content_uses_metadata_only_and_warns(self) -> None:
+        fixtures = {
+            "vendor/library.py": b"vendored secret",
+            "build/output.js": b"generated secret",
+            ".cache/state.json": b"cache secret",
+            ".env": b"credential secret",
+            "keys/deploy.pem": b"private key secret",
+            "assets/logo.png": b"\x89PNG binary secret",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            repo = init_committed_repo(Path(directory) / "repo")
+            for relative, content in fixtures.items():
+                path = repo / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+
+            opened_excluded: list[Path] = []
+            real_open = os.open
+
+            def recording_open(
+                path: object, flags: int, *args: object, **kwargs: object
+            ) -> int:
+                candidate = (
+                    Path(os.fsdecode(path))
+                    if isinstance(path, (str, bytes, os.PathLike))
+                    else None
+                )
+                excluded_names = {
+                    "library.py", "output.js", "state.json", ".env",
+                    "deploy.pem", "logo.png",
+                }
+                if candidate is not None and candidate.name in excluded_names:
+                    opened_excluded.append(candidate)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch(
+                "taf_context.git_snapshot.os.open", side_effect=recording_open
+            ):
+                snapshot = collect_snapshot(repo)
+
+            self.assertFalse(snapshot.dirty_fingerprint_complete)
+            self.assertEqual(snapshot.dirty_bytes_hashed, 0)
+            self.assertEqual(snapshot.binary_file_count, 1)
+            self.assertEqual(opened_excluded, [])
+            self.assertIn("dirty-content-excluded", snapshot.warnings)
+            self.assertIn("dirty-credential-content-excluded", snapshot.warnings)
+            self.assertIn("dirty-generated-or-vendored-content-excluded", snapshot.warnings)
+            self.assertIn("dirty-binary-content-excluded", snapshot.warnings)
+
+    def test_dirty_reader_is_ceiling_bounded_and_detects_growth(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = init_committed_repo(Path(directory) / "repo")
+            write(repo / "tracked.txt", "12345678")
+            real_read = os.read
+            requested: list[int] = []
+            returned: list[int] = []
+
+            def grow_after_first_read(descriptor: int, amount: int) -> bytes:
+                requested.append(amount)
+                value = real_read(descriptor, amount)
+                returned.append(len(value))
+                if len(requested) == 1:
+                    with (repo / "tracked.txt").open("ab") as target:
+                        target.write(b"growth")
+                return value
+
+            with mock.patch(
+                "taf_context.git_snapshot.os.read", side_effect=grow_after_first_read
+            ):
+                descriptor = _content_descriptor(repo, "tracked.txt", 64)
+
+            self.assertTrue(all(amount <= 65 for amount in requested))
+            self.assertLessEqual(sum(returned), 65)
+            self.assertFalse(descriptor[3])
+            self.assertEqual(descriptor[4], "dirty-file-changed-during-read")
+
+    def test_symlink_replacement_never_reads_outside_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            outside = root / "outside.txt"
+            outside.write_text("outside secret", encoding="utf-8")
+            write(repo / "tracked.txt", "dirty")
+            real_open = os.open
+            replaced = False
+
+            def replace_before_leaf_open(
+                path: object, flags: int, *args: object, **kwargs: object
+            ) -> int:
+                nonlocal replaced
+                if path == "tracked.txt" and kwargs.get("dir_fd") is not None and not replaced:
+                    replaced = True
+                    (repo / "tracked.txt").unlink()
+                    (repo / "tracked.txt").symlink_to(outside)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch(
+                "taf_context.git_snapshot.os.open", side_effect=replace_before_leaf_open
+            ):
+                descriptor = _content_descriptor(repo, "tracked.txt", 1024)
+
+            self.assertEqual(descriptor[1], 0)
+            self.assertFalse(descriptor[3])
+            self.assertEqual(descriptor[4], "dirty-path-unsafe")
+
     def test_every_dirty_source_and_path_kind_changes_fingerprint_deterministically(
         self,
     ) -> None:
@@ -314,6 +421,37 @@ class InventoryAndManifestTests(unittest.TestCase):
 
 
 class BoundedGitTests(unittest.TestCase):
+    def test_git_boundary_disables_optional_locks_and_configured_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = init_committed_repo(Path(directory) / "repo")
+            marker = repo / "helper-ran"
+            helper = repo / "fsmonitor-helper"
+            write(helper, f"#!/bin/sh\ntouch '{marker}'\nprintf '0\\n'\n")
+            helper.chmod(0o755)
+            run(repo, "git", "config", "core.fsmonitor", str(helper))
+            index = Path(run(repo, "git", "rev-parse", "--git-path", "index"))
+            if not index.is_absolute():
+                index = repo / index
+            before = index.stat().st_mtime_ns
+
+            real_run = subprocess.run
+            environments: list[dict[str, str]] = []
+
+            def recording_run(argv: list[str], **kwargs: object):
+                environments.append(dict(kwargs.get("env", {})))
+                return real_run(argv, **kwargs)
+
+            with mock.patch(
+                "taf_context.git_snapshot.subprocess.run", side_effect=recording_run
+            ):
+                collect_snapshot(repo)
+
+            self.assertFalse(marker.exists())
+            self.assertEqual(index.stat().st_mtime_ns, before)
+            self.assertTrue(environments)
+            self.assertTrue(all(env.get("GIT_OPTIONAL_LOCKS") == "0" for env in environments))
+            self.assertTrue(all(env.get("GIT_CONFIG_NOSYSTEM") == "1" for env in environments))
+
     def test_every_git_command_uses_the_twenty_second_timeout(self) -> None:
         real_run = subprocess.run
         observed_timeouts: list[object] = []
@@ -337,14 +475,18 @@ class BoundedGitTests(unittest.TestCase):
     def test_collector_uses_only_local_allowlisted_git_commands(self) -> None:
         allowed = {
             ("rev-parse", "--show-toplevel"),
+            (
+                "config", "--local", "--includes", "--name-only", "--get-regexp",
+                r"^filter\..*\.(clean|smudge|process)$",
+            ),
             ("rev-parse", "--absolute-git-dir"),
             ("rev-parse", "--git-common-dir"),
             ("rev-parse", "--verify", "HEAD"),
             ("symbolic-ref", "--short", "-q", "HEAD"),
             ("rev-list", "--max-parents=0", "HEAD"),
             ("ls-files", "-z"),
-            ("diff", "--cached", "--name-only", "-z"),
-            ("diff", "--name-only", "-z"),
+            ("diff", "--no-ext-diff", "--no-textconv", "--cached", "--name-only", "-z"),
+            ("diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z"),
             ("ls-files", "--others", "--exclude-standard", "-z"),
             (
                 "status",
@@ -353,8 +495,8 @@ class BoundedGitTests(unittest.TestCase):
                 "--ignored=matching",
                 "--untracked-files=normal",
             ),
-            ("diff", "--numstat", "-z", "HEAD"),
-            ("diff", "--cached", "--numstat", "-z", "HEAD"),
+            ("diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", "HEAD"),
+            ("diff", "--no-ext-diff", "--no-textconv", "--cached", "--numstat", "-z", "HEAD"),
         }
         real_run = subprocess.run
         invocations: list[tuple[str, ...]] = []
@@ -447,7 +589,7 @@ class DeferredEdgeCaseTests(unittest.TestCase):
             manifest = manifest_from_snapshot(snapshot, "2026-08-25T00:00:00Z")
             self.assertIn("dirty-fingerprint-incomplete", manifest.warnings)
 
-    def test_binary_dirty_file_is_counted_without_exposing_content(self) -> None:
+    def test_binary_dirty_file_is_counted_without_reading_or_exposing_content(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = init_committed_repo(Path(directory) / "repo")
             secret = b"binary-secret\x00payload"
@@ -457,7 +599,9 @@ class DeferredEdgeCaseTests(unittest.TestCase):
 
             self.assertEqual(snapshot.binary_file_count, 1)
             self.assertNotIn("binary-secret", repr(snapshot))
-            self.assertEqual(snapshot.dirty_bytes_hashed, len(secret))
+            self.assertEqual(snapshot.dirty_bytes_hashed, 0)
+            self.assertFalse(snapshot.dirty_fingerprint_complete)
+            self.assertIn("dirty-binary-content-excluded", snapshot.warnings)
 
     def test_unborn_repository_has_deterministic_empty_head_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -7,10 +7,14 @@ so it can be stored and compared without exposing a checkout's layout.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any
+
+
+_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 
 
 class ManifestError(ValueError):
@@ -169,6 +173,8 @@ class ContextManifest:
             )
         }
         head_sha = _optional_string(value, "head_sha")
+        if head_sha is not None and not _OBJECT_ID.fullmatch(head_sha):
+            raise ManifestError("head_sha")
         index_levels = _strings(value, "index_levels")
         capabilities = _repository_relative_strings(value, "capabilities")
         warnings = _repository_relative_strings(value, "warnings")
