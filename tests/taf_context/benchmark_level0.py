@@ -23,6 +23,7 @@ import platform
 import random
 import resource
 import socket
+import _socket
 import subprocess
 import sys
 import tempfile
@@ -117,11 +118,13 @@ class _CountingReader:
         relative: str,
         dirty: bool,
         record: object,
+        reject: object,
     ) -> None:
         self._source = source
         self._relative = relative
         self._dirty = dirty
         self._record = record
+        self._reject = reject
         self._observed = False
 
     def _count(self, value: object) -> object:
@@ -174,6 +177,11 @@ class _CountingReader:
         return self._source.__exit__(*args)
 
     def __getattr__(self, name: str) -> object:
+        if name in {"raw", "buffer", "fileno", "detach"}:
+            self._reject(name)
+            raise InstrumentationViolation(
+                "wrapped stream escape blocked: {}".format(name)
+            )
         return getattr(self._source, name)
 
 
@@ -269,6 +277,7 @@ def _guards(repo: Path, dirty_paths: Iterable[str]) -> Iterator[Dict[str, object
     }
     real_builtin_open = builtins.open
     real_io_open = io.open
+    real_native_open = _io.open
     real_io_fileio = io.FileIO
     real_native_fileio = _io.FileIO
     real_os_open = os.open
@@ -282,6 +291,8 @@ def _guards(repo: Path, dirty_paths: Iterable[str]) -> Iterator[Dict[str, object
     real_mmap = mmap_module.mmap
     real_popen = subprocess.Popen
     real_socket_class = socket.socket
+    real_socket_type_alias = socket.SocketType
+    real_native_socket = _socket.socket
     real_socket_methods = {
         name: getattr(real_socket_class, name)
         for name in (
@@ -339,11 +350,16 @@ def _guards(repo: Path, dirty_paths: Iterable[str]) -> Iterator[Dict[str, object
             counters["{}_file_content_reads".format(prefix)] += 1
             counters["content_read_paths"].append(relative)
 
+    def reject_stream_escape(name: str) -> None:
+        counters["native_bypass_rejections"] += 1
+
     def wrap_reader(source: object, classification: object, mode: str) -> object:
         if classification is None or ("r" not in mode and "+" not in mode):
             return source
         relative, is_dirty = classification
-        return _CountingReader(source, relative, is_dirty, record_bytes)
+        return _CountingReader(
+            source, relative, is_dirty, record_bytes, reject_stream_escape
+        )
 
     def guarded_builtin_open(file: object, *args: object, **kwargs: object) -> object:
         mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
@@ -462,6 +478,7 @@ def _guards(repo: Path, dirty_paths: Iterable[str]) -> Iterator[Dict[str, object
 
     builtins.open = guarded_builtin_open  # type: ignore[assignment]
     io.open = guarded_io_open  # type: ignore[assignment]
+    _io.open = guarded_io_open  # type: ignore[assignment]
     io.FileIO = guarded_fileio  # type: ignore[assignment]
     _io.FileIO = guarded_fileio  # type: ignore[assignment]
     os.open = guarded_os_open  # type: ignore[assignment]
@@ -480,6 +497,8 @@ def _guards(repo: Path, dirty_paths: Iterable[str]) -> Iterator[Dict[str, object
     for name in real_socket_methods:
         setattr(real_socket_class, name, blocked_network)
     socket.socket = blocked_network  # type: ignore[assignment]
+    socket.SocketType = blocked_network  # type: ignore[assignment]
+    _socket.socket = blocked_network  # type: ignore[assignment]
     socket.create_connection = blocked_network  # type: ignore[assignment]
     socket.socketpair = blocked_network  # type: ignore[assignment]
     socket.getaddrinfo = blocked_network  # type: ignore[assignment]
@@ -488,6 +507,7 @@ def _guards(repo: Path, dirty_paths: Iterable[str]) -> Iterator[Dict[str, object
     finally:
         builtins.open = real_builtin_open  # type: ignore[assignment]
         io.open = real_io_open  # type: ignore[assignment]
+        _io.open = real_native_open  # type: ignore[assignment]
         io.FileIO = real_io_fileio  # type: ignore[assignment]
         _io.FileIO = real_native_fileio  # type: ignore[assignment]
         os.open = real_os_open  # type: ignore[assignment]
@@ -504,6 +524,8 @@ def _guards(repo: Path, dirty_paths: Iterable[str]) -> Iterator[Dict[str, object
         mmap_module.mmap = real_mmap  # type: ignore[assignment]
         subprocess.Popen = real_popen  # type: ignore[assignment]
         socket.socket = real_socket_class  # type: ignore[assignment]
+        socket.SocketType = real_socket_type_alias  # type: ignore[assignment]
+        _socket.socket = real_native_socket  # type: ignore[assignment]
         for name, method in real_socket_methods.items():
             setattr(real_socket_class, name, method)
         socket.create_connection = real_create_connection  # type: ignore[assignment]
@@ -634,6 +656,73 @@ def _worker(args: argparse.Namespace) -> int:
     return 0 if result["correctness_passed"] else 1
 
 
+_OK_INTEGER_METRICS = (
+    "peak_rss_bytes",
+    "paths_inspected",
+    "dirty_bytes_hashed",
+    "measured_dirty_bytes_read",
+    "measured_clean_bytes_read",
+    "eligible_dirty_bytes",
+    "artifact_total_bytes",
+    "dossier_characters",
+    "reported_dossier_characters",
+    "clean_file_content_reads",
+    "dirty_file_content_reads",
+    "network_calls",
+    "llm_calls",
+    "allowed_process_calls",
+    "rejected_process_calls",
+    "native_bypass_rejections",
+)
+_OK_NUMBER_METRICS = (
+    "warm_wall_seconds",
+    "warm_cpu_seconds",
+    "cold_wall_seconds",
+    "cold_cpu_seconds",
+)
+
+
+def _ok_sample_structure_errors(sample: Dict[str, object]) -> List[str]:
+    errors = []
+    if sample.get("status") != "ok":
+        errors.append("status")
+    if sample.get("correctness_passed") is not True:
+        errors.append("correctness_passed")
+    for field in _OK_INTEGER_METRICS:
+        value = sample.get(field)
+        if type(value) is not int or value < 0:
+            errors.append(field)
+    for field in _OK_NUMBER_METRICS:
+        value = sample.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            errors.append(field)
+    sizes = sample.get("artifact_sizes_bytes")
+    artifact_names = {"manifest.json", "snapshot.json", "dossier.md"}
+    if (
+        type(sizes) is not dict
+        or set(sizes) != artifact_names
+        or any(type(value) is not int or value < 0 for value in sizes.values())
+    ):
+        errors.append("artifact_sizes_bytes")
+    checks = sample.get("correctness_checks")
+    if (
+        type(checks) is not dict
+        or not checks
+        or any(type(value) is not bool for value in checks.values())
+        or not all(checks.values())
+    ):
+        errors.append("correctness_checks")
+    commands = sample.get("git_commands")
+    if type(commands) is not list or not commands:
+        errors.append("git_commands")
+    return sorted(set(errors))
+
+
 def _measured_worker(
     repo: Path,
     output: Path,
@@ -697,6 +786,23 @@ def _measured_worker(
     sample["cold_wall_seconds"] = cold_wall
     sample["cold_cpu_seconds"] = cold_cpu
     sample["worker_exit_code"] = completed.returncode
+    if sample.get("status") == "ok":
+        structure_errors = _ok_sample_structure_errors(sample)
+        if structure_errors:
+            return {
+                "status": "worker-structure-error",
+                "error": "missing or invalid mandatory metrics: {}".format(
+                    ", ".join(structure_errors)
+                ),
+                "worker_result": sample,
+                "worker_stderr": completed.stderr,
+                "cold_wall_seconds": cold_wall,
+                "cold_cpu_seconds": cold_cpu,
+                "worker_exit_code": completed.returncode,
+                "correctness_passed": False,
+                "correctness_failure": True,
+                "performance_failure": False,
+            }
     sample["correctness_failure"] = (
         not bool(sample.get("correctness_passed")) or completed.returncode != 0
     )

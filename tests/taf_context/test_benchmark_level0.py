@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import builtins
+import _io
 import io
 import json
 import mmap
 import os
 from pathlib import Path
 import socket
+import _socket
 import subprocess
 import tempfile
 import unittest
@@ -59,6 +61,18 @@ class InstrumentationGuardTests(unittest.TestCase):
                 udp.sendto(b"blocked", ("127.0.0.1", 9))
         self.assertEqual(counters["network_calls"], 2)
 
+    def test_native_socket_constructor_aliases_are_blocked(self) -> None:
+        with benchmark._guards(self.repo, ["dirty.txt"]) as counters:
+            for constructor in (socket.SocketType, _socket.socket):
+                with self.subTest(constructor=constructor):
+                    try:
+                        created = constructor(socket.AF_INET, socket.SOCK_DGRAM)
+                    except benchmark.InstrumentationViolation:
+                        continue
+                    created.close()
+                    self.fail("native socket constructor alias was not blocked")
+        self.assertEqual(counters["network_calls"], 2)
+
     def test_open_surfaces_measure_actual_returned_bytes_once(self) -> None:
         with benchmark._guards(self.repo, ["dirty.txt"]) as counters:
             with Path(self.dirty).open("rb") as source:
@@ -71,6 +85,24 @@ class InstrumentationGuardTests(unittest.TestCase):
         self.assertEqual(counters["measured_clean_bytes_read"], 16)
         self.assertEqual(counters["dirty_file_content_reads"], 1)
         self.assertEqual(counters["clean_file_content_reads"], 2)
+
+    def test_native_open_and_wrapped_stream_escape_hatches_are_blocked(self) -> None:
+        with benchmark._guards(self.repo, ["dirty.txt"]) as counters:
+            with _io.open(self.dirty, "rb") as source:
+                self.assertEqual(source.read(), b"dirty bytes")
+            with builtins.open(self.clean, "rb") as source:
+                with self.assertRaises(benchmark.InstrumentationViolation):
+                    source.raw.read()
+            for attribute in ("buffer", "fileno", "detach"):
+                with self.subTest(attribute=attribute):
+                    with builtins.open(self.clean, "rb") as source:
+                        with self.assertRaises(benchmark.InstrumentationViolation):
+                            escaped = getattr(source, attribute)
+                            if callable(escaped):
+                                escaped()
+        self.assertEqual(counters["measured_dirty_bytes_read"], 11)
+        self.assertEqual(counters["measured_clean_bytes_read"], 0)
+        self.assertEqual(counters["native_bypass_rejections"], 4)
 
     def test_fd_reads_are_measured_and_mmap_is_rejected(self) -> None:
         with benchmark._guards(self.repo, ["dirty.txt"]) as counters:
@@ -192,6 +224,44 @@ class EvidenceSemanticsTests(unittest.TestCase):
         self.assertTrue(result["correctness_passed"])
         self.assertFalse(result["mandatory_gates_passed"])
         self.assertEqual(result["performance_failures"][0]["run"], 2)
+
+    def test_structurally_malformed_ok_sample_is_retained_after_prior_success(self) -> None:
+        malformed_json = json.dumps(
+            {
+                "status": "ok",
+                "correctness_passed": True,
+                "warm_wall_seconds": 0.1,
+            }
+        )
+        completed = subprocess.CompletedProcess(["worker"], 0, malformed_json, "")
+        with mock.patch("subprocess.run", return_value=completed):
+            malformed = benchmark._measured_worker(
+                Path("/fixture"), Path("/output"), 10, []
+            )
+        self.assertEqual(malformed["status"], "worker-structure-error")
+        self.assertTrue(malformed["correctness_failure"])
+
+        outcomes = [self._ok_sample(), self._ok_sample(), malformed]
+        outcomes.extend([self._ok_sample() for _ in range(3)])
+        status = subprocess.CompletedProcess(["git", "status"], 0, "", "")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            with mock.patch.object(
+                benchmark, "_fixture", return_value=(repo, [])
+            ), mock.patch.object(
+                benchmark, "_measured_worker", side_effect=outcomes
+            ), mock.patch.object(benchmark, "_run", return_value=status):
+                result = benchmark._case_result(
+                    root / "case",
+                    {"tracked_files": 10, "dirty_files": 0, "warm_p95_seconds": 2.0},
+                )
+        self.assertEqual(len(result["samples"]), 5)
+        self.assertEqual(result["samples"][0]["status"], "ok")
+        self.assertEqual(result["samples"][1]["status"], "worker-structure-error")
+        self.assertFalse(result["correctness_passed"])
+        self.assertFalse(result["mandatory_gates_passed"])
 
 
 if __name__ == "__main__":
