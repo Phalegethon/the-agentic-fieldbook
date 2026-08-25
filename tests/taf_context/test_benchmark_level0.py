@@ -132,14 +132,28 @@ class EvidenceSemanticsTests(unittest.TestCase):
             "cold_cpu_seconds": 0.1,
             "warm_cpu_seconds": 0.05,
             "peak_rss_bytes": 1024,
+            "paths_inspected": 10,
+            "dirty_bytes_hashed": 0,
             "dossier_characters": 10,
+            "reported_dossier_characters": 10,
             "measured_dirty_bytes_read": 0,
             "eligible_dirty_bytes": 0,
             "clean_file_content_reads": 0,
+            "dirty_file_content_reads": 0,
             "measured_clean_bytes_read": 0,
+            "artifact_sizes_bytes": {
+                "manifest.json": 20,
+                "snapshot.json": 70,
+                "dossier.md": 10,
+            },
             "artifact_total_bytes": 100,
             "network_calls": 0,
             "llm_calls": 0,
+            "allowed_process_calls": 12,
+            "rejected_process_calls": 0,
+            "native_bypass_rejections": 0,
+            "correctness_checks": {"valid": True},
+            "git_commands": [["status"]],
         }
 
     def test_dossier_characters_are_decoded_independently(self) -> None:
@@ -234,6 +248,41 @@ class EvidenceSemanticsTests(unittest.TestCase):
             }
         )
         completed = subprocess.CompletedProcess(["worker"], 0, malformed_json, "")
+        with mock.patch("subprocess.run", return_value=completed):
+            malformed = benchmark._measured_worker(
+                Path("/fixture"), Path("/output"), 10, []
+            )
+        self.assertEqual(malformed["status"], "worker-structure-error")
+        self.assertTrue(malformed["correctness_failure"])
+
+        outcomes = [self._ok_sample(), self._ok_sample(), malformed]
+        outcomes.extend([self._ok_sample() for _ in range(3)])
+        status = subprocess.CompletedProcess(["git", "status"], 0, "", "")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            with mock.patch.object(
+                benchmark, "_fixture", return_value=(repo, [])
+            ), mock.patch.object(
+                benchmark, "_measured_worker", side_effect=outcomes
+            ), mock.patch.object(benchmark, "_run", return_value=status):
+                result = benchmark._case_result(
+                    root / "case",
+                    {"tracked_files": 10, "dirty_files": 0, "warm_p95_seconds": 2.0},
+                )
+        self.assertEqual(len(result["samples"]), 5)
+        self.assertEqual(result["samples"][0]["status"], "ok")
+        self.assertEqual(result["samples"][1]["status"], "worker-structure-error")
+        self.assertFalse(result["correctness_passed"])
+        self.assertFalse(result["mandatory_gates_passed"])
+
+    def test_huge_integer_metric_is_retained_without_overflow_or_sample_loss(self) -> None:
+        huge = self._ok_sample()
+        huge["warm_wall_seconds"] = 10**400
+        completed = subprocess.CompletedProcess(
+            ["worker"], 0, json.dumps(huge), ""
+        )
         with mock.patch("subprocess.run", return_value=completed):
             malformed = benchmark._measured_worker(
                 Path("/fixture"), Path("/output"), 10, []

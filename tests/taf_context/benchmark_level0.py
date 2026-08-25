@@ -682,6 +682,20 @@ _OK_NUMBER_METRICS = (
 )
 
 
+def _is_bounded_nonnegative_integer(value: object) -> bool:
+    return type(value) is int and 0 <= value <= (1 << 63) - 1
+
+
+def _is_finite_nonnegative_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(converted) and converted >= 0
+
+
 def _ok_sample_structure_errors(sample: Dict[str, object]) -> List[str]:
     errors = []
     if sample.get("status") != "ok":
@@ -690,23 +704,21 @@ def _ok_sample_structure_errors(sample: Dict[str, object]) -> List[str]:
         errors.append("correctness_passed")
     for field in _OK_INTEGER_METRICS:
         value = sample.get(field)
-        if type(value) is not int or value < 0:
+        if not _is_bounded_nonnegative_integer(value):
             errors.append(field)
     for field in _OK_NUMBER_METRICS:
         value = sample.get(field)
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value < 0
-        ):
+        if not _is_finite_nonnegative_number(value):
             errors.append(field)
     sizes = sample.get("artifact_sizes_bytes")
     artifact_names = {"manifest.json", "snapshot.json", "dossier.md"}
     if (
         type(sizes) is not dict
         or set(sizes) != artifact_names
-        or any(type(value) is not int or value < 0 for value in sizes.values())
+        or any(
+            not _is_bounded_nonnegative_integer(value)
+            for value in sizes.values()
+        )
     ):
         errors.append("artifact_sizes_bytes")
     checks = sample.get("correctness_checks")
