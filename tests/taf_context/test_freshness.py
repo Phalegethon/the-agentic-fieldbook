@@ -240,6 +240,32 @@ class FreshnessPrecedenceTests(unittest.TestCase):
         self.assertFalse(assessment.requires_rebuild)
         self.assertFalse(assessment.can_incrementally_update)
 
+    def test_different_worktree_is_unusable_even_with_matching_repository_and_head(
+        self,
+    ) -> None:
+        assessment = assess_freshness(
+            manifest(worktree_identity="sha256:other-worktree"),
+            snapshot(),
+            expectation(),
+        )
+
+        self.assertEqual(assessment.freshness, Freshness.UNUSABLE)
+        self.assertEqual(assessment.reason_codes, ("worktree-scope-mismatch",))
+        self.assertFalse(assessment.requires_rebuild)
+        self.assertFalse(assessment.can_incrementally_update)
+
+    def test_matching_verified_head_is_exact_without_changed_path_count(self) -> None:
+        assessment = assess_freshness(
+            manifest(),
+            snapshot(),
+            expectation(changed_path_count=None),
+        )
+
+        self.assertEqual(assessment.freshness, Freshness.EXACT)
+        self.assertEqual(assessment.reason_codes, ("exact-match",))
+        self.assertFalse(assessment.requires_rebuild)
+        self.assertFalse(assessment.can_incrementally_update)
+
 
 if __name__ == "__main__":
     unittest.main()
