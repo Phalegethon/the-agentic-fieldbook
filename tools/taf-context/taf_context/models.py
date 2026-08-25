@@ -238,7 +238,13 @@ class ContextManifest:
 
 def canonical_json(value: object) -> str:
     """Serialize *value* to a compact, deterministic UTF-8 JSON string."""
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ) + "\n"
 
 
 def _string(value: dict[str, object], field: str) -> str:

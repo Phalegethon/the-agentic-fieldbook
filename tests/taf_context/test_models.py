@@ -115,6 +115,12 @@ class ContextManifestTests(unittest.TestCase):
 
         self.assertEqual(canonical_json(value), '{"a":[2,1],"z":"İ"}\n')
 
+    def test_canonical_json_rejects_non_finite_floats(self) -> None:
+        for value in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    canonical_json({"coverage": value})
+
 
 class EnumWireValueTests(unittest.TestCase):
     def test_freshness_wire_values_are_stable(self) -> None:
