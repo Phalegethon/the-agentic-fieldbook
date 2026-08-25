@@ -3,9 +3,9 @@
 
 The public harness creates synthetic Git repositories, but benchmark evidence is
 written only to the path supplied by the caller.  A measured sample is run in a
-fresh Python process: ``cold_*`` includes process startup, while ``warm_*`` is
-the guarded interval including guard setup, CLI parsing, collection, and
-artifact emission.
+fresh Python process: ``cold_*`` includes process startup, while ``warm_*``
+excludes guard setup and collector import and includes CLI parsing, collection,
+rendering, and artifact emission.
 """
 
 from __future__ import annotations
@@ -63,22 +63,26 @@ ALLOWED_GIT_COMMANDS = {
     ("git", "symbolic-ref", "--short", "-q", "HEAD"),
     ("git", "ls-files", "-z"),
     (
-        "git", "diff", "--no-ext-diff", "--no-textconv", "--cached",
-        "--name-only", "-z",
+        "git", "diff", "--no-ext-diff", "--no-textconv",
+        "--ignore-submodules=all", "--cached", "--name-only", "-z",
     ),
-    ("git", "diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z"),
+    (
+        "git", "diff", "--no-ext-diff", "--no-textconv",
+        "--ignore-submodules=all", "--name-only", "-z",
+    ),
     ("git", "ls-files", "--others", "--exclude-standard", "-z"),
     (
         "git",
         "status",
+        "--ignore-submodules=all",
         "--porcelain=v1",
         "-z",
         "--ignored=matching",
         "--untracked-files=normal",
     ),
     (
-        "git", "diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z",
-        "HEAD",
+        "git", "diff", "--no-ext-diff", "--no-textconv",
+        "--ignore-submodules=all", "--numstat", "-z", "HEAD",
     ),
 }
 NETWORK_GIT_COMMANDS = {
@@ -1048,7 +1052,7 @@ def _driver(output: Path) -> int:
         "percentile_method": "nearest-rank",
         "timing_definitions": {
             "cold": "fresh worker process including interpreter and harness startup",
-            "warm": "guarded worker interval including guard setup, CLI parsing, collection, and artifact emission",
+            "warm": "worker timer excludes guard setup and collector import; includes CLI parsing, collection, rendering, and artifact emission",
         },
         "machine": _machine(),
         "classes": results,

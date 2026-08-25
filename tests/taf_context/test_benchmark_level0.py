@@ -188,6 +188,24 @@ class EvidenceSemanticsTests(unittest.TestCase):
                     benchmark._retention_decision(correctness, gates),
                 )
 
+    def test_driver_describes_the_actual_warm_timer_boundary(self) -> None:
+        completed_class = {
+            "correctness_passed": True,
+            "mandatory_gates_passed": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "evidence.json"
+            with mock.patch.object(benchmark, "CASES", ({},)), mock.patch.object(
+                benchmark, "_case_result", return_value=completed_class
+            ), mock.patch.object(benchmark, "_machine", return_value={}):
+                self.assertEqual(benchmark._driver(output), 0)
+            evidence = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            evidence["timing_definitions"]["warm"],
+            "worker timer excludes guard setup and collector import; includes CLI parsing, collection, rendering, and artifact emission",
+        )
+
     def test_timeout_is_retained_as_performance_failure(self) -> None:
         with mock.patch(
             "subprocess.run",

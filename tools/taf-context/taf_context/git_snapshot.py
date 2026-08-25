@@ -39,8 +39,8 @@ _BINARY_SUFFIXES = {
     ".7z", ".bin", ".bz2", ".class", ".dat", ".db", ".dll", ".dylib",
     ".exe", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg", ".mov",
     ".mp3", ".mp4", ".otf", ".pdf", ".png", ".pyc", ".so",
-    ".tar", ".tgz", ".ttf", ".war", ".webp", ".woff", ".woff2", ".xz",
-    ".zip",
+    ".sqlite", ".tar", ".tgz", ".ttf", ".war", ".webp", ".woff",
+    ".woff2", ".xz", ".zip",
 }
 _CREDENTIAL_NAMES = {
     ".env", "credentials", "credentials.json", "id_dsa", "id_ecdsa",
@@ -370,7 +370,7 @@ def _content_descriptor(
                 False,
                 "dirty-path-unsafe",
             )
-        remaining = max_dirty_file_bytes + 1
+        remaining = max_dirty_file_bytes
         while remaining:
             chunk = os.read(descriptor, min(_HASH_CHUNK_BYTES, remaining))
             if not chunk:
@@ -395,14 +395,6 @@ def _content_descriptor(
             False,
             False,
             "dirty-file-changed-during-read",
-        )
-    if bytes_hashed > max_dirty_file_bytes:
-        return (
-            _metadata_descriptor("oversized", after),
-            max_dirty_file_bytes + 1,
-            False,
-            False,
-            "dirty-fingerprint-incomplete",
         )
     return (
         f"regular:{after.st_size}:sha256:{digest.hexdigest()}",
@@ -524,10 +516,19 @@ def collect_snapshot(
 
     tracked_paths = _z_paths(_git(repo, "ls-files", "-z"), "tracked paths")
     staged_paths = _z_paths(
-        _git(repo, "diff", "--cached", "--name-only", "-z"), "staged paths"
+        _git(
+            repo,
+            "diff",
+            "--ignore-submodules=all",
+            "--cached",
+            "--name-only",
+            "-z",
+        ),
+        "staged paths",
     )
     unstaged_paths = _z_paths(
-        _git(repo, "diff", "--name-only", "-z"), "unstaged paths"
+        _git(repo, "diff", "--ignore-submodules=all", "--name-only", "-z"),
+        "unstaged paths",
     )
     untracked_paths = _z_paths(
         _git(repo, "ls-files", "--others", "--exclude-standard", "-z"),
@@ -537,6 +538,7 @@ def collect_snapshot(
         _git(
             repo,
             "status",
+            "--ignore-submodules=all",
             "--porcelain=v1",
             "-z",
             "--ignored=matching",
@@ -550,6 +552,8 @@ def collect_snapshot(
     binary_file_count = 0
     oversized_file_count = 0
     dirty_complete = True
+    tracked_dirty_paths = set(staged_paths + unstaged_paths)
+    diff_statistics_complete = True
     warnings: set[str] = set()
     for path in dirty_paths:
         flags = statuses.get(path)
@@ -563,6 +567,12 @@ def collect_snapshot(
         binary_file_count += int(binary)
         oversized_file_count += int(descriptor.startswith("oversized:"))
         dirty_complete = dirty_complete and complete
+        if path in tracked_dirty_paths:
+            diff_statistics_complete = (
+                diff_statistics_complete
+                and complete
+                and descriptor.startswith("regular:")
+            )
         if warning is not None:
             warnings.add(warning)
             if warning.startswith("dirty-") and warning.endswith("-content-excluded"):
@@ -584,9 +594,19 @@ def collect_snapshot(
     )
     if head_sha is None:
         insertions = deletions = 0
+    elif tracked_dirty_paths and not diff_statistics_complete:
+        insertions = deletions = 0
+        warnings.add("dirty-diff-statistics-incomplete")
     else:
         insertions, deletions = _numstat(
-            _git(repo, "diff", "--numstat", "-z", "HEAD")
+            _git(
+                repo,
+                "diff",
+                "--ignore-submodules=all",
+                "--numstat",
+                "-z",
+                "HEAD",
+            )
         )
 
     return RepositorySnapshot(

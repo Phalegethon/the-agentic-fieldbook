@@ -113,6 +113,7 @@ class DirtyOverlayTests(unittest.TestCase):
             ".env": b"credential secret",
             "keys/deploy.pem": b"private key secret",
             "assets/logo.png": b"\x89PNG binary secret",
+            "data/cache.sqlite": b"SQLite format 3\x00secret",
         }
         with tempfile.TemporaryDirectory() as directory:
             repo = init_committed_repo(Path(directory) / "repo")
@@ -134,7 +135,7 @@ class DirtyOverlayTests(unittest.TestCase):
                 )
                 excluded_names = {
                     "library.py", "output.js", "state.json", ".env",
-                    "deploy.pem", "logo.png",
+                    "deploy.pem", "logo.png", "cache.sqlite",
                 }
                 if candidate is not None and candidate.name in excluded_names:
                     opened_excluded.append(candidate)
@@ -147,7 +148,7 @@ class DirtyOverlayTests(unittest.TestCase):
 
             self.assertFalse(snapshot.dirty_fingerprint_complete)
             self.assertEqual(snapshot.dirty_bytes_hashed, 0)
-            self.assertEqual(snapshot.binary_file_count, 1)
+            self.assertEqual(snapshot.binary_file_count, 2)
             self.assertEqual(opened_excluded, [])
             self.assertIn("dirty-content-excluded", snapshot.warnings)
             self.assertIn("dirty-credential-content-excluded", snapshot.warnings)
@@ -176,10 +177,34 @@ class DirtyOverlayTests(unittest.TestCase):
             ):
                 descriptor = _content_descriptor(repo, "tracked.txt", 64)
 
-            self.assertTrue(all(amount <= 65 for amount in requested))
-            self.assertLessEqual(sum(returned), 65)
+            self.assertTrue(all(amount <= 64 for amount in requested))
+            self.assertLessEqual(sum(returned), 64)
             self.assertFalse(descriptor[3])
             self.assertEqual(descriptor[4], "dirty-file-changed-during-read")
+
+    def test_dirty_reader_returns_at_most_the_exact_configured_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = init_committed_repo(Path(directory) / "repo")
+            write(repo / "tracked.txt", "12345678")
+            real_read = os.read
+            requested: list[int] = []
+            returned: list[int] = []
+
+            def recording_read(descriptor: int, amount: int) -> bytes:
+                requested.append(amount)
+                value = real_read(descriptor, amount)
+                returned.append(len(value))
+                return value
+
+            with mock.patch(
+                "taf_context.git_snapshot.os.read", side_effect=recording_read
+            ):
+                descriptor = _content_descriptor(repo, "tracked.txt", 8)
+
+            self.assertEqual(requested, [8])
+            self.assertEqual(returned, [8])
+            self.assertEqual(descriptor[1], 8)
+            self.assertTrue(descriptor[3])
 
     def test_symlink_replacement_never_reads_outside_repository(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -294,6 +319,46 @@ class DirtyOverlayTests(unittest.TestCase):
 
             self.assertEqual(snapshot.insertions, 2)
             self.assertEqual(snapshot.deletions, 1)
+
+    def test_numstat_is_skipped_for_ineligible_tracked_dirty_content(self) -> None:
+        fixtures = {
+            "large.txt": b"123456789",
+            "assets/logo.png": b"\x89PNG dirty binary",
+            ".env": b"dirty credential",
+            "generated/output.txt": b"dirty generated output",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, (relative, content) in enumerate(fixtures.items()):
+                with self.subTest(relative=relative):
+                    repo = init_committed_repo(root / f"repo-{index}")
+                    path = repo / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"initial")
+                    commit_all(repo, "track protected fixture")
+                    path.write_bytes(content)
+                    real_run = subprocess.run
+                    numstat_invocations: list[tuple[str, ...]] = []
+
+                    def recording_run(argv: list[str], **kwargs: object):
+                        command = tuple(argv[1:])
+                        if "--numstat" in command:
+                            numstat_invocations.append(command)
+                        return real_run(argv, **kwargs)
+
+                    with mock.patch(
+                        "taf_context.git_snapshot.subprocess.run",
+                        side_effect=recording_run,
+                    ):
+                        snapshot = collect_snapshot(
+                            repo, max_dirty_file_bytes=8
+                        )
+
+                    self.assertEqual(numstat_invocations, [])
+                    self.assertEqual((snapshot.insertions, snapshot.deletions), (0, 0))
+                    self.assertIn(
+                        "dirty-diff-statistics-incomplete", snapshot.warnings
+                    )
 
     @staticmethod
     def _stage_change(repo: Path) -> str:
@@ -421,6 +486,39 @@ class InventoryAndManifestTests(unittest.TestCase):
 
 
 class BoundedGitTests(unittest.TestCase):
+    def test_submodule_local_helpers_are_not_invoked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = init_committed_repo(root / "child")
+            repo = init_committed_repo(root / "repo")
+            run(
+                repo,
+                "git",
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                str(child),
+                "modules/child",
+            )
+            commit_all(repo, "add submodule")
+            marker = repo / "submodule-helper-ran"
+            helper = repo / "submodule-fsmonitor"
+            write(helper, f"#!/bin/sh\ntouch '{marker}'\nprintf '0\\n'\n")
+            helper.chmod(0o755)
+            submodule = repo / "modules/child"
+            run(submodule, "git", "config", "core.fsmonitor", str(helper))
+            write(submodule / "tracked.txt", "dirty submodule\n")
+
+            snapshot = collect_snapshot(repo)
+
+            self.assertFalse(marker.exists())
+            self.assertEqual(
+                snapshot.tracked_paths,
+                (".gitmodules", "modules/child", "tracked.txt"),
+            )
+
     def test_git_boundary_disables_optional_locks_and_configured_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = init_committed_repo(Path(directory) / "repo")
@@ -485,18 +583,19 @@ class BoundedGitTests(unittest.TestCase):
             ("symbolic-ref", "--short", "-q", "HEAD"),
             ("rev-list", "--max-parents=0", "HEAD"),
             ("ls-files", "-z"),
-            ("diff", "--no-ext-diff", "--no-textconv", "--cached", "--name-only", "-z"),
-            ("diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z"),
+            ("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--cached", "--name-only", "-z"),
+            ("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--name-only", "-z"),
             ("ls-files", "--others", "--exclude-standard", "-z"),
             (
                 "status",
+                "--ignore-submodules=all",
                 "--porcelain=v1",
                 "-z",
                 "--ignored=matching",
                 "--untracked-files=normal",
             ),
-            ("diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", "HEAD"),
-            ("diff", "--no-ext-diff", "--no-textconv", "--cached", "--numstat", "-z", "HEAD"),
+            ("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-z", "HEAD"),
+            ("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--cached", "--numstat", "-z", "HEAD"),
         }
         real_run = subprocess.run
         invocations: list[tuple[str, ...]] = []
