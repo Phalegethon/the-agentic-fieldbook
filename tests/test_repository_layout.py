@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).parents[1]
 SKILL = ROOT / "skills" / "branch-handoff"
+WORK_RECOVERY_SKILL = ROOT / "skills" / "work-recovery"
 EXPECTED_TAF_CONTEXT_FILES = {
     "__init__.py",
     "__main__.py",
@@ -25,6 +26,9 @@ EXPECTED_TAF_CONTEXT_FILES = {
     "provider_models.py",
     "provider_state.py",
     "routing.py",
+    "recovery.py",
+    "recovery_cli.py",
+    "recovery_models.py",
 }
 NONPRODUCTION_CONTEXT_DIRECTORIES = {
     "conformance",
@@ -188,6 +192,13 @@ class RepositoryLayoutTest(unittest.TestCase):
         self.assertTrue(skill_md.startswith("---\nname: branch-handoff\n"))
         self.assertTrue((SKILL / "scripts" / "collect_diff.py").is_file())
         self.assertTrue((SKILL / "references" / "handoff-contract.md").is_file())
+
+    def test_work_recovery_is_a_standalone_agent_skill(self) -> None:
+        skill_md = (WORK_RECOVERY_SKILL / "SKILL.md").read_text(encoding="utf-8")
+        self.assertTrue(skill_md.startswith("---\nname: work-recovery\n"))
+        self.assertTrue((WORK_RECOVERY_SKILL / "scripts" / "collect_recovery.py").is_file())
+        self.assertTrue((WORK_RECOVERY_SKILL / "scripts" / "runtime-manifest.json").is_file())
+        self.assertTrue((WORK_RECOVERY_SKILL / "references" / "recovery-contract.md").is_file())
 
     def test_claude_marketplace_exposes_only_implemented_skills(self) -> None:
         marketplace = json.loads(

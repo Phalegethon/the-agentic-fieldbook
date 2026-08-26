@@ -1,0 +1,18 @@
+{
+  "name": "work-recovery",
+  "description": "Recovers interrupted Git work from bounded, read-only evidence.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Gürkan Süerdem",
+    "url": "https://github.com/Phalegethon"
+  },
+  "homepage": "https://github.com/Phalegethon/the-agentic-fieldbook/tree/main/skills/work-recovery",
+  "repository": "https://github.com/Phalegethon/the-agentic-fieldbook",
+  "license": "MIT",
+  "keywords": [
+    "git",
+    "recovery",
+    "session",
+    "worktree"
+  ]
+}

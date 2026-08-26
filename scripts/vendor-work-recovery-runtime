@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Vendor the exact bounded recovery runtime into the standalone skill."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TARGET = ROOT / "skills" / "work-recovery" / "scripts"
+ALLOWLIST = {
+    "taf_context/__init__.py": "tools/taf-context/taf_context/__init__.py",
+    "taf_context/git_snapshot.py": "tools/taf-context/taf_context/git_snapshot.py",
+    "taf_context/models.py": "tools/taf-context/taf_context/models.py",
+    "taf_context/recovery.py": "tools/taf-context/taf_context/recovery.py",
+    "taf_context/recovery_models.py": "tools/taf-context/taf_context/recovery_models.py",
+}
+
+
+def _manifest() -> dict[str, object]:
+    records = []
+    for destination, source in sorted(ALLOWLIST.items()):
+        payload = (ROOT / source).read_bytes()
+        records.append(
+            {
+                "destination": destination,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "source": source,
+            }
+        )
+    return {"schema_version": "1", "files": records}
+
+
+def _validate_import_closure() -> None:
+    available = {
+        Path(destination).with_suffix("").name for destination in ALLOWLIST
+    }
+    for destination, source in ALLOWLIST.items():
+        tree = ast.parse((ROOT / source).read_text(encoding="utf-8"), filename=source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level and node.module:
+                dependency = node.module.split(".", 1)[0]
+                if dependency not in available:
+                    raise RuntimeError(
+                        f"unexpected relative import {dependency!r} in {destination}"
+                    )
+
+
+def _canonical(value: object) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+
+def _check() -> list[str]:
+    failures: list[str] = []
+    expected_files = set(ALLOWLIST)
+    runtime_root = TARGET / "taf_context"
+    actual_files = {
+        path.relative_to(TARGET).as_posix()
+        for path in runtime_root.rglob("*.py")
+    } if runtime_root.exists() else set()
+    if actual_files != expected_files:
+        failures.append("vendored runtime file set differs from allowlist")
+    for destination, source in ALLOWLIST.items():
+        target = TARGET / destination
+        if not target.is_file() or target.read_bytes() != (ROOT / source).read_bytes():
+            failures.append(f"runtime drift: {destination}")
+    manifest_path = TARGET / "runtime-manifest.json"
+    if not manifest_path.is_file() or manifest_path.read_bytes() != _canonical(_manifest()):
+        failures.append("runtime manifest drift")
+    return failures
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+    try:
+        _validate_import_closure()
+        if args.check:
+            failures = _check()
+            if failures:
+                print("error: " + "; ".join(failures), file=sys.stderr)
+                return 1
+            print("work-recovery runtime is current")
+            return 0
+        runtime_root = TARGET / "taf_context"
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        actual_files = {
+            path.relative_to(TARGET).as_posix() for path in runtime_root.rglob("*.py")
+        }
+        unexpected = actual_files - set(ALLOWLIST)
+        if unexpected:
+            raise RuntimeError("unexpected vendored runtime files: " + ", ".join(sorted(unexpected)))
+        for destination, source in sorted(ALLOWLIST.items()):
+            target = TARGET / destination
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / source, target)
+        (TARGET / "runtime-manifest.json").write_bytes(_canonical(_manifest()))
+        print("vendored work-recovery runtime")
+        return 0
+    except (OSError, RuntimeError, SyntaxError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

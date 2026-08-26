@@ -1,0 +1,4 @@
+interface:
+  display_name: "Work Recovery"
+  short_description: "Recover interrupted Git work from bounded evidence"
+  default_prompt: "Use $work-recovery to tell me where this work stopped and the single best next step without running tests or changing repository state."
