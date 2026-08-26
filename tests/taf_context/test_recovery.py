@@ -126,12 +126,16 @@ class RecoveryStateTests(unittest.TestCase):
     def test_clean_unique_commit_is_active_committed(self) -> None:
         repo, _ = self._feature_repo()
         write(repo / "feature.txt", "feature\n")
-        commit_all(repo, "feature")
+        commit_all(repo, "finish parser boundary")
 
-        state = collect_recovery(RecoveryRequest(repo=repo, base="main")).dossier.current
+        dossier = collect_recovery(RecoveryRequest(repo=repo, base="main")).dossier
+        state = dossier.current
 
         self.assertIs(state.state, WorkState.ACTIVE_COMMITTED)
         self.assertEqual((state.ahead_count, state.behind_count), (1, 0))
+        subject = next(claim for claim in dossier.claims if claim.claim_id == "commit.tip-subject")
+        self.assertEqual(subject.evidence_class.value, "observed")
+        self.assertIn("finish parser boundary", subject.text)
 
     def test_head_reachable_from_base_is_integrated(self) -> None:
         repo, _ = self._feature_repo()

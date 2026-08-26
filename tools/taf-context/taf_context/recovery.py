@@ -154,6 +154,12 @@ def collect_recovery(request: RecoveryRequest) -> RecoveryResult:
         staged_paths,
         unstaged_paths,
     )
+    commit_claims = _committed_metadata_claims(
+        root,
+        repository_identity,
+        current_identity,
+        current,
+    )
     untracked_claims, untracked_warnings = _untracked_claims(
         root,
         repository_identity,
@@ -171,7 +177,7 @@ def collect_recovery(request: RecoveryRequest) -> RecoveryResult:
         request.note_files,
         request.test_result_files,
     )
-    optional_claims = tuple(diff_claims + untracked_claims + artifact_claims)
+    optional_claims = tuple(diff_claims + commit_claims + untracked_claims + artifact_claims)
     dossier, model_text = _budgeted_dossier(
         request.max_chars,
         repository_identity,
@@ -554,6 +560,42 @@ def _tracked_diff_claims(
                 )
             )
     return claims
+
+
+def _committed_metadata_claims(
+    repo: Path,
+    repository_identity: str,
+    worktree_identity: str,
+    current: WorkstreamState,
+) -> list[RecoveryClaim]:
+    if not current.ahead_count or current.branch is None:
+        return []
+    subject = _single_line(
+        repo,
+        "for-each-ref",
+        "--count=1",
+        "--format=%(subject)",
+        f"refs/heads/{current.branch}",
+        allow_failure=True,
+    )
+    if subject is None:
+        return []
+    return [
+        RecoveryClaim.from_dict(
+            {
+                "claim_id": "commit.tip-subject",
+                "evidence_class": "observed",
+                "text": f"Current branch tip subject: {_excerpt(_redact(subject))}",
+                "repository_identity": repository_identity,
+                "worktree_identity": worktree_identity,
+                "provenance": ["git/ref/current-subject"],
+                "freshness": "exact",
+                "supports": ["current.next-action"],
+                "conflicts": [],
+                "qualifications": ["metadata-only"],
+            }
+        )
+    ]
 
 
 def _untracked_claims(

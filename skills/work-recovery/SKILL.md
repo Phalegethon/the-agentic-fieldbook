@@ -15,7 +15,7 @@ Let `<skill-dir>` be this skill's directory. Resolve the repository (default: cu
 
 1. Check Git and resolve `<python>` to `python3` or a Python 3 `python`. If missing, read `references/tool-setup.md`; never install without approval.
 2. Run `<python> <skill-dir>/scripts/collect_recovery.py --repo <repo>` exactly once. Pass `--base`, `--max-output-chars`, `--include-untracked`, `--note-file`, or `--test-results-file` only for exact values the user supplied. Do not inspect repository source before or after the collector.
-3. Stop on nonzero exit or invalid JSON. Retain the returned dossier for this conversation. Read `references/recovery-contract.md` and synthesize one report in the user's language. Current Git facts outrank reported notes; preserve conflicts and unknowns. Give one primary next action and at most two conditional follow-ups.
-4. End every report with a localized reminder that a compact continuation prompt can be generated on request.
+3. Stop on nonzero exit or invalid JSON. Retain the returned dossier for this conversation. Read `references/recovery-contract.md` and synthesize one report in the user's language. Copy the dossier's exact work-state enum and evidence classes; do not rename or downgrade them. Current Git facts outrank reported notes; preserve conflicts and unknowns. Use the contract's state-based next-action matrix.
+4. End every report with the contract's localized continuation-reminder line. “Do not generate a continuation prompt” still requires this one-line reminder: the reminder is not the prompt.
 
 Do not run project validation or change repository state. Do not generate the continuation prompt in the recovery report. If the user later asks for it, read `references/continuation-contract.md` and render from the retained dossier without collecting again. Read `references/context-actions.md` only when the user explicitly asks about indexed/provider context or supplies such evidence.
