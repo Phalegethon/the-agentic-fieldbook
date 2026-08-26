@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Callable, Sequence, TextIO
+from typing import Callable, Mapping, Sequence, TextIO
 
 from .dossier import build_dossier
 from .freshness import (
@@ -36,6 +36,7 @@ from .models import (
     RepositorySnapshot,
     canonical_json,
 )
+from .provider_cli import register_provider_commands, run_provider_command
 
 
 _DEFAULT_MAX_OUTPUT_CHARS = 12000
@@ -60,11 +61,13 @@ def main(
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
     utc_clock: Callable[[], datetime] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> int:
     """Run one command and return a process-style exit code."""
     stdout = sys.stdout if stdout is None else stdout
     stderr = sys.stderr if stderr is None else stderr
     utc_clock = _utc_now if utc_clock is None else utc_clock
+    environment = os.environ if environment is None else environment
     try:
         args = _parser().parse_args(argv)
         if args.command == "snapshot":
@@ -78,6 +81,13 @@ def main(
         elif args.command == "status":
             result = _status_command(
                 repo=Path(args.repo), manifest_path=Path(args.manifest)
+            )
+        elif args.command in {"providers", "consent"}:
+            result = run_provider_command(
+                args,
+                stdout=stdout,
+                environment=environment,
+                utc_clock=utc_clock,
             )
         else:  # pragma: no cover - argparse requires a command.
             raise CLIError("a command is required")
@@ -113,6 +123,7 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status")
     status.add_argument("--repo", required=True)
     status.add_argument("--manifest", required=True)
+    register_provider_commands(commands)
     return parser
 
 
