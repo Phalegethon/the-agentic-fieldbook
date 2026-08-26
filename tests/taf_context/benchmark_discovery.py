@@ -136,6 +136,11 @@ CASES = (
         "consent_decision_warm_p95_limit_seconds": 0.010,
     },
 )
+_CASE_INTEGER_FIELDS = (
+    "provider_count",
+    "capabilities_per_provider",
+    "expected_rejected_provider_count",
+)
 
 CHECK_NAMES = (
     "corpus_provider_count_exact",
@@ -1166,7 +1171,10 @@ def _sample_structure_errors(
         errors.append("status")
     if sample.get("case_name") != case["name"]:
         errors.append("case_name")
-    if sample.get("run_index") != run_index:
+    if (
+        type(sample.get("run_index")) is not int
+        or sample.get("run_index") != run_index
+    ):
         errors.append("run_index")
     if type(sample.get("correctness_passed")) is not bool:
         errors.append("correctness_passed")
@@ -1842,7 +1850,10 @@ def _validate_summary(value: object, field: str) -> None:
         for item in samples
     ):
         raise ValueError("{} summary samples".format(field))
-    if value["sample_count"] != len(samples):
+    if (
+        type(value["sample_count"]) is not int
+        or value["sample_count"] != len(samples)
+    ):
         raise ValueError("{} summary sample_count".format(field))
     for percentile in ("p50", "p95"):
         metric = value[percentile]
@@ -1876,20 +1887,38 @@ def _validate_sample_shape(
     if not expected_fields or set(value) != expected_fields:
         raise ValueError("{} sample fields".format(field))
     if status in {"ok", "correctness-failure"}:
-        if value.get("run_index") != expected_run_index:
+        if (
+            type(value.get("run_index")) is not int
+            or value.get("run_index") != expected_run_index
+        ):
             raise ValueError("{} run index".format(field))
         structural = _sample_structure_errors(value, case, expected_run_index)
         if structural:
             raise ValueError("{} sample structure: {}".format(field, structural))
     else:
-        if value.get("run_index") != expected_run_index:
+        if (
+            type(value.get("run_index")) is not int
+            or value.get("run_index") != expected_run_index
+        ):
             raise ValueError("{} run index".format(field))
         for metric in ("cold_wall_seconds", "cold_cpu_seconds"):
             if not _is_sane_timing(value.get(metric)):
                 raise ValueError("{} {}".format(field, metric))
         if not isinstance(value.get("error"), str):
             raise ValueError("{} error".format(field))
+        worker_exit_code = value.get("worker_exit_code")
+        if status == "timeout":
+            if worker_exit_code is not None:
+                raise ValueError("{} worker exit code".format(field))
+        elif (
+            type(worker_exit_code) is not int
+            or not -MAX_INTEGER <= worker_exit_code <= MAX_INTEGER
+        ):
+            raise ValueError("{} worker exit code".format(field))
         if status != "timeout":
+            for counter in ("worker_stdout_bytes", "worker_stderr_bytes"):
+                if not _is_nonnegative_integer(value.get(counter)):
+                    raise ValueError("{} {}".format(field, counter))
             for diagnostic in (
                 "worker_stdout_excerpt",
                 "worker_stderr_excerpt",
@@ -1914,6 +1943,11 @@ def _validate_class(
         != _canonical_document(dict(CASES[index]))
     ):
         raise ValueError("class corpus")
+    if any(
+        not _is_nonnegative_integer(corpus.get(field))
+        for field in _CASE_INTEGER_FIELDS
+    ):
+        raise ValueError("class corpus integer fields")
     if value["name"] != corpus["name"]:
         raise ValueError("class name")
     if type(value["samples"]) is not list:
@@ -2055,11 +2089,18 @@ def _validate_class(
 def _validate_evidence_document(value: object, *, require_complete: bool) -> None:
     if type(value) is not dict or set(value) != EVIDENCE_FIELDS:
         raise ValueError("evidence fields")
-    if value["schema"] != SCHEMA or value["seed"] != SEED:
+    if (
+        value["schema"] != SCHEMA
+        or type(value["seed"]) is not int
+        or value["seed"] != SEED
+    ):
         raise ValueError("evidence identity")
-    if value["warm_up_runs_per_class"] != WARM_UP_RUNS or value[
-        "measured_runs_per_class"
-    ] != MEASURED_RUNS:
+    if (
+        type(value["warm_up_runs_per_class"]) is not int
+        or value["warm_up_runs_per_class"] != WARM_UP_RUNS
+        or type(value["measured_runs_per_class"]) is not int
+        or value["measured_runs_per_class"] != MEASURED_RUNS
+    ):
         raise ValueError("evidence run counts")
     if value["percentile_method"] != "nearest-rank":
         raise ValueError("evidence percentile")

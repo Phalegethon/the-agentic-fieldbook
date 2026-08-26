@@ -457,6 +457,34 @@ class RetainedEvidenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     benchmark._validate_evidence(evidence)
 
+    def test_strict_evidence_rejects_bool_and_float_integer_coercions(self) -> None:
+        mutations = {
+            "float-seed": lambda value: value.__setitem__(
+                "seed", 20260826.0
+            ),
+            "bool-warmup-count": lambda value: value.__setitem__(
+                "warm_up_runs_per_class", True
+            ),
+            "float-retained-count": lambda value: value.__setitem__(
+                "measured_runs_per_class", 5.0
+            ),
+            "float-warmup-index": lambda value: value["classes"][0][
+                "warmup"
+            ].__setitem__("run_index", 0.0),
+            "float-retained-index": lambda value: value["classes"][0][
+                "samples"
+            ][0].__setitem__("run_index", 1.0),
+            "bool-retained-index": lambda value: value["classes"][0][
+                "samples"
+            ][0].__setitem__("run_index", True),
+        }
+        for name, mutation in mutations.items():
+            with self.subTest(name=name):
+                evidence = copy.deepcopy(self._complete_evidence())
+                mutation(evidence)
+                with self.assertRaises(ValueError):
+                    benchmark._validate_evidence(evidence)
+
     def test_five_record_mixed_failure_is_not_complete_evidence(self) -> None:
         classes = [
             self._mixed_failure_class(dict(case))
