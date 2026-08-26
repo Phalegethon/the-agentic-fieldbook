@@ -57,15 +57,17 @@ class AuthorizationLedger:
         if type(self.records) is not tuple:
             raise ConsentError("records")
 
-        normalized: dict[tuple[ContextAction, str, str, str, datetime], ConsentRecord] = {}
+        normalized: set[ConsentRecord] = set()
+        decisions: dict[tuple[ContextAction, str, str, str, datetime], ConsentDisposition] = {}
         for index, record in enumerate(self.records):
             parsed = _parse_record(record, f"records[{index}]")
             key = _record_time_scope(parsed)
-            existing = normalized.get(key)
-            if existing is not None and existing != parsed:
+            existing = decisions.get(key)
+            if existing is not None and existing is not parsed.disposition:
                 raise ConsentError(f"records[{index}]")
-            normalized[key] = parsed
-        object.__setattr__(self, "records", tuple(sorted(normalized.values(), key=_record_sort_key)))
+            decisions[key] = parsed.disposition
+            normalized.add(parsed)
+        object.__setattr__(self, "records", tuple(sorted(normalized, key=_record_sort_key)))
 
     def record(
         self,

@@ -154,6 +154,21 @@ class AuthorizationLedgerTests(unittest.TestCase):
 
         self.assertEqual(ledger.to_dict(), {"schema_version": "2", "records": [_record()]})
 
+    def test_same_disposition_records_at_one_scope_and_timestamp_keep_distinct_digests(self) -> None:
+        from taf_context.consent import AuthorizationLedger
+
+        first = _record(request_digest="sha256:" + "a" * 64)
+        second = _record(request_digest="sha256:" + "b" * 64)
+
+        ledger = AuthorizationLedger.from_dict(
+            {"schema_version": "2", "records": [second, first]}
+        )
+
+        self.assertEqual(
+            ledger.to_dict(),
+            {"schema_version": "2", "records": [first, second]},
+        )
+
     def test_later_rfc3339_decision_wins_only_for_its_exact_scope(self) -> None:
         from taf_context.consent import AuthorizationLedger, ConsentDisposition
 
