@@ -39,7 +39,6 @@ class SkillShapeTests(unittest.TestCase):
         self.assertLessEqual(len(frontmatter), 1024)
         for relative in (
             "agents/openai.yaml",
-            ".claude-plugin/plugin.json",
             "references/recovery-contract.md",
             "references/continuation-contract.md",
             "references/context-actions.md",
@@ -49,12 +48,8 @@ class SkillShapeTests(unittest.TestCase):
         ):
             self.assertTrue((SKILL / relative).is_file(), relative)
 
-    def test_plugin_and_agent_metadata_are_consistent(self) -> None:
-        plugin = json.loads((SKILL / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(plugin["name"], "work-recovery")
-        self.assertEqual(plugin["version"], "1.0.1")
-        self.assertEqual(plugin["author"]["name"], "Gürkan Süerdem")
-        self.assertEqual(plugin["author"]["url"], "https://github.com/Phalegethon")
+    def test_agent_metadata_is_skill_specific_without_a_child_plugin(self) -> None:
+        self.assertFalse((SKILL / ".claude-plugin" / "plugin.json").exists())
         agent = (SKILL / "agents" / "openai.yaml").read_text(encoding="utf-8")
         self.assertIn('$work-recovery', agent)
 

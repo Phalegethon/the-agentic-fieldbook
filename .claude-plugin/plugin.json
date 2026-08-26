@@ -1,0 +1,20 @@
+{
+  "name": "taf",
+  "displayName": "The Agentic Fieldbook (TAF)",
+  "description": "Evidence-backed recovery and handoff skills for reliable software delivery.",
+  "version": "2.0.0",
+  "author": {
+    "name": "Gürkan Süerdem",
+    "url": "https://github.com/Phalegethon"
+  },
+  "homepage": "https://github.com/Phalegethon/the-agentic-fieldbook",
+  "repository": "https://github.com/Phalegethon/the-agentic-fieldbook",
+  "license": "MIT",
+  "keywords": [
+    "agent-skills",
+    "git",
+    "handoff",
+    "recovery",
+    "software-delivery"
+  ]
+}

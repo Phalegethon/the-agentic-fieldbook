@@ -1,50 +1,31 @@
 {
   "name": "the-agentic-fieldbook",
-  "description": "Independently installable Agent Skills for practical software delivery.",
-  "version": "1.3.1",
+  "description": "The Agentic Fieldbook: evidence-backed skills for practical software delivery.",
+  "version": "2.0.0",
   "owner": {
     "name": "Gürkan Süerdem",
     "url": "https://github.com/Phalegethon"
   },
   "plugins": [
     {
-      "name": "branch-handoff",
-      "displayName": "Branch Handoff",
-      "source": "./skills/branch-handoff",
-      "description": "Create evidence-backed DEV and QA handoffs from a bounded branch diff. Run /branch-handoff:branch-handoff from the feature worktree.",
+      "name": "taf",
+      "displayName": "The Agentic Fieldbook (TAF)",
+      "source": "./",
+      "description": "Evidence-backed Git recovery and branch handoffs in one TAF plugin. Use /taf:work-recovery or /taf:branch-handoff; full instructions load only when relevant.",
       "author": {
         "name": "Gürkan Süerdem",
         "url": "https://github.com/Phalegethon"
       },
-      "homepage": "https://github.com/Phalegethon/the-agentic-fieldbook#install-branch-handoff",
+      "homepage": "https://github.com/Phalegethon/the-agentic-fieldbook",
       "repository": "https://github.com/Phalegethon/the-agentic-fieldbook",
       "license": "MIT",
       "category": "development",
       "tags": [
-        "branch",
-        "handoff",
-        "qa",
-        "pull-request"
-      ]
-    },
-    {
-      "name": "work-recovery",
-      "displayName": "Work Recovery",
-      "source": "./skills/work-recovery",
-      "description": "Recover interrupted Git work from bounded, read-only evidence and identify the single best next step. Run /work-recovery:work-recovery from the affected worktree.",
-      "author": {
-        "name": "Gürkan Süerdem",
-        "url": "https://github.com/Phalegethon"
-      },
-      "homepage": "https://github.com/Phalegethon/the-agentic-fieldbook#install-work-recovery",
-      "repository": "https://github.com/Phalegethon/the-agentic-fieldbook",
-      "license": "MIT",
-      "category": "development",
-      "tags": [
+        "agent-skills",
         "git",
+        "handoff",
         "recovery",
-        "session",
-        "worktree"
+        "software-delivery"
       ]
     }
   ]

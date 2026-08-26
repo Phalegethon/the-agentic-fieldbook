@@ -9,77 +9,66 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 SKILL = ROOT / "skills" / "branch-handoff"
 WORK_RECOVERY = ROOT / "skills" / "work-recovery"
-VERSION = "1.2.1"
-WORK_RECOVERY_VERSION = "1.0.1"
-MARKETPLACE_VERSION = "1.3.1"
+TAF_VERSION = "2.0.0"
+SKILL_VERSIONS = {
+    "branch-handoff": "1.2.1",
+    "work-recovery": "1.0.1",
+}
 
 
 class ReleaseMetadataTest(unittest.TestCase):
-    def test_skill_and_plugin_versions_match_current_release(self) -> None:
-        skill_md = (SKILL / "SKILL.md").read_text(encoding="utf-8")
-        match = re.search(r'^  version: "([^"]+)"$', skill_md, re.MULTILINE)
-        self.assertIsNotNone(match)
-        plugin = json.loads(
-            (SKILL / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
-        )
-        assert match is not None
-        self.assertEqual(VERSION, match.group(1))
-        self.assertEqual(VERSION, plugin["version"])
+    def test_skill_versions_remain_independent_of_the_product_version(self) -> None:
+        for skill_name, expected_version in SKILL_VERSIONS.items():
+            with self.subTest(skill=skill_name):
+                skill = ROOT / "skills" / skill_name
+                skill_md = (skill / "SKILL.md").read_text(encoding="utf-8")
+                match = re.search(r'^  version: "([^"]+)"$', skill_md, re.MULTILINE)
+                self.assertIsNotNone(match)
+                assert match is not None
+                self.assertEqual(expected_version, match.group(1))
+                self.assertFalse((skill / ".claude-plugin" / "plugin.json").exists())
 
-    def test_marketplace_exposes_both_independent_plugins_in_order(self) -> None:
+    def test_root_plugin_manifests_publish_one_taf_product(self) -> None:
+        claude = json.loads(
+            (ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+        )
+        codex = json.loads(
+            (ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(("taf", TAF_VERSION), (claude["name"], claude["version"]))
+        self.assertEqual(("taf", TAF_VERSION), (codex["name"], codex["version"]))
+        self.assertEqual("The Agentic Fieldbook (TAF)", claude["displayName"])
+        self.assertEqual("./skills/", codex["skills"])
+        self.assertEqual(
+            set(SKILL_VERSIONS),
+            {path.parent.name for path in (ROOT / "skills").glob("*/SKILL.md")},
+        )
+
+    def test_marketplace_exposes_one_root_sourced_taf_plugin(self) -> None:
         marketplace = json.loads(
             (ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(MARKETPLACE_VERSION, marketplace["version"])
+        self.assertEqual(TAF_VERSION, marketplace["version"])
         self.assertEqual(
-            ["branch-handoff", "work-recovery"],
-            [plugin["name"] for plugin in marketplace["plugins"]],
+            [{"name": "taf", "source": "./"}],
+            [
+                {"name": plugin["name"], "source": plugin["source"]}
+                for plugin in marketplace["plugins"]
+            ],
         )
-        self.assertEqual(
-            ["./skills/branch-handoff", "./skills/work-recovery"],
-            [plugin["source"] for plugin in marketplace["plugins"]],
-        )
-        self.assertTrue(all("version" not in plugin for plugin in marketplace["plugins"]))
-        self.assertEqual(len({plugin["name"] for plugin in marketplace["plugins"]}), 2)
-
-    def test_work_recovery_skill_and_plugin_versions_match_current_release(self) -> None:
-        skill_md = (WORK_RECOVERY / "SKILL.md").read_text(encoding="utf-8")
-        match = re.search(r'^  version: "([^"]+)"$', skill_md, re.MULTILINE)
-        self.assertIsNotNone(match)
-        plugin = json.loads(
-            (WORK_RECOVERY / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
-        )
-        assert match is not None
-        self.assertEqual(WORK_RECOVERY_VERSION, match.group(1))
-        self.assertEqual(WORK_RECOVERY_VERSION, plugin["version"])
-        self.assertEqual("https://github.com/Phalegethon", plugin["author"]["url"])
-        self.assertEqual("MIT", plugin["license"])
 
     def test_claude_catalog_explains_outcome_and_namespaced_invocation(self) -> None:
         marketplace = json.loads(
             (ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
         )
-        entries = {entry["name"]: entry for entry in marketplace["plugins"]}
-
-        for skill, display_name in (
-            ("branch-handoff", "Branch Handoff"),
-            ("work-recovery", "Work Recovery"),
-        ):
-            plugin = json.loads(
-                (ROOT / "skills" / skill / ".claude-plugin" / "plugin.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            entry = entries[skill]
-            invocation = f"/{skill}:{skill}"
-
-            self.assertEqual(display_name, plugin["displayName"])
-            self.assertEqual(display_name, entry["displayName"])
-            self.assertEqual(plugin["description"], entry["description"])
-            self.assertIn(invocation, plugin["description"])
-            self.assertLessEqual(len(plugin["description"]), 200)
-            self.assertEqual(plugin["homepage"], entry["homepage"])
-            self.assertTrue(plugin["homepage"].endswith(f"#install-{skill}"))
+        self.assertEqual(1, len(marketplace["plugins"]))
+        entry = marketplace["plugins"][0]
+        self.assertEqual("The Agentic Fieldbook (TAF)", entry["displayName"])
+        self.assertIn("handoff", entry["description"].lower())
+        self.assertIn("recover", entry["description"].lower())
+        self.assertIn("/taf:branch-handoff", entry["description"])
+        self.assertIn("/taf:work-recovery", entry["description"])
+        self.assertLessEqual(len(entry["description"]), 200)
 
     def test_changelog_and_readme_publish_update_paths(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")

@@ -200,7 +200,7 @@ class RepositoryLayoutTest(unittest.TestCase):
         self.assertTrue((WORK_RECOVERY_SKILL / "scripts" / "runtime-manifest.json").is_file())
         self.assertTrue((WORK_RECOVERY_SKILL / "references" / "recovery-contract.md").is_file())
 
-    def test_claude_marketplace_exposes_only_implemented_skills(self) -> None:
+    def test_claude_marketplace_exposes_only_the_taf_product(self) -> None:
         marketplace = json.loads(
             (ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
         )
@@ -210,12 +210,8 @@ class RepositoryLayoutTest(unittest.TestCase):
         self.assertEqual(
             [
                 {
-                    "name": "branch-handoff",
-                    "source": "./skills/branch-handoff",
-                },
-                {
-                    "name": "work-recovery",
-                    "source": "./skills/work-recovery",
+                    "name": "taf",
+                    "source": "./",
                 }
             ],
             [
@@ -224,18 +220,28 @@ class RepositoryLayoutTest(unittest.TestCase):
             ],
         )
 
-    def test_branch_handoff_has_consistent_claude_plugin_identity(self) -> None:
-        plugin = json.loads(
-            (SKILL / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual("branch-handoff", plugin["name"])
-        self.assertEqual("1.2.1", plugin["version"])
-        self.assertEqual("MIT", plugin["license"])
-        self.assertEqual("Gürkan Süerdem", plugin["author"]["name"])
-        self.assertEqual("https://github.com/Phalegethon", plugin["author"]["url"])
-        self.assertEqual(
-            "https://github.com/Phalegethon/the-agentic-fieldbook",
-            plugin["repository"],
+    def test_root_manifests_have_consistent_taf_identity(self) -> None:
+        for relative in (
+            Path(".claude-plugin/plugin.json"),
+            Path(".codex-plugin/plugin.json"),
+        ):
+            with self.subTest(manifest=relative.as_posix()):
+                plugin = json.loads((ROOT / relative).read_text(encoding="utf-8"))
+                self.assertEqual("taf", plugin["name"])
+                self.assertEqual("2.0.0", plugin["version"])
+                self.assertEqual("MIT", plugin["license"])
+                self.assertEqual("Gürkan Süerdem", plugin["author"]["name"])
+                self.assertEqual(
+                    "https://github.com/Phalegethon", plugin["author"]["url"]
+                )
+                self.assertEqual(
+                    "https://github.com/Phalegethon/the-agentic-fieldbook",
+                    plugin["repository"],
+                )
+
+        self.assertFalse((SKILL / ".claude-plugin" / "plugin.json").exists())
+        self.assertFalse(
+            (WORK_RECOVERY_SKILL / ".claude-plugin" / "plugin.json").exists()
         )
 
     def test_publication_files_identify_taf(self) -> None:
