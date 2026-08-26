@@ -78,20 +78,67 @@ class RepositoryLayoutTest(unittest.TestCase):
 
     def test_public_layout_contains_taf_context_engine_without_exposure(self) -> None:
         package = ROOT / "tools" / "taf-context" / "taf_context"
-        package_files = {
+        expected_package_files = {
             "__init__.py",
             "__main__.py",
             "cli.py",
             "consent.py",
+            "discovery.py",
             "dossier.py",
             "freshness.py",
             "git_snapshot.py",
             "models.py",
+            "provider_cli.py",
+            "provider_models.py",
+            "provider_state.py",
+            "routing.py",
         }
-        for filename in package_files:
-            self.assertTrue((package / filename).is_file(), filename)
+        actual_package_files = {
+            path.name for path in package.iterdir() if path.is_file()
+        }
+        self.assertEqual(expected_package_files, actual_package_files)
 
         self.assertFalse((ROOT / "tools" / "taf-context" / "SKILL.md").exists())
+
+        context_tool = ROOT / "tools" / "taf-context"
+        forbidden_engine_segments = {
+            "adapter",
+            "adapters",
+            "indexes",
+            "integration",
+            "integrations",
+            "level1",
+            "level_1",
+            "parser",
+            "parsers",
+            "provider_adapters",
+            "providers",
+            "storage",
+            "stores",
+            "watcher",
+            "watchers",
+        }
+        for path in context_tool.rglob("*"):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            relative = path.relative_to(context_tool)
+            normalized_parts = {
+                part.lower().replace("-", "_").removesuffix(".py")
+                for part in relative.parts
+            }
+            self.assertFalse(
+                normalized_parts & forbidden_engine_segments,
+                relative.as_posix(),
+            )
+            self.assertFalse(
+                relative.stem.lower().endswith(
+                    ("_adapter", "_parser", "_storage", "_watcher")
+                ),
+                relative.as_posix(),
+            )
+            normalized_path = relative.as_posix().lower().replace("-", "_")
+            self.assertNotIn("level1", normalized_path, relative.as_posix())
+            self.assertNotIn("level_1", normalized_path, relative.as_posix())
 
         marketplace = json.loads(
             (ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
@@ -100,17 +147,53 @@ class RepositoryLayoutTest(unittest.TestCase):
         self.assertNotIn("taf-context", json.dumps(marketplace_sources))
 
         private_prefixes = (
-            "evals/context-infrastructure",
+            ".superpowers",
+            "benchmarks/context-discovery-routing",
             "benchmarks/context-infrastructure",
+            "evals/context-discovery-routing",
+            "evals/context-infrastructure",
             "docs/superpowers",
+            "tests/taf_context/evidence",
+            "tests/taf_context/private",
         )
-        public_paths = (
+        public_paths = tuple(
             path.relative_to(ROOT).as_posix()
             for path in ROOT.rglob("*")
             if ".git" not in path.relative_to(ROOT).parts
         )
         self.assertFalse(
             any(path.startswith(private_prefixes) for path in public_paths)
+        )
+        self.assertFalse(
+            any(
+                path.startswith("docs/")
+                and "context-discovery-routing" in path
+                and any(token in path for token in ("design", "execution", "plan", "spec"))
+                for path in public_paths
+            )
+        )
+
+        private_result_names = {
+            "benchmark-evidence.json",
+            "benchmark-results.json",
+            "benchmark-results.md",
+            "measurements.json",
+        }
+        self.assertFalse(
+            any(
+                path.startswith("tests/taf_context/")
+                and Path(path).name in private_result_names
+                for path in public_paths
+            )
+        )
+
+        local_state_names = {"audit.jsonl", "consent.json", "providers.json"}
+        self.assertFalse(
+            any(
+                Path(path).name in local_state_names
+                and not {"conformance", "fixtures"} & set(Path(path).parts)
+                for path in public_paths
+            )
         )
 
 
