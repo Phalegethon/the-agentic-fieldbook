@@ -14,6 +14,7 @@ Created and maintained by
 | Skill | Status | Purpose |
 |---|---|---|
 | [`branch-handoff`](skills/branch-handoff) | Stable | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
+| [`work-recovery`](skills/work-recovery) | Stable | Recover interrupted work and the single best next step from bounded, read-only Git evidence. |
 
 Planned names such as `pr-summary`, `release-risk`, `incident-brief`, and
 `dependency-audit` are roadmap items, not installable packages yet.
@@ -198,18 +199,111 @@ Defaults and boundaries:
 Runtime requirements are Git and Python 3. There are no Python package
 dependencies.
 
+## Install `work-recovery`
+
+Run the command for the agent that should use the skill. Each command installs
+only `work-recovery` into the current project.
+
+### Claude Code
+
+```bash
+npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
+  --skill work-recovery \
+  --agent claude-code \
+  --yes
+```
+
+### Codex
+
+```bash
+npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
+  --skill work-recovery \
+  --agent codex \
+  --yes
+```
+
+### Antigravity and Antigravity CLI
+
+```bash
+npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
+  --skill work-recovery \
+  --agent antigravity \
+  --agent antigravity-cli \
+  --yes
+```
+
+Add `--global` only for an intentional user-wide installation. Codex may also
+install directly from:
+
+```text
+https://github.com/Phalegethon/the-agentic-fieldbook/tree/main/skills/work-recovery
+```
+
+Claude marketplace users can run
+`/plugin install work-recovery@the-agentic-fieldbook` and then
+`/reload-plugins`.
+
+Runtime requirements are Git and Python 3. The bundled collector uses only the
+Python standard library.
+
+## Update `work-recovery`
+
+Re-run the matching install command above with the same `--agent` and scope.
+Claude marketplace users can run
+`/plugin update work-recovery@the-agentic-fieldbook` followed by
+`/reload-plugins` when prompted. Verify the active copy with:
+
+```bash
+npx --yes skills@latest list --json
+```
+
+## Use work-recovery
+
+From the interrupted Git worktree, ask:
+
+```text
+Use work-recovery to tell me where this work stopped and the single best next step. Do not run tests or change repository state.
+```
+
+The normal report ends with a reminder rather than a generated handoff. To move
+the same evidence into another session, ask separately:
+
+```text
+Now turn that recovery dossier into a compact continuation prompt for another
+session.
+```
+
+Default boundaries:
+
+- Reads bounded current-worktree Git metadata and tracked staged/unstaged diff
+  evidence; other worktrees contribute metadata only.
+- Untracked content requires exact path authorization and remains protected by
+  no-follow, file-type, size, binary, generated, and credential gates.
+- Does not run tests, builds, lint, project validation, or repository mutation.
+- Does not build or update an index, query a provider, or access the network.
+- Uses an existing provider/index only after separate explicit authorization;
+  native recovery remains complete when none is available.
+- Writes no recovery artifact and reports exact evidence omissions within the
+  selected context budget.
+
 ## Repository structure
 
 ```text
 the-agentic-fieldbook/
 ├── .claude-plugin/marketplace.json
 ├── skills/
-│   └── branch-handoff/
+│   ├── branch-handoff/
+│   │   ├── SKILL.md
+│   │   ├── .claude-plugin/plugin.json
+│   │   ├── agents/openai.yaml
+│   │   ├── references/
+│   │   └── scripts/collect_diff.py
+│   └── work-recovery/
 │       ├── SKILL.md
 │       ├── .claude-plugin/plugin.json
 │       ├── agents/openai.yaml
 │       ├── references/
-│       └── scripts/collect_diff.py
+│       └── scripts/
 └── tests/
 ```
 

@@ -212,6 +212,10 @@ class RepositoryLayoutTest(unittest.TestCase):
                 {
                     "name": "branch-handoff",
                     "source": "./skills/branch-handoff",
+                },
+                {
+                    "name": "work-recovery",
+                    "source": "./skills/work-recovery",
                 }
             ],
             [

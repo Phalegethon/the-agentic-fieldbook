@@ -2,6 +2,27 @@
 
 All notable changes to independently released TAF skills are recorded here.
 
+## [1.3.0] - 2026-08-26
+
+### Added
+
+- `work-recovery` 1.0.0 with bounded current-worktree evidence, strict work
+  states, exact omission accounting, and an optional same-dossier continuation
+  prompt.
+- A standalone vendored Python standard-library runtime with deterministic hash
+  drift checks and a zero-artifact collector.
+
+### Changed
+
+- The marketplace now publishes `branch-handoff` and `work-recovery` as
+  independently installable skills.
+
+### Security
+
+- Recovery is read-only by default: it performs no validation, network/provider
+  action, index lifecycle, repository mutation, or unapproved untracked and
+  other-worktree content read.
+
 ## [1.2.0] - 2026-08-24
 
 ### Added
