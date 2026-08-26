@@ -34,7 +34,7 @@ _ALLOWED_BUDGETS = (2000, 4000, 8000, 12000)
 _ARTIFACT_BYTE_LIMIT = 64 * 1024
 _CONTENT_EXCERPT_CHARS = 420
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?im)^(\s*[a-z0-9_-]*(?:api[_-]?key|token|password|passwd|secret)[a-z0-9_-]*\s*[:=]\s*).*$"
+    r"(?im)^([+-]?\s*[a-z0-9_-]*(?:api[_-]?key|token|password|passwd|secret)[a-z0-9_-]*\s*[:=]\s*).*$"
 )
 _ABSOLUTE_PATH = re.compile(r"(?<![\w.-])/(?:Users|home|private|var|tmp)/[^\s'\"`]+")
 
@@ -361,16 +361,19 @@ def _relation(repo: Path, head: str | None, base: str | None) -> tuple[int | Non
     parts = raw.split()
     if len(parts) != 2 or any(not part.isdigit() for part in parts):
         raise RecoveryError("malformed Git relation")
-    ancestor_process = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", head, base],
-        cwd=repo,
-        env=_git_environment(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=20,
-    )
+    try:
+        ancestor_process = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", head, base],
+            cwd=repo,
+            env=_git_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RecoveryError("local Git relation failed") from error
     if ancestor_process.returncode not in (0, 1):
         raise RecoveryError("local Git relation failed")
     return int(parts[0]), int(parts[1]), ancestor_process.returncode == 0

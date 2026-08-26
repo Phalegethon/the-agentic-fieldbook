@@ -5,10 +5,14 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 from taf_context.recovery import (
+    RecoveryError,
     RecoveryRequest,
+    _relation,
     collect_recovery,
     resolve_recovery_base,
 )
@@ -93,6 +97,20 @@ class RecoveryBaseTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "base"):
             resolve_recovery_base(repo, "missing-ref")
+
+    def test_merge_base_timeout_is_reported_as_recovery_error(self) -> None:
+        repo = init_committed_repo(self.root / "repo")
+        head = run(repo, "git", "rev-parse", "HEAD")
+        relation_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"0\t0\n", stderr=b""
+        )
+
+        with patch(
+            "taf_context.recovery.subprocess.run",
+            side_effect=[relation_result, subprocess.TimeoutExpired(["git", "merge-base"], 20)],
+        ):
+            with self.assertRaisesRegex(RecoveryError, "relation"):
+                _relation(repo, head, head)
 
 
 class RecoveryStateTests(unittest.TestCase):
@@ -305,6 +323,18 @@ class RecoveryEvidenceTests(unittest.TestCase):
 
         self.assertIn("mode=dev", result.model_text)
         self.assertNotIn("super-secret", result.model_text)
+        self.assertIn("[redacted]", result.model_text)
+
+    def test_tracked_diff_redacts_added_and_removed_secret_assignments(self) -> None:
+        write(self.repo / "secrets.txt", "token: old-secret\n")
+        run(self.repo, "git", "add", "secrets.txt")
+        run(self.repo, "git", "commit", "-m", "add secret fixture")
+        write(self.repo / "secrets.txt", "API_KEY=new-secret\n")
+
+        result = collect_recovery(RecoveryRequest(repo=self.repo, base="main", max_chars=4000))
+
+        self.assertNotIn("old-secret", result.model_text)
+        self.assertNotIn("new-secret", result.model_text)
         self.assertIn("[redacted]", result.model_text)
 
     def test_supplied_note_is_reported_and_cannot_override_dirty_git_state(self) -> None:
