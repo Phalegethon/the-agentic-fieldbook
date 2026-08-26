@@ -504,7 +504,12 @@ def _candidate_worktrees(repo: Path, current_identity: str, base: str | None) ->
         if head and (len(head) not in (40, 64) or any(char not in "0123456789abcdefABCDEF" for char in head)):
             raise RecoveryError("malformed Git worktree list")
         branch_ref = fields.get("branch")
-        branch = branch_ref.removeprefix("refs/heads/") if branch_ref else None
+        branch_prefix = "refs/heads/"
+        branch = (
+            branch_ref[len(branch_prefix) :]
+            if branch_ref and branch_ref.startswith(branch_prefix)
+            else branch_ref
+        )
         candidates.append(
             _classify(
                 repo,
