@@ -18,7 +18,7 @@ def register_recovery_command(subparsers: argparse._SubParsersAction) -> None:
         "--max-output-chars",
         type=int,
         choices=(2000, 4000, 8000, 12000),
-        default=4000,
+        default=2000,
     )
     recover.add_argument("--include-untracked", action="append", default=[])
     recover.add_argument("--note-file", action="append", default=[])

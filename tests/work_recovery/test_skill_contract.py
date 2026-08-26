@@ -122,7 +122,8 @@ class VendoredRuntimeTests(unittest.TestCase):
             self.assertEqual(envelope["schema_version"], "1")
             self.assertEqual(envelope["collection_count"], 1)
             self.assertEqual(envelope["dossier"]["current"]["state"], "active-dirty")
-            self.assertLessEqual(envelope["characters_used"], 4000)
+            self.assertEqual(envelope["dossier"]["coverage"]["budget_characters"], 2000)
+            self.assertLessEqual(envelope["characters_used"], 2000)
             self.assertFalse(any(path.name.startswith(".taf") for path in repo.iterdir()))
 
 

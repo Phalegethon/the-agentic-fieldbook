@@ -202,12 +202,35 @@ class RecoveryEvidenceTests(unittest.TestCase):
 
         result = collect_recovery(RecoveryRequest(repo=self.repo, base="main", max_chars=4000))
 
-        claims = {claim.claim_id: claim for claim in result.dossier.claims}
-        self.assertIn("diff.staged.staged.txt", claims)
-        self.assertIn("staged evidence", claims["diff.staged.staged.txt"].text)
-        self.assertNotIn("unstaged evidence", claims["diff.staged.staged.txt"].text)
-        self.assertIn("diff.unstaged.tracked.txt", claims)
-        self.assertIn("unstaged evidence", claims["diff.unstaged.tracked.txt"].text)
+        staged = next(
+            claim for claim in result.dossier.claims if claim.provenance == ("git/diff/staged/staged.txt",)
+        )
+        unstaged = next(
+            claim
+            for claim in result.dossier.claims
+            if claim.provenance == ("git/diff/unstaged/tracked.txt",)
+        )
+        self.assertIn("staged evidence", staged.text)
+        self.assertNotIn("unstaged evidence", staged.text)
+        self.assertIn("unstaged evidence", unstaged.text)
+
+    def test_changed_paths_with_same_normalized_form_have_unique_claim_ids(self) -> None:
+        write(self.repo / "a-b.py", "before dash\n")
+        write(self.repo / "a_b.py", "before underscore\n")
+        run(self.repo, "git", "add", "a-b.py", "a_b.py")
+        run(self.repo, "git", "commit", "-m", "add colliding path fixtures")
+        write(self.repo / "a-b.py", "after dash\n")
+        write(self.repo / "a_b.py", "after underscore\n")
+
+        result = collect_recovery(RecoveryRequest(repo=self.repo, base="main", max_chars=4000))
+
+        diff_claims = [
+            claim for claim in result.dossier.claims if claim.claim_id.startswith("diff.unstaged.")
+        ]
+        self.assertEqual(len(diff_claims), 2)
+        self.assertEqual(len({claim.claim_id for claim in diff_claims}), 2)
+        self.assertTrue(any("a-b.py" in claim.text for claim in diff_claims))
+        self.assertTrue(any("a_b.py" in claim.text for claim in diff_claims))
 
     def test_untracked_content_is_metadata_only_until_exactly_authorized(self) -> None:
         write(self.repo / "scratch.txt", "private scratch detail\n")

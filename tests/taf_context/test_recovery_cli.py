@@ -49,6 +49,7 @@ class RecoveryCommandTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         value = json.loads(stdout)
         self.assertEqual(value["schema_version"], "1")
+        self.assertEqual(value["coverage"]["budget_characters"], 2000)
         self.assertEqual(stdout, json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
 
     def test_all_explicit_inputs_reach_the_collector(self) -> None:

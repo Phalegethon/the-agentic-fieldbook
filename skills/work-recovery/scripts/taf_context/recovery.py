@@ -29,7 +29,7 @@ from .recovery_models import (
 
 
 _MAX_GIT_OUTPUT = 4 * 1024 * 1024
-_DEFAULT_BUDGET = 4000
+_DEFAULT_BUDGET = 2000
 _ALLOWED_BUDGETS = (2000, 4000, 8000, 12000)
 _ARTIFACT_BYTE_LIMIT = 64 * 1024
 _CONTENT_EXCERPT_CHARS = 420
@@ -850,10 +850,9 @@ def _claim_path_id(path: str) -> str:
         normalized = re.sub(r"\.+", ".", normalized).strip("-.") or "path"
         components.append(normalized)
     candidate = ".".join(components)
-    if len(candidate) <= 96:
-        return candidate
     digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
-    return candidate[:79].rstrip(".-_:") + "." + digest
+    stem = candidate[:79].rstrip(".-_:") or "path"
+    return stem + "." + digest
 
 
 def _budgeted_dossier(

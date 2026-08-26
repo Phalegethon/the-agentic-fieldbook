@@ -18,7 +18,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True)
     parser.add_argument("--base")
-    parser.add_argument("--max-output-chars", type=int, choices=(2000, 4000, 8000, 12000), default=4000)
+    parser.add_argument("--max-output-chars", type=int, choices=(2000, 4000, 8000, 12000), default=2000)
     parser.add_argument("--include-untracked", action="append", default=[])
     parser.add_argument("--note-file", action="append", default=[])
     parser.add_argument("--test-results-file", action="append", default=[])
