@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import copy
 import _io
 import io
 import json
@@ -82,6 +83,46 @@ class InstrumentationGuardTests(unittest.TestCase):
         self.assertEqual(counters["network_calls"], 3)
         self.assertGreaterEqual(counters["native_bypass_attempts"], 3)
 
+    def test_preopened_stream_read_alias_fails_closed_without_consuming_data(self) -> None:
+        stream = self.path.open("rb")
+        self.addCleanup(stream.close)
+        prebound_read = stream.read
+
+        with benchmark._guards() as counters:
+            with self.assertRaises(benchmark.InstrumentationViolation):
+                prebound_read(1)
+
+        self.assertEqual(counters["source_read_calls"], 1)
+        self.assertEqual(counters["source_bytes_read"], 0)
+        self.assertEqual(counters["native_bypass_attempts"], 1)
+        self.assertEqual(prebound_read(1), b"f")
+
+    def test_prebound_connected_socket_send_alias_fails_closed_and_restores_hook(self) -> None:
+        sender, receiver = socket.socketpair()
+        self.addCleanup(sender.close)
+        self.addCleanup(receiver.close)
+        prebound_send = sender.send
+        prior_events: list[str] = []
+
+        def prior_profile(
+            _frame: object, event: str, _argument: object
+        ) -> None:
+            prior_events.append(event)
+
+        original_profile = sys.getprofile()
+        sys.setprofile(prior_profile)
+        self.addCleanup(sys.setprofile, original_profile)
+        with benchmark._guards() as counters:
+            with self.assertRaises(benchmark.InstrumentationViolation):
+                prebound_send(b"x")
+
+        self.assertIs(sys.getprofile(), prior_profile)
+        self.assertIn("c_call", prior_events)
+        self.assertEqual(counters["network_calls"], 1)
+        self.assertEqual(counters["native_bypass_attempts"], 1)
+        self.assertEqual(prebound_send(b"x"), 1)
+        self.assertEqual(receiver.recv(1), b"x")
+
 
 class RetainedEvidenceTests(unittest.TestCase):
     @staticmethod
@@ -152,12 +193,45 @@ class RetainedEvidenceTests(unittest.TestCase):
 
     def _completed_class(self, case: dict[str, object] | None = None) -> dict[str, object]:
         case = case or self._case()
+        warmup = self._ok_sample(case)
+        warmup["run_index"] = 0
         samples = []
         for index in range(5):
             sample = self._ok_sample(case)
             sample["run_index"] = index + 1
             samples.append(sample)
-        return benchmark._assemble_class(case, self._ok_sample(case), samples)
+        return benchmark._assemble_class(case, warmup, samples)
+
+    def _complete_evidence(self) -> dict[str, object]:
+        return benchmark._evidence(
+            [self._completed_class(dict(case)) for case in benchmark.CASES],
+            machine={},
+        )
+
+    def _mixed_failure_class(
+        self, case: dict[str, object] | None = None
+    ) -> dict[str, object]:
+        case = case or self._case()
+        samples = []
+        for index in range(4):
+            sample = self._ok_sample(case)
+            sample["run_index"] = index + 1
+            samples.append(sample)
+        samples.append(
+            benchmark._protocol_error(
+                case,
+                5,
+                error="malformed retained record",
+                stdout="not-json",
+                stderr="",
+                cold_wall_seconds=0.02,
+                cold_cpu_seconds=0.01,
+                worker_exit_code=0,
+            )
+        )
+        warmup = self._ok_sample(case)
+        warmup["run_index"] = 0
+        return benchmark._assemble_class(case, warmup, samples)
 
     def test_missing_malformed_duplicate_and_nonfinite_worker_json_are_retained(self) -> None:
         payloads = ("", "not-json", '{"status":"ok","status":"ok"}', '{"x":NaN}')
@@ -195,6 +269,7 @@ class RetainedEvidenceTests(unittest.TestCase):
         mutations = (
             ("warm_wall_seconds", -0.1),
             ("warm_cpu_seconds", math.inf),
+            ("routing_warm_seconds", 1e308),
             ("peak_rss_bytes", 2**63),
             ("routing_output_bytes", -1),
         )
@@ -252,12 +327,18 @@ class RetainedEvidenceTests(unittest.TestCase):
                 self.assertEqual(retained["status"], "worker-structure-error")
 
     def test_one_warmup_is_discarded_and_five_samples_are_retained(self) -> None:
-        outcomes = [self._ok_sample() for _ in range(6)]
+        outcomes = []
+        for index in range(6):
+            sample = self._ok_sample()
+            sample["run_index"] = index
+            outcomes.append(sample)
         with mock.patch.object(benchmark, "_measured_worker", side_effect=outcomes):
             result = benchmark._case_result(self._case())
-        self.assertEqual(result["warmup"]["run_index"], 1)
+        self.assertEqual(result["warmup"]["run_index"], 0)
         self.assertEqual(len(result["samples"]), 5)
-        self.assertEqual([item["run_index"] for item in result["samples"]], [1] * 5)
+        self.assertEqual(
+            [item["run_index"] for item in result["samples"]], [1, 2, 3, 4, 5]
+        )
         self.assertTrue(result["correctness_passed"])
 
     def test_incomplete_class_is_no_go_even_if_retained_samples_pass(self) -> None:
@@ -282,17 +363,33 @@ class RetainedEvidenceTests(unittest.TestCase):
         self.assertFalse(result["gates"]["consent_decision_warm_p95_at_most_0_010_seconds"])
         self.assertFalse(result["mandatory_gates_passed"])
 
+    def test_consent_gate_uses_worst_retained_class_not_only_64x64(self) -> None:
+        case = self._case("65x64-overflow")
+        samples = []
+        for index in range(5):
+            sample = self._ok_sample(case)
+            sample["run_index"] = index + 1
+            sample["consent_decision_warm_seconds"] = (
+                0.011 if index == 4 else 0.001
+            )
+            samples.append(sample)
+        result = benchmark._assemble_class(case, self._ok_sample(case), samples)
+        self.assertFalse(
+            result["gates"][
+                "consent_decision_warm_p95_at_most_0_010_seconds"
+            ]
+        )
+        self.assertFalse(result["mandatory_gates_passed"])
+
     def test_strict_evidence_schema_rejects_unknown_fields(self) -> None:
-        case = self._case()
-        evidence = benchmark._evidence([self._completed_class(case)], machine={})
+        evidence = self._complete_evidence()
         benchmark._validate_evidence(evidence)
         evidence["unexpected"] = True
         with self.assertRaisesRegex(ValueError, "evidence fields"):
             benchmark._validate_evidence(evidence)
 
     def test_strict_evidence_schema_recomputes_aggregate_decision_flags(self) -> None:
-        case = self._case()
-        evidence = benchmark._evidence([self._completed_class(case)], machine={})
+        evidence = self._complete_evidence()
         evidence["correctness_passed"] = False
         evidence["mandatory_gates_passed"] = False
         evidence["python_retention_decision"] = benchmark._retention_decision(
@@ -301,28 +398,129 @@ class RetainedEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "evidence aggregate flags"):
             benchmark._validate_evidence(evidence)
 
+    def test_strict_evidence_recomputes_contract_summaries_checks_and_gates(self) -> None:
+        mutations = {
+            "threshold": lambda value: value["thresholds"].__setitem__(
+                "routing_64x64_warm_p95_seconds", 999.0
+            ),
+            "threshold-type": lambda value: value["thresholds"].__setitem__(
+                "source_bytes", False
+            ),
+            "timing-definition": lambda value: value[
+                "timing_definitions"
+            ].__setitem__("cold", "arbitrary"),
+            "missing-class": lambda value: value["classes"].pop(),
+            "reordered-corpora": lambda value: value["classes"].reverse(),
+            "corpus-type": lambda value: value["classes"][0][
+                "corpus"
+            ].__setitem__("provider_count", True),
+            "four-retained": lambda value: value["classes"][0]["samples"].pop(),
+            "duplicate-run-index": lambda value: value["classes"][0]["samples"][
+                4
+            ].__setitem__("run_index", 4),
+            "stale-p95": lambda value: value["classes"][2]["samples"][0].__setitem__(
+                "routing_warm_seconds", 999.0
+            ),
+            "huge-leaf": lambda value: value["classes"][0]["samples"][0].__setitem__(
+                "warm_wall_seconds", 1e308
+            ),
+            "stale-summary": lambda value: value["classes"][1]["wall_time"][
+                "warm_seconds"
+            ].__setitem__("p50", 0.5),
+            "summary-number-type": lambda value: value["classes"][0][
+                "output_bytes"
+            ]["discovery_output_bytes"].__setitem__(
+                "p50",
+                int(
+                    value["classes"][0]["output_bytes"][
+                        "discovery_output_bytes"
+                    ]["p50"]
+                ),
+            ),
+            "contradictory-check": lambda value: value["classes"][1][
+                "corpus_checks"
+            ].__setitem__("samples_have_no_correctness_failure", False),
+            "contradictory-gate": lambda value: value["classes"][1][
+                "gates"
+            ].__setitem__("zero_network_calls", False),
+            "forbidden-total": lambda value: value["classes"][1][
+                "forbidden_counter_totals"
+            ].__setitem__("network_calls", 1),
+            "performance-failure": lambda value: value["classes"][1][
+                "performance_failures"
+            ].append({"run": 1, "status": "timeout", "error": "stale"}),
+        }
+        for name, mutation in mutations.items():
+            with self.subTest(name=name):
+                evidence = copy.deepcopy(self._complete_evidence())
+                mutation(evidence)
+                with self.assertRaises(ValueError):
+                    benchmark._validate_evidence(evidence)
+
+    def test_five_record_mixed_failure_is_not_complete_evidence(self) -> None:
+        classes = [
+            self._mixed_failure_class(dict(case))
+            if index == 0
+            else self._completed_class(dict(case))
+            for index, case in enumerate(benchmark.CASES)
+        ]
+        evidence = benchmark._evidence(classes, machine={})
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "discovery-raw.json"
+            output.write_text(
+                benchmark._canonical_document(evidence), encoding="utf-8"
+            )
+            self.assertFalse(benchmark._existing_complete_evidence(output))
+
+    def test_five_record_mixed_failure_cannot_overwrite_valid_evidence(self) -> None:
+        valid = self._complete_evidence()
+        mixed = [
+            self._mixed_failure_class(dict(case))
+            if index == 0
+            else self._completed_class(dict(case))
+            for index, case in enumerate(benchmark.CASES)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "discovery-raw.json"
+            output.write_text(
+                benchmark._canonical_document(valid), encoding="utf-8"
+            )
+            original = output.read_bytes()
+            with mock.patch.object(
+                benchmark, "_case_result", side_effect=mixed
+            ), mock.patch.object(benchmark, "_machine", return_value={}):
+                self.assertEqual(benchmark._driver(output), 1)
+            self.assertEqual(output.read_bytes(), original)
+
     def test_partial_rerun_cannot_overwrite_valid_evidence(self) -> None:
-        case = self._case()
-        completed = self._completed_class(case)
-        valid = benchmark._evidence([completed], machine={})
+        case = dict(benchmark.CASES[0])
+        valid = self._complete_evidence()
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "discovery-raw.json"
             output.write_text(benchmark._canonical_document(valid), encoding="utf-8")
             original = output.read_bytes()
             failed = benchmark._failed_class(case, RuntimeError("fixture failed"))
-            with mock.patch.object(benchmark, "CASES", (case,)), mock.patch.object(
-                benchmark, "_case_result", return_value=failed
+            results = [
+                failed if index == 0 else self._completed_class(dict(item))
+                for index, item in enumerate(benchmark.CASES)
+            ]
+            with mock.patch.object(
+                benchmark, "_case_result", side_effect=results
             ), mock.patch.object(benchmark, "_machine", return_value={}):
                 self.assertEqual(benchmark._driver(output), 1)
             self.assertEqual(output.read_bytes(), original)
 
     def test_partial_evidence_is_written_when_no_valid_evidence_exists(self) -> None:
-        case = self._case()
+        case = dict(benchmark.CASES[0])
         failed = benchmark._failed_class(case, RuntimeError("cleanup failed"))
+        results = [
+            failed if index == 0 else self._completed_class(dict(item))
+            for index, item in enumerate(benchmark.CASES)
+        ]
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "discovery-raw.json"
-            with mock.patch.object(benchmark, "CASES", (case,)), mock.patch.object(
-                benchmark, "_case_result", return_value=failed
+            with mock.patch.object(
+                benchmark, "_case_result", side_effect=results
             ), mock.patch.object(benchmark, "_machine", return_value={}):
                 self.assertEqual(benchmark._driver(output), 1)
             evidence = json.loads(output.read_text(encoding="utf-8"))

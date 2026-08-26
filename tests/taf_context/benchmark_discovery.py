@@ -65,6 +65,7 @@ SEED = 20260826
 WARM_UP_RUNS = 1
 MEASURED_RUNS = 5
 WORKER_TIMEOUT_SECONDS = 30
+MAX_TIMING_SECONDS = WORKER_TIMEOUT_SECONDS * 2
 MAX_WORKER_OUTPUT_BYTES = 1024 * 1024
 MAX_DIAGNOSTIC_BYTES = 2048
 MAX_INTEGER = (1 << 63) - 1
@@ -74,6 +75,29 @@ MAX_DISCOVERY_ARTIFACT_BYTES = 256 * 1024
 MAX_HOST_INVENTORY_BYTES = 256 * 1024
 UTC_NOW = "2026-08-26T12:00:00Z"
 
+TIMING_DEFINITIONS = {
+    "cold": "fresh worker process including interpreter, harness import, corpus construction, guard setup, measurement, validation, and serialization",
+    "warm": "worker timer excludes production import, deterministic corpus construction, and guard setup; includes canonical, reversed, and seeded-permuted in-memory discovery, routing, strict round trips, and serialization",
+    "routing": "one canonical route_provider call over the completed discovery snapshot",
+    "consent_lookup_decision": "a repeated canonical route_provider call including exact AuthorizationLedger decision lookups",
+}
+
+THRESHOLDS = {
+    "routing_64x64_warm_p95_seconds": 0.050,
+    "consent_lookup_decision_warm_p95_seconds": 0.010,
+    "model_summary_characters": MAX_MODEL_SUMMARY_CHARACTERS,
+    "machine_decision_bytes": MAX_MACHINE_DECISION_BYTES,
+    "host_inventory_bytes": MAX_HOST_INVENTORY_BYTES,
+    "discovery_artifact_bytes": MAX_DISCOVERY_ARTIFACT_BYTES,
+    "source_bytes": 0,
+    "provider_processes": 0,
+    "git_processes": 0,
+    "network_calls": 0,
+    "llm_calls": 0,
+    "native_bypasses": 0,
+    "retained_samples_per_class": MEASURED_RUNS,
+}
+
 CASES = (
     {
         "name": "1x2-native-only",
@@ -82,7 +106,7 @@ CASES = (
         "scenario": "native-only",
         "expected_rejected_provider_count": 0,
         "routing_warm_p95_limit_seconds": None,
-        "consent_decision_warm_p95_limit_seconds": None,
+        "consent_decision_warm_p95_limit_seconds": 0.010,
     },
     {
         "name": "16x16-mixed-consent-freshness",
@@ -91,7 +115,7 @@ CASES = (
         "scenario": "mixed-consent-freshness",
         "expected_rejected_provider_count": 0,
         "routing_warm_p95_limit_seconds": None,
-        "consent_decision_warm_p95_limit_seconds": None,
+        "consent_decision_warm_p95_limit_seconds": 0.010,
     },
     {
         "name": "64x64-conflicts-denials-network-markers",
@@ -109,7 +133,7 @@ CASES = (
         "scenario": "overflow-exact-omission",
         "expected_rejected_provider_count": 0,
         "routing_warm_p95_limit_seconds": None,
-        "consent_decision_warm_p95_limit_seconds": None,
+        "consent_decision_warm_p95_limit_seconds": 0.010,
     },
 )
 
@@ -269,6 +293,32 @@ _NETWORK_C_CALLS = _present_functions(
         "gethostbyname_ex", "getnameinfo", "socket", "socketpair",
     ),
 )
+_NATIVE_SOCKET_TYPE = _socket.socket
+_BOUND_FILE_IO_METHODS = frozenset(
+    {
+        "fileno", "flush", "read", "read1", "readall", "readinto",
+        "readinto1", "readline", "readlines", "seek", "truncate", "write",
+        "writelines",
+    }
+)
+_BOUND_SOCKET_IO_METHODS = frozenset(
+    {
+        "accept", "bind", "connect", "connect_ex", "listen", "makefile",
+        "recv", "recv_into", "recvfrom", "recvfrom_into", "recvmsg",
+        "recvmsg_into", "send", "sendall", "sendmsg", "sendto",
+        "sendfile", "shutdown",
+    }
+)
+
+
+def _bound_instance_call(argument: object) -> str | None:
+    owner = getattr(argument, "__self__", None)
+    name = getattr(argument, "__name__", None)
+    if isinstance(owner, io.IOBase) and name in _BOUND_FILE_IO_METHODS:
+        return "file"
+    if isinstance(owner, _NATIVE_SOCKET_TYPE) and name in _BOUND_SOCKET_IO_METHODS:
+        return "network"
+    return None
 
 
 def _c_profile(
@@ -282,6 +332,15 @@ def _c_profile(
         previous(frame, event, argument)  # type: ignore[operator]
     if event != "c_call":
         return
+    bound_kind = _bound_instance_call(argument)
+    if bound_kind == "file":
+        counters["source_read_calls"] += 1
+        counters["native_bypass_attempts"] += 1
+        raise InstrumentationViolation("prebound file instance I/O blocked")
+    if bound_kind == "network":
+        counters["network_calls"] += 1
+        counters["native_bypass_attempts"] += 1
+        raise InstrumentationViolation("prebound socket instance I/O blocked")
     if any(argument is function for function in (*_FILE_C_CALLS, *_METADATA_C_CALLS)):
         counters["source_read_calls"] += 1
         counters["native_bypass_attempts"] += 1
@@ -301,7 +360,9 @@ def _guards() -> Iterator[dict[str, int]]:
     _install_audit_hook()
     counters = _counter_template()
     previous_profile = sys.getprofile()
-    get_thread_profile = getattr(threading, "getprofile", lambda: None)
+    get_thread_profile = getattr(
+        threading, "getprofile", lambda: getattr(threading, "_profile_hook", None)
+    )
     previous_thread_profile = get_thread_profile()
 
     saved: list[tuple[object, str, object]] = []
@@ -348,9 +409,12 @@ def _guards() -> Iterator[dict[str, int]]:
     def profile(frame: object, event: str, argument: object) -> None:
         _c_profile(previous_profile, counters, frame, event, argument)
 
+    def thread_profile(frame: object, event: str, argument: object) -> None:
+        _c_profile(previous_thread_profile, counters, frame, event, argument)
+
     _ACTIVE_GUARDS.append(counters)
     sys.setprofile(profile)
-    threading.setprofile(profile)
+    threading.setprofile(thread_profile)
     try:
         yield counters
     finally:
@@ -1083,6 +1147,13 @@ def _is_finite_nonnegative_number(value: object) -> bool:
     return math.isfinite(converted) and converted >= 0.0
 
 
+def _is_sane_timing(value: object) -> bool:
+    return (
+        _is_finite_nonnegative_number(value)
+        and float(value) <= MAX_TIMING_SECONDS
+    )
+
+
 def _sample_structure_errors(
     sample: dict[str, object],
     case: Mapping[str, object],
@@ -1109,7 +1180,7 @@ def _sample_structure_errors(
         if not _is_nonnegative_integer(sample.get(field)):
             errors.append(field)
     for field in _NUMBER_METRICS:
-        if not _is_finite_nonnegative_number(sample.get(field)):
+        if not _is_sane_timing(sample.get(field)):
             errors.append(field)
     for field in _HASH_FIELDS:
         value = sample.get(field)
@@ -1746,27 +1817,8 @@ def _evidence(
         "warm_up_runs_per_class": WARM_UP_RUNS,
         "measured_runs_per_class": MEASURED_RUNS,
         "percentile_method": "nearest-rank",
-        "timing_definitions": {
-            "cold": "fresh worker process including interpreter, harness import, corpus construction, guard setup, measurement, validation, and serialization",
-            "warm": "worker timer excludes production import, deterministic corpus construction, and guard setup; includes canonical, reversed, and seeded-permuted in-memory discovery, routing, strict round trips, and serialization",
-            "routing": "one canonical route_provider call over the completed discovery snapshot",
-            "consent_lookup_decision": "a repeated canonical route_provider call including exact AuthorizationLedger decision lookups",
-        },
-        "thresholds": {
-            "routing_64x64_warm_p95_seconds": 0.050,
-            "consent_lookup_decision_warm_p95_seconds": 0.010,
-            "model_summary_characters": MAX_MODEL_SUMMARY_CHARACTERS,
-            "machine_decision_bytes": MAX_MACHINE_DECISION_BYTES,
-            "host_inventory_bytes": MAX_HOST_INVENTORY_BYTES,
-            "discovery_artifact_bytes": MAX_DISCOVERY_ARTIFACT_BYTES,
-            "source_bytes": 0,
-            "provider_processes": 0,
-            "git_processes": 0,
-            "network_calls": 0,
-            "llm_calls": 0,
-            "native_bypasses": 0,
-            "retained_samples_per_class": MEASURED_RUNS,
-        },
+        "timing_definitions": dict(TIMING_DEFINITIONS),
+        "thresholds": dict(THRESHOLDS),
         "machine": _machine_record(machine),
         "classes": results,
         "correctness_passed": correctness_passed,
@@ -1781,20 +1833,31 @@ def _validate_summary(value: object, field: str) -> None:
     if type(value) is not dict or set(value) != _SUMMARY_FIELDS:
         raise ValueError("{} summary fields".format(field))
     samples = value["samples"]
+    upper_bound = (
+        MAX_TIMING_SECONDS if "seconds" in field else MAX_INTEGER
+    )
     if type(samples) is not list or any(
-        not _is_finite_nonnegative_number(item) for item in samples
+        not _is_finite_nonnegative_number(item)
+        or float(item) > upper_bound
+        for item in samples
     ):
         raise ValueError("{} summary samples".format(field))
     if value["sample_count"] != len(samples):
         raise ValueError("{} summary sample_count".format(field))
     for percentile in ("p50", "p95"):
         metric = value[percentile]
-        if metric is not None and not _is_finite_nonnegative_number(metric):
+        if metric is not None and (
+            not _is_finite_nonnegative_number(metric)
+            or float(metric) > upper_bound
+        ):
             raise ValueError("{} summary {}".format(field, percentile))
 
 
 def _validate_sample_shape(
-    value: object, case: Mapping[str, object], field: str
+    value: object,
+    case: Mapping[str, object],
+    field: str,
+    expected_run_index: int,
 ) -> None:
     if type(value) is not dict:
         raise ValueError("{} sample".format(field))
@@ -1813,15 +1876,16 @@ def _validate_sample_shape(
     if not expected_fields or set(value) != expected_fields:
         raise ValueError("{} sample fields".format(field))
     if status in {"ok", "correctness-failure"}:
-        run_index = value.get("run_index")
-        if type(run_index) is not int:
+        if value.get("run_index") != expected_run_index:
             raise ValueError("{} run index".format(field))
-        structural = _sample_structure_errors(value, case, run_index)
+        structural = _sample_structure_errors(value, case, expected_run_index)
         if structural:
             raise ValueError("{} sample structure: {}".format(field, structural))
     else:
+        if value.get("run_index") != expected_run_index:
+            raise ValueError("{} run index".format(field))
         for metric in ("cold_wall_seconds", "cold_cpu_seconds"):
-            if not _is_finite_nonnegative_number(value.get(metric)):
+            if not _is_sane_timing(value.get(metric)):
                 raise ValueError("{} {}".format(field, metric))
         if not isinstance(value.get("error"), str):
             raise ValueError("{} error".format(field))
@@ -1837,12 +1901,19 @@ def _validate_sample_shape(
                     raise ValueError("{} {}".format(field, diagnostic))
 
 
-def _validate_class(value: object, index: int) -> None:
+def _validate_class(
+    value: object, index: int, *, require_complete: bool
+) -> None:
     if type(value) is not dict or set(value) != CLASS_FIELDS:
         raise ValueError("class fields")
     corpus = value["corpus"]
-    if type(corpus) is not dict or set(corpus) != set(CASES[0]):
-        raise ValueError("class corpus fields")
+    if (
+        type(corpus) is not dict
+        or index >= len(CASES)
+        or _canonical_document(corpus)
+        != _canonical_document(dict(CASES[index]))
+    ):
+        raise ValueError("class corpus")
     if value["name"] != corpus["name"]:
         raise ValueError("class name")
     if type(value["samples"]) is not list:
@@ -1867,16 +1938,62 @@ def _validate_class(value: object, index: int) -> None:
         raise ValueError("class decisions")
 
     if value["status"] == "class-error":
+        if require_complete:
+            raise ValueError("incomplete class")
         if value["warmup"] is not None or value["samples"] != []:
             raise ValueError("failed class retention")
-        if not isinstance(value["error"], str):
+        if (
+            not isinstance(value["error"], str)
+            or not value["error"]
+            or len(value["error"].encode("utf-8", "replace"))
+            > MAX_DIAGNOSTIC_BYTES
+        ):
             raise ValueError("failed class error")
+        if any(
+            value[field] != {}
+            for field in (
+                "wall_time",
+                "cpu_time",
+                "peak_rss_bytes",
+                "input_bytes",
+                "output_bytes",
+                "counts",
+                "forbidden_counter_totals",
+            )
+        ):
+            raise ValueError("failed class summaries")
+        if value["performance_failures"] != []:
+            raise ValueError("failed class performance failures")
+        if any(value["corpus_checks"].values()) or any(value["gates"].values()):
+            raise ValueError("failed class flags")
+        if value["correctness_passed"] or value["mandatory_gates_passed"]:
+            raise ValueError("failed class decisions")
         return
     if value["status"] != "ok" or value["error"] is not None:
         raise ValueError("class status")
-    _validate_sample_shape(value["warmup"], corpus, "class warmup")
+    _validate_sample_shape(value["warmup"], corpus, "class warmup", 0)
     for sample_index, sample in enumerate(value["samples"]):
-        _validate_sample_shape(sample, corpus, "class sample {}".format(sample_index))
+        _validate_sample_shape(
+            sample,
+            corpus,
+            "class sample {}".format(sample_index),
+            sample_index + 1,
+        )
+    complete = (
+        value["warmup"].get("status") == "ok"
+        and value["warmup"].get("correctness_passed") is True
+        and value["warmup"].get("correctness_failure") is False
+        and len(value["samples"]) == MEASURED_RUNS
+        and all(
+            sample.get("status") == "ok"
+            and sample.get("correctness_passed") is True
+            and sample.get("correctness_failure") is False
+            and sample.get("performance_failure") is False
+            for sample in value["samples"]
+        )
+    )
+    if require_complete and not complete:
+        raise ValueError("class retained samples incomplete")
     for group, expected_keys in (
         (
             value["wall_time"],
@@ -1930,8 +2047,12 @@ def _validate_class(value: object, index: int) -> None:
             _validate_summary(summary, str(name))
     _validate_summary(value["peak_rss_bytes"], "peak_rss_bytes")
 
+    expected = _assemble_class(corpus, value["warmup"], value["samples"])
+    if _canonical_document(value) != _canonical_document(expected):
+        raise ValueError("class derived evidence")
 
-def _validate_evidence(value: object) -> None:
+
+def _validate_evidence_document(value: object, *, require_complete: bool) -> None:
     if type(value) is not dict or set(value) != EVIDENCE_FIELDS:
         raise ValueError("evidence fields")
     if value["schema"] != SCHEMA or value["seed"] != SEED:
@@ -1942,14 +2063,42 @@ def _validate_evidence(value: object) -> None:
         raise ValueError("evidence run counts")
     if value["percentile_method"] != "nearest-rank":
         raise ValueError("evidence percentile")
+    if (
+        type(value["timing_definitions"]) is not dict
+        or _canonical_document(value["timing_definitions"])
+        != _canonical_document(TIMING_DEFINITIONS)
+    ):
+        raise ValueError("evidence timing definitions")
+    if (
+        type(value["thresholds"]) is not dict
+        or _canonical_document(value["thresholds"])
+        != _canonical_document(THRESHOLDS)
+    ):
+        raise ValueError("evidence thresholds")
     if type(value["machine"]) is not dict or set(value["machine"]) != set(
         MACHINE_FIELDS
     ):
         raise ValueError("evidence machine fields")
-    if type(value["classes"]) is not list or not value["classes"]:
+    for field in MACHINE_FIELDS:
+        machine_value = value["machine"][field]
+        if field == "cpu_count":
+            if machine_value is not None and not _is_nonnegative_integer(
+                machine_value
+            ):
+                raise ValueError("evidence machine cpu_count")
+        elif not isinstance(machine_value, str) or len(
+            machine_value.encode("utf-8", "replace")
+        ) > MAX_DIAGNOSTIC_BYTES:
+            raise ValueError("evidence machine {}".format(field))
+    if value["machine"]["git"] != "not invoked by pure benchmark":
+        raise ValueError("evidence machine git")
+    if (
+        type(value["classes"]) is not list
+        or len(value["classes"]) != len(CASES)
+    ):
         raise ValueError("evidence classes")
     for index, item in enumerate(value["classes"]):
-        _validate_class(item, index)
+        _validate_class(item, index, require_complete=require_complete)
     if type(value["correctness_passed"]) is not bool or type(
         value["mandatory_gates_passed"]
     ) is not bool:
@@ -1972,6 +2121,14 @@ def _validate_evidence(value: object) -> None:
         raise ValueError("evidence decision")
     # The encoder below rejects non-finite values at every nested depth.
     json.dumps(value, allow_nan=False)
+
+
+def _validate_evidence(value: object) -> None:
+    _validate_evidence_document(value, require_complete=True)
+
+
+def _validate_partial_evidence(value: object) -> None:
+    _validate_evidence_document(value, require_complete=False)
 
 
 def _canonical_document(value: Mapping[str, object]) -> str:
@@ -2000,10 +2157,28 @@ def _existing_complete_evidence(path: Path) -> bool:
         _validate_evidence(value)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
-    return all(
-        item.get("status") == "ok"
-        and len(item.get("samples", [])) == MEASURED_RUNS
-        for item in value["classes"]
+    return True
+
+
+def _class_is_complete(value: Mapping[str, object]) -> bool:
+    warmup = value.get("warmup")
+    samples = value.get("samples")
+    return (
+        value.get("status") == "ok"
+        and isinstance(warmup, Mapping)
+        and warmup.get("status") == "ok"
+        and warmup.get("correctness_passed") is True
+        and warmup.get("correctness_failure") is False
+        and isinstance(samples, list)
+        and len(samples) == MEASURED_RUNS
+        and all(
+            isinstance(sample, Mapping)
+            and sample.get("status") == "ok"
+            and sample.get("correctness_passed") is True
+            and sample.get("correctness_failure") is False
+            and sample.get("performance_failure") is False
+            for sample in samples
+        )
     )
 
 
@@ -2038,13 +2213,11 @@ def _driver(output: Path) -> int:
             result = _failed_class(case, exc)
         classes.append(result)
     evidence = _evidence(classes, machine=_machine())
-    _validate_evidence(evidence)
-
-    partial = any(
-        item["status"] == "class-error"
-        or len(item["samples"]) != MEASURED_RUNS
-        for item in classes
-    )
+    partial = not all(_class_is_complete(item) for item in classes)
+    if partial:
+        _validate_partial_evidence(evidence)
+    else:
+        _validate_evidence(evidence)
     preserved = partial and _existing_complete_evidence(output)
     if not preserved:
         _write_atomic(output, evidence)
