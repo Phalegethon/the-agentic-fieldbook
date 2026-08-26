@@ -1,0 +1,1 @@
+{"schema_version":"1","fixture_id":"same-head-worktree","kind":"state","input":{"staged_count":0,"unstaged_count":0,"untracked_count":0,"ahead_count":0,"behind_count":0,"head_reachable_from_base":true,"head_matches_base":true,"metadata_only":false,"base_known":true,"head_known":true},"expected":{"state":"integrated","reason_codes":["head-reachable-from-base"]}}

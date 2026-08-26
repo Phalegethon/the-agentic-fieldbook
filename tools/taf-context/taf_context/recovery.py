@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import re
+import stat
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from .git_snapshot import _git_environment
+from .git_snapshot import (
+    _excluded_dirty_category,
+    _git_environment,
+    _open_regular_beneath,
+    _same_file_state,
+)
 from .models import Freshness
 from .recovery_models import (
     EvidenceClass,
@@ -22,6 +31,12 @@ from .recovery_models import (
 _MAX_GIT_OUTPUT = 4 * 1024 * 1024
 _DEFAULT_BUDGET = 4000
 _ALLOWED_BUDGETS = (2000, 4000, 8000, 12000)
+_ARTIFACT_BYTE_LIMIT = 64 * 1024
+_CONTENT_EXCERPT_CHARS = 420
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?im)^(\s*[a-z0-9_-]*(?:api[_-]?key|token|password|passwd|secret)[a-z0-9_-]*\s*[:=]\s*).*$"
+)
+_ABSOLUTE_PATH = re.compile(r"(?<![\w.-])/(?:Users|home|private|var|tmp)/[^\s'\"`]+")
 
 
 class RecoveryError(RuntimeError):
@@ -103,7 +118,8 @@ def collect_recovery(request: RecoveryRequest) -> RecoveryResult:
     current_identity = _identity(root)
     head = _rev_parse(root, "HEAD")
     branch = _single_line(root, "symbolic-ref", "--quiet", "--short", "HEAD", allow_failure=True)
-    staged, unstaged, untracked = _current_status_counts(root)
+    staged_paths, unstaged_paths, untracked_paths = _current_status_paths(root)
+    staged, unstaged, untracked = len(staged_paths), len(unstaged_paths), len(untracked_paths)
     current = _classify(
         root,
         current_identity,
@@ -116,8 +132,8 @@ def collect_recovery(request: RecoveryRequest) -> RecoveryResult:
         metadata_only=False,
     )
     candidates = _candidate_worktrees(root, current_identity, base.sha)
-    warnings = tuple(sorted(item for item in (base.warning,) if item))
-    claim = RecoveryClaim.from_dict(
+    warning_set = {item for item in (base.warning,) if item}
+    state_claim = RecoveryClaim.from_dict(
         {
             "claim_id": "current.state",
             "evidence_class": EvidenceClass.OBSERVED.value,
@@ -131,30 +147,43 @@ def collect_recovery(request: RecoveryRequest) -> RecoveryResult:
             "qualifications": [],
         }
     )
-    dossier = RecoveryDossier.from_dict(
-        {
-            "schema_version": "1",
-            "repository_identity": repository_identity,
-            "worktree_identity": current_identity,
-            "current": current.to_dict(),
-            "candidates": [candidate.to_dict() for candidate in candidates],
-            "claims": [claim.to_dict()],
-            "coverage": RecoveryCoverage(
-                changed_path_count=staged + unstaged + untracked,
-                examined_path_count=0,
-                cluster_count=0,
-                included_cluster_count=0,
-                omitted_item_count=0,
-                omitted_characters=0,
-                budget_characters=request.max_chars,
-            ).to_dict(),
-            "warnings": list(warnings),
-            "next_action_hint": _next_action(current),
-        }
+    diff_claims = _tracked_diff_claims(
+        root,
+        repository_identity,
+        current_identity,
+        staged_paths,
+        unstaged_paths,
     )
-    model_text = _render_state_only(dossier)
-    if len(model_text) > request.max_chars:
-        raise RecoveryError("recovery identity exceeds output budget")
+    untracked_claims, untracked_warnings = _untracked_claims(
+        root,
+        repository_identity,
+        current_identity,
+        untracked_paths,
+        request.untracked_content_paths,
+    )
+    warning_set.update(untracked_warnings)
+    dirty_fingerprint = _dirty_fingerprint(root, staged_paths, unstaged_paths, untracked_paths)
+    artifact_claims = _artifact_claims(
+        repository_identity,
+        current_identity,
+        current,
+        dirty_fingerprint,
+        request.note_files,
+        request.test_result_files,
+    )
+    optional_claims = tuple(diff_claims + untracked_claims + artifact_claims)
+    dossier, model_text = _budgeted_dossier(
+        request.max_chars,
+        repository_identity,
+        current_identity,
+        current,
+        candidates,
+        state_claim,
+        optional_claims,
+        tuple(sorted(warning_set)),
+        len(set(staged_paths + unstaged_paths + untracked_paths)),
+        len(set(staged_paths + unstaged_paths)) + len(set(request.untracked_content_paths)),
+    )
     return RecoveryResult(dossier=dossier, model_text=model_text, characters_used=len(model_text))
 
 
@@ -176,9 +205,9 @@ def _git_common_dir(repo: Path) -> Path:
 
 
 def _run_git(repo: Path, *args: str, allow_failure: bool = False) -> bytes | None:
-    command = ["git", *args]
+    command = ["git", "--no-pager", *args]
     if args and args[0] == "diff":
-        command[2:2] = ["--no-ext-diff", "--no-textconv"]
+        command[3:3] = ["--no-ext-diff", "--no-textconv"]
     try:
         result = subprocess.run(
             command,
@@ -255,12 +284,14 @@ def _identity(path: Path) -> str:
     return "sha256:" + hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
 
 
-def _current_status_counts(repo: Path) -> tuple[int, int, int]:
+def _current_status_paths(repo: Path) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     raw = _run_git(repo, "status", "--porcelain=v2", "-z", "--branch", "--untracked-files=normal")
     assert raw is not None
     if raw and not raw.endswith(b"\x00"):
         raise RecoveryError("malformed Git status")
-    staged = unstaged = untracked = 0
+    staged: set[str] = set()
+    unstaged: set[str] = set()
+    untracked: set[str] = set()
     records = [] if not raw else raw[:-1].split(b"\x00")
     index = 0
     while index < len(records):
@@ -269,23 +300,51 @@ def _current_status_counts(repo: Path) -> tuple[int, int, int]:
         if record.startswith(b"# "):
             continue
         if record.startswith(b"? "):
-            untracked += 1
+            untracked.add(_decode_path(record[2:]))
             continue
         if record.startswith(b"! "):
             continue
         if record.startswith((b"1 ", b"2 ", b"u ")) and len(record) >= 4:
             status = record[2:4]
+            if record.startswith(b"1 "):
+                parts = record.split(b" ", 8)
+                path_raw = parts[8] if len(parts) == 9 else b""
+            elif record.startswith(b"2 "):
+                parts = record.split(b" ", 9)
+                path_raw = parts[9] if len(parts) == 10 else b""
+            else:
+                parts = record.split(b" ", 10)
+                path_raw = parts[10] if len(parts) == 11 else b""
+            path = _decode_path(path_raw)
             if status[:1] not in (b".", b" "):
-                staged += 1
+                staged.add(path)
             if status[1:2] not in (b".", b" "):
-                unstaged += 1
+                unstaged.add(path)
             if record.startswith(b"2 "):
                 if index >= len(records):
                     raise RecoveryError("malformed Git status")
                 index += 1
             continue
         raise RecoveryError("malformed Git status")
-    return staged, unstaged, untracked
+    raw_untracked = _run_git(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    assert raw_untracked is not None
+    if raw_untracked and not raw_untracked.endswith(b"\x00"):
+        raise RecoveryError("malformed untracked path list")
+    expanded_untracked = {
+        _decode_path(item) for item in ([] if not raw_untracked else raw_untracked[:-1].split(b"\x00"))
+    }
+    return tuple(sorted(staged)), tuple(sorted(unstaged)), tuple(sorted(expanded_untracked))
+
+
+def _decode_path(raw: bytes) -> str:
+    try:
+        value = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RecoveryError("non-UTF-8 repository path") from error
+    path = PurePosixPath(value)
+    if not value or path.is_absolute() or ".." in path.parts or "\\" in value:
+        raise RecoveryError("unsafe repository path")
+    return value
 
 
 def _relation(repo: Path, head: str | None, base: str | None) -> tuple[int | None, int | None, bool | None]:
@@ -324,33 +383,18 @@ def _classify(
     metadata_only: bool,
 ) -> WorkstreamState:
     ahead, behind, ancestor = _relation(repo, head, base)
-    reasons: set[str] = set()
-    if metadata_only:
-        reasons.add("metadata-only")
-    if staged or unstaged:
-        reasons.add("dirty-tracked")
-    if untracked:
-        reasons.add("untracked-present")
-    if staged or unstaged or untracked:
-        state = WorkState.ACTIVE_DIRTY
-    elif base is None or head is None:
-        state = WorkState.CLEAN_UNRESOLVED
-        reasons.add("base-or-head-unresolved")
-    elif ahead and behind:
-        state = WorkState.DIVERGED
-        reasons.add("ahead-and-behind")
-    elif ancestor and head != base and metadata_only:
-        state = WorkState.SUPERSEDED_STALE
-        reasons.add("reachable-behind-base")
-    elif ancestor:
-        state = WorkState.INTEGRATED
-        reasons.add("head-reachable-from-base")
-    elif ahead and ahead > 0:
-        state = WorkState.ACTIVE_COMMITTED
-        reasons.add("unique-commits")
-    else:
-        state = WorkState.UNKNOWN
-        reasons.add("relation-unknown")
+    state, reasons = classify_recovery_state(
+        staged_count=staged,
+        unstaged_count=unstaged,
+        untracked_count=untracked,
+        ahead_count=ahead,
+        behind_count=behind,
+        head_reachable_from_base=ancestor,
+        head_matches_base=head is not None and head == base,
+        metadata_only=metadata_only,
+        base_known=base is not None,
+        head_known=head is not None,
+    )
     return WorkstreamState(
         worktree_identity=worktree_identity,
         branch=branch,
@@ -362,8 +406,52 @@ def _classify(
         untracked_count=untracked,
         ahead_count=ahead,
         behind_count=behind,
-        reason_codes=tuple(sorted(reasons)),
+        reason_codes=reasons,
     )
+
+
+def classify_recovery_state(
+    *,
+    staged_count: int,
+    unstaged_count: int,
+    untracked_count: int,
+    ahead_count: int | None,
+    behind_count: int | None,
+    head_reachable_from_base: bool | None,
+    head_matches_base: bool,
+    metadata_only: bool,
+    base_known: bool,
+    head_known: bool,
+) -> tuple[WorkState, tuple[str, ...]]:
+    """Classify normalized evidence without consulting a filesystem or provider."""
+    reasons: set[str] = set()
+    if metadata_only:
+        reasons.add("metadata-only")
+    if staged_count or unstaged_count:
+        reasons.add("dirty-tracked")
+    if untracked_count:
+        reasons.add("untracked-present")
+    if staged_count or unstaged_count or untracked_count:
+        state = WorkState.ACTIVE_DIRTY
+    elif not base_known or not head_known:
+        state = WorkState.CLEAN_UNRESOLVED
+        reasons.add("base-or-head-unresolved")
+    elif ahead_count and behind_count:
+        state = WorkState.DIVERGED
+        reasons.add("ahead-and-behind")
+    elif head_reachable_from_base and not head_matches_base and metadata_only:
+        state = WorkState.SUPERSEDED_STALE
+        reasons.add("reachable-behind-base")
+    elif head_reachable_from_base:
+        state = WorkState.INTEGRATED
+        reasons.add("head-reachable-from-base")
+    elif ahead_count and ahead_count > 0:
+        state = WorkState.ACTIVE_COMMITTED
+        reasons.add("unique-commits")
+    else:
+        state = WorkState.UNKNOWN
+        reasons.add("relation-unknown")
+    return state, tuple(sorted(reasons))
 
 
 def _candidate_worktrees(repo: Path, current_identity: str, base: str | None) -> tuple[WorkstreamState, ...]:
@@ -425,8 +513,381 @@ def _next_action(state: WorkstreamState) -> str:
     return "Establish the intended base and unfinished objective before changing code."
 
 
-def _render_state_only(dossier: RecoveryDossier) -> str:
+def _tracked_diff_claims(
+    repo: Path,
+    repository_identity: str,
+    worktree_identity: str,
+    staged_paths: tuple[str, ...],
+    unstaged_paths: tuple[str, ...],
+) -> list[RecoveryClaim]:
+    claims: list[RecoveryClaim] = []
+    for kind, paths, cached in (
+        ("staged", staged_paths, True),
+        ("unstaged", unstaged_paths, False),
+    ):
+        for path in paths:
+            arguments = ["diff", "--unified=3", "--no-renames", "--ignore-submodules=all"]
+            if cached:
+                arguments.append("--cached")
+            arguments.extend(("--", path))
+            raw = _run_git(repo, *arguments)
+            assert raw is not None
+            try:
+                diff = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                diff = "[binary-or-non-UTF-8 diff content excluded]"
+            excerpt = _excerpt(_redact(diff))
+            claims.append(
+                RecoveryClaim.from_dict(
+                    {
+                        "claim_id": f"diff.{kind}.{_claim_path_id(path)}",
+                        "evidence_class": "observed",
+                        "text": f"Tracked {kind} diff for {path}: {excerpt}",
+                        "repository_identity": repository_identity,
+                        "worktree_identity": worktree_identity,
+                        "provenance": [f"git/diff/{kind}/{path}"],
+                        "freshness": "exact",
+                        "supports": ["current.next-action"],
+                        "conflicts": [],
+                        "qualifications": [],
+                    }
+                )
+            )
+    return claims
+
+
+def _untracked_claims(
+    repo: Path,
+    repository_identity: str,
+    worktree_identity: str,
+    untracked_paths: tuple[str, ...],
+    authorized_paths: tuple[str, ...],
+) -> tuple[list[RecoveryClaim], set[str]]:
+    authorized = _validated_relative_set(authorized_paths, "untracked authorization")
+    unknown = authorized - set(untracked_paths)
+    if unknown:
+        raise ValueError("untracked authorization does not name an untracked path")
+    claims: list[RecoveryClaim] = []
+    warnings: set[str] = set()
+    for path in untracked_paths:
+        qualifications = ["metadata-only"]
+        text = f"Untracked path {path}; content not inspected."
+        if path in authorized:
+            content, exclusion = _read_untracked(repo, path)
+            if exclusion:
+                qualifications = ["content-excluded", exclusion]
+                text = f"Untracked path {path}; content-excluded ({exclusion})."
+                warnings.add(f"untracked-{exclusion}")
+            else:
+                qualifications = ["content-authorized"]
+                text = f"Authorized untracked content for {path}: {_excerpt(_redact(content))}"
+        claims.append(
+            RecoveryClaim.from_dict(
+                {
+                    "claim_id": f"untracked.{_claim_path_id(path)}",
+                    "evidence_class": "observed",
+                    "text": text,
+                    "repository_identity": repository_identity,
+                    "worktree_identity": worktree_identity,
+                    "provenance": [f"git/untracked/{path}"],
+                    "freshness": "exact",
+                    "supports": ["current.next-action"],
+                    "conflicts": [],
+                    "qualifications": sorted(qualifications),
+                }
+            )
+        )
+    return claims, warnings
+
+
+def _validated_relative_set(paths: tuple[str, ...], label: str) -> set[str]:
+    if len(paths) != len(set(paths)):
+        raise ValueError(f"duplicate {label}")
+    result: set[str] = set()
+    for value in paths:
+        path = PurePosixPath(value)
+        if not value or path.is_absolute() or ".." in path.parts or "\\" in value:
+            raise ValueError(f"invalid {label}")
+        result.add(value)
+    return result
+
+
+def _read_untracked(repo: Path, relative: str) -> tuple[str, str | None]:
+    path = repo / relative
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ValueError("untracked content metadata unavailable") from error
+    excluded = _excluded_dirty_category(relative)
+    if excluded is not None:
+        return "", excluded
+    if not stat.S_ISREG(metadata.st_mode):
+        return "", "unsafe-file-type"
+    if metadata.st_size > _ARTIFACT_BYTE_LIMIT:
+        return "", "oversized"
+    descriptor = -1
+    parents: list[int] = []
+    try:
+        descriptor, parents = _open_regular_beneath(repo, relative)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or not _same_file_state(metadata, before):
+            return "", "changed-during-read"
+        chunks: list[bytes] = []
+        remaining = _ARTIFACT_BYTE_LIMIT + 1
+        while remaining:
+            chunk = os.read(descriptor, min(8192, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    except OSError:
+        return "", "unsafe-read"
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        for parent in reversed(parents):
+            os.close(parent)
+    if not _same_file_state(before, after):
+        return "", "changed-during-read"
+    raw = b"".join(chunks)
+    if len(raw) > _ARTIFACT_BYTE_LIMIT or b"\x00" in raw:
+        return "", "binary-or-oversized"
+    try:
+        return raw.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return "", "non-UTF-8"
+
+
+def _artifact_claims(
+    repository_identity: str,
+    worktree_identity: str,
+    current: WorkstreamState,
+    dirty_fingerprint: str,
+    note_files: tuple[Path, ...],
+    test_result_files: tuple[Path, ...],
+) -> list[RecoveryClaim]:
+    if len(note_files) + len(test_result_files) > 8:
+        raise ValueError("at most eight supplied artifacts are allowed")
+    claims: list[RecoveryClaim] = []
+    for index, path in enumerate(sorted((Path(item) for item in note_files), key=lambda item: str(item)), 1):
+        text = _read_artifact(path)
+        qualifications = []
+        lowered = text.lower()
+        if current.state is WorkState.ACTIVE_DIRTY and any(word in lowered for word in ("complete", "done", "finished")):
+            qualifications.append("state-conflict")
+        claims.append(
+            _reported_claim(
+                f"note.{index:02d}",
+                f"Supplied note reports: {_excerpt(_redact(text))}",
+                f"supplied/note-{index:02d}",
+                repository_identity,
+                worktree_identity,
+                qualifications,
+            )
+        )
+    for index, path in enumerate(sorted((Path(item) for item in test_result_files), key=lambda item: str(item)), 1):
+        raw = _read_artifact(path)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ValueError("malformed test result artifact") from error
+        if type(parsed) is not dict or set(parsed) != {"head_sha", "dirty_fingerprint", "summary"}:
+            raise ValueError("malformed test result artifact")
+        if any(not isinstance(parsed[field], str) or not parsed[field] for field in parsed):
+            raise ValueError("malformed test result artifact")
+        current_validation = parsed["head_sha"] == current.head_sha and parsed["dirty_fingerprint"] == dirty_fingerprint
+        qualification = "validation-current" if current_validation else "stale-validation"
+        claims.append(
+            _reported_claim(
+                f"validation.{index:02d}",
+                f"Supplied validation reports: {_excerpt(_redact(parsed['summary']))}",
+                f"supplied/validation-{index:02d}",
+                repository_identity,
+                worktree_identity,
+                [qualification],
+            )
+        )
+    return claims
+
+
+def _reported_claim(
+    claim_id: str,
+    text: str,
+    provenance: str,
+    repository_identity: str,
+    worktree_identity: str,
+    qualifications: list[str],
+) -> RecoveryClaim:
+    return RecoveryClaim.from_dict(
+        {
+            "claim_id": claim_id,
+            "evidence_class": "reported",
+            "text": text,
+            "repository_identity": repository_identity,
+            "worktree_identity": worktree_identity,
+            "provenance": [provenance],
+            "freshness": "unknown",
+            "supports": ["current.next-action"],
+            "conflicts": [],
+            "qualifications": sorted(qualifications),
+        }
+    )
+
+
+def _read_artifact(path: Path) -> str:
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise ValueError("supplied artifact unavailable") from error
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_size > _ARTIFACT_BYTE_LIMIT:
+        raise ValueError("unsafe supplied artifact")
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        if not _same_file_state(before, opened):
+            raise ValueError("unsafe supplied artifact")
+        raw = os.read(descriptor, _ARTIFACT_BYTE_LIMIT + 1)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise ValueError("unsafe supplied artifact") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not _same_file_state(opened, after) or len(raw) > _ARTIFACT_BYTE_LIMIT or b"\x00" in raw:
+        raise ValueError("unsafe supplied artifact")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("invalid UTF-8 supplied artifact") from error
+
+
+def _dirty_fingerprint(
+    repo: Path,
+    staged_paths: tuple[str, ...],
+    unstaged_paths: tuple[str, ...],
+    untracked_paths: tuple[str, ...],
+) -> str:
+    digest = hashlib.sha256()
+    for cached, paths in ((True, staged_paths), (False, unstaged_paths)):
+        if not paths:
+            continue
+        args = ["diff", "--unified=0", "--no-renames", "--ignore-submodules=all"]
+        if cached:
+            args.append("--cached")
+        args.extend(("--", *paths))
+        raw = _run_git(repo, *args)
+        assert raw is not None
+        digest.update(raw)
+    for path in untracked_paths:
+        metadata = (repo / path).lstat()
+        digest.update(path.encode("utf-8"))
+        digest.update(f":{metadata.st_mode}:{metadata.st_size}:{metadata.st_mtime_ns}".encode("ascii"))
+    return "sha256:" + digest.hexdigest()
+
+
+def _redact(text: str) -> str:
+    if "-----BEGIN PRIVATE KEY-----" in text:
+        return "[private-key-content-redacted]"
+    text = _SECRET_ASSIGNMENT.sub(r"\1[redacted]", text)
+    return _ABSOLUTE_PATH.sub("[absolute-path-redacted]", text)
+
+
+def _excerpt(text: str) -> str:
+    line_atomic = text.replace("\r", "").replace("\n", "\\n").strip()
+    if len(line_atomic) > _CONTENT_EXCERPT_CHARS:
+        return line_atomic[: _CONTENT_EXCERPT_CHARS - 1] + "…"
+    return line_atomic or "[empty]"
+
+
+def _claim_path_id(path: str) -> str:
+    components = []
+    for component in PurePosixPath(path).parts:
+        normalized = re.sub(r"[^a-z0-9.]+", "-", component.lower())
+        normalized = re.sub(r"\.+", ".", normalized).strip("-.") or "path"
+        components.append(normalized)
+    candidate = ".".join(components)
+    if len(candidate) <= 96:
+        return candidate
+    digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+    return candidate[:79].rstrip(".-_:") + "." + digest
+
+
+def _budgeted_dossier(
+    budget: int,
+    repository_identity: str,
+    worktree_identity: str,
+    current: WorkstreamState,
+    candidates: tuple[WorkstreamState, ...],
+    state_claim: RecoveryClaim,
+    optional_claims: tuple[RecoveryClaim, ...],
+    warnings: tuple[str, ...],
+    changed_path_count: int,
+    examined_path_count: int,
+) -> tuple[RecoveryDossier, str]:
+    optional_lines = tuple(_claim_line(claim) for claim in optional_claims)
+    selected: list[int] = []
+
+    def build(indices: list[int]) -> tuple[RecoveryDossier, str]:
+        selected_set = set(indices)
+        omitted = [line for index, line in enumerate(optional_lines) if index not in selected_set]
+        coverage = RecoveryCoverage(
+            changed_path_count=changed_path_count,
+            examined_path_count=min(examined_path_count, changed_path_count),
+            cluster_count=len(optional_lines),
+            included_cluster_count=len(indices),
+            omitted_item_count=len(omitted),
+            omitted_characters=sum(len(line) for line in omitted),
+            budget_characters=budget,
+        )
+        dossier = RecoveryDossier.from_dict(
+            {
+                "schema_version": "1",
+                "repository_identity": repository_identity,
+                "worktree_identity": worktree_identity,
+                "current": current.to_dict(),
+                "candidates": [candidate.to_dict() for candidate in candidates],
+                "claims": [state_claim.to_dict()] + [optional_claims[index].to_dict() for index in indices],
+                "coverage": coverage.to_dict(),
+                "warnings": list(warnings),
+                "next_action_hint": _next_action(current),
+            }
+        )
+        return dossier, _render_dossier(dossier)
+
+    dossier, model_text = build(selected)
+    if len(model_text) > budget:
+        raise RecoveryError("recovery identity exceeds output budget")
+    for index in range(len(optional_lines)):
+        candidate_indices = [*selected, index]
+        candidate_dossier, candidate_text = build(candidate_indices)
+        if len(candidate_text) <= budget:
+            selected = candidate_indices
+            dossier, model_text = candidate_dossier, candidate_text
+    return dossier, model_text
+
+
+def _claim_line(claim: RecoveryClaim) -> str:
+    qualifications = ",".join(claim.qualifications) or "none"
+    return f"- [{claim.evidence_class.value}] {claim.claim_id}: {claim.text} (qualifications={qualifications})\n"
+
+
+def _render_dossier(dossier: RecoveryDossier) -> str:
     current = dossier.current
+    claims = "".join(_claim_line(claim) for claim in dossier.claims)
+    candidate_lines = "".join(
+        f"- {candidate.branch or 'detached'}: {candidate.state.value} (metadata-only)\n"
+        for candidate in dossier.candidates
+    ) or "- None observed.\n"
+    validation = [claim for claim in dossier.claims if claim.claim_id.startswith("validation.")]
+    validation_line = (
+        "- " + "; ".join(
+            f"{claim.claim_id}={','.join(claim.qualifications) or 'reported'}" for claim in validation
+        ) + "\n"
+        if validation
+        else "- Not run or supplied; recovery performs no validation.\n"
+    )
     return (
         "# TAF Work Recovery Evidence\n"
         "## Scope\n"
@@ -439,12 +900,14 @@ def _render_state_only(dossier: RecoveryDossier) -> str:
         f"- Base: {current.base_sha or 'unknown'}\n"
         "## Candidate Workstreams\n"
         f"- Count: {len(dossier.candidates)}\n"
+        f"{candidate_lines}"
         "## Evidence Claims\n"
-        f"- [observed] {dossier.claims[0].text}\n"
+        f"{claims}"
         "## Validation State\n"
-        "- Not run; recovery is read-only.\n"
+        f"{validation_line}"
         "## Coverage and Omissions\n"
-        f"- Changed paths: {dossier.coverage.changed_path_count}; examined: 0; omitted: 0.\n"
+        f"- Changed paths: {dossier.coverage.changed_path_count}; examined: {dossier.coverage.examined_path_count}.\n"
+        f"- Clusters: {dossier.coverage.included_cluster_count}/{dossier.coverage.cluster_count}; omitted items: {dossier.coverage.omitted_item_count}; omitted characters: {dossier.coverage.omitted_characters}; budget: {dossier.coverage.budget_characters}.\n"
         "## Next-Action Boundary\n"
         f"- {dossier.next_action_hint}\n"
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from taf_context.recovery import (
@@ -175,6 +176,181 @@ class RecoveryStateTests(unittest.TestCase):
         self.assertEqual(dossier.candidates[0].staged_count, 0)
         self.assertEqual(dossier.candidates[0].unstaged_count, 0)
         self.assertIn("metadata-only", dossier.candidates[0].reason_codes)
+
+
+class RecoveryEvidenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.repo = init_committed_repo(self.root / "repo")
+        run(self.repo, "git", "checkout", "-b", "feature")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_staged_and_unstaged_diff_evidence_remain_separate(self) -> None:
+        write(self.repo / "staged.txt", "before\n")
+        run(self.repo, "git", "add", "staged.txt")
+        run(self.repo, "git", "commit", "-m", "add staged fixture")
+        write(self.repo / "staged.txt", "staged evidence\n")
+        run(self.repo, "git", "add", "staged.txt")
+        write(self.repo / "tracked.txt", "unstaged evidence\n")
+
+        result = collect_recovery(RecoveryRequest(repo=self.repo, base="main", max_chars=4000))
+
+        claims = {claim.claim_id: claim for claim in result.dossier.claims}
+        self.assertIn("diff.staged.staged.txt", claims)
+        self.assertIn("staged evidence", claims["diff.staged.staged.txt"].text)
+        self.assertNotIn("unstaged evidence", claims["diff.staged.staged.txt"].text)
+        self.assertIn("diff.unstaged.tracked.txt", claims)
+        self.assertIn("unstaged evidence", claims["diff.unstaged.tracked.txt"].text)
+
+    def test_untracked_content_is_metadata_only_until_exactly_authorized(self) -> None:
+        write(self.repo / "scratch.txt", "private scratch detail\n")
+
+        default = collect_recovery(RecoveryRequest(repo=self.repo, base="main"))
+        allowed = collect_recovery(
+            RecoveryRequest(
+                repo=self.repo,
+                base="main",
+                untracked_content_paths=("scratch.txt",),
+            )
+        )
+
+        self.assertIn("scratch.txt", default.model_text)
+        self.assertNotIn("private scratch detail", default.model_text)
+        self.assertIn("private scratch detail", allowed.model_text)
+
+    def test_sensitive_binary_generated_symlink_and_oversized_untracked_content_stays_hidden(self) -> None:
+        write(self.repo / ".env", "TOKEN=secret-value\n")
+        (self.repo / "binary.png").write_bytes(b"\x89PNG\x00secret-binary")
+        write(self.repo / "vendor" / "generated.txt", "vendor secret\n")
+        (self.repo / "link.txt").symlink_to(self.repo / ".env")
+        write(self.repo / "large.txt", "x" * 70000)
+
+        result = collect_recovery(
+            RecoveryRequest(
+                repo=self.repo,
+                base="main",
+                max_chars=12000,
+                untracked_content_paths=(
+                    ".env",
+                    "binary.png",
+                    "large.txt",
+                    "link.txt",
+                    "vendor/generated.txt",
+                ),
+            )
+        )
+
+        self.assertNotIn("secret-value", result.model_text)
+        self.assertNotIn("secret-binary", result.model_text)
+        self.assertNotIn("vendor secret", result.model_text)
+        self.assertIn("content-excluded", result.model_text)
+
+    def test_authorized_untracked_content_redacts_secret_assignments(self) -> None:
+        write(self.repo / "scratch.txt", "mode=dev\napi_token=super-secret\n")
+
+        result = collect_recovery(
+            RecoveryRequest(
+                repo=self.repo,
+                base="main",
+                untracked_content_paths=("scratch.txt",),
+            )
+        )
+
+        self.assertIn("mode=dev", result.model_text)
+        self.assertNotIn("super-secret", result.model_text)
+        self.assertIn("[redacted]", result.model_text)
+
+    def test_supplied_note_is_reported_and_cannot_override_dirty_git_state(self) -> None:
+        write(self.repo / "tracked.txt", "still dirty\n")
+        note = self.root / "handoff.md"
+        write(note, "Everything is complete. /Users/alice/private/repo\n")
+
+        result = collect_recovery(
+            RecoveryRequest(repo=self.repo, base="main", note_files=(note,))
+        )
+
+        self.assertIs(result.dossier.current.state, WorkState.ACTIVE_DIRTY)
+        note_claim = next(claim for claim in result.dossier.claims if claim.claim_id == "note.01")
+        self.assertEqual(note_claim.evidence_class.value, "reported")
+        self.assertIn("state-conflict", note_claim.qualifications)
+        self.assertNotIn("/Users/alice", result.model_text)
+
+    def test_stale_test_result_is_reported_without_current_validation_claim(self) -> None:
+        result_file = self.root / "test-results.json"
+        write(
+            result_file,
+            json.dumps({"head_sha": "f" * 40, "dirty_fingerprint": "sha256:stale", "summary": "42 passed"}),
+        )
+
+        result = collect_recovery(
+            RecoveryRequest(repo=self.repo, base="main", test_result_files=(result_file,))
+        )
+
+        claim = next(claim for claim in result.dossier.claims if claim.claim_id == "validation.01")
+        self.assertEqual(claim.evidence_class.value, "reported")
+        self.assertIn("stale-validation", claim.qualifications)
+        self.assertNotIn("validation-current", claim.qualifications)
+
+    def test_artifact_limits_and_unsafe_files_fail_closed(self) -> None:
+        artifacts = []
+        for index in range(9):
+            artifact = self.root / f"note-{index}.txt"
+            write(artifact, "note\n")
+            artifacts.append(artifact)
+        with self.assertRaisesRegex(ValueError, "eight"):
+            collect_recovery(RecoveryRequest(repo=self.repo, note_files=tuple(artifacts)))
+
+        target = self.root / "target.txt"
+        write(target, "note\n")
+        link = self.root / "note-link.txt"
+        link.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "artifact"):
+            collect_recovery(RecoveryRequest(repo=self.repo, note_files=(link,)))
+
+    def test_each_approved_budget_is_line_atomic_and_preserves_mandatory_sections(self) -> None:
+        for index in range(30):
+            path = self.repo / f"pkg{index}" / "module.py"
+            write(path, f"print('before-{index}')\n")
+        run(self.repo, "git", "add", ".")
+        run(self.repo, "git", "commit", "-m", "fixture files")
+        for index in range(30):
+            write(self.repo / f"pkg{index}" / "module.py", "x = '" + ("z" * 300) + "'\n")
+
+        for budget in (2000, 4000, 8000, 12000):
+            with self.subTest(budget=budget):
+                result = collect_recovery(RecoveryRequest(repo=self.repo, base="main", max_chars=budget))
+                self.assertLessEqual(len(result.model_text), budget)
+                self.assertEqual(result.characters_used, len(result.model_text))
+                for heading in (
+                    "## Scope",
+                    "## Current Workstream",
+                    "## Candidate Workstreams",
+                    "## Evidence Claims",
+                    "## Validation State",
+                    "## Coverage and Omissions",
+                    "## Next-Action Boundary",
+                ):
+                    self.assertIn(heading, result.model_text)
+                self.assertGreater(result.dossier.coverage.omitted_item_count, 0)
+                self.assertGreater(result.dossier.coverage.omitted_characters, 0)
+                self.assertTrue(result.model_text.endswith("\n"))
+
+    def test_equivalent_authorization_order_produces_identical_output(self) -> None:
+        write(self.repo / "a.txt", "A\n")
+        write(self.repo / "b.txt", "B\n")
+
+        left = collect_recovery(
+            RecoveryRequest(repo=self.repo, base="main", untracked_content_paths=("b.txt", "a.txt"))
+        )
+        right = collect_recovery(
+            RecoveryRequest(repo=self.repo, base="main", untracked_content_paths=("a.txt", "b.txt"))
+        )
+
+        self.assertEqual(left.dossier.to_dict(), right.dossier.to_dict())
+        self.assertEqual(left.model_text, right.model_text)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1 @@
+{"schema_version":"1","fixture_id":"divergence","kind":"state","input":{"staged_count":0,"unstaged_count":0,"untracked_count":0,"ahead_count":2,"behind_count":4,"head_reachable_from_base":false,"head_matches_base":false,"metadata_only":false,"base_known":true,"head_known":true},"expected":{"state":"diverged","reason_codes":["ahead-and-behind"]}}

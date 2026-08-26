@@ -1,0 +1,1 @@
+{"schema_version":"1","fixture_id":"dirty-mixed-state","kind":"state","input":{"staged_count":1,"unstaged_count":2,"untracked_count":3,"ahead_count":1,"behind_count":1,"head_reachable_from_base":false,"head_matches_base":false,"metadata_only":false,"base_known":true,"head_known":true},"expected":{"state":"active-dirty","reason_codes":["dirty-tracked","untracked-present"]}}
