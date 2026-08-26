@@ -37,6 +37,8 @@ from .models import (
     canonical_json,
 )
 from .provider_cli import register_provider_commands, run_provider_command
+from .recovery import RecoveryError
+from .recovery_cli import register_recovery_command, run_recovery_command
 
 
 _DEFAULT_MAX_OUTPUT_CHARS = 12000
@@ -89,6 +91,9 @@ def main(
                 environment=environment,
                 utc_clock=utc_clock,
             )
+        elif args.command == "recover":
+            stdout.write(run_recovery_command(args))
+            return 0
         else:  # pragma: no cover - argparse requires a command.
             raise CLIError("a command is required")
         stdout.write(canonical_json(result))
@@ -97,7 +102,7 @@ def main(
         _write_error(stderr, "invalid manifest JSON")
     except UnicodeError:
         _write_error(stderr, "invalid UTF-8 data")
-    except (CLIError, SnapshotError, ManifestError, ValueError) as exc:
+    except (CLIError, SnapshotError, RecoveryError, ManifestError, ValueError) as exc:
         _write_error(stderr, str(exc))
     except OSError:
         _write_error(stderr, "artifact operation failed")
@@ -124,6 +129,7 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("--repo", required=True)
     status.add_argument("--manifest", required=True)
     register_provider_commands(commands)
+    register_recovery_command(commands)
     return parser
 
 
