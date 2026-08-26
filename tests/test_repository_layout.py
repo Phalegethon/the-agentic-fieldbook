@@ -26,6 +26,36 @@ EXPECTED_TAF_CONTEXT_FILES = {
     "provider_state.py",
     "routing.py",
 }
+NONPRODUCTION_CONTEXT_DIRECTORIES = {
+    "conformance",
+    "fixture",
+    "fixtures",
+    "test",
+    "tests",
+}
+CONTEXT_COMPOUND_SUFFIXES = {
+    "adapter",
+    "adapters",
+    "bridge",
+    "broker",
+    "discovery",
+    "engine",
+    "index",
+    "integration",
+    "level1",
+    "parser",
+    "provider",
+    "providers",
+    "registry",
+    "router",
+    "routing",
+    "runtime",
+    "service",
+    "storage",
+    "store",
+    "watcher",
+    "watchers",
+}
 
 
 @contextmanager
@@ -50,23 +80,31 @@ def _normalized_path_parts(relative: Path) -> tuple[str, ...]:
     )
 
 
+def _is_context_scope_component(component: str) -> bool:
+    tokens = set(component.split("_"))
+    if {"context", "contextual", "taf"} & tokens:
+        return True
+    collapsed = component.replace("_", "")
+    for prefix in ("context", "tafcontext"):
+        if collapsed.startswith(prefix):
+            suffix = collapsed.removeprefix(prefix)
+            return (prefix == "tafcontext" and not suffix) or (
+                suffix in CONTEXT_COMPOUND_SUFFIXES
+            )
+    return False
+
+
 def _is_context_production_scope(relative: Path) -> bool:
     if not relative.parts:
         return False
     normalized_parts = _normalized_path_parts(relative)
-    tokens = {
-        token
-        for part in normalized_parts
-        for token in part.split("_")
-        if token
-    }
-    if relative.parts[0].lower() == "tests" or {
-        "conformance",
-        "fixtures",
-    } & tokens:
-        return False
-    collapsed_parts = tuple(part.replace("_", "") for part in normalized_parts)
-    return any("context" in part or part == "taf" for part in collapsed_parts)
+    for directory in normalized_parts[:-1]:
+        if set(directory.split("_")) & NONPRODUCTION_CONTEXT_DIRECTORIES:
+            return False
+    return any(
+        _is_context_scope_component(component)
+        for component in normalized_parts
+    )
 
 
 def _is_forbidden_context_production_surface(relative: Path) -> bool:
@@ -116,6 +154,8 @@ class RepositoryLayoutTest(unittest.TestCase):
             "tools/logging/watcher.py",
             "packages/book-level1/parser.py",
             "tools/cloud/provider_adapter.py",
+            "packages/tafcontext/tests/test_watcher.py",
+            "tools/contextvars/watcher.py",
             "tests/taf_context/test_watcher.py",
             "samples/fixtures/context-watcher/level1/parser.json",
         )
@@ -366,6 +406,18 @@ class RepositoryLayoutTest(unittest.TestCase):
             "tools/logging/watcher.py",
             "packages/book-level1/parser.py",
             "tools/cloud/provider_adapter.py",
+        )
+        for relative in relative_mutations:
+            with self.subTest(relative=relative), _isolated_context_layout() as root:
+                mutation = root / relative
+                mutation.parent.mkdir(parents=True)
+                mutation.write_text("", encoding="utf-8")
+                self.test_public_layout_contains_taf_context_engine_without_exposure()
+
+    def test_public_boundary_allows_nested_tests_and_contextvars(self) -> None:
+        relative_mutations = (
+            "packages/tafcontext/tests/test_watcher.py",
+            "tools/contextvars/watcher.py",
         )
         for relative in relative_mutations:
             with self.subTest(relative=relative), _isolated_context_layout() as root:

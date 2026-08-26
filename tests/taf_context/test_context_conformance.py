@@ -10,6 +10,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -237,27 +238,49 @@ def _forbidden_call_profile(
         )
 
 
+def _get_thread_profile_hook() -> object:
+    getter = getattr(threading, "getprofile", None)
+    return getter() if callable(getter) else getattr(
+        threading, "_profile_hook", None
+    )
+
+
 class _ForbiddenActivityGuard:
     def __init__(self, patches: "_PatchStack") -> None:
         self._patches = patches
         self._previous_profile: object = None
+        self._previous_thread_profile: object = None
 
     def _profile(self, frame: object, event: str, argument: object) -> None:
         _forbidden_call_profile(frame, event, argument)
         if callable(self._previous_profile):
             self._previous_profile(frame, event, argument)
 
+    def _thread_profile(
+        self, frame: object, event: str, argument: object
+    ) -> None:
+        _forbidden_call_profile(frame, event, argument)
+        if callable(self._previous_thread_profile):
+            self._previous_thread_profile(frame, event, argument)
+
     def __enter__(self) -> "_ForbiddenActivityGuard":
         global _forbidden_audit_depth
         _install_forbidden_audit_hook()
         _forbidden_audit_depth += 1
         self._previous_profile = sys.getprofile()
-        sys.setprofile(self._profile)
+        self._previous_thread_profile = _get_thread_profile_hook()
         try:
+            sys.setprofile(self._profile)
+            threading.setprofile(self._thread_profile)
             self._patches.__enter__()
         except BaseException:
-            sys.setprofile(self._previous_profile)  # type: ignore[arg-type]
             _forbidden_audit_depth -= 1
+            try:
+                threading.setprofile(  # type: ignore[arg-type]
+                    self._previous_thread_profile
+                )
+            finally:
+                sys.setprofile(self._previous_profile)  # type: ignore[arg-type]
             raise
         return self
 
@@ -267,7 +290,12 @@ class _ForbiddenActivityGuard:
             self._patches.__exit__(*exc)
         finally:
             _forbidden_audit_depth -= 1
-            sys.setprofile(self._previous_profile)  # type: ignore[arg-type]
+            try:
+                threading.setprofile(  # type: ignore[arg-type]
+                    self._previous_thread_profile
+                )
+            finally:
+                sys.setprofile(self._previous_profile)  # type: ignore[arg-type]
 
 
 class _PatchStack:
@@ -285,6 +313,44 @@ class _PatchStack:
 
 
 class ForbiddenActivityGuardTests(unittest.TestCase):
+    @staticmethod
+    def _thread_profile_hook() -> object:
+        return _get_thread_profile_hook()
+
+    def _assert_worker_call_blocked(self, probe: object) -> None:
+        outcomes: list[object] = []
+
+        def worker() -> None:
+            try:
+                probe()  # type: ignore[operator]
+            except BaseException as error:
+                outcomes.append(error)
+            else:
+                outcomes.append(None)
+
+        original_thread_profile = self._thread_profile_hook()
+
+        def previous_thread_profile(
+            _frame: object, _event: str, _argument: object
+        ) -> None:
+            return None
+
+        threading.setprofile(previous_thread_profile)
+        try:
+            with _forbid_active_discovery():
+                thread = threading.Thread(target=worker)
+                thread.start()
+                thread.join(timeout=5)
+            self.assertFalse(thread.is_alive(), "metadata probe thread did not finish")
+            self.assertIs(self._thread_profile_hook(), previous_thread_profile)
+            self.assertEqual(len(outcomes), 1)
+            self.assertIsInstance(outcomes[0], AssertionError)
+            self.assertRegex(
+                str(outcomes[0]), r"forbidden activity: filesystem\.stat"
+            )
+        finally:
+            threading.setprofile(original_thread_profile)  # type: ignore[arg-type]
+
     def test_guard_blocks_prebound_file_alias(self) -> None:
         with self.assertRaisesRegex(AssertionError, "forbidden activity"):
             with _forbid_active_discovery(), _PREBOUND_OPEN(os.devnull, "rb"):
@@ -320,6 +386,14 @@ class ForbiddenActivityGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "forbidden activity"):
             with _forbid_active_discovery():
                 _PREBOUND_PATH_EXISTS(Path(os.devnull))
+
+    def test_guard_blocks_prebound_metadata_alias_in_worker_thread(self) -> None:
+        self._assert_worker_call_blocked(lambda: _PREBOUND_STAT(os.devnull))
+
+    def test_guard_blocks_prebound_existence_alias_in_worker_thread(self) -> None:
+        self._assert_worker_call_blocked(
+            lambda: _PREBOUND_PATH_EXISTS(Path(os.devnull))
+        )
 
 
 class ContextConformanceTests(unittest.TestCase):
