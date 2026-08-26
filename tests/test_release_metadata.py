@@ -57,6 +57,29 @@ class ReleaseMetadataTest(unittest.TestCase):
             ],
         )
 
+    def test_codex_marketplace_exposes_the_same_root_taf_plugin(self) -> None:
+        marketplace = json.loads(
+            (ROOT / ".agents" / "plugins" / "marketplace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual("the-agentic-fieldbook", marketplace["name"])
+        self.assertEqual("The Agentic Fieldbook", marketplace["interface"]["displayName"])
+        self.assertEqual(
+            [
+                {
+                    "name": "taf",
+                    "source": {"source": "local", "path": "./"},
+                    "policy": {
+                        "installation": "AVAILABLE",
+                        "authentication": "ON_INSTALL",
+                    },
+                    "category": "Developer Tools",
+                }
+            ],
+            marketplace["plugins"],
+        )
+
     def test_claude_catalog_explains_outcome_and_namespaced_invocation(self) -> None:
         marketplace = json.loads(
             (ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")

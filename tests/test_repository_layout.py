@@ -244,6 +244,24 @@ class RepositoryLayoutTest(unittest.TestCase):
             (WORK_RECOVERY_SKILL / ".claude-plugin" / "plugin.json").exists()
         )
 
+    def test_codex_marketplace_points_to_the_canonical_repository_root(self) -> None:
+        marketplace = json.loads(
+            (ROOT / ".agents" / "plugins" / "marketplace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            [("taf", "local", "./")],
+            [
+                (
+                    plugin["name"],
+                    plugin["source"]["source"],
+                    plugin["source"]["path"],
+                )
+                for plugin in marketplace["plugins"]
+            ],
+        )
+
     def test_publication_files_identify_taf(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("# The Agentic Fieldbook", readme)

@@ -1,0 +1,20 @@
+{
+  "name": "the-agentic-fieldbook",
+  "interface": {
+    "displayName": "The Agentic Fieldbook"
+  },
+  "plugins": [
+    {
+      "name": "taf",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
