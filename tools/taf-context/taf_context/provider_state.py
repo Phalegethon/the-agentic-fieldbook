@@ -46,6 +46,18 @@ _AUDIT_FIELDS = frozenset(
     }
 )
 _REQUEST_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_POSIX_SECURITY_PRIMITIVES = (
+    fcntl is not None
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.stat in os.supports_follow_symlinks
+    and os.link in os.supports_dir_fd
+    and os.link in os.supports_follow_symlinks
+    and os.rename in os.supports_dir_fd
+    and os.unlink in os.supports_dir_fd
+)
 
 
 class StateError(ValueError):
@@ -223,17 +235,7 @@ def append_audit(paths: StatePaths, record: Mapping[str, object]) -> None:
 
 def _require_secure_runtime() -> None:
     """Fail closed where stdlib cannot provide the required no-follow primitives."""
-    supported = (
-        os.name == "posix"
-        and fcntl is not None
-        and hasattr(os, "O_NOFOLLOW")
-        and hasattr(os, "O_DIRECTORY")
-        and os.open in os.supports_dir_fd
-        and os.stat in os.supports_dir_fd
-        and os.stat in os.supports_follow_symlinks
-        and os.rename in os.supports_dir_fd
-        and os.unlink in os.supports_dir_fd
-    )
+    supported = os.name == "posix" and _POSIX_SECURITY_PRIMITIVES
     if not supported:
         raise StateError("secure-state-unsupported")
 
@@ -513,6 +515,7 @@ def _atomic_install_at(
 ) -> None:
     temporary_fd: int | None = None
     temporary_name: str | None = None
+    recovery_name: str | None = None
     try:
         for _ in range(128):
             temporary_name = f".{name}.{secrets.token_hex(8)}"
@@ -540,13 +543,56 @@ def _atomic_install_at(
         temporary_fd = None
         if _generation_at(directory_fd, name, changed_code) != expected_generation:
             raise StateError(changed_code)
-        os.replace(
-            temporary_name,
-            name,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
+
+        if expected_generation is not None:
+            recovery_name = _reserve_name_at(directory_fd, name, "recovery")
+            try:
+                os.replace(
+                    name,
+                    recovery_name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+            except OSError:
+                os.unlink(recovery_name, dir_fd=directory_fd)
+                recovery_name = None
+                raise
+            try:
+                evacuated_generation = _generation_at(
+                    directory_fd, recovery_name, changed_code
+                )
+            except StateError:
+                _restore_recovery_at(directory_fd, recovery_name, name)
+                recovery_name = None
+                raise
+            if evacuated_generation[:2] != expected_generation[:2]:
+                _restore_recovery_at(directory_fd, recovery_name, name)
+                recovery_name = None
+                raise StateError(changed_code)
+
+        try:
+            os.link(
+                temporary_name,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError as exc:
+            if recovery_name is not None:
+                os.fsync(directory_fd)
+                recovery_name = None  # Retained so both external files remain recoverable.
+            raise StateError(changed_code) from exc
+        except OSError:
+            if recovery_name is not None:
+                _restore_recovery_at(directory_fd, recovery_name, name)
+                recovery_name = None
+            raise
+        os.unlink(temporary_name, dir_fd=directory_fd)
         temporary_name = None
+        if recovery_name is not None:
+            os.unlink(recovery_name, dir_fd=directory_fd)
+            recovery_name = None
         os.fsync(directory_fd)
     except StateError:
         raise
@@ -560,3 +606,37 @@ def _atomic_install_at(
                 os.unlink(temporary_name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
+
+
+def _reserve_name_at(directory_fd: int, name: str, purpose: str) -> str:
+    for _ in range(128):
+        candidate = f".{name}.{purpose}.{secrets.token_hex(8)}"
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise OSError("cannot allocate unique state recovery file")
+
+
+def _restore_recovery_at(directory_fd: int, recovery_name: str, name: str) -> None:
+    """Restore without overwriting; retain recovery if a new destination exists."""
+    try:
+        os.link(
+            recovery_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError:
+        os.fsync(directory_fd)
+        return
+    os.unlink(recovery_name, dir_fd=directory_fd)
+    os.fsync(directory_fd)

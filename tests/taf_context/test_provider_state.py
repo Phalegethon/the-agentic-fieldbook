@@ -297,22 +297,22 @@ class AtomicWriteTests(unittest.TestCase):
     def test_writes_owner_only_state_and_fsyncs_file_replace_then_directory(self) -> None:
         events: list[str] = []
         real_fsync = os.fsync
-        real_replace = os.replace
+        real_link = os.link
 
         def recording_fsync(fd: int) -> None:
             events.append("directory-fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file-fsync")
             real_fsync(fd)
 
-        def recording_replace(source: object, destination: object, *args: object, **kwargs: object) -> None:
-            events.append("replace")
-            real_replace(source, destination, *args, **kwargs)
+        def recording_link(source: object, destination: object, *args: object, **kwargs: object) -> None:
+            events.append("install")
+            real_link(source, destination, *args, **kwargs)
 
         with mock.patch("taf_context.provider_state.os.fsync", side_effect=recording_fsync), mock.patch(
-            "taf_context.provider_state.os.replace", side_effect=recording_replace
+            "taf_context.provider_state.os.link", side_effect=recording_link
         ):
             write_consent(self.paths, _ledger(), _audit())
 
-        self.assertEqual(events, ["file-fsync", "replace", "directory-fsync"] * 2)
+        self.assertEqual(events, ["file-fsync", "install", "directory-fsync"] * 2)
         if os.name == "posix":
             self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(self.paths.consent.stat().st_mode), 0o600)
@@ -383,18 +383,55 @@ class AtomicWriteTests(unittest.TestCase):
         self.assertFalse(self.paths.audit.exists())
         self.assertEqual(sorted(self.root.iterdir()), [self.paths.consent])
 
+    @unittest.skipUnless(os.name == "posix", "final-install POSIX contract")
+    def test_consent_swap_after_final_generation_check_is_not_overwritten(self) -> None:
+        self.root.mkdir(parents=True)
+        self.paths.consent.write_text(
+            canonical_json(AuthorizationLedger().to_dict()), encoding="utf-8"
+        )
+        corrupt = b'{"schema_version":"2","records":['
+        real_generation_at = provider_state._generation_at
+        swapped_generation: tuple[int, int] | None = None
+
+        def swap_after_check(directory_fd: int, name: str, changed_code: str):
+            nonlocal swapped_generation
+            generation = real_generation_at(directory_fd, name, changed_code)
+            if name == self.paths.consent.name and swapped_generation is None:
+                replacement = self.root / "replacement-consent"
+                replacement.write_bytes(corrupt)
+                os.replace(replacement, self.paths.consent)
+                metadata = self.paths.consent.stat()
+                swapped_generation = (metadata.st_dev, metadata.st_ino)
+            return generation
+
+        with mock.patch(
+            "taf_context.provider_state._generation_at", side_effect=swap_after_check
+        ):
+            with self.assertRaises(StateError) as caught:
+                write_consent(self.paths, _ledger(), _audit())
+
+        self.assertEqual(caught.exception.code, "consent-state-changed")
+        self.assertEqual(self.paths.consent.read_bytes(), corrupt)
+        metadata = self.paths.consent.stat()
+        self.assertEqual((metadata.st_dev, metadata.st_ino), swapped_generation)
+        self.assertFalse(self.paths.audit.exists())
+        self.assertEqual(sorted(self.root.iterdir()), [self.paths.consent])
+
     def test_replace_failure_preserves_ready_state_and_cleans_temporary_file(self) -> None:
         self.root.mkdir(parents=True)
         old = canonical_json(AuthorizationLedger().to_dict()).encode("utf-8")
         self.paths.consent.write_bytes(old)
-        real_replace = os.replace
+        real_link = os.link
+        failed = False
 
         def fail_consent(source: object, destination: object, *args: object, **kwargs: object) -> None:
-            if Path(destination).name == self.paths.consent.name:
+            nonlocal failed
+            if Path(destination).name == self.paths.consent.name and not failed:
+                failed = True
                 raise OSError("injected replace failure")
-            real_replace(source, destination, *args, **kwargs)
+            real_link(source, destination, *args, **kwargs)
 
-        with mock.patch("taf_context.provider_state.os.replace", side_effect=fail_consent):
+        with mock.patch("taf_context.provider_state.os.link", side_effect=fail_consent):
             with self.assertRaises(StateError) as caught:
                 write_consent(self.paths, _ledger(), _audit())
 
