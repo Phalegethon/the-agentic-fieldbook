@@ -13,6 +13,7 @@ from taf_context.recovery import (
     RecoveryError,
     RecoveryRequest,
     _relation,
+    _run_git,
     collect_recovery,
     resolve_recovery_base,
 )
@@ -238,18 +239,38 @@ class RecoveryEvidenceTests(unittest.TestCase):
         result = collect_recovery(RecoveryRequest(repo=self.repo, base="main", max_chars=4000))
 
         staged = next(
-            claim for claim in result.dossier.claims if claim.provenance == ("git/diff/staged/staged.txt",)
+            claim for claim in result.dossier.claims if claim.provenance == ("git/diff/staged",)
         )
         unstaged = next(
             claim
             for claim in result.dossier.claims
-            if claim.provenance == ("git/diff/unstaged/tracked.txt",)
+            if claim.provenance == ("git/diff/unstaged",)
         )
         self.assertIn("staged evidence", staged.text)
         self.assertNotIn("unstaged evidence", staged.text)
         self.assertIn("unstaged evidence", unstaged.text)
 
-    def test_changed_paths_with_same_normalized_form_have_unique_claim_ids(self) -> None:
+    def test_many_changed_paths_use_a_bounded_number_of_diff_processes(self) -> None:
+        for index in range(20):
+            write(self.repo / "src" / f"module-{index:02d}.py", f"before = {index}\n")
+        run(self.repo, "git", "add", "src")
+        run(self.repo, "git", "commit", "-m", "add process-bound fixtures")
+        for index in range(20):
+            write(self.repo / "src" / f"module-{index:02d}.py", f"after = {index}\n")
+
+        with patch("taf_context.recovery._run_git", wraps=_run_git) as git_call:
+            collect_recovery(RecoveryRequest(repo=self.repo, base="main", max_chars=4000))
+
+        diff_calls = [call for call in git_call.call_args_list if call.args[1] == "diff"]
+        self.assertLessEqual(len(diff_calls), 2)
+
+    def test_control_characters_in_repository_paths_fail_closed(self) -> None:
+        write(self.repo / "bad\n## injected.md", "unsafe path\n")
+
+        with self.assertRaisesRegex(RecoveryError, "control"):
+            collect_recovery(RecoveryRequest(repo=self.repo, base="main"))
+
+    def test_changed_paths_with_same_normalized_form_share_one_bounded_diff_claim(self) -> None:
         write(self.repo / "a-b.py", "before dash\n")
         write(self.repo / "a_b.py", "before underscore\n")
         run(self.repo, "git", "add", "a-b.py", "a_b.py")
@@ -259,13 +280,10 @@ class RecoveryEvidenceTests(unittest.TestCase):
 
         result = collect_recovery(RecoveryRequest(repo=self.repo, base="main", max_chars=4000))
 
-        diff_claims = [
-            claim for claim in result.dossier.claims if claim.claim_id.startswith("diff.unstaged.")
-        ]
-        self.assertEqual(len(diff_claims), 2)
-        self.assertEqual(len({claim.claim_id for claim in diff_claims}), 2)
-        self.assertTrue(any("a-b.py" in claim.text for claim in diff_claims))
-        self.assertTrue(any("a_b.py" in claim.text for claim in diff_claims))
+        diff_claims = [claim for claim in result.dossier.claims if claim.claim_id == "diff.unstaged"]
+        self.assertEqual(len(diff_claims), 1)
+        self.assertIn("a-b.py", diff_claims[0].text)
+        self.assertIn("a_b.py", diff_claims[0].text)
 
     def test_untracked_content_is_metadata_only_until_exactly_authorized(self) -> None:
         write(self.repo / "scratch.txt", "private scratch detail\n")
@@ -392,6 +410,8 @@ class RecoveryEvidenceTests(unittest.TestCase):
         run(self.repo, "git", "commit", "-m", "fixture files")
         for index in range(30):
             write(self.repo / f"pkg{index}" / "module.py", "x = '" + ("z" * 300) + "'\n")
+        for index in range(100):
+            write(self.repo / "scratch" / f"note-{index:03d}.txt", "metadata only\n")
 
         for budget in (2000, 4000, 8000, 12000):
             with self.subTest(budget=budget):

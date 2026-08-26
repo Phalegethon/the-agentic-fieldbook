@@ -348,6 +348,8 @@ def _decode_path(raw: bytes) -> str:
     except UnicodeDecodeError as error:
         raise RecoveryError("non-UTF-8 repository path") from error
     path = PurePosixPath(value)
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise RecoveryError("control character in repository path")
     if not value or path.is_absolute() or ".." in path.parts or "\\" in value:
         raise RecoveryError("unsafe repository path")
     return value
@@ -547,34 +549,34 @@ def _tracked_diff_claims(
         ("staged", staged_paths, True),
         ("unstaged", unstaged_paths, False),
     ):
-        for path in paths:
-            arguments = ["diff", "--unified=3", "--no-renames", "--ignore-submodules=all"]
-            if cached:
-                arguments.append("--cached")
-            arguments.extend(("--", path))
-            raw = _run_git(repo, *arguments)
-            assert raw is not None
-            try:
-                diff = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                diff = "[binary-or-non-UTF-8 diff content excluded]"
-            excerpt = _excerpt(_redact(diff))
-            claims.append(
-                RecoveryClaim.from_dict(
-                    {
-                        "claim_id": f"diff.{kind}.{_claim_path_id(path)}",
-                        "evidence_class": "observed",
-                        "text": f"Tracked {kind} diff for {path}: {excerpt}",
-                        "repository_identity": repository_identity,
-                        "worktree_identity": worktree_identity,
-                        "provenance": [f"git/diff/{kind}/{path}"],
-                        "freshness": "exact",
-                        "supports": ["current.next-action"],
-                        "conflicts": [],
-                        "qualifications": [],
-                    }
-                )
+        if not paths:
+            continue
+        arguments = ["diff", "--unified=3", "--no-renames", "--ignore-submodules=all"]
+        if cached:
+            arguments.append("--cached")
+        raw = _run_git(repo, *arguments)
+        assert raw is not None
+        try:
+            diff = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            diff = "[binary-or-non-UTF-8 diff content excluded]"
+        excerpt = _excerpt(_redact(diff))
+        claims.append(
+            RecoveryClaim.from_dict(
+                {
+                    "claim_id": f"diff.{kind}",
+                    "evidence_class": "observed",
+                    "text": f"Tracked {kind} diff across {len(paths)} path(s): {excerpt}",
+                    "repository_identity": repository_identity,
+                    "worktree_identity": worktree_identity,
+                    "provenance": [f"git/diff/{kind}"],
+                    "freshness": "exact",
+                    "supports": ["current.next-action"],
+                    "conflicts": [],
+                    "qualifications": [],
+                }
             )
+        )
     return claims
 
 
@@ -834,7 +836,6 @@ def _dirty_fingerprint(
         args = ["diff", "--unified=0", "--no-renames", "--ignore-submodules=all"]
         if cached:
             args.append("--cached")
-        args.extend(("--", *paths))
         raw = _run_git(repo, *args)
         assert raw is not None
         digest.update(raw)
@@ -889,11 +890,11 @@ def _budgeted_dossier(
         ("candidate", candidate, _candidate_line(candidate)) for candidate in candidates
     )
     optional_lines = tuple(item[2] for item in optional_items)
+    total_optional_characters = sum(len(line) for line in optional_lines)
     selected: list[int] = []
+    selected_characters = 0
 
-    def build(indices: list[int]) -> tuple[RecoveryDossier, str]:
-        selected_set = set(indices)
-        omitted = [line for index, line in enumerate(optional_lines) if index not in selected_set]
+    def build(indices: list[int], included_characters: int) -> tuple[RecoveryDossier, str]:
         selected_claims = [
             optional_items[index][1]
             for index in indices
@@ -909,8 +910,8 @@ def _budgeted_dossier(
             examined_path_count=min(examined_path_count, changed_path_count),
             cluster_count=len(optional_lines),
             included_cluster_count=len(indices),
-            omitted_item_count=len(omitted),
-            omitted_characters=sum(len(line) for line in omitted),
+            omitted_item_count=len(optional_lines) - len(indices),
+            omitted_characters=total_optional_characters - included_characters,
             budget_characters=budget,
         )
         dossier = RecoveryDossier.from_dict(
@@ -928,14 +929,16 @@ def _budgeted_dossier(
         )
         return dossier, _render_dossier(dossier)
 
-    dossier, model_text = build(selected)
+    dossier, model_text = build(selected, selected_characters)
     if len(model_text) > budget:
         raise RecoveryError("recovery identity exceeds output budget")
     for index in range(len(optional_lines)):
         candidate_indices = [*selected, index]
-        candidate_dossier, candidate_text = build(candidate_indices)
+        candidate_characters = selected_characters + len(optional_lines[index])
+        candidate_dossier, candidate_text = build(candidate_indices, candidate_characters)
         if len(candidate_text) <= budget:
             selected = candidate_indices
+            selected_characters = candidate_characters
             dossier, model_text = candidate_dossier, candidate_text
     return dossier, model_text
 
