@@ -16,6 +16,7 @@ from taf_context.discovery import discover_providers, native_level0_descriptor
 from taf_context.models import Confidence, ContextAction, Freshness, RepositorySnapshot
 from taf_context.provider_models import (
     Availability,
+    DiscoverySnapshot,
     DiscoverySource,
     HostInventory,
     ProjectRegistration,
@@ -52,7 +53,7 @@ class PassiveDiscoveryTests(unittest.TestCase):
                 status_evidence=StatusEvidence.MANIFEST_VALIDATED,
                 freshness=Freshness.EXACT,
                 path_coverage=1.0,
-                language_coverage=(),
+                language_coverage=None,
                 latency_ms=None,
                 confidence=Confidence.VERIFIED,
                 supported_actions=(ContextAction.QUERY,),
@@ -70,6 +71,10 @@ class PassiveDiscoveryTests(unittest.TestCase):
         self.assertFalse(discovered.partial)
         self.assertTrue(discovered.inventory_fingerprint.startswith("sha256:"))
         self.assertEqual(len(discovered.inventory_fingerprint), 71)
+        self.assertEqual(ProviderDescriptor.from_dict(exact.to_dict()), exact)
+        self.assertEqual(
+            DiscoverySnapshot.from_dict(discovered.to_dict()), discovered
+        )
 
     def test_source_overlays_do_not_invent_availability_or_consent(self) -> None:
         host = _descriptor("host.provider", source=DiscoverySource.HOST_INVENTORY)
@@ -296,6 +301,24 @@ class PassiveDiscoveryTests(unittest.TestCase):
             ),
         )
 
+    def test_spoofed_host_claim_taints_same_identity_valid_registry_claim(self) -> None:
+        spoofed_host = _descriptor(
+            "tainted.provider", source=DiscoverySource.USER_REGISTRY
+        )
+        valid_registry = _descriptor("tainted.provider")
+
+        with _forbid_active_discovery():
+            result = discover_providers(
+                _snapshot(), _inventory(spoofed_host), (valid_registry,), None
+            )
+
+        self.assertNotIn("tainted.provider", _identities(result.providers))
+        self.assertEqual(result.rejected_provider_count, 1)
+        self.assertEqual(
+            result.rejection_summaries,
+            ("tainted.provider:invalid-host-discovery-source",),
+        )
+
     def test_sixty_five_providers_truncate_by_identity_with_exact_omission(self) -> None:
         registry = tuple(
             _descriptor(f"z-provider-{index:02d}") for index in reversed(range(64))
@@ -386,6 +409,45 @@ class PassiveDiscoveryTests(unittest.TestCase):
         self.assertEqual(result.rejection_summaries, tuple(sorted(result.rejection_summaries)))
         self.assertTrue(result.partial)
         self.assertIn("inventory-partial", result.warnings)
+
+    def test_exact_wire_counter_ceiling_is_portable_without_local_increments(self) -> None:
+        ceiling = 2**31 - 1
+
+        with _forbid_active_discovery():
+            result = discover_providers(
+                _snapshot(),
+                _inventory(
+                    rejected_provider_count=ceiling,
+                    omitted_provider_count=ceiling,
+                    partial=True,
+                ),
+                (),
+                None,
+            )
+
+        self.assertEqual(result.rejected_provider_count, ceiling)
+        self.assertEqual(result.omitted_provider_count, ceiling)
+        self.assertEqual(DiscoverySnapshot.from_dict(result.to_dict()), result)
+
+    def test_exact_rejection_count_overflow_fails_closed(self) -> None:
+        inventory = _inventory(rejected_provider_count=2**31 - 1, partial=True)
+        registration = _registration(_registration_entry("missing.provider"))
+
+        with _forbid_active_discovery(), self.assertRaisesRegex(
+            ValueError, "^rejected-provider-count-overflow$"
+        ):
+            discover_providers(_snapshot(), inventory, (), registration)
+
+    def test_exact_omission_count_overflow_fails_closed(self) -> None:
+        inventory = _inventory(omitted_provider_count=2**31 - 1, partial=True)
+        registry = tuple(
+            _descriptor(f"z-provider-{index:02d}") for index in range(64)
+        )
+
+        with _forbid_active_discovery(), self.assertRaisesRegex(
+            ValueError, "^omitted-provider-count-overflow$"
+        ):
+            discover_providers(_snapshot(), inventory, registry, None)
 
     def test_inventory_partial_warning_survives_a_full_snapshot_warning_budget(self) -> None:
         snapshot = _snapshot(

@@ -42,6 +42,7 @@ _MAX_PROVIDERS = 64
 _MAX_SUMMARIES = 64
 _MAX_MARKERS = 16
 _MAX_STRINGS = 64
+_MAX_COUNTER = 2**31 - 1
 _NATIVE_IDENTITY = "taf-context"
 
 _VERSION_CONFLICT = "provider-version-conflict"
@@ -73,7 +74,7 @@ def native_level0_descriptor(snapshot: RepositorySnapshot) -> ProviderDescriptor
             Freshness.EXACT if snapshot.dirty_fingerprint_complete else Freshness.PARTIAL
         ),
         path_coverage=1.0,
-        language_coverage=(),
+        language_coverage=None,
         latency_ms=None,
         confidence=Confidence.VERIFIED,
         supported_actions=(ContextAction.QUERY,),
@@ -98,9 +99,11 @@ def discover_providers(
 
     rejections: list[tuple[str, tuple[str, ...]]] = []
     valid_host: list[ProviderDescriptor] = []
+    tainted_host_identities: set[str] = set()
     for descriptor in sorted(host_inventory.providers, key=_descriptor_key):
         if descriptor.discovery_sources != (DiscoverySource.HOST_INVENTORY,):
             rejections.append((descriptor.provider_identity, (_INVALID_HOST_SOURCE,)))
+            tainted_host_identities.add(descriptor.provider_identity)
             continue
         valid_host.append(descriptor)
 
@@ -122,6 +125,8 @@ def discover_providers(
     for identity in identities:
         host_claims = host_by_identity.get(identity, ())
         registry_claims = registry_by_identity.get(identity, ())
+        if identity in tainted_host_identities:
+            continue
         if identity == _NATIVE_IDENTITY:
             for _ in (*host_claims, *registry_claims):
                 rejections.append((identity, (_RESERVED_IDENTITY,)))
@@ -178,6 +183,10 @@ def discover_providers(
     locally_omitted = all_providers[maximum_providers:]
     omitted_count = host_inventory.omitted_provider_count + len(locally_omitted)
     rejected_count = host_inventory.rejected_provider_count + len(rejections)
+    if rejected_count > _MAX_COUNTER:
+        raise ValueError("rejected-provider-count-overflow")
+    if omitted_count > _MAX_COUNTER:
+        raise ValueError("omitted-provider-count-overflow")
     summaries = tuple(
         sorted(
             set(host_inventory.rejection_summaries)
