@@ -1,140 +1,316 @@
-"""Denial-first tests for exact-action context consent."""
+"""Contract tests for exact allow and deny context-consent decisions."""
 
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import unittest
 
 from taf_context.models import ContextAction
+from taf_context.provider_models import ConsentRequest, ProviderLocality
+
+
+_DECIDED_AT = "2026-08-26T00:00:00Z"
+_REQUEST_DIGEST = "sha256:" + "a" * 64
+
+
+def _record(
+    action: str = "query",
+    repository_identity: str = "sha256:repo",
+    provider_identity: str = "local.graph",
+    provider_schema_version: str = "1",
+    disposition: str = "allow",
+    decided_at: str = _DECIDED_AT,
+    request_digest: str = _REQUEST_DIGEST,
+) -> dict[str, str]:
+    """Return a literal v2 record fixture independent of ledger helpers."""
+    return {
+        "action": action,
+        "repository_identity": repository_identity,
+        "provider_identity": provider_identity,
+        "provider_schema_version": provider_schema_version,
+        "disposition": disposition,
+        "decided_at": decided_at,
+        "request_digest": request_digest,
+    }
+
+
+def _request(*actions: ContextAction) -> ConsentRequest:
+    return ConsentRequest.create(
+        schema_version="1",
+        repository_identity="sha256:repo",
+        provider_identity="local.graph",
+        provider_schema_version="1",
+        actions=actions,
+        locality=ProviderLocality.LOCAL,
+        data_surface="repository-metadata",
+        fallback="native",
+        requested_at=_DECIDED_AT,
+    )
 
 
 class AuthorizationLedgerTests(unittest.TestCase):
-    def test_empty_ledger_denies_every_action(self) -> None:
+    def test_empty_ledger_has_no_decision_for_every_action(self) -> None:
         from taf_context.consent import AuthorizationLedger
 
         ledger = AuthorizationLedger()
 
         for action in ContextAction:
             with self.subTest(action=action):
-                self.assertFalse(ledger.is_authorized(action, "repo", "provider"))
+                self.assertIsNone(
+                    ledger.decision_for(action, "sha256:repo", "local.graph", "1")
+                )
+                self.assertFalse(
+                    ledger.is_authorized(action, "sha256:repo", "local.graph", "1")
+                )
+                self.assertFalse(
+                    ledger.is_denied(action, "sha256:repo", "local.graph", "1")
+                )
 
-    def test_grant_authorizes_only_exact_action_and_scope(self) -> None:
+    def test_all_fifty_six_ordered_cross_action_pairs_do_not_imply_decisions(self) -> None:
         from taf_context.consent import AuthorizationLedger
 
-        ledger = AuthorizationLedger().authorize(
-            ContextAction.BUILD, "repo-a", "provider-a", "2026-08-25T00:00:00Z"
+        for decided, requested in (
+            (left, right)
+            for left in ContextAction
+            for right in ContextAction
+            if left is not right
+        ):
+            with self.subTest(decided=decided, requested=requested):
+                ledger = AuthorizationLedger.from_dict(
+                    {"schema_version": "2", "records": [_record(action=decided.value)]}
+                )
+                self.assertIsNone(
+                    ledger.decision_for(requested, "sha256:repo", "local.graph", "1")
+                )
+                self.assertFalse(
+                    ledger.is_authorized(requested, "sha256:repo", "local.graph", "1")
+                )
+                self.assertFalse(
+                    ledger.is_denied(requested, "sha256:repo", "local.graph", "1")
+                )
+
+    def test_allow_and_deny_apply_only_to_the_exact_four_part_scope(self) -> None:
+        from taf_context.consent import AuthorizationLedger
+
+        ledger = AuthorizationLedger.from_dict(
+            {"schema_version": "2", "records": [_record(), _record(disposition="deny", action="inspect")]}
         )
 
-        self.assertTrue(ledger.is_authorized(ContextAction.BUILD, "repo-a", "provider-a"))
-        self.assertFalse(ledger.is_authorized(ContextAction.BUILD, "repo-b", "provider-a"))
-        self.assertFalse(ledger.is_authorized(ContextAction.BUILD, "repo-a", "provider-b"))
-
-    def test_authorization_for_one_action_never_implies_any_other_action(self) -> None:
-        from taf_context.consent import AuthorizationLedger
-
-        for granted, requested in ((a, b) for a in ContextAction for b in ContextAction if a != b):
-            with self.subTest(granted=granted, requested=requested):
-                ledger = AuthorizationLedger().authorize(
-                    granted, "repo", "provider", "2026-08-25T00:00:00Z"
+        self.assertTrue(ledger.is_authorized(ContextAction.QUERY, "sha256:repo", "local.graph", "1"))
+        self.assertFalse(ledger.is_denied(ContextAction.QUERY, "sha256:repo", "local.graph", "1"))
+        self.assertTrue(ledger.is_denied(ContextAction.INSPECT, "sha256:repo", "local.graph", "1"))
+        self.assertFalse(ledger.is_authorized(ContextAction.INSPECT, "sha256:repo", "local.graph", "1"))
+        for repository_identity, provider_identity, provider_schema_version in (
+            ("sha256:other", "local.graph", "1"),
+            ("sha256:repo", "other.graph", "1"),
+            ("sha256:repo", "local.graph", "2"),
+        ):
+            with self.subTest(
+                repository_identity=repository_identity,
+                provider_identity=provider_identity,
+                provider_schema_version=provider_schema_version,
+            ):
+                self.assertIsNone(
+                    ledger.decision_for(
+                        ContextAction.QUERY,
+                        repository_identity,
+                        provider_identity,
+                        provider_schema_version,
+                    )
                 )
-                self.assertFalse(ledger.is_authorized(requested, "repo", "provider"))
 
-    def test_duplicate_grant_is_idempotent(self) -> None:
+    def test_record_adds_one_allow_record_for_every_requested_action(self) -> None:
+        from taf_context.consent import AuthorizationLedger, ConsentDisposition
+
+        request = _request(ContextAction.INSPECT, ContextAction.QUERY)
+        ledger = AuthorizationLedger().record(request, ConsentDisposition.ALLOW, _DECIDED_AT)
+
+        self.assertEqual(
+            ledger.to_dict(),
+            {
+                "schema_version": "2",
+                "records": [
+                    _record(action="inspect", request_digest="sha256:" + request.digest),
+                    _record(action="query", request_digest="sha256:" + request.digest),
+                ],
+            },
+        )
+
+    def test_record_rejects_a_request_whose_digest_no_longer_matches_its_fields(self) -> None:
+        from taf_context.consent import AuthorizationLedger, ConsentDisposition, ConsentError
+
+        request = replace(_request(ContextAction.QUERY), digest="b" * 64)
+
+        with self.assertRaises(ConsentError):
+            AuthorizationLedger().record(request, ConsentDisposition.ALLOW, _DECIDED_AT)
+
+    def test_identical_records_are_idempotent(self) -> None:
         from taf_context.consent import AuthorizationLedger
 
-        grant = (ContextAction.BUILD, "repo", "provider", "2026-08-25T00:00:00Z")
-        ledger = AuthorizationLedger().authorize(*grant).authorize(*grant)
+        ledger = AuthorizationLedger.from_dict(
+            {"schema_version": "2", "records": [_record(), _record()]}
+        )
 
-        self.assertEqual(ledger.grants, (grant,))
+        self.assertEqual(ledger.to_dict(), {"schema_version": "2", "records": [_record()]})
 
-    def test_round_trip_preserves_exact_sorted_grants(self) -> None:
+    def test_later_rfc3339_decision_wins_only_for_its_exact_scope(self) -> None:
+        from taf_context.consent import AuthorizationLedger, ConsentDisposition
+
+        ledger = AuthorizationLedger.from_dict(
+            {
+                "schema_version": "2",
+                "records": [
+                    _record(disposition="allow", decided_at="2026-08-26T00:00:00Z"),
+                    _record(disposition="deny", decided_at="2026-08-26T00:00:01Z"),
+                    _record(
+                        disposition="allow",
+                        provider_schema_version="2",
+                        decided_at="2026-08-26T00:00:02Z",
+                    ),
+                ],
+            }
+        )
+
+        self.assertEqual(
+            ledger.decision_for(ContextAction.QUERY, "sha256:repo", "local.graph", "1"),
+            ConsentDisposition.DENY,
+        )
+        self.assertEqual(
+            ledger.decision_for(ContextAction.QUERY, "sha256:repo", "local.graph", "2"),
+            ConsentDisposition.ALLOW,
+        )
+
+    def test_conflicting_records_at_one_exact_scope_and_timestamp_are_rejected(self) -> None:
+        from taf_context.consent import AuthorizationLedger, ConsentError
+
+        with self.assertRaises(ConsentError):
+            AuthorizationLedger.from_dict(
+                {
+                    "schema_version": "2",
+                    "records": [_record(disposition="allow"), _record(disposition="deny")],
+                }
+            )
+
+    def test_decided_at_requires_a_strict_rfc3339_timestamp(self) -> None:
+        from taf_context.consent import AuthorizationLedger, ConsentError
+
+        for decided_at in (
+            "2026-08-26",
+            "2026-08-26T00:00:00",
+            "2026-08-26T00:00:00+00",
+            "2026-02-30T00:00:00Z",
+            "2026-08-26T00:00:00z",
+        ):
+            with self.subTest(decided_at=decided_at):
+                with self.assertRaises(ConsentError):
+                    AuthorizationLedger.from_dict(
+                        {"schema_version": "2", "records": [_record(decided_at=decided_at)]}
+                    )
+
+    def test_revoke_removes_every_and_only_the_exact_scope(self) -> None:
         from taf_context.consent import AuthorizationLedger
 
-        ledger = AuthorizationLedger()
-        ledger = ledger.authorize(ContextAction.UPDATE, "repo-b", "provider", "2026-08-25T00:00:00Z")
-        ledger = ledger.authorize(ContextAction.BUILD, "repo-z", "provider", "2026-08-25T00:00:00Z")
-        ledger = ledger.authorize(ContextAction.BUILD, "repo-a", "provider", "2026-08-25T00:00:00Z")
-        expected = {
-            "grants": [
-                {
-                    "action": "build",
-                    "repository_identity": "repo-a",
-                    "provider_name": "provider",
-                    "granted_at": "2026-08-25T00:00:00Z",
-                },
-                {
-                    "action": "build",
-                    "repository_identity": "repo-z",
-                    "provider_name": "provider",
-                    "granted_at": "2026-08-25T00:00:00Z",
-                },
-                {
-                    "action": "update",
-                    "repository_identity": "repo-b",
-                    "provider_name": "provider",
-                    "granted_at": "2026-08-25T00:00:00Z",
-                },
-            ]
+        ledger = AuthorizationLedger.from_dict(
+            {
+                "schema_version": "2",
+                "records": [
+                    _record(disposition="allow"),
+                    _record(disposition="deny", decided_at="2026-08-26T00:00:01Z"),
+                    _record(action="inspect"),
+                    _record(provider_schema_version="2"),
+                    _record(provider_identity="other.graph"),
+                    _record(repository_identity="sha256:other"),
+                ],
+            }
+        )
+
+        revoked = ledger.revoke(ContextAction.QUERY, "sha256:repo", "local.graph", "1")
+
+        self.assertEqual(
+            revoked.to_dict(),
+            {
+                "schema_version": "2",
+                "records": [
+                    _record(action="inspect"),
+                    _record(repository_identity="sha256:other"),
+                    _record(provider_schema_version="2"),
+                    _record(provider_identity="other.graph"),
+                ],
+            },
+        )
+
+    def test_v2_round_trip_is_canonical_and_immutable(self) -> None:
+        from taf_context.consent import AuthorizationLedger
+
+        wire = {
+            "schema_version": "2",
+            "records": [
+                _record(action="query", provider_identity="z.graph"),
+                _record(action="build", repository_identity="sha256:z"),
+                _record(action="build", repository_identity="sha256:a"),
+            ],
         }
+        expected = {
+            "schema_version": "2",
+            "records": [
+                _record(action="build", repository_identity="sha256:a"),
+                _record(action="build", repository_identity="sha256:z"),
+                _record(action="query", provider_identity="z.graph"),
+            ],
+        }
+
+        ledger = AuthorizationLedger.from_dict(copy.deepcopy(wire))
 
         self.assertEqual(ledger.to_dict(), expected)
         self.assertEqual(AuthorizationLedger.from_dict(copy.deepcopy(expected)), ledger)
-
-    def test_ledger_and_grants_are_immutable(self) -> None:
-        from taf_context.consent import AuthorizationLedger
-
-        ledger = AuthorizationLedger().authorize(
-            ContextAction.BUILD, "repo", "provider", "2026-08-25T00:00:00Z"
-        )
-
         with self.assertRaises((AttributeError, TypeError)):
-            ledger.grants += (ledger.grants[0],)
-        with self.assertRaises(TypeError):
-            ledger.grants[0][0] = ContextAction.UPDATE  # type: ignore[index]
+            ledger.records += (ledger.records[0],)
+        with self.assertRaises((AttributeError, TypeError)):
+            ledger.records[0].disposition = "deny"  # type: ignore[misc]
 
-    def test_rejects_empty_scope_values_and_unknown_actions(self) -> None:
+    def test_from_dict_requires_the_exact_v2_wire_shape_and_rejects_v1_grants(self) -> None:
         from taf_context.consent import AuthorizationLedger, ConsentError
-
-        for repository, provider in (("", "provider"), ("repo", "")):
-            with self.subTest(repository=repository, provider=provider):
-                with self.assertRaises(ConsentError):
-                    AuthorizationLedger().authorize(
-                        ContextAction.BUILD, repository, provider, "2026-08-25T00:00:00Z"
-                    )
-
-        with self.assertRaises(ConsentError):
-            AuthorizationLedger().authorize(
-                "unknown", "repo", "provider", "2026-08-25T00:00:00Z"  # type: ignore[arg-type]
-            )
-
-    def test_from_dict_rejects_malformed_or_unknown_fields(self) -> None:
-        from taf_context.consent import AuthorizationLedger, ConsentError
-
-        valid = {
-            "grants": [
-                {
-                    "action": "build",
-                    "repository_identity": "repo",
-                    "provider_name": "provider",
-                    "granted_at": "2026-08-25T00:00:00Z",
-                }
-            ]
-        }
 
         for invalid in (
             {},
-            {"grants": "not-a-list"},
-            {"grants": [{"action": "build"}]},
-            {**valid, "unexpected": True},
+            {"schema_version": "1", "records": []},
+            {"schema_version": "2", "records": "not-a-list"},
+            {"schema_version": "2", "records": [{"action": "query"}]},
+            {"schema_version": "2", "records": [_record()], "unexpected": True},
+            {"grants": []},
+            {
+                "grants": [
+                    {
+                        "action": "query",
+                        "repository_identity": "sha256:repo",
+                        "provider_name": "local.graph",
+                        "granted_at": _DECIDED_AT,
+                    }
+                ]
+            },
         ):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ConsentError):
                     AuthorizationLedger.from_dict(invalid)
 
-        invalid_grant = copy.deepcopy(valid)
-        invalid_grant["grants"][0]["action"] = "unknown"
-        with self.assertRaises(ConsentError):
-            AuthorizationLedger.from_dict(invalid_grant)
+    def test_from_dict_rejects_invalid_record_members(self) -> None:
+        from taf_context.consent import AuthorizationLedger, ConsentError
+
+        for field, value in (
+            ("action", "unknown"),
+            ("repository_identity", ""),
+            ("provider_identity", ""),
+            ("provider_schema_version", ""),
+            ("disposition", "grant"),
+            ("request_digest", "a" * 64),
+            ("request_digest", "sha256:" + "A" * 64),
+        ):
+            with self.subTest(field=field, value=value):
+                invalid = _record()
+                invalid[field] = value
+                with self.assertRaises(ConsentError):
+                    AuthorizationLedger.from_dict({"schema_version": "2", "records": [invalid]})
 
 
 if __name__ == "__main__":
