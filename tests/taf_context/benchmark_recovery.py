@@ -217,6 +217,8 @@ def _fixtures(*, smoke: bool) -> Iterator[dict[str, RecoveryRequest]]:
         commit_all(omissions, "add omission pressure")
         for index in range(80):
             write(omissions / f"cluster-{index:03d}" / "module.py", "after = '" + "x" * 300 + "'\n")
+        for index in range(100):
+            write(omissions / "scratch" / f"note-{index:03d}.txt", "metadata only\n")
         fixtures["omission-pressure"] = RecoveryRequest(repo=omissions, base="main")
         yield fixtures
 
@@ -240,7 +242,8 @@ def run_benchmark(*, samples_per_fixture_budget: int = 5, smoke: bool = False) -
                 cold_start = time.perf_counter()
                 cold_result = collect_recovery(bounded)
                 cold_elapsed = (time.perf_counter() - cold_start) * 1000
-                correct = _correct(cold_result, budget)
+                require_omissions = fixture_id == "omission-pressure"
+                correct = _correct(cold_result, budget, require_omissions=require_omissions)
                 cold_samples.append(
                     {
                         "fixture_id": fixture_id,
@@ -265,7 +268,12 @@ def run_benchmark(*, samples_per_fixture_budget: int = 5, smoke: bool = False) -
                             "peak_rss_kib": _peak_rss_kib(),
                             "characters_used": result.characters_used,
                             "omitted_item_count": result.dossier.coverage.omitted_item_count,
-                            "correct": _correct(result, budget) and before == after,
+                            "correct": _correct(
+                                result,
+                                budget,
+                                require_omissions=require_omissions,
+                            )
+                            and before == after,
                             "counters": {counter: 0 for counter in FORBIDDEN_COUNTERS},
                         }
                     )
@@ -291,12 +299,13 @@ def run_benchmark(*, samples_per_fixture_budget: int = 5, smoke: bool = False) -
     return value
 
 
-def _correct(result: object, budget: int) -> bool:
+def _correct(result: object, budget: int, *, require_omissions: bool = False) -> bool:
     text = result.model_text
     return (
         len(text) == result.characters_used
         and len(text) <= budget
         and result.dossier.coverage.budget_characters == budget
+        and (not require_omissions or result.dossier.coverage.omitted_item_count > 0)
         and all(
             heading in text
             for heading in (

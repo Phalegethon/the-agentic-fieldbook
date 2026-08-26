@@ -7,6 +7,7 @@ import unittest
 
 from tests.taf_context.benchmark_recovery import (
     BenchmarkValidationError,
+    _correct,
     summarize_samples,
     validate_benchmark_result,
 )
@@ -58,6 +59,24 @@ def result() -> dict[str, object]:
 
 
 class BenchmarkValidationTests(unittest.TestCase):
+    def test_omission_pressure_gate_requires_a_real_omission(self) -> None:
+        class Coverage:
+            budget_characters = 2000
+            omitted_item_count = 0
+
+        class Dossier:
+            coverage = Coverage()
+
+        class Result:
+            model_text = (
+                "## Scope\n## Current Workstream\n## Evidence Claims\n"
+                "## Coverage and Omissions\n## Next-Action Boundary\n"
+            )
+            characters_used = len(model_text)
+            dossier = Dossier()
+
+        self.assertFalse(_correct(Result(), 2000, require_omissions=True))
+
     def test_valid_result_uses_leaf_derived_aggregates(self) -> None:
         value = result()
 
