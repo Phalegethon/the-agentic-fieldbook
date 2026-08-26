@@ -33,7 +33,7 @@ NONPRODUCTION_CONTEXT_DIRECTORIES = {
     "test",
     "tests",
 }
-CONTEXT_COMPOUND_SUFFIXES = {
+CONTEXT_ENGINE_TERMS = (
     "adapter",
     "adapters",
     "bridge",
@@ -55,7 +55,8 @@ CONTEXT_COMPOUND_SUFFIXES = {
     "store",
     "watcher",
     "watchers",
-}
+)
+CONTEXT_SCOPE_PREFIXES = ("tafcontext", "contextual", "context")
 
 
 @contextmanager
@@ -74,23 +75,35 @@ def _isolated_context_layout() -> Iterator[Path]:
 
 
 def _normalized_path_parts(relative: Path) -> tuple[str, ...]:
+    parts = relative.parts
     return tuple(
-        part.lower().replace("-", "_").replace(".", "_")
-        for part in relative.parts
+        (Path(part).stem if index == len(parts) - 1 else part)
+        .lower()
+        .replace("-", "_")
+        .replace(".", "_")
+        for index, part in enumerate(parts)
     )
 
 
+def _is_complete_context_compound(remainder: str) -> bool:
+    reachable_offsets = {0}
+    for offset in range(len(remainder) + 1):
+        if offset not in reachable_offsets:
+            continue
+        for term in CONTEXT_ENGINE_TERMS:
+            if remainder.startswith(term, offset):
+                reachable_offsets.add(offset + len(term))
+    return len(remainder) in reachable_offsets
+
+
 def _is_context_scope_component(component: str) -> bool:
-    tokens = set(component.split("_"))
-    if {"context", "contextual", "taf"} & tokens:
-        return True
     collapsed = component.replace("_", "")
-    for prefix in ("context", "tafcontext"):
+    if collapsed == "taf":
+        return True
+    for prefix in CONTEXT_SCOPE_PREFIXES:
         if collapsed.startswith(prefix):
-            suffix = collapsed.removeprefix(prefix)
-            return (prefix == "tafcontext" and not suffix) or (
-                suffix in CONTEXT_COMPOUND_SUFFIXES
-            )
+            remainder = collapsed[len(prefix) :]
+            return _is_complete_context_compound(remainder)
     return False
 
 
@@ -149,6 +162,10 @@ class RepositoryLayoutTest(unittest.TestCase):
             "skills/contextbridge/SKILL.md",
             "src/tafcontext/parser.py",
             "src/contextual_runtime/storage.py",
+            "tools/contextprovideradapter.py",
+            "tools/contextualruntime/storage.py",
+            "packages/contextlevel1parser.py",
+            "src/contextdiscoveryrouting/watcher.py",
         )
         unrelated_paths = (
             "tools/logging/watcher.py",
@@ -397,6 +414,21 @@ class RepositoryLayoutTest(unittest.TestCase):
             with self.subTest(relative=relative), _isolated_context_layout() as root:
                 mutation = root / relative
                 mutation.parent.mkdir(parents=True)
+                mutation.write_text("", encoding="utf-8")
+                with self.assertRaisesRegex(AssertionError, relative):
+                    self.test_public_layout_contains_taf_context_engine_without_exposure()
+
+    def test_public_boundary_rejects_multi_term_context_compounds(self) -> None:
+        relative_mutations = (
+            "tools/contextprovideradapter.py",
+            "tools/contextualruntime/storage.py",
+            "packages/contextlevel1parser.py",
+            "src/contextdiscoveryrouting/watcher.py",
+        )
+        for relative in relative_mutations:
+            with self.subTest(relative=relative), _isolated_context_layout() as root:
+                mutation = root / relative
+                mutation.parent.mkdir(parents=True, exist_ok=True)
                 mutation.write_text("", encoding="utf-8")
                 with self.assertRaisesRegex(AssertionError, relative):
                     self.test_public_layout_contains_taf_context_engine_without_exposure()
