@@ -43,40 +43,89 @@ def _isolated_context_layout() -> Iterator[Path]:
             yield root
 
 
-def _is_forbidden_context_production_surface(relative: Path) -> bool:
-    normalized_parts = tuple(
+def _normalized_path_parts(relative: Path) -> tuple[str, ...]:
+    return tuple(
         part.lower().replace("-", "_").replace(".", "_")
         for part in relative.parts
     )
+
+
+def _is_context_production_scope(relative: Path) -> bool:
+    if not relative.parts:
+        return False
+    normalized_parts = _normalized_path_parts(relative)
     tokens = {
         token
         for part in normalized_parts
         for token in part.split("_")
         if token
     }
-    if relative.parts[0] == "tests" or {"conformance", "fixtures"} & tokens:
+    if relative.parts[0].lower() == "tests" or {
+        "conformance",
+        "fixtures",
+    } & tokens:
         return False
+    collapsed_parts = tuple(part.replace("_", "") for part in normalized_parts)
+    return any("context" in part or part == "taf" for part in collapsed_parts)
 
+
+def _is_forbidden_context_production_surface(relative: Path) -> bool:
+    if not _is_context_production_scope(relative):
+        return False
+    normalized_parts = _normalized_path_parts(relative)
+    tokens = {
+        token
+        for part in normalized_parts
+        for token in part.split("_")
+        if token
+    }
     normalized_path = "/".join(normalized_parts)
-    has_context = "context" in tokens
     has_provider_adapter = bool(
         {"provider", "providers"} & tokens and {"adapter", "adapters"} & tokens
+    ) or any("provideradapter" in part for part in normalized_parts)
+    has_watcher = bool({"watcher", "watchers"} & tokens) or any(
+        part.replace("_", "").endswith(("watcher", "watchers"))
+        for part in normalized_parts
     )
-    has_watcher = bool({"watcher", "watchers"} & tokens)
     has_level_one = "level1" in normalized_path or "level_1" in normalized_path
     has_parser_or_storage = bool(
         {"parser", "parsers", "storage", "store", "stores"} & tokens
+    ) or any(
+        part.replace("_", "").endswith(
+            ("parser", "parsers", "storage", "store", "stores")
+        )
+        for part in normalized_parts
     )
     return bool(
-        (relative.name.lower() == "skill.md" and has_context)
+        relative.name.lower() == "skill.md"
         or has_provider_adapter
         or has_watcher
         or has_level_one
-        or (has_context and has_parser_or_storage)
+        or has_parser_or_storage
     )
 
 
 class RepositoryLayoutTest(unittest.TestCase):
+    def test_context_scope_predicate_distinguishes_compound_paths(self) -> None:
+        context_paths = (
+            "skills/contextbridge/SKILL.md",
+            "src/tafcontext/parser.py",
+            "src/contextual_runtime/storage.py",
+        )
+        unrelated_paths = (
+            "tools/logging/watcher.py",
+            "packages/book-level1/parser.py",
+            "tools/cloud/provider_adapter.py",
+            "tests/taf_context/test_watcher.py",
+            "samples/fixtures/context-watcher/level1/parser.json",
+        )
+        for relative in context_paths:
+            with self.subTest(relative=relative):
+                self.assertTrue(_is_context_production_scope(Path(relative)))
+        for relative in unrelated_paths:
+            with self.subTest(relative=relative):
+                self.assertFalse(_is_context_production_scope(Path(relative)))
+
     def test_branch_handoff_is_a_standalone_agent_skill(self) -> None:
         skill_md = (SKILL / "SKILL.md").read_text(encoding="utf-8")
         self.assertTrue(skill_md.startswith("---\nname: branch-handoff\n"))
@@ -295,6 +344,35 @@ class RepositoryLayoutTest(unittest.TestCase):
                 mutation.write_text("", encoding="utf-8")
                 with self.assertRaisesRegex(AssertionError, relative):
                     self.test_public_layout_contains_taf_context_engine_without_exposure()
+
+    def test_public_boundary_rejects_compound_context_production_surfaces(
+        self,
+    ) -> None:
+        relative_mutations = (
+            "skills/contextbridge/SKILL.md",
+            "src/tafcontext/parser.py",
+            "src/contextual_runtime/storage.py",
+        )
+        for relative in relative_mutations:
+            with self.subTest(relative=relative), _isolated_context_layout() as root:
+                mutation = root / relative
+                mutation.parent.mkdir(parents=True)
+                mutation.write_text("", encoding="utf-8")
+                with self.assertRaisesRegex(AssertionError, relative):
+                    self.test_public_layout_contains_taf_context_engine_without_exposure()
+
+    def test_public_boundary_allows_unrelated_production_components(self) -> None:
+        relative_mutations = (
+            "tools/logging/watcher.py",
+            "packages/book-level1/parser.py",
+            "tools/cloud/provider_adapter.py",
+        )
+        for relative in relative_mutations:
+            with self.subTest(relative=relative), _isolated_context_layout() as root:
+                mutation = root / relative
+                mutation.parent.mkdir(parents=True)
+                mutation.write_text("", encoding="utf-8")
+                self.test_public_layout_contains_taf_context_engine_without_exposure()
 
     def test_public_boundary_allows_negative_test_vocabulary_and_fixtures(
         self,

@@ -33,6 +33,8 @@ _PREBOUND_OPEN = builtins.open
 _PREBOUND_POPEN = subprocess.Popen
 _PREBOUND_SOCKET = socket.socket
 _PREBOUND_SOCKET_BIND = socket.socket.bind
+_PREBOUND_STAT = os.stat
+_PREBOUND_PATH_EXISTS = Path.exists
 
 
 FIXTURES = Path(__file__).with_name("conformance") / "context-discovery-routing"
@@ -64,6 +66,23 @@ _FORBIDDEN_AUDIT_PREFIXES = (
     "os.posix_spawn",
     "os.spawn",
     "socket.",
+)
+_FORBIDDEN_FILESYSTEM_METADATA_CALLS = tuple(
+    function
+    for name in (
+        "access",
+        "fpathconf",
+        "fstat",
+        "fstatvfs",
+        "getxattr",
+        "listxattr",
+        "lstat",
+        "pathconf",
+        "readlink",
+        "stat",
+        "statvfs",
+    )
+    if (function := getattr(os, name, None)) is not None
 )
 _forbidden_audit_depth = 0
 _forbidden_audit_hook_installed = False
@@ -202,17 +221,42 @@ def _install_forbidden_audit_hook() -> None:
         _forbidden_audit_hook_installed = True
 
 
+def _forbidden_call_profile(
+    _frame: object, event: str, argument: object
+) -> None:
+    if not _forbidden_audit_depth or event != "c_call":
+        return
+    if any(
+        argument is forbidden
+        for forbidden in _FORBIDDEN_FILESYSTEM_METADATA_CALLS
+    ):
+        name = getattr(argument, "__name__", "metadata")
+        raise AssertionError(
+            "conformance discovery attempted forbidden activity: "
+            f"filesystem.{name}"
+        )
+
+
 class _ForbiddenActivityGuard:
     def __init__(self, patches: "_PatchStack") -> None:
         self._patches = patches
+        self._previous_profile: object = None
+
+    def _profile(self, frame: object, event: str, argument: object) -> None:
+        _forbidden_call_profile(frame, event, argument)
+        if callable(self._previous_profile):
+            self._previous_profile(frame, event, argument)
 
     def __enter__(self) -> "_ForbiddenActivityGuard":
         global _forbidden_audit_depth
         _install_forbidden_audit_hook()
         _forbidden_audit_depth += 1
+        self._previous_profile = sys.getprofile()
+        sys.setprofile(self._profile)
         try:
             self._patches.__enter__()
         except BaseException:
+            sys.setprofile(self._previous_profile)  # type: ignore[arg-type]
             _forbidden_audit_depth -= 1
             raise
         return self
@@ -223,6 +267,7 @@ class _ForbiddenActivityGuard:
             self._patches.__exit__(*exc)
         finally:
             _forbidden_audit_depth -= 1
+            sys.setprofile(self._previous_profile)  # type: ignore[arg-type]
 
 
 class _PatchStack:
@@ -265,6 +310,16 @@ class ForbiddenActivityGuardTests(unittest.TestCase):
                     _PREBOUND_SOCKET_BIND(active_socket, ("127.0.0.1", 0))
         finally:
             active_socket.close()
+
+    def test_guard_blocks_prebound_filesystem_metadata_alias(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "forbidden activity"):
+            with _forbid_active_discovery():
+                _PREBOUND_STAT(os.devnull)
+
+    def test_guard_blocks_prebound_path_existence_alias(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "forbidden activity"):
+            with _forbid_active_discovery():
+                _PREBOUND_PATH_EXISTS(Path(os.devnull))
 
 
 class ContextConformanceTests(unittest.TestCase):
