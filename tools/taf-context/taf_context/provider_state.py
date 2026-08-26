@@ -1,4 +1,10 @@
-"""Safe, bounded persistence for provider metadata and exact consent state."""
+"""Safe, bounded persistence for provider metadata and exact consent state.
+
+State-path resolution is portable. State I/O intentionally fails closed with
+``secure-state-unsupported`` on Windows or any runtime without POSIX dirfd,
+no-follow, atomic rename, directory-fsync, and advisory-lock primitives; the
+Python standard library cannot provide the same race-resistant contract there.
+"""
 
 from __future__ import annotations
 
@@ -6,11 +12,17 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
-import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Mapping
+from typing import Callable, Iterator, Mapping
+
+try:
+    import fcntl
+except ImportError:  # Windows has no stdlib advisory file locking.
+    fcntl = None  # type: ignore[assignment]
 
 from .consent import AuthorizationLedger, ConsentDisposition
 from .models import ContextAction, canonical_json
@@ -80,6 +92,7 @@ def resolve_state_paths(
 
 def read_user_registry(paths: StatePaths) -> tuple[ProviderDescriptor, ...]:
     """Read a strict list of user-registered descriptors, or empty state."""
+    _require_secure_runtime()
     raw = _read_path(paths.providers, _MAX_CONTROL_BYTES, "unsafe-state-file")
     if raw is None:
         return ()
@@ -98,6 +111,7 @@ def read_user_registry(paths: StatePaths) -> tuple[ProviderDescriptor, ...]:
 
 def read_consent(paths: StatePaths) -> AuthorizationLedger:
     """Read strict schema-v2 consent, treating a missing file as empty state."""
+    _require_secure_runtime()
     raw = _read_path(paths.consent, _MAX_CONTROL_BYTES, "unsafe-state-file")
     if raw is None:
         return AuthorizationLedger()
@@ -112,6 +126,7 @@ def read_project_registration(
     repo: Path | str, repository_identity: str
 ) -> ProjectRegistration | None:
     """Read only ``.taf/context/registration.json`` through no-follow dirfds."""
+    _require_secure_runtime()
     directory_fds: list[int] = []
     file_fd: int | None = None
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -159,17 +174,68 @@ def write_consent(
     paths: StatePaths, ledger: AuthorizationLedger, audit_record: Mapping[str, object]
 ) -> None:
     """Install prepared consent first and its prepared audit second."""
+    _require_secure_runtime()
     consent_data = _prepare_consent(ledger)
-    audit_data = _prepare_audit(paths, audit_record)
-    if _path_exists_without_following(paths.consent):
-        read_consent(paths)
-    _atomic_install(paths.consent, consent_data)
-    _atomic_install(paths.audit, audit_data)
+    audit_line = _prepare_audit_line(audit_record)
+    with _locked_state_directory(paths.root) as directory_fd:
+        audit_raw, audit_generation = _read_name_at(
+            directory_fd, paths.audit.name, _MAX_AUDIT_BYTES, "unsafe-state-file"
+        )
+        audit_data = _rotate_audit(audit_raw or b"", audit_line)
+        consent_raw, consent_generation = _read_name_at(
+            directory_fd, paths.consent.name, _MAX_CONTROL_BYTES, "unsafe-state-file"
+        )
+        if consent_raw is not None:
+            _parse_consent(consent_raw)
+        _atomic_install_at(
+            directory_fd,
+            paths.consent.name,
+            consent_data,
+            consent_generation,
+            "consent-state-changed",
+        )
+        _atomic_install_at(
+            directory_fd,
+            paths.audit.name,
+            audit_data,
+            audit_generation,
+            "audit-state-changed",
+        )
 
 
 def append_audit(paths: StatePaths, record: Mapping[str, object]) -> None:
     """Append one metadata-only record through bounded atomic rotation."""
-    _atomic_install(paths.audit, _prepare_audit(paths, record))
+    _require_secure_runtime()
+    audit_line = _prepare_audit_line(record)
+    with _locked_state_directory(paths.root) as directory_fd:
+        previous, generation = _read_name_at(
+            directory_fd, paths.audit.name, _MAX_AUDIT_BYTES, "unsafe-state-file"
+        )
+        data = _rotate_audit(previous or b"", audit_line)
+        _atomic_install_at(
+            directory_fd,
+            paths.audit.name,
+            data,
+            generation,
+            "audit-state-changed",
+        )
+
+
+def _require_secure_runtime() -> None:
+    """Fail closed where stdlib cannot provide the required no-follow primitives."""
+    supported = (
+        os.name == "posix"
+        and fcntl is not None
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and os.stat in os.supports_follow_symlinks
+        and os.rename in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+    )
+    if not supported:
+        raise StateError("secure-state-unsupported")
 
 
 def _prepare_consent(ledger: AuthorizationLedger) -> bytes:
@@ -186,13 +252,16 @@ def _prepare_consent(ledger: AuthorizationLedger) -> bytes:
     return data
 
 
-def _prepare_audit(paths: StatePaths, record: Mapping[str, object]) -> bytes:
+def _prepare_audit_line(record: Mapping[str, object]) -> bytes:
     new_record = _validate_audit_record(record)
     new_line = canonical_json(new_record).encode("utf-8")
     if len(new_line) > _MAX_AUDIT_BYTES:
         raise StateError("audit-too-large")
-    previous = _read_path(paths.audit, _MAX_AUDIT_BYTES, "unsafe-state-file")
-    records = _parse_audit(previous or b"")
+    return new_line
+
+
+def _rotate_audit(previous: bytes, new_line: bytes) -> bytes:
+    records = _parse_audit(previous)
     lines = [canonical_json(item).encode("utf-8") for item in records]
     lines.append(new_line)
     lines = lines[-_MAX_AUDIT_RECORDS:]
@@ -202,6 +271,13 @@ def _prepare_audit(paths: StatePaths, record: Mapping[str, object]) -> bytes:
     if not lines:
         raise StateError("audit-too-large")
     return b"".join(lines)
+
+
+def _parse_consent(raw: bytes) -> AuthorizationLedger:
+    try:
+        return AuthorizationLedger.from_dict(_load_json(raw))
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StateError("consent-corrupt") from exc
 
 
 def _parse_audit(data: bytes) -> list[dict[str, object]]:
@@ -335,12 +411,49 @@ def _read_fd(
     return data
 
 
-def _path_exists_without_following(path: Path) -> bool:
+def _read_name_at(
+    directory_fd: int, name: str, maximum: int, unsafe_code: str
+) -> tuple[bytes | None, tuple[int, ...] | None]:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
     try:
-        os.lstat(path)
+        fd = os.open(name, flags, dir_fd=directory_fd)
     except FileNotFoundError:
-        return False
-    return True
+        return None, None
+    except OSError as exc:
+        raise StateError(unsafe_code) from exc
+    try:
+        raw = _read_fd(
+            fd,
+            maximum,
+            unsafe_code,
+            lambda: os.stat(name, dir_fd=directory_fd, follow_symlinks=False),
+        )
+        return raw, _generation(os.fstat(fd))
+    finally:
+        os.close(fd)
+
+
+def _generation(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _generation_at(directory_fd: int, name: str, changed_code: str) -> tuple[int, ...] | None:
+    try:
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise StateError(changed_code) from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise StateError(changed_code)
+    return _generation(metadata)
 
 
 def _ensure_state_directory(path: Path) -> int:
@@ -372,15 +485,50 @@ def _ensure_state_directory(path: Path) -> int:
         raise StateError("state-write-failed") from exc
 
 
-def _atomic_install(path: Path, data: bytes) -> None:
-    directory_fd: int | None = None
-    temporary_fd: int | None = None
-    temporary_path: str | None = None
+@contextmanager
+def _locked_state_directory(path: Path) -> Iterator[int]:
+    directory_fd = _ensure_state_directory(path)
     try:
-        directory_fd = _ensure_state_directory(path.parent)
-        temporary_fd, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        if os.name == "posix":
-            os.fchmod(temporary_fd, 0o600)
+        assert fcntl is not None
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        yield directory_fd
+    except StateError:
+        raise
+    except OSError as exc:
+        raise StateError("state-write-failed") from exc
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(directory_fd)
+
+
+def _atomic_install_at(
+    directory_fd: int,
+    name: str,
+    data: bytes,
+    expected_generation: tuple[int, ...] | None,
+    changed_code: str,
+) -> None:
+    temporary_fd: int | None = None
+    temporary_name: str | None = None
+    try:
+        for _ in range(128):
+            temporary_name = f".{name}.{secrets.token_hex(8)}"
+            try:
+                temporary_fd = os.open(
+                    temporary_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                break
+            except FileExistsError:
+                continue
+        if temporary_fd is None:
+            raise OSError("cannot allocate unique state temporary file")
+        os.fchmod(temporary_fd, 0o600)
         view = memoryview(data)
         while view:
             written = os.write(temporary_fd, view)
@@ -390,8 +538,15 @@ def _atomic_install(path: Path, data: bytes) -> None:
         os.fsync(temporary_fd)
         os.close(temporary_fd)
         temporary_fd = None
-        os.replace(temporary_path, path)
-        temporary_path = None
+        if _generation_at(directory_fd, name, changed_code) != expected_generation:
+            raise StateError(changed_code)
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
         os.fsync(directory_fd)
     except StateError:
         raise
@@ -400,10 +555,8 @@ def _atomic_install(path: Path, data: bytes) -> None:
     finally:
         if temporary_fd is not None:
             os.close(temporary_fd)
-        if temporary_path is not None:
+        if temporary_name is not None and directory_fd is not None:
             try:
-                os.unlink(temporary_path)
+                os.unlink(temporary_name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
-        if directory_fd is not None:
-            os.close(directory_fd)

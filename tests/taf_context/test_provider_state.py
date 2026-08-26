@@ -7,9 +7,11 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
+import taf_context.provider_state as provider_state
 from taf_context.consent import AuthorizationLedger
 from taf_context.models import ContextAction, canonical_json
 from taf_context.provider_models import ProviderDescriptor
@@ -327,6 +329,60 @@ class AtomicWriteTests(unittest.TestCase):
 
         self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o700)
 
+    @unittest.skipUnless(os.name == "posix", "descriptor-relative POSIX contract")
+    def test_directory_swap_cannot_redirect_temporary_or_destination_writes(self) -> None:
+        self.root.mkdir(parents=True)
+        moved_root = self.root.with_name("validated-state")
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        real_fchmod = os.fchmod
+        swapped = False
+
+        def swap_after_validation(fd: int, mode: int) -> None:
+            nonlocal swapped
+            real_fchmod(fd, mode)
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and not swapped:
+                swapped = True
+                self.root.rename(moved_root)
+                self.root.symlink_to(outside, target_is_directory=True)
+
+        with mock.patch("taf_context.provider_state.os.fchmod", side_effect=swap_after_validation):
+            append_audit(self.paths, _audit())
+
+        self.assertFalse((outside / "audit.jsonl").exists())
+        self.assertEqual(
+            json.loads((moved_root / "audit.jsonl").read_text(encoding="utf-8")),
+            _audit(),
+        )
+
+    @unittest.skipUnless(os.name == "posix", "generation-check POSIX contract")
+    def test_consent_generation_swap_after_validation_is_preserved(self) -> None:
+        self.root.mkdir(parents=True)
+        self.paths.consent.write_text(
+            canonical_json(AuthorizationLedger().to_dict()), encoding="utf-8"
+        )
+        corrupt = b'{"schema_version":"2","records":['
+        real_fsync = os.fsync
+        swapped = False
+
+        def swap_after_temp_fsync(fd: int) -> None:
+            nonlocal swapped
+            real_fsync(fd)
+            if not stat.S_ISDIR(os.fstat(fd).st_mode) and not swapped:
+                swapped = True
+                replacement = self.root / "replacement-consent"
+                replacement.write_bytes(corrupt)
+                os.replace(replacement, self.paths.consent)
+
+        with mock.patch("taf_context.provider_state.os.fsync", side_effect=swap_after_temp_fsync):
+            with self.assertRaises(StateError) as caught:
+                write_consent(self.paths, _ledger(), _audit())
+
+        self.assertEqual(caught.exception.code, "consent-state-changed")
+        self.assertEqual(self.paths.consent.read_bytes(), corrupt)
+        self.assertFalse(self.paths.audit.exists())
+        self.assertEqual(sorted(self.root.iterdir()), [self.paths.consent])
+
     def test_replace_failure_preserves_ready_state_and_cleans_temporary_file(self) -> None:
         self.root.mkdir(parents=True)
         old = canonical_json(AuthorizationLedger().to_dict()).encode("utf-8")
@@ -334,7 +390,7 @@ class AtomicWriteTests(unittest.TestCase):
         real_replace = os.replace
 
         def fail_consent(source: object, destination: object, *args: object, **kwargs: object) -> None:
-            if Path(destination) == self.paths.consent:
+            if Path(destination).name == self.paths.consent.name:
                 raise OSError("injected replace failure")
             real_replace(source, destination, *args, **kwargs)
 
@@ -433,6 +489,64 @@ class AuditTests(unittest.TestCase):
         retained = self._read_lines()
         self.assertEqual(retained, [second])
         self.assertLessEqual(self.paths.audit.stat().st_size, _MAX_AUDIT_BYTES)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX interprocess-lock contract")
+    def test_concurrent_appends_do_not_lose_complete_records(self) -> None:
+        append_audit(self.paths, _audit(0))
+        workers = 24
+        barrier = threading.Barrier(workers)
+        failures: list[BaseException] = []
+
+        def append(index: int) -> None:
+            try:
+                barrier.wait()
+                append_audit(self.paths, _audit(index))
+            except BaseException as exc:  # Preserve worker failures for the main assertion.
+                failures.append(exc)
+
+        threads = [threading.Thread(target=append, args=(index,)) for index in range(1, workers + 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(failures, [])
+        retained = self._read_lines()
+        self.assertEqual(len(retained), workers + 1)
+        self.assertEqual(
+            {item["request_digest"] for item in retained},
+            {_audit(index)["request_digest"] for index in range(workers + 1)},
+        )
+
+
+class UnsupportedPlatformTests(unittest.TestCase):
+    def test_windows_paths_resolve_but_secure_io_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "state"
+            root.mkdir()
+            paths = _paths(root)
+            paths.providers.write_text("[]\n", encoding="utf-8")
+            repo = Path(temporary) / "repo"
+            (repo / ".taf/context").mkdir(parents=True)
+            resolved = resolve_state_paths(
+                {"LOCALAPPDATA": "C:/Users/test/AppData/Local"},
+                "win32",
+                Path("C:/Users/test"),
+            )
+
+            self.assertEqual(resolved.root, Path("C:/Users/test/AppData/Local/TAF/context"))
+            with mock.patch.object(provider_state.os, "name", "nt"):
+                for operation in (
+                    lambda: read_user_registry(paths),
+                    lambda: read_consent(paths),
+                    lambda: read_project_registration(repo, "sha256:repo"),
+                    lambda: append_audit(paths, _audit()),
+                    lambda: write_consent(paths, _ledger(), _audit()),
+                ):
+                    with self.subTest(operation=operation):
+                        with self.assertRaises(StateError) as caught:
+                            operation()
+                        self.assertEqual(caught.exception.code, "secure-state-unsupported")
 
 
 if __name__ == "__main__":
