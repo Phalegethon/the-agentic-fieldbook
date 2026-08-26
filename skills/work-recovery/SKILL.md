@@ -4,7 +4,7 @@ description: Use when a developer asks where interrupted work stopped, what rema
 license: MIT
 metadata:
   author: The Agentic Fieldbook
-  version: "1.0.0"
+  version: "1.0.1"
 ---
 
 # Work Recovery

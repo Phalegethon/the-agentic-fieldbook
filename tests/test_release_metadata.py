@@ -9,12 +9,13 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 SKILL = ROOT / "skills" / "branch-handoff"
 WORK_RECOVERY = ROOT / "skills" / "work-recovery"
-VERSION = "1.2.0"
-MARKETPLACE_VERSION = "1.3.0"
+VERSION = "1.2.1"
+WORK_RECOVERY_VERSION = "1.0.1"
+MARKETPLACE_VERSION = "1.3.1"
 
 
 class ReleaseMetadataTest(unittest.TestCase):
-    def test_skill_and_plugin_versions_match_1_2_0(self) -> None:
+    def test_skill_and_plugin_versions_match_current_release(self) -> None:
         skill_md = (SKILL / "SKILL.md").read_text(encoding="utf-8")
         match = re.search(r'^  version: "([^"]+)"$', skill_md, re.MULTILINE)
         self.assertIsNotNone(match)
@@ -25,7 +26,7 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertEqual(VERSION, match.group(1))
         self.assertEqual(VERSION, plugin["version"])
 
-    def test_marketplace_1_3_0_exposes_both_independent_plugins_in_order(self) -> None:
+    def test_marketplace_exposes_both_independent_plugins_in_order(self) -> None:
         marketplace = json.loads(
             (ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
         )
@@ -41,7 +42,7 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertTrue(all("version" not in plugin for plugin in marketplace["plugins"]))
         self.assertEqual(len({plugin["name"] for plugin in marketplace["plugins"]}), 2)
 
-    def test_work_recovery_skill_and_plugin_versions_match_1_0_0(self) -> None:
+    def test_work_recovery_skill_and_plugin_versions_match_current_release(self) -> None:
         skill_md = (WORK_RECOVERY / "SKILL.md").read_text(encoding="utf-8")
         match = re.search(r'^  version: "([^"]+)"$', skill_md, re.MULTILINE)
         self.assertIsNotNone(match)
@@ -49,10 +50,36 @@ class ReleaseMetadataTest(unittest.TestCase):
             (WORK_RECOVERY / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
         assert match is not None
-        self.assertEqual("1.0.0", match.group(1))
-        self.assertEqual("1.0.0", plugin["version"])
+        self.assertEqual(WORK_RECOVERY_VERSION, match.group(1))
+        self.assertEqual(WORK_RECOVERY_VERSION, plugin["version"])
         self.assertEqual("https://github.com/Phalegethon", plugin["author"]["url"])
         self.assertEqual("MIT", plugin["license"])
+
+    def test_claude_catalog_explains_outcome_and_namespaced_invocation(self) -> None:
+        marketplace = json.loads(
+            (ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
+        )
+        entries = {entry["name"]: entry for entry in marketplace["plugins"]}
+
+        for skill, display_name in (
+            ("branch-handoff", "Branch Handoff"),
+            ("work-recovery", "Work Recovery"),
+        ):
+            plugin = json.loads(
+                (ROOT / "skills" / skill / ".claude-plugin" / "plugin.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            entry = entries[skill]
+            invocation = f"/{skill}:{skill}"
+
+            self.assertEqual(display_name, plugin["displayName"])
+            self.assertEqual(display_name, entry["displayName"])
+            self.assertEqual(plugin["description"], entry["description"])
+            self.assertIn(invocation, plugin["description"])
+            self.assertLessEqual(len(plugin["description"]), 200)
+            self.assertEqual(plugin["homepage"], entry["homepage"])
+            self.assertTrue(plugin["homepage"].endswith(f"#install-{skill}"))
 
     def test_changelog_and_readme_publish_update_paths(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")

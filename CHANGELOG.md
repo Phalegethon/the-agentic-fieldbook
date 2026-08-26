@@ -2,6 +2,17 @@
 
 All notable changes to independently released TAF skills are recorded here.
 
+## [1.3.1] - 2026-08-27
+
+### Changed
+
+- Claude marketplace cards now explain each skill's outcome and show its
+  namespaced invocation command.
+- Plugin display names and documentation links now lead users from compact UI
+  metadata to the matching English install and usage guidance.
+- `branch-handoff` 1.2.1 and `work-recovery` 1.0.1 contain metadata-only
+  discoverability improvements; their runtime behavior is unchanged.
+
 ## [1.3.0] - 2026-08-26
 
 ### Added

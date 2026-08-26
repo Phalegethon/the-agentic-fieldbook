@@ -1,12 +1,13 @@
 {
   "name": "work-recovery",
-  "description": "Recovers interrupted Git work from bounded, read-only evidence.",
-  "version": "1.0.0",
+  "displayName": "Work Recovery",
+  "description": "Recover interrupted Git work from bounded, read-only evidence and identify the single best next step. Run /work-recovery:work-recovery from the affected worktree.",
+  "version": "1.0.1",
   "author": {
     "name": "Gürkan Süerdem",
     "url": "https://github.com/Phalegethon"
   },
-  "homepage": "https://github.com/Phalegethon/the-agentic-fieldbook/tree/main/skills/work-recovery",
+  "homepage": "https://github.com/Phalegethon/the-agentic-fieldbook#install-work-recovery",
   "repository": "https://github.com/Phalegethon/the-agentic-fieldbook",
   "license": "MIT",
   "keywords": [

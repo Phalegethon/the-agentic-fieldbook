@@ -52,7 +52,7 @@ class SkillShapeTests(unittest.TestCase):
     def test_plugin_and_agent_metadata_are_consistent(self) -> None:
         plugin = json.loads((SKILL / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(plugin["name"], "work-recovery")
-        self.assertEqual(plugin["version"], "1.0.0")
+        self.assertEqual(plugin["version"], "1.0.1")
         self.assertEqual(plugin["author"]["name"], "Gürkan Süerdem")
         self.assertEqual(plugin["author"]["url"], "https://github.com/Phalegethon")
         agent = (SKILL / "agents" / "openai.yaml").read_text(encoding="utf-8")
