@@ -56,6 +56,8 @@ class ContextAction(str, Enum):
     INSTALL = "install"
     NETWORK = "network"
     DELETE = "delete"
+    INSPECT = "inspect"
+    QUERY = "query"
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,79 @@ class RepositorySnapshot:
     deletions: int
     dirty_bytes_hashed: int
     warnings: tuple[str, ...]
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "RepositorySnapshot":
+        """Load the exact, portable repository snapshot schema version 1."""
+        if type(value) is not dict or set(value) != set(cls.__dataclass_fields__):
+            raise ManifestError("repository_snapshot")
+        if _string(value, "schema_version") != "1":
+            raise ManifestError("schema_version")
+        strings = {
+            field: _bounded_string(value, field)
+            for field in (
+                "repository_identity", "canonical_root", "canonical_root_fingerprint",
+                "git_dir", "git_common_dir", "git_common_dir_fingerprint",
+                "worktree_identity", "dirty_fingerprint",
+            )
+        }
+        head_sha = _optional_string(value, "head_sha")
+        if head_sha is not None and not _OBJECT_ID.fullmatch(head_sha):
+            raise ManifestError("head_sha")
+        branch = _optional_bounded_string(value, "branch")
+        boolean = value["dirty_fingerprint_complete"]
+        if type(boolean) is not bool:
+            raise ManifestError("dirty_fingerprint_complete")
+        paths = {
+            field: _sorted_relative_strings(value, field)
+            for field in ("tracked_paths", "staged_paths", "unstaged_paths", "untracked_paths",
+                          "candidate_artifacts", "provider_markers")
+        }
+        counts = {
+            field: _bounded_non_negative_integer(value, field)
+            for field in ("ignored_entry_count", "generated_or_vendored_count",
+                          "binary_file_count", "oversized_file_count", "insertions",
+                          "deletions", "dirty_bytes_hashed")
+        }
+        language_counts = _language_counts(value, "language_counts")
+        warnings = _sorted_strings(value, "warnings")
+        return cls(
+            schema_version="1", head_sha=head_sha, branch=branch,
+            dirty_fingerprint_complete=boolean, language_counts=language_counts,
+            warnings=warnings, **strings, **paths, **counts,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the explicit JSON wire shape, without ``asdict`` leakage."""
+        return {
+            "schema_version": self.schema_version,
+            "repository_identity": self.repository_identity,
+            "canonical_root": self.canonical_root,
+            "canonical_root_fingerprint": self.canonical_root_fingerprint,
+            "git_dir": self.git_dir,
+            "git_common_dir": self.git_common_dir,
+            "git_common_dir_fingerprint": self.git_common_dir_fingerprint,
+            "worktree_identity": self.worktree_identity,
+            "head_sha": self.head_sha,
+            "branch": self.branch,
+            "dirty_fingerprint": self.dirty_fingerprint,
+            "dirty_fingerprint_complete": self.dirty_fingerprint_complete,
+            "tracked_paths": list(self.tracked_paths),
+            "staged_paths": list(self.staged_paths),
+            "unstaged_paths": list(self.unstaged_paths),
+            "untracked_paths": list(self.untracked_paths),
+            "ignored_entry_count": self.ignored_entry_count,
+            "generated_or_vendored_count": self.generated_or_vendored_count,
+            "binary_file_count": self.binary_file_count,
+            "oversized_file_count": self.oversized_file_count,
+            "language_counts": dict(self.language_counts),
+            "candidate_artifacts": list(self.candidate_artifacts),
+            "provider_markers": list(self.provider_markers),
+            "insertions": self.insertions,
+            "deletions": self.deletions,
+            "dirty_bytes_hashed": self.dirty_bytes_hashed,
+            "warnings": list(self.warnings),
+        }
 
 
 @dataclass(frozen=True)
@@ -321,3 +396,57 @@ def _non_negative_integer(value: dict[str, object], field: str) -> int:
     if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate < 0:
         raise ManifestError(field)
     return candidate
+
+
+_MAX_PORTABLE_COUNTER = 2**31 - 1
+
+
+def _bounded_string(value: dict[str, object], field: str) -> str:
+    candidate = _string(value, field)
+    if len(candidate) > 256:
+        raise ManifestError(field)
+    return candidate
+
+
+def _optional_bounded_string(value: dict[str, object], field: str) -> str | None:
+    candidate = _optional_string(value, field)
+    if candidate is not None and len(candidate) > 256:
+        raise ManifestError(field)
+    return candidate
+
+
+def _sorted_strings(value: dict[str, object], field: str) -> tuple[str, ...]:
+    items = _strings(value, field)
+    if any(len(item) > 256 for item in items) or tuple(sorted(items)) != items or len(set(items)) != len(items):
+        raise ManifestError(field)
+    return items
+
+
+def _sorted_relative_strings(value: dict[str, object], field: str) -> tuple[str, ...]:
+    items = _sorted_strings(value, field)
+    if any(not _is_repository_relative(item) for item in items):
+        raise ManifestError(field)
+    return items
+
+
+def _bounded_non_negative_integer(value: dict[str, object], field: str) -> int:
+    candidate = _non_negative_integer(value, field)
+    if candidate > _MAX_PORTABLE_COUNTER:
+        raise ManifestError(field)
+    return candidate
+
+
+def _language_counts(value: dict[str, object], field: str) -> tuple[tuple[str, int], ...]:
+    candidate = value[field]
+    if type(candidate) is not dict:
+        raise ManifestError(field)
+    entries: list[tuple[str, int]] = []
+    for language, count in candidate.items():
+        if not isinstance(language, str) or not language or len(language) > 256:
+            raise ManifestError(field)
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= _MAX_PORTABLE_COUNTER:
+            raise ManifestError(field)
+        entries.append((language, count))
+    if entries != sorted(entries):
+        raise ManifestError(field)
+    return tuple(entries)
