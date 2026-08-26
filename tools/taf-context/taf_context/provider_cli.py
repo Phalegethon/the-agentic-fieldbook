@@ -145,9 +145,7 @@ def _route_command(
     consent_state_usable = True
     try:
         consent = read_consent(paths)
-    except StateError as exc:
-        if exc.code != "consent-corrupt":
-            raise
+    except StateError:
         consent = AuthorizationLedger()
         consent_state_usable = False
     decision = route_provider(
@@ -372,6 +370,6 @@ def _rfc3339(value: datetime) -> str:
         raise ProviderCLIError("UTC clock returned an invalid time")
     return (
         value.astimezone(timezone.utc)
-        .isoformat(timespec="seconds")
+        .isoformat(timespec="auto")
         .replace("+00:00", "Z")
     )

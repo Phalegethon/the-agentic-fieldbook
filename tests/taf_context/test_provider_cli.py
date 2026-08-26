@@ -45,6 +45,7 @@ def _invoke(
     *argv: str,
     state_home: Path | None = None,
     stdin: str | None = None,
+    now: datetime = FIXED_NOW,
 ) -> tuple[int, str, str]:
     stdout = StringIO()
     stderr = StringIO()
@@ -60,7 +61,7 @@ def _invoke(
             list(argv),
             stdout=stdout,
             stderr=stderr,
-            utc_clock=lambda: FIXED_NOW,
+            utc_clock=lambda: now,
         )
     return code, stdout.getvalue(), stderr.getvalue()
 
@@ -504,6 +505,97 @@ class ProviderRoutingCommandTests(unittest.TestCase):
             self.assertEqual((state / "consent.json").read_bytes(), corrupt)
             self.assertFalse((state / "audit.jsonl").exists())
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_route_treats_symlinked_consent_as_unusable_without_following(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            discovery = root / "discovery.json"
+            request = root / "request.json"
+            _write_json(discovery, _discovery(_descriptor()))
+            _write_json(request, _broker_request())
+            state = root / "state"
+            state.mkdir()
+            outside = root / "outside-consent.json"
+            outside_bytes = _canonical(
+                {"schema_version": "2", "records": []}
+            ).encode("utf-8")
+            outside.write_bytes(outside_bytes)
+            (state / "consent.json").symlink_to(outside)
+
+            code, stdout, stderr = _invoke(
+                "providers", "route", "--discovery", str(discovery),
+                "--request", str(request), state_home=state,
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            decision = json.loads(stdout)
+            self.assertEqual(decision["status"], "insufficient-context")
+            self.assertEqual(decision["consent_requests"], [])
+            self.assertEqual(decision["next_safe_action"], "repair-consent-store")
+            self.assertIn(
+                "consent-store-corrupt",
+                decision["rejected_alternatives"][0]["reason_codes"],
+            )
+            self.assertTrue((state / "consent.json").is_symlink())
+            self.assertEqual((state / "consent.json").readlink(), outside)
+            self.assertEqual(outside.read_bytes(), outside_bytes)
+
+    def test_route_treats_oversized_consent_as_unusable_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            discovery = root / "discovery.json"
+            request = root / "request.json"
+            _write_json(discovery, _discovery(_descriptor()))
+            _write_json(request, _broker_request())
+            state = root / "state"
+            state.mkdir()
+            oversized = b"{" + b" " * MAX_CONTROL_BYTES
+            (state / "consent.json").write_bytes(oversized)
+
+            code, stdout, stderr = _invoke(
+                "providers", "route", "--discovery", str(discovery),
+                "--request", str(request), state_home=state,
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            decision = json.loads(stdout)
+            self.assertEqual(decision["status"], "insufficient-context")
+            self.assertEqual(decision["consent_requests"], [])
+            self.assertEqual(decision["next_safe_action"], "repair-consent-store")
+            self.assertIn(
+                "consent-store-corrupt",
+                decision["rejected_alternatives"][0]["reason_codes"],
+            )
+            self.assertEqual((state / "consent.json").read_bytes(), oversized)
+
+    def test_route_treats_unsupported_secure_state_as_unusable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            discovery = root / "discovery.json"
+            request = root / "request.json"
+            _write_json(discovery, _discovery(_descriptor()))
+            _write_json(request, _broker_request())
+            state = root / "state"
+
+            with mock.patch(
+                "taf_context.provider_state._POSIX_SECURITY_PRIMITIVES", False
+            ):
+                code, stdout, stderr = _invoke(
+                    "providers", "route", "--discovery", str(discovery),
+                    "--request", str(request), state_home=state,
+                )
+
+            self.assertEqual((code, stderr), (0, ""))
+            decision = json.loads(stdout)
+            self.assertEqual(decision["status"], "insufficient-context")
+            self.assertEqual(decision["consent_requests"], [])
+            self.assertEqual(decision["next_safe_action"], "repair-consent-store")
+            self.assertIn(
+                "consent-store-corrupt",
+                decision["rejected_alternatives"][0]["reason_codes"],
+            )
+            self.assertFalse(state.exists())
+
     def test_route_rejects_duplicate_and_oversize_control_documents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -683,6 +775,60 @@ class ConsentCommandTests(unittest.TestCase):
                 )
             )
             self.assertEqual(_state_files(state), before)
+
+    def test_opposing_same_second_decisions_retain_fractional_ordering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            request_file = root / "consent-request.json"
+            _write_json(request_file, _consent_request(actions=["query"]))
+
+            first = _invoke(
+                "consent", "record", "--request", str(request_file),
+                "--decision", "allow", state_home=state,
+                now=datetime(
+                    2026, 8, 26, 12, 34, 56, 100000, tzinfo=timezone.utc
+                ),
+            )
+            second = _invoke(
+                "consent", "record", "--request", str(request_file),
+                "--decision", "deny", state_home=state,
+                now=datetime(
+                    2026, 8, 26, 12, 34, 56, 900000, tzinfo=timezone.utc
+                ),
+            )
+
+            self.assertEqual((first[0], first[2]), (0, ""))
+            self.assertEqual((second[0], second[2]), (0, ""))
+            records = json.loads(second[1])["records"]
+            self.assertEqual(
+                [
+                    (record["decided_at"], record["disposition"])
+                    for record in records
+                ],
+                [
+                    ("2026-08-26T12:34:56.100000Z", "allow"),
+                    ("2026-08-26T12:34:56.900000Z", "deny"),
+                ],
+            )
+
+            discovery = root / "discovery.json"
+            broker_request = root / "broker-request.json"
+            _write_json(discovery, _discovery(_descriptor()))
+            _write_json(broker_request, _broker_request())
+            code, stdout, stderr = _invoke(
+                "providers", "route", "--discovery", str(discovery),
+                "--request", str(broker_request), state_home=state,
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            decision = json.loads(stdout)
+            self.assertEqual(decision["status"], "insufficient-context")
+            self.assertEqual(decision["consent_requests"], [])
+            self.assertIn(
+                "consent-query-denied",
+                decision["rejected_alternatives"][0]["reason_codes"],
+            )
 
     def test_list_filters_canonical_records_and_does_not_mutate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
