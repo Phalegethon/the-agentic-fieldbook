@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -28,6 +29,12 @@ from taf_context.provider_models import (
 from taf_context.routing import route_provider
 
 
+_PREBOUND_OPEN = builtins.open
+_PREBOUND_POPEN = subprocess.Popen
+_PREBOUND_SOCKET = socket.socket
+_PREBOUND_SOCKET_BIND = socket.socket.bind
+
+
 FIXTURES = Path(__file__).with_name("conformance") / "context-discovery-routing"
 SCHEMA = "taf-context-conformance/1"
 FIXTURE_FIELDS = {
@@ -43,6 +50,23 @@ FIXTURE_FIELDS = {
     "expected_decision",
 }
 CONSENT_FIELDS = {"ledger", "state_usable", "utc_now"}
+_FORBIDDEN_AUDIT_EVENTS = {
+    "open",
+    "os.listdir",
+    "os.scandir",
+    "os.system",
+    "subprocess.Popen",
+    "urllib.Request",
+}
+_FORBIDDEN_AUDIT_PREFIXES = (
+    "os.exec",
+    "os.fork",
+    "os.posix_spawn",
+    "os.spawn",
+    "socket.",
+)
+_forbidden_audit_depth = 0
+_forbidden_audit_hook_installed = False
 
 
 class DuplicateKeyError(ValueError):
@@ -139,23 +163,66 @@ def _execute(
 
 def _forbid_active_discovery() -> object:
     forbidden = AssertionError("conformance discovery attempted forbidden activity")
-    return _PatchStack(
-        patch.object(subprocess, "Popen", side_effect=forbidden),
-        patch.object(subprocess, "run", side_effect=forbidden),
-        patch.object(socket, "socket", side_effect=forbidden),
-        patch.object(os, "listdir", side_effect=forbidden),
-        patch.object(os, "open", side_effect=forbidden),
-        patch.object(os, "scandir", side_effect=forbidden),
-        patch.object(os, "system", side_effect=forbidden),
-        patch.object(Path, "glob", side_effect=forbidden),
-        patch.object(Path, "iterdir", side_effect=forbidden),
-        patch.object(Path, "open", side_effect=forbidden),
-        patch.object(Path, "rglob", side_effect=forbidden),
-        patch.object(Path, "read_text", side_effect=forbidden),
-        patch.object(Path, "read_bytes", side_effect=forbidden),
-        patch.object(builtins, "open", side_effect=forbidden),
-        patch.object(io, "open", side_effect=forbidden),
+    return _ForbiddenActivityGuard(
+        _PatchStack(
+            patch.object(subprocess, "Popen", side_effect=forbidden),
+            patch.object(subprocess, "run", side_effect=forbidden),
+            patch.object(socket, "socket", side_effect=forbidden),
+            patch.object(os, "listdir", side_effect=forbidden),
+            patch.object(os, "open", side_effect=forbidden),
+            patch.object(os, "scandir", side_effect=forbidden),
+            patch.object(os, "system", side_effect=forbidden),
+            patch.object(Path, "glob", side_effect=forbidden),
+            patch.object(Path, "iterdir", side_effect=forbidden),
+            patch.object(Path, "open", side_effect=forbidden),
+            patch.object(Path, "rglob", side_effect=forbidden),
+            patch.object(Path, "read_text", side_effect=forbidden),
+            patch.object(Path, "read_bytes", side_effect=forbidden),
+            patch.object(builtins, "open", side_effect=forbidden),
+            patch.object(io, "open", side_effect=forbidden),
+        )
     )
+
+
+def _forbidden_audit_hook(event: str, _arguments: tuple[object, ...]) -> None:
+    if not _forbidden_audit_depth:
+        return
+    if event in _FORBIDDEN_AUDIT_EVENTS or event.startswith(
+        _FORBIDDEN_AUDIT_PREFIXES
+    ):
+        raise AssertionError(
+            f"conformance discovery attempted forbidden activity: {event}"
+        )
+
+
+def _install_forbidden_audit_hook() -> None:
+    global _forbidden_audit_hook_installed
+    if not _forbidden_audit_hook_installed:
+        sys.addaudithook(_forbidden_audit_hook)
+        _forbidden_audit_hook_installed = True
+
+
+class _ForbiddenActivityGuard:
+    def __init__(self, patches: "_PatchStack") -> None:
+        self._patches = patches
+
+    def __enter__(self) -> "_ForbiddenActivityGuard":
+        global _forbidden_audit_depth
+        _install_forbidden_audit_hook()
+        _forbidden_audit_depth += 1
+        try:
+            self._patches.__enter__()
+        except BaseException:
+            _forbidden_audit_depth -= 1
+            raise
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        global _forbidden_audit_depth
+        try:
+            self._patches.__exit__(*exc)
+        finally:
+            _forbidden_audit_depth -= 1
 
 
 class _PatchStack:
@@ -170,6 +237,34 @@ class _PatchStack:
     def __exit__(self, *exc: object) -> None:
         for patcher in reversed(self._patchers):
             patcher.stop()  # type: ignore[attr-defined]
+
+
+class ForbiddenActivityGuardTests(unittest.TestCase):
+    def test_guard_blocks_prebound_file_alias(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "forbidden activity"):
+            with _forbid_active_discovery(), _PREBOUND_OPEN(os.devnull, "rb"):
+                pass
+
+    def test_guard_blocks_prebound_process_alias(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "forbidden activity"):
+            with _forbid_active_discovery():
+                process = _PREBOUND_POPEN([sys.executable, "-c", "pass"])
+                process.wait(timeout=5)
+
+    def test_guard_blocks_prebound_socket_alias(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "forbidden activity"):
+            with _forbid_active_discovery():
+                active_socket = _PREBOUND_SOCKET()
+                active_socket.close()
+
+    def test_guard_blocks_prebound_network_alias(self) -> None:
+        active_socket = _PREBOUND_SOCKET()
+        try:
+            with self.assertRaisesRegex(AssertionError, "forbidden activity"):
+                with _forbid_active_discovery():
+                    _PREBOUND_SOCKET_BIND(active_socket, ("127.0.0.1", 0))
+        finally:
+            active_socket.close()
 
 
 class ContextConformanceTests(unittest.TestCase):

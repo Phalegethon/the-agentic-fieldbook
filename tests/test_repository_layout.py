@@ -1,12 +1,79 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).parents[1]
 SKILL = ROOT / "skills" / "branch-handoff"
+EXPECTED_TAF_CONTEXT_FILES = {
+    "__init__.py",
+    "__main__.py",
+    "cli.py",
+    "consent.py",
+    "discovery.py",
+    "dossier.py",
+    "freshness.py",
+    "git_snapshot.py",
+    "models.py",
+    "provider_cli.py",
+    "provider_models.py",
+    "provider_state.py",
+    "routing.py",
+}
+
+
+@contextmanager
+def _isolated_context_layout() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        package = root / "tools" / "taf-context" / "taf_context"
+        package.mkdir(parents=True)
+        for filename in EXPECTED_TAF_CONTEXT_FILES:
+            (package / filename).write_text("", encoding="utf-8")
+        marketplace = root / ".claude-plugin" / "marketplace.json"
+        marketplace.parent.mkdir()
+        marketplace.write_text('{"plugins":[]}', encoding="utf-8")
+        with patch(f"{__name__}.ROOT", root):
+            yield root
+
+
+def _is_forbidden_context_production_surface(relative: Path) -> bool:
+    normalized_parts = tuple(
+        part.lower().replace("-", "_").replace(".", "_")
+        for part in relative.parts
+    )
+    tokens = {
+        token
+        for part in normalized_parts
+        for token in part.split("_")
+        if token
+    }
+    if relative.parts[0] == "tests" or {"conformance", "fixtures"} & tokens:
+        return False
+
+    normalized_path = "/".join(normalized_parts)
+    has_context = "context" in tokens
+    has_provider_adapter = bool(
+        {"provider", "providers"} & tokens and {"adapter", "adapters"} & tokens
+    )
+    has_watcher = bool({"watcher", "watchers"} & tokens)
+    has_level_one = "level1" in normalized_path or "level_1" in normalized_path
+    has_parser_or_storage = bool(
+        {"parser", "parsers", "storage", "store", "stores"} & tokens
+    )
+    return bool(
+        (relative.name.lower() == "skill.md" and has_context)
+        or has_provider_adapter
+        or has_watcher
+        or has_level_one
+        or (has_context and has_parser_or_storage)
+    )
 
 
 class RepositoryLayoutTest(unittest.TestCase):
@@ -78,25 +145,12 @@ class RepositoryLayoutTest(unittest.TestCase):
 
     def test_public_layout_contains_taf_context_engine_without_exposure(self) -> None:
         package = ROOT / "tools" / "taf-context" / "taf_context"
-        expected_package_files = {
-            "__init__.py",
-            "__main__.py",
-            "cli.py",
-            "consent.py",
-            "discovery.py",
-            "dossier.py",
-            "freshness.py",
-            "git_snapshot.py",
-            "models.py",
-            "provider_cli.py",
-            "provider_models.py",
-            "provider_state.py",
-            "routing.py",
+        actual_package_entries = {
+            path.relative_to(package).as_posix()
+            for path in package.rglob("*")
+            if "__pycache__" not in path.relative_to(package).parts
         }
-        actual_package_files = {
-            path.name for path in package.iterdir() if path.is_file()
-        }
-        self.assertEqual(expected_package_files, actual_package_files)
+        self.assertEqual(EXPECTED_TAF_CONTEXT_FILES, actual_package_entries)
 
         self.assertFalse((ROOT / "tools" / "taf-context" / "SKILL.md").exists())
 
@@ -157,10 +211,24 @@ class RepositoryLayoutTest(unittest.TestCase):
             "tests/taf_context/private",
         )
         public_paths = tuple(
-            path.relative_to(ROOT).as_posix()
-            for path in ROOT.rglob("*")
-            if ".git" not in path.relative_to(ROOT).parts
+            sorted(
+                path.relative_to(ROOT).as_posix()
+                for path in ROOT.rglob("*")
+                if ".git" not in path.relative_to(ROOT).parts
+            )
         )
+        public_files = tuple(
+            sorted(
+                path.relative_to(ROOT)
+                for path in ROOT.rglob("*")
+                if path.is_file() and ".git" not in path.relative_to(ROOT).parts
+            )
+        )
+        for relative in public_files:
+            self.assertFalse(
+                _is_forbidden_context_production_surface(relative),
+                relative.as_posix(),
+            )
         self.assertFalse(
             any(path.startswith(private_prefixes) for path in public_paths)
         )
@@ -195,6 +263,58 @@ class RepositoryLayoutTest(unittest.TestCase):
                 for path in public_paths
             )
         )
+
+    def test_public_boundary_rejects_nested_production_subpackage(self) -> None:
+        with _isolated_context_layout() as root:
+            mutation = (
+                root
+                / "tools"
+                / "taf-context"
+                / "taf_context"
+                / "neutral"
+                / "helpers.py"
+            )
+            mutation.parent.mkdir()
+            mutation.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "neutral/helpers.py"):
+                self.test_public_layout_contains_taf_context_engine_without_exposure()
+
+    def test_public_boundary_rejects_alternate_context_production_surfaces(
+        self,
+    ) -> None:
+        relative_mutations = (
+            "skills/context-bridge/SKILL.md",
+            "tools/context-bridge/provider_adapter.py",
+            "src/context_runtime/watcher.py",
+            "packages/context-level1/parser.py",
+        )
+        for relative in relative_mutations:
+            with self.subTest(relative=relative), _isolated_context_layout() as root:
+                mutation = root / relative
+                mutation.parent.mkdir(parents=True)
+                mutation.write_text("", encoding="utf-8")
+                with self.assertRaisesRegex(AssertionError, relative):
+                    self.test_public_layout_contains_taf_context_engine_without_exposure()
+
+    def test_public_boundary_allows_negative_test_vocabulary_and_fixtures(
+        self,
+    ) -> None:
+        with _isolated_context_layout() as root:
+            negative_test = root / "tests" / "taf_context" / "test_provider_adapter.py"
+            negative_test.parent.mkdir(parents=True)
+            negative_test.write_text("watcher level1 storage", encoding="utf-8")
+            fixture = (
+                root
+                / "tests"
+                / "taf_context"
+                / "fixtures"
+                / "context-watcher"
+                / "level1"
+                / "parser.json"
+            )
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text('{"provider_adapter":true}', encoding="utf-8")
+            self.test_public_layout_contains_taf_context_engine_without_exposure()
 
 
 if __name__ == "__main__":
