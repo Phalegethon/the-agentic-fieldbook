@@ -179,7 +179,24 @@ class RecoveryStateTests(unittest.TestCase):
         self.assertEqual(dossier.candidates[0].branch, "other")
         self.assertEqual(dossier.candidates[0].staged_count, 0)
         self.assertEqual(dossier.candidates[0].unstaged_count, 0)
+        self.assertIs(dossier.candidates[0].state, WorkState.UNKNOWN)
         self.assertIn("metadata-only", dossier.candidates[0].reason_codes)
+        self.assertIn("dirty-state-unobserved", dossier.candidates[0].reason_codes)
+
+    def test_untracked_only_work_recommends_exact_content_authorization(self) -> None:
+        repo, _ = self._feature_repo()
+        write(repo / "new-module.py", "unfinished\n")
+
+        dossier = collect_recovery(RecoveryRequest(repo=repo, base="main")).dossier
+
+        self.assertIs(dossier.current.state, WorkState.ACTIVE_DIRTY)
+        self.assertEqual(dossier.current.staged_count, 0)
+        self.assertEqual(dossier.current.unstaged_count, 0)
+        self.assertEqual(dossier.current.untracked_count, 1)
+        self.assertEqual(
+            dossier.next_action_hint,
+            "Review the untracked path metadata and authorize only the exact content needed.",
+        )
 
 
 class RecoveryEvidenceTests(unittest.TestCase):

@@ -433,6 +433,20 @@ def classify_recovery_state(
     reasons: set[str] = set()
     if metadata_only:
         reasons.add("metadata-only")
+        reasons.add("dirty-state-unobserved")
+        if not base_known or not head_known:
+            reasons.add("base-or-head-unresolved")
+        elif ahead_count and behind_count:
+            reasons.add("ahead-and-behind")
+        elif head_reachable_from_base and not head_matches_base:
+            reasons.add("reachable-behind-base")
+        elif head_reachable_from_base:
+            reasons.add("head-reachable-from-base")
+        elif ahead_count and ahead_count > 0:
+            reasons.add("unique-commits")
+        else:
+            reasons.add("relation-unknown")
+        return WorkState.UNKNOWN, tuple(sorted(reasons))
     if staged_count or unstaged_count:
         reasons.add("dirty-tracked")
     if untracked_count:
@@ -445,9 +459,6 @@ def classify_recovery_state(
     elif ahead_count and behind_count:
         state = WorkState.DIVERGED
         reasons.add("ahead-and-behind")
-    elif head_reachable_from_base and not head_matches_base and metadata_only:
-        state = WorkState.SUPERSEDED_STALE
-        reasons.add("reachable-behind-base")
     elif head_reachable_from_base:
         state = WorkState.INTEGRATED
         reasons.add("head-reachable-from-base")
@@ -509,6 +520,8 @@ def _candidate_worktrees(repo: Path, current_identity: str, base: str | None) ->
 
 def _next_action(state: WorkstreamState) -> str:
     if state.state is WorkState.ACTIVE_DIRTY:
+        if not state.staged_count and not state.unstaged_count and state.untracked_count:
+            return "Review the untracked path metadata and authorize only the exact content needed."
         return "Review the current tracked changes before continuing implementation."
     if state.state is WorkState.ACTIVE_COMMITTED:
         return "Review the unique commits before continuing implementation."
