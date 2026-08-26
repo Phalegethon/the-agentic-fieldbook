@@ -1,187 +1,150 @@
 # The Agentic Fieldbook
 
-**TAF** is a collection of small, independently installable Agent Skills for
-real software-delivery work. Skills follow the open
-[Agent Skills specification](https://agentskills.io/specification) and keep
-deterministic work in scripts so agents spend their context on decisions and
-communication.
+**The Agentic Fieldbook (TAF)** is one plugin containing focused Agent Skills
+for real software-delivery work. Install TAF once; use its skills independently.
+Each skill follows the open
+[Agent Skills specification](https://agentskills.io/specification), keeps
+deterministic work in scripts, and loads its full instructions only when it is
+relevant.
 
 Created and maintained by
 [Gürkan Süerdem (@Phalegethon)](https://github.com/Phalegethon).
 
 ## Available skills
 
-| Skill | Status | Purpose |
-|---|---|---|
-| [`branch-handoff`](skills/branch-handoff) | Stable | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`work-recovery`](skills/work-recovery) | Stable | Recover interrupted work and the single best next step from bounded, read-only Git evidence. |
+| Skill | Version | Purpose |
+|---|---:|---|
+| [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
+| [`work-recovery`](skills/work-recovery) | 1.0.1 | Recover interrupted work and the single best next step from bounded, read-only Git evidence. |
+
+Claude Code exposes these as `/taf:branch-handoff` and
+`/taf:work-recovery`. Codex uses the corresponding plugin-qualified TAF
+skills and can select them automatically for relevant requests.
 
 Planned names such as `pr-summary`, `release-risk`, `incident-brief`, and
-`dependency-audit` are roadmap items, not installable packages yet.
+`dependency-audit` are roadmap items, not shipped skills.
 
-## Install `branch-handoff`
+## Install TAF
 
-### Quick install by agent
+### Claude Code
 
-Run one command from the project that should use the skill. These commands use
-the current `skills` CLI and avoid package, agent, scope, confirmation, and
-optional `find-skills` prompts. The flow is verified with CLI version `1.5.23`
-and later.
+Add the TAF marketplace, install the single plugin, and reload:
 
-#### Claude Code
-
-```bash
-npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
-  --skill branch-handoff \
-  --agent claude-code \
-  --yes
+```text
+/plugin marketplace add Phalegethon/the-agentic-fieldbook
+/plugin install taf@the-agentic-fieldbook
+/reload-plugins
 ```
 
-Expected project path: `.claude/skills/branch-handoff`.
+Open the plugin details to see both contained skills. Installing TAF makes the
+collection discoverable; Claude reads a full `SKILL.md` only when that skill
+is invoked or selected.
 
-#### Codex
+### Codex
+
+Add this Git repository as a marketplace and install the single TAF plugin:
 
 ```bash
-npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
-  --skill branch-handoff \
-  --agent codex \
-  --yes
+codex plugin marketplace add Phalegethon/the-agentic-fieldbook
+codex plugin add taf@the-agentic-fieldbook
 ```
 
-Expected project path: `.agents/skills/branch-handoff`.
+In the Codex app, the same plugin can then present
+`taf:branch-handoff` and `taf:work-recovery` beneath TAF. The repository
+contains a native `.codex-plugin/plugin.json`; no copied aggregate skill
+bundle is created.
 
-#### Antigravity
+### Other Agent Skills hosts
+
+For a host supported by the `skills` CLI, install the complete TAF collection
+for that agent:
 
 ```bash
-# Antigravity
 npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
-  --skill branch-handoff \
+  --skill '*' \
   --agent antigravity \
   --yes
-
-# Antigravity CLI
-npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
-  --skill branch-handoff \
-  --agent antigravity-cli \
-  --yes
 ```
 
-Expected project path: `.agents/skills/branch-handoff`.
+Replace `antigravity` with the intended supported agent. Add `--global`
+only for an intentional user-wide installation. This compatibility path may
+materialize separate skill directories because the host has no plugin
+container, but it installs the same TAF collection from the same canonical
+`skills/` sources.
 
-To install for more than one agent, repeat `--agent`. The installer keeps one
-canonical copy when possible and links agent-specific paths to it:
+## Migrate to TAF 2.0
+
+TAF 2.0 replaces the former `branch-handoff` and `work-recovery` Claude
+plugins with one `taf` plugin. Run this clean migration in order:
+
+```text
+/plugin uninstall branch-handoff@the-agentic-fieldbook
+/plugin uninstall work-recovery@the-agentic-fieldbook
+/plugin marketplace update the-agentic-fieldbook
+/plugin install taf@the-agentic-fieldbook
+/reload-plugins
+```
+
+The old namespaces are intentionally not retained. After reloading, verify that
+`/taf:branch-handoff` and `/taf:work-recovery` appear under the TAF plugin.
+Historical Git tags remain available if an installation must be recovered, but
+TAF 2.x is the supported product line.
+
+## Update TAF
+
+Claude Code users can refresh the marketplace and update the unified plugin:
+
+```text
+/plugin marketplace update the-agentic-fieldbook
+/plugin update taf@the-agentic-fieldbook
+/reload-plugins
+```
+
+To opt into Claude marketplace auto-update, open `/plugin`, choose
+`Marketplaces`, select `the-agentic-fieldbook`, and enable auto-update. TAF
+never enables silent updates or performs a network update check while a skill
+runs.
+
+Codex users can refresh the Git marketplace and reinstall the selected product:
 
 ```bash
-npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
-  --skill branch-handoff \
-  --agent claude-code \
-  --agent codex \
-  --yes
+codex plugin marketplace upgrade the-agentic-fieldbook
+codex plugin add taf@the-agentic-fieldbook
 ```
 
-The first `--yes` belongs to `npx`; the final `--yes` belongs to the `skills`
-installer. These examples install into the current project. Add `--global`
-only when you intentionally want the skill available across projects.
-
-Project installation creates or updates `skills-lock.json`. Verify the result
-and selected agent paths with:
+Agent Skills compatibility installations should rerun the matching
+`skills@latest add` command with the same agent and scope, then verify active
+paths with:
 
 ```bash
 npx --yes skills@latest list --json
 ```
 
-### Interactive installation
-
-Use the interactive form when you deliberately want to choose agents and
-scope from menus:
-
-```bash
-npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
-  --skill branch-handoff
-```
-
-Before confirming, check that the selected-agent summary contains only the
-agents you intended. The optional `find-skills` offer is provided by the
-installer and is not part of TAF or required by `branch-handoff`.
-
-### Alternative installation paths
-
-Codex can install the skill directly from its GitHub path:
-
-```text
-Install branch-handoff from
-https://github.com/Phalegethon/the-agentic-fieldbook/tree/main/skills/branch-handoff
-```
-
-The Codex user-level destination is `$CODEX_HOME/skills/branch-handoff`,
-normally `~/.codex/skills/branch-handoff`.
-
-Claude Code users may alternatively use the TAF marketplace:
-
-```text
-/plugin marketplace add Phalegethon/the-agentic-fieldbook
-/plugin install branch-handoff@the-agentic-fieldbook
-/reload-plugins
-```
-
-The marketplace command is `/branch-handoff:branch-handoff`. For a manual
-project installation, copy `skills/branch-handoff` into the agent's supported
-project skill directory.
-
-## Update `branch-handoff`
-
-Copied and project-installed skills cannot receive a universal push
-notification from this repository. Re-run the matching agent-specific install command
-from the installation section so the selected runtime copy is overwritten.
-For example, Claude Code project and global updates are:
-
-```bash
-# Claude Code project installation
-npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
-  --skill branch-handoff \
-  --agent claude-code \
-  --yes
-
-# Claude Code global installation
-npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
-  --skill branch-handoff \
-  --agent claude-code \
-  --global \
-  --yes
-```
-
-Codex and Antigravity users should rerun their matching command above with the
-same `--agent` and scope. For agent-targeted installations, do not substitute
-the generic `skills update` command: a TAF release smoke test found that it can
-refresh the canonical `.agents/skills` copy while leaving a runtime-specific
-copy stale. Verify the active path and source afterward with
-`npx --yes skills@latest list --json`.
-
-Subscribe to this repository's GitHub Releases to be notified when a new TAF
-skill version is published.
-
-Claude marketplace users can update manually with
-`/plugin update branch-handoff@the-agentic-fieldbook`, then run
-`/reload-plugins` when prompted. To opt into auto-update, open `/plugin`, choose
-`Marketplaces`, select `the-agentic-fieldbook`, and enable auto-update. TAF
-never enables silent updates or performs a network update check when the skill
-runs.
+Subscribe to this repository's GitHub Releases for TAF product updates. Product
+releases list every bundled skill version.
 
 ## Use branch-handoff
 
-From a Git repository, ask the agent:
+From a Git repository, ask:
+
+```text
+Use /taf:branch-handoff to compare this branch with main and prepare the DEV and QA handoff.
+```
+
+Natural-language invocation also works when the host supports automatic skill
+selection:
 
 ```text
 Compare this branch with main and prepare the DEV and QA handoff.
 ```
 
-When the request supplies neither a platform target nor `local only`, the skill
-asks one combined structured question for optional Jira and GitHub context
-before repository or diff analysis. Choose Jira, GitHub, both, or local-only;
-the skill then requests only the selected exact targets and permissions.
+When the request supplies neither a platform target nor `local only`, the
+skill asks one combined structured question for optional Jira and GitHub
+context before repository or diff analysis. Choose Jira, GitHub, both, or
+local-only; the skill then requests only the selected exact targets and
+permissions.
 
-To include Jira intent and acceptance criteria, supply the exact issue. The
-skill asks for bounded Jira consent before repository or diff analysis:
+To include Jira intent and acceptance criteria, supply the exact issue:
 
 ```text
 Use branch-handoff to compare the current branch with origin/main and prepare the DEV and QA handoff. jira FE-2669
@@ -199,78 +162,19 @@ Defaults and boundaries:
 Runtime requirements are Git and Python 3. There are no Python package
 dependencies.
 
-## Install `work-recovery`
-
-Run the command for the agent that should use the skill. Each command installs
-only `work-recovery` into the current project.
-
-### Claude Code
-
-```bash
-npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
-  --skill work-recovery \
-  --agent claude-code \
-  --yes
-```
-
-### Codex
-
-```bash
-npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
-  --skill work-recovery \
-  --agent codex \
-  --yes
-```
-
-### Antigravity and Antigravity CLI
-
-```bash
-npx --yes skills@latest add Phalegethon/the-agentic-fieldbook \
-  --skill work-recovery \
-  --agent antigravity \
-  --agent antigravity-cli \
-  --yes
-```
-
-Add `--global` only for an intentional user-wide installation. Codex may also
-install directly from:
-
-```text
-https://github.com/Phalegethon/the-agentic-fieldbook/tree/main/skills/work-recovery
-```
-
-Claude marketplace users can run
-`/plugin install work-recovery@the-agentic-fieldbook` and then
-`/reload-plugins`.
-
-Runtime requirements are Git and Python 3. The bundled collector uses only the
-Python standard library.
-
-## Update `work-recovery`
-
-Re-run the matching install command above with the same `--agent` and scope.
-Claude marketplace users can run
-`/plugin update work-recovery@the-agentic-fieldbook` followed by
-`/reload-plugins` when prompted. Verify the active copy with:
-
-```bash
-npx --yes skills@latest list --json
-```
-
 ## Use work-recovery
 
 From the interrupted Git worktree, ask:
 
 ```text
-Use work-recovery to tell me where this work stopped and the single best next step. Do not run tests or change repository state.
+Use /taf:work-recovery to tell me where this work stopped and the single best next step. Do not run tests or change repository state.
 ```
 
 The normal report ends with a reminder rather than a generated handoff. To move
 the same evidence into another session, ask separately:
 
 ```text
-Now turn that recovery dossier into a compact continuation prompt for another
-session.
+Now turn that recovery dossier into a compact continuation prompt for another session.
 ```
 
 Default boundaries:
@@ -286,39 +190,57 @@ Default boundaries:
 - Writes no recovery artifact and reports exact evidence omissions within the
   selected context budget.
 
+Runtime requirements are Git and Python 3. The bundled collector uses only the
+Python standard library.
+
+## Versioning and releases
+
+TAF and its skills have separate versions:
+
+- TAF `2.0.0` versions the collection, manifests, namespaces, and release.
+- `branch-handoff` `1.2.1` versions its behavior contract.
+- `work-recovery` `1.0.1` versions its behavior contract.
+
+New primary GitHub releases use the TAF product version, beginning with
+`v2.0.0`. Historical per-skill releases remain as legacy records.
+
 ## Repository structure
 
 ```text
 the-agentic-fieldbook/
-├── .claude-plugin/marketplace.json
+├── .agents/plugins/marketplace.json
+├── .claude-plugin/
+│   ├── marketplace.json
+│   └── plugin.json
+├── .codex-plugin/plugin.json
 ├── skills/
 │   ├── branch-handoff/
 │   │   ├── SKILL.md
-│   │   ├── .claude-plugin/plugin.json
 │   │   ├── agents/openai.yaml
 │   │   ├── references/
 │   │   └── scripts/collect_diff.py
 │   └── work-recovery/
 │       ├── SKILL.md
-│       ├── .claude-plugin/plugin.json
 │       ├── agents/openai.yaml
 │       ├── references/
 │       └── scripts/
 └── tests/
 ```
 
+Both plugin manifests use the same canonical `skills/` directory. Full skill
+instructions are not combined into one prompt.
+
 ## Verification
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py' -v
-python3 tests/preparing_branch_handoff/benchmark_collector.py
-```
-
-Claude Code users can additionally validate the local marketplace:
-
-```bash
+scripts/vendor-work-recovery-runtime --check
 claude plugin validate .
 ```
+
+Codex packaging can be tested without changing a normal Codex installation by
+using a temporary `CODEX_HOME`, adding the repository marketplace, and
+installing `taf@the-agentic-fieldbook`.
 
 ## Contributing
 

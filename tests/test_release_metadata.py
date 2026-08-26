@@ -93,38 +93,65 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertIn("/taf:work-recovery", entry["description"])
         self.assertLessEqual(len(entry["description"]), 200)
 
-    def test_changelog_and_readme_publish_update_paths(self) -> None:
+    def test_readme_publishes_one_taf_install_migration_and_update_path(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("## [1.2.0] - 2026-08-24", changelog)
-        self.assertIn("optional Jira and GitHub context", readme)
-        self.assertIn(
-            "Re-run the matching agent-specific install command",
-            readme,
-        )
-        update_section = readme.split("## Update `branch-handoff`", 1)[1]
-        self.assertIn("--agent claude-code", update_section)
-        self.assertIn("--global", update_section)
-        self.assertNotIn("skills@latest update branch-handoff", readme)
-        self.assertIn("auto-update", readme.lower())
-        self.assertIn("GitHub Release", readme)
+        self.assertIn("## [2.0.0] - 2026-08-27", changelog)
+        for required in (
+            "Install TAF once",
+            "## Install TAF",
+            "/plugin install taf@the-agentic-fieldbook",
+            "codex plugin add taf@the-agentic-fieldbook",
+            "/taf:branch-handoff",
+            "/taf:work-recovery",
+            "## Migrate to TAF 2.0",
+            "## Update TAF",
+            "/plugin update taf@the-agentic-fieldbook",
+        ):
+            self.assertIn(required, readme)
+        for legacy in (
+            "/plugin install branch-handoff@the-agentic-fieldbook",
+            "/plugin install work-recovery@the-agentic-fieldbook",
+            "/branch-handoff:branch-handoff",
+            "/work-recovery:work-recovery",
+        ):
+            self.assertNotIn(legacy, readme)
 
-    def test_readme_publishes_work_recovery_install_update_use_and_boundaries(self) -> None:
-        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        migration = readme.split("## Migrate to TAF 2.0", 1)[1].split(
+            "## Update TAF", 1
+        )[0]
+        uninstall_branch = migration.index(
+            "/plugin uninstall branch-handoff@the-agentic-fieldbook"
+        )
+        uninstall_recovery = migration.index(
+            "/plugin uninstall work-recovery@the-agentic-fieldbook"
+        )
+        marketplace_update = migration.index(
+            "/plugin marketplace update the-agentic-fieldbook"
+        )
+        install_taf = migration.index("/plugin install taf@the-agentic-fieldbook")
+        self.assertLess(uninstall_branch, uninstall_recovery)
+        self.assertLess(uninstall_recovery, marketplace_update)
+        self.assertLess(marketplace_update, install_taf)
+
+    def test_readme_preserves_skill_use_and_runtime_boundaries(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("## [1.3.0] - 2026-08-26", changelog)
-        self.assertIn("## Install `work-recovery`", readme)
-        self.assertIn("## Update `work-recovery`", readme)
+        normalized = " ".join(readme.split()).lower()
+        self.assertNotIn("## Install `work-recovery`", readme)
+        self.assertNotIn("## Update `work-recovery`", readme)
+        self.assertNotIn("## Install `branch-handoff`", readme)
+        self.assertNotIn("## Update `branch-handoff`", readme)
+        self.assertIn("## Use branch-handoff", readme)
         self.assertIn("## Use work-recovery", readme)
-        work_section = readme.split("## Install `work-recovery`", 1)[1]
-        for agent in ("claude-code", "codex", "antigravity", "antigravity-cli"):
-            self.assertIn(f"--agent {agent}", work_section)
-        self.assertIn("--skill work-recovery", work_section)
-        self.assertIn("Git and Python 3", work_section)
-        self.assertIn("single best next step", work_section)
-        self.assertIn("compact continuation prompt", work_section)
-        self.assertIn("does not build or update an index", work_section.lower())
-        self.assertIn("does not run tests", work_section.lower())
+        for phrase in (
+            "optional Jira and GitHub context",
+            "Git and Python 3",
+            "single best next step",
+            "compact continuation prompt",
+            "does not build or update an index",
+            "does not run tests",
+        ):
+            self.assertIn(phrase.lower(), normalized)
 
 
 if __name__ == "__main__":

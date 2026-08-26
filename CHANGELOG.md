@@ -1,6 +1,33 @@
 # Changelog
 
-All notable changes to independently released TAF skills are recorded here.
+All notable TAF product releases and their bundled skill versions are recorded
+here. Skills keep independent behavior versions inside their `SKILL.md` files.
+
+## [2.0.0] - 2026-08-27
+
+### Added
+
+- One `taf` plugin for Claude Code and Codex containing `branch-handoff` 1.2.1
+  and `work-recovery` 1.0.1.
+- A Codex marketplace manifest that installs the repository root without
+  copying or aggregating the canonical `skills/` sources.
+- Clean migration guidance from the two legacy Claude plugin installations.
+
+### Changed
+
+- Claude invocations are now `/taf:branch-handoff` and
+  `/taf:work-recovery` under one product entry.
+- GitHub releases now version The Agentic Fieldbook product and list bundled
+  skill versions instead of presenting one skill as the complete release.
+- Installation makes the collection discoverable while full skill instructions
+  continue to load only when relevant.
+
+### Compatibility
+
+- This is a breaking Claude packaging and namespace change. The legacy
+  per-skill plugin entries are removed rather than retained as aliases.
+- Skill behavior, runtime requirements, bounded-context guarantees, consent
+  rules, and output contracts are unchanged.
 
 ## [1.3.1] - 2026-08-27
 
