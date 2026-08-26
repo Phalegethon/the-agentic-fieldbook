@@ -408,7 +408,7 @@ def _rank_key(
     latency = float("inf") if provider.latency_ms is None else provider.latency_ms
     return (
         0 if request.preferred_provider == provider.provider_identity else 1,
-        len(provider.capabilities) - 1,
+        0 if provider.capabilities == (request.required_capability,) else 1,
         -FRESHNESS_RANK[provider.freshness],
         -path_coverage,
         -language_coverage,

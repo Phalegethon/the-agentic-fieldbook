@@ -334,6 +334,31 @@ class DeterministicRoutingTests(unittest.TestCase):
                 self.assertIs(decision.status, RoutingStatus.SELECTED)
                 self.assertEqual(decision.selected_provider, expected)
 
+    def test_capability_fit_is_binary_so_freshness_orders_two_non_exact_fits(self) -> None:
+        narrow_stale = replace(
+            _descriptor("narrow.stale"),
+            freshness=Freshness.INCREMENTALLY_STALE,
+            status_evidence=StatusEvidence.PROVIDER_INSPECTED,
+        )
+        broad_fresh = replace(
+            _descriptor("broad.fresh"),
+            capabilities=("extra-capability", "semantic-search", "status"),
+            freshness=Freshness.EXACT,
+            status_evidence=StatusEvidence.PROVIDER_INSPECTED,
+        )
+        consent = _allow_query(narrow_stale, broad_fresh)
+        request = _request(minimum_freshness=Freshness.STRUCTURALLY_STALE)
+
+        for permutation in itertools.permutations((narrow_stale, broad_fresh)):
+            with self.subTest(order=tuple(item.provider_identity for item in permutation)):
+                discovery = replace(
+                    _discovery(), providers=(_native(), *permutation)
+                )
+                decision = route_provider(
+                    discovery, request, consent, utc_now=_UTC_NOW
+                )
+                self.assertEqual(decision.selected_provider, "broad.fresh")
+
     def test_rejections_display_five_summaries_and_preserve_exact_counts(self) -> None:
         rejected = tuple(
             _descriptor(
