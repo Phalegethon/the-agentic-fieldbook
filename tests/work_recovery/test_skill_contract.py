@@ -99,12 +99,19 @@ class VendoredRuntimeTests(unittest.TestCase):
             root = Path(directory)
             copied_skill = root / "work-recovery"
             shutil.copytree(SKILL, copied_skill)
+            skill_files_before = {
+                path.relative_to(copied_skill): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in copied_skill.rglob("*")
+                if path.is_file()
+            }
             repo = init_committed_repo(root / "fixture")
             write(repo / "tracked.txt", "interrupted\n")
 
             completed = subprocess.run(
                 [
                     "python3",
+                    "-X",
+                    "pycache_prefix=",
                     str(copied_skill / "scripts" / "collect_recovery.py"),
                     "--repo",
                     str(repo),
@@ -125,6 +132,12 @@ class VendoredRuntimeTests(unittest.TestCase):
             self.assertEqual(envelope["dossier"]["coverage"]["budget_characters"], 2000)
             self.assertLessEqual(envelope["characters_used"], 2000)
             self.assertFalse(any(path.name.startswith(".taf") for path in repo.iterdir()))
+            skill_files_after = {
+                path.relative_to(copied_skill): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in copied_skill.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(skill_files_after, skill_files_before)
 
 
 if __name__ == "__main__":
