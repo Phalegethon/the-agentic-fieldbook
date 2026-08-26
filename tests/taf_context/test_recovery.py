@@ -355,6 +355,21 @@ class RecoveryEvidenceTests(unittest.TestCase):
         self.assertNotIn("new-secret", result.model_text)
         self.assertIn("[redacted]", result.model_text)
 
+    def test_tracked_diff_redacts_quoted_json_and_yaml_secret_assignments(self) -> None:
+        write(self.repo / "config.txt", "safe=true\n")
+        run(self.repo, "git", "add", "config.txt")
+        run(self.repo, "git", "commit", "-m", "add quoted secret fixture")
+        write(
+            self.repo / "config.txt",
+            '"access_token": "json-secret",\n\'password\': yaml-secret\n',
+        )
+
+        result = collect_recovery(RecoveryRequest(repo=self.repo, base="main", max_chars=4000))
+
+        self.assertNotIn("json-secret", result.model_text)
+        self.assertNotIn("yaml-secret", result.model_text)
+        self.assertGreaterEqual(result.model_text.count("[redacted]"), 2)
+
     def test_supplied_note_is_reported_and_cannot_override_dirty_git_state(self) -> None:
         write(self.repo / "tracked.txt", "still dirty\n")
         note = self.root / "handoff.md"

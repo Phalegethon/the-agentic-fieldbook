@@ -34,7 +34,7 @@ _ALLOWED_BUDGETS = (2000, 4000, 8000, 12000)
 _ARTIFACT_BYTE_LIMIT = 64 * 1024
 _CONTENT_EXCERPT_CHARS = 420
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?im)^([+-]?\s*[a-z0-9_-]*(?:api[_-]?key|token|password|passwd|secret)[a-z0-9_-]*\s*[:=]\s*).*$"
+    r'''(?im)^([+-]?\s*["']?[a-z0-9_-]*(?:api[_-]?key|token|password|passwd|secret)[a-z0-9_-]*["']?\s*[:=]\s*).*$'''
 )
 _ABSOLUTE_PATH = re.compile(r"(?<![\w.-])/(?:Users|home|private|var|tmp)/[^\s'\"`]+")
 
