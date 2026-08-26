@@ -826,12 +826,27 @@ def _budgeted_dossier(
     changed_path_count: int,
     examined_path_count: int,
 ) -> tuple[RecoveryDossier, str]:
-    optional_lines = tuple(_claim_line(claim) for claim in optional_claims)
+    optional_items: tuple[tuple[str, object, str], ...] = tuple(
+        ("claim", claim, _claim_line(claim)) for claim in optional_claims
+    ) + tuple(
+        ("candidate", candidate, _candidate_line(candidate)) for candidate in candidates
+    )
+    optional_lines = tuple(item[2] for item in optional_items)
     selected: list[int] = []
 
     def build(indices: list[int]) -> tuple[RecoveryDossier, str]:
         selected_set = set(indices)
         omitted = [line for index, line in enumerate(optional_lines) if index not in selected_set]
+        selected_claims = [
+            optional_items[index][1]
+            for index in indices
+            if optional_items[index][0] == "claim"
+        ]
+        selected_candidates = [
+            optional_items[index][1]
+            for index in indices
+            if optional_items[index][0] == "candidate"
+        ]
         coverage = RecoveryCoverage(
             changed_path_count=changed_path_count,
             examined_path_count=min(examined_path_count, changed_path_count),
@@ -847,8 +862,8 @@ def _budgeted_dossier(
                 "repository_identity": repository_identity,
                 "worktree_identity": worktree_identity,
                 "current": current.to_dict(),
-                "candidates": [candidate.to_dict() for candidate in candidates],
-                "claims": [state_claim.to_dict()] + [optional_claims[index].to_dict() for index in indices],
+                "candidates": [candidate.to_dict() for candidate in selected_candidates],
+                "claims": [state_claim.to_dict()] + [claim.to_dict() for claim in selected_claims],
                 "coverage": coverage.to_dict(),
                 "warnings": list(warnings),
                 "next_action_hint": _next_action(current),
@@ -873,13 +888,14 @@ def _claim_line(claim: RecoveryClaim) -> str:
     return f"- [{claim.evidence_class.value}] {claim.claim_id}: {claim.text} (qualifications={qualifications})\n"
 
 
+def _candidate_line(candidate: WorkstreamState) -> str:
+    return f"- {candidate.branch or 'detached'}: {candidate.state.value} (metadata-only)\n"
+
+
 def _render_dossier(dossier: RecoveryDossier) -> str:
     current = dossier.current
     claims = "".join(_claim_line(claim) for claim in dossier.claims)
-    candidate_lines = "".join(
-        f"- {candidate.branch or 'detached'}: {candidate.state.value} (metadata-only)\n"
-        for candidate in dossier.candidates
-    ) or "- None observed.\n"
+    candidate_lines = "".join(_candidate_line(candidate) for candidate in dossier.candidates) or "- None included.\n"
     validation = [claim for claim in dossier.claims if claim.claim_id.startswith("validation.")]
     validation_line = (
         "- " + "; ".join(
