@@ -68,6 +68,7 @@ _MAX_STRING = 256
 _MAX_COLLECTION = 64
 _MAX_MARKERS = 16
 _MAX_COUNTER = 2**31 - 1
+_MAX_INVENTORY_BYTES = 256 * 1024
 _E = TypeVar("_E", bound=Enum)
 
 
@@ -181,6 +182,8 @@ def parse_host_inventory(value: object) -> HostInventoryParseResult:
         text = canonical_json(value)
         raw = text.encode("utf-8")
     else:
+        raise ProviderModelError("inventory")
+    if len(raw) > _MAX_INVENTORY_BYTES:
         raise ProviderModelError("inventory")
     try:
         envelope = json.loads(text, object_pairs_hook=_no_duplicates, parse_constant=_bad_constant)
@@ -518,7 +521,7 @@ def _markers(value: dict[str, object], field: str) -> tuple[str, ...]:
     markers = _strings(value, field, _MAX_MARKERS)
     for marker in markers:
         path = PurePosixPath(marker)
-        if path.is_absolute() or ".." in path.parts or "\\" in marker:
+        if path.is_absolute() or re.match(r"^[A-Za-z]:", marker) or ".." in path.parts or "\\" in marker:
             raise ProviderModelError(field)
     return markers
 

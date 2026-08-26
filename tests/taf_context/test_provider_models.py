@@ -75,6 +75,8 @@ class ProviderDescriptorTests(unittest.TestCase):
         cases.append(marker)
         absolute = copy.deepcopy(DESCRIPTOR); absolute["marker_hints"] = ["/secret"]
         cases.append(absolute)
+        drive_qualified = copy.deepcopy(DESCRIPTOR); drive_qualified["marker_hints"] = ["C:/secret"]
+        cases.append(drive_qualified)
         huge = copy.deepcopy(DESCRIPTOR); huge["provider_version"] = "x" * 257
         cases.append(huge)
         truth = copy.deepcopy(DESCRIPTOR); truth["latency_ms"] = True
@@ -104,6 +106,15 @@ class HostInventoryTests(unittest.TestCase):
             with self.subTest(malformed=malformed):
                 with self.assertRaises(ValueError):
                     parse_host_inventory(malformed)
+
+    def test_rejects_inventory_larger_than_256_kib_before_json_parsing(self) -> None:
+        envelope = {
+            "schema_version": "1", "providers": [], "rejected_provider_count": 0,
+            "rejection_summaries": [], "omitted_provider_count": 0, "partial": False,
+        }
+        oversized = json.dumps(envelope) + (" " * (256 * 1024))
+        with self.assertRaises(ValueError):
+            parse_host_inventory(oversized)
 
     def test_rejects_more_than_64_descriptors_directly(self) -> None:
         value = {"schema_version": "1", "providers": [DESCRIPTOR] * 65,
