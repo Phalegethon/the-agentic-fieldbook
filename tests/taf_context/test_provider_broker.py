@@ -110,6 +110,150 @@ class ProviderBrokerTests(unittest.TestCase):
         self.assertEqual(execution.route, "bounded-fallback")
         self.assertEqual(execution.reason_codes, ("invalid-query-output",))
 
+    def test_inspection_fanout_is_bounded_and_preferred_provider_is_first(self) -> None:
+        providers = tuple(
+            replace(descriptor(), provider_identity=f"fixture.graph-{index}")
+            for index in range(4)
+        )
+        discovery = DiscoverySnapshot(
+            "1", snapshot().repository_identity, snapshot().worktree_identity,
+            "sha256:inventory", providers, 0, (), 0, False, (), 1, 1,
+        )
+        wire = request_wire()
+        wire.update(
+            {
+                "provider_identity": providers[-1].provider_identity,
+                "repository_identity": snapshot().repository_identity,
+                "worktree_identity": snapshot().worktree_identity,
+                "dirty_overlay_fingerprint": snapshot().dirty_fingerprint,
+                "committed_head": snapshot().head_sha,
+            }
+        )
+        request = Level1Request.from_dict(wire)
+        ledger = AuthorizationLedger()
+        for provider in providers:
+            permission = ConsentRequest.create(
+                schema_version="1",
+                repository_identity=snapshot().repository_identity,
+                provider_identity=provider.provider_identity,
+                provider_schema_version=provider.provider_schema_version,
+                actions=(ContextAction.INSPECT, ContextAction.QUERY),
+                locality=provider.locality,
+                data_surface="repository-metadata",
+                fallback="bounded-level1",
+                requested_at="2026-08-27T00:00:00Z",
+            )
+            ledger = ledger.record(
+                permission, ConsentDisposition.ALLOW,
+                "2026-08-27T00:00:00Z",
+            )
+        inspections = []
+
+        def inspect_call(provider):
+            inspections.append(provider.provider_identity)
+            record = replace(
+                inspection(), provider_identity=provider.provider_identity
+            )
+            attempt = AttemptRecord(
+                "1", provider.provider_identity, "inspect",
+                AttemptStatus.SUCCEEDED, (), 1, 1, 0,
+            )
+            return record, attempt
+
+        execution = execute_broker_request(
+            discovery,
+            request,
+            ledger,
+            snapshot(),
+            {provider.provider_identity: object() for provider in providers},
+            inspect_call=inspect_call,
+            query_call=lambda provider, routed_request: provider_result(
+                routed_request, provider
+            ),
+            fallback_call=None,
+            utc_now="2026-08-27T00:00:00Z",
+            maximum_inspections=2,
+        )
+
+        self.assertEqual(
+            inspections,
+            [providers[-1].provider_identity, providers[0].provider_identity],
+        )
+        self.assertEqual(execution.route, providers[-1].provider_identity)
+
+    def test_selected_alternative_receives_its_own_provider_and_index_binding(self) -> None:
+        selected = replace(descriptor(), provider_identity="fixture.graph-a")
+        unavailable_preference = replace(
+            descriptor(), provider_identity="fixture.graph-z"
+        )
+        discovery = DiscoverySnapshot(
+            "1", snapshot().repository_identity, snapshot().worktree_identity,
+            "sha256:inventory", (selected, unavailable_preference),
+            0, (), 0, False, (), 1, 1,
+        )
+        wire = request_wire()
+        wire.update(
+            {
+                "provider_identity": unavailable_preference.provider_identity,
+                "repository_identity": snapshot().repository_identity,
+                "worktree_identity": snapshot().worktree_identity,
+                "dirty_overlay_fingerprint": snapshot().dirty_fingerprint,
+                "committed_head": snapshot().head_sha,
+            }
+        )
+        request = Level1Request.from_dict(wire)
+        selected_consent = ConsentRequest.create(
+            schema_version="1",
+            repository_identity=snapshot().repository_identity,
+            provider_identity=selected.provider_identity,
+            provider_schema_version=selected.provider_schema_version,
+            actions=(ContextAction.INSPECT, ContextAction.QUERY),
+            locality=selected.locality,
+            data_surface="repository-metadata",
+            fallback="bounded-level1",
+            requested_at="2026-08-27T00:00:00Z",
+        )
+        ledger = AuthorizationLedger().record(
+            selected_consent, ConsentDisposition.ALLOW,
+            "2026-08-27T00:00:00Z",
+        )
+        observed_requests = []
+
+        def query_call(provider, routed_request):
+            observed_requests.append(routed_request)
+            return provider_result(routed_request, provider)
+
+        execution = execute_broker_request(
+            discovery,
+            request,
+            ledger,
+            snapshot(),
+            {
+                selected.provider_identity: object(),
+                unavailable_preference.provider_identity: object(),
+            },
+            inspect_call=lambda provider: (
+                replace(
+                    inspection(), provider_identity=provider.provider_identity
+                ),
+                AttemptRecord(
+                    "1", provider.provider_identity, "inspect",
+                    AttemptStatus.SUCCEEDED, (), 1, 1, 0,
+                ),
+            ),
+            query_call=query_call,
+            fallback_call=None,
+            utc_now="2026-08-27T00:00:00Z",
+        )
+
+        self.assertEqual(execution.route, selected.provider_identity)
+        self.assertEqual(
+            observed_requests[0].provider_identity, selected.provider_identity
+        )
+        self.assertEqual(
+            observed_requests[0].index_identity, inspection().index_identity
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

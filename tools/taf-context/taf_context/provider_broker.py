@@ -50,12 +50,24 @@ def execute_broker_request(
     ],
     fallback_call: Callable[[Level1Request], Level1Result] | None,
     utc_now: str,
+    maximum_inspections: int = 3,
 ) -> BrokerExecution:
     """Inspect only authorized candidates, reroute once, and execute one route."""
+    if type(maximum_inspections) is not int or not 0 <= maximum_inspections <= 3:
+        raise ValueError("invalid-maximum-inspections")
     attempts: list[AttemptRecord] = []
     reasons: list[str] = []
     refined: list[ProviderDescriptor] = []
-    for provider in sorted(discovery.providers, key=lambda item: item.provider_identity):
+    inspections: dict[str, InspectionRecord] = {}
+    inspected_count = 0
+    ordered_providers = sorted(
+        discovery.providers,
+        key=lambda item: (
+            item.provider_identity != request.provider_identity,
+            item.provider_identity,
+        ),
+    )
+    for provider in ordered_providers:
         if provider.provider_identity not in adapters:
             refined.append(provider)
             continue
@@ -65,14 +77,21 @@ def execute_broker_request(
         if not consent.is_authorized(ContextAction.INSPECT, discovery.repository_identity, provider.provider_identity, provider.provider_schema_version):
             refined.append(provider)
             continue
+        if inspected_count >= maximum_inspections:
+            reasons.append("inspection-budget-exhausted")
+            refined.append(provider)
+            continue
+        inspected_count += 1
         try:
             inspected, attempt = inspect_call(provider)
             assessment = derive_provider_freshness(inspected, snapshot)
             refined.append(refine_descriptor(provider, inspected, assessment))
+            inspections[provider.provider_identity] = inspected
             attempts.append(attempt)
         except Exception as error:
-            code = getattr(error, "reason_code", str(error) or "provider-inspection-failed")
-            reasons.append(code if len(code) <= 256 else "provider-inspection-failed")
+            reasons.append(
+                _reason_code(error, "provider-inspection-failed")
+            )
             refined.append(provider)
     refreshed = replace(discovery, providers=tuple(sorted(refined, key=lambda item: item.provider_identity)))
     broker_request = BrokerRequest(
@@ -85,8 +104,12 @@ def execute_broker_request(
     decision = route_provider(refreshed, broker_request, consent, utc_now=utc_now)
     if decision.status is RoutingStatus.SELECTED and decision.selected_provider:
         provider = next(item for item in refreshed.providers if item.provider_identity == decision.selected_provider)
+        routed_request = _routed_request(
+            request, provider.provider_identity,
+            inspections.get(provider.provider_identity),
+        )
         try:
-            queried = query_call(provider, request)
+            queried = query_call(provider, routed_request)
             if isinstance(queried, tuple) and len(queried) == 2:
                 result, attempt = queried
                 attempts.append(attempt)
@@ -119,6 +142,27 @@ def _fallback_request(
     return replace(
         request,
         provider_identity="taf.bounded-fallback",
+        index_identity=index_identity,
+    )
+
+
+def _routed_request(
+    request: Level1Request,
+    provider_identity: str,
+    inspection: InspectionRecord | None,
+) -> Level1Request:
+    index_identity = request.index_identity
+    if (
+        inspection is not None
+        and request.operation not in {
+            Level1Operation.ESTIMATE,
+            Level1Operation.BUILD,
+        }
+    ):
+        index_identity = inspection.index_identity
+    return replace(
+        request,
+        provider_identity=provider_identity,
         index_identity=index_identity,
     )
 

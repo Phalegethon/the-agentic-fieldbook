@@ -279,6 +279,7 @@ def _execute_command(
         query_call=query_call,
         fallback_call=fallback_call,
         utc_now=_rfc3339(utc_clock()),
+        maximum_inspections=policy.maximum_inspections,
     )
     return execution.to_dict()
 

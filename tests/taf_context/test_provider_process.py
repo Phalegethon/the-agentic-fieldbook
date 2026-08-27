@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import shutil
 import socket
 import sys
@@ -93,7 +94,11 @@ class ProviderProcessTests(unittest.TestCase):
         for mode, reason in (
             ("wrong-identity", "inspection-identity-mismatch"),
             ("duplicate", "invalid-inspection-output"),
+            ("nonfinite", "invalid-inspection-output"),
+            ("invalid-utf8", "invalid-inspection-output"),
             ("multiple", "invalid-stdout-framing"),
+            ("nonzero", "provider-nonzero"),
+            ("oversized-stdout", "stdout-oversized"),
             ("oversized-stderr", "stderr-oversized"),
         ):
             with self.subTest(mode=mode), self.assertRaisesRegex(ProviderProcessError, reason):
@@ -111,6 +116,18 @@ class ProviderProcessTests(unittest.TestCase):
                 policy(),
             )
         self.assertFalse((self.repo / "escape.txt").exists())
+
+    def test_adapter_executable_cannot_mutate_itself(self) -> None:
+        executable = self.adapter / "bin/provider"
+        before = hashlib.sha256(executable.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ProviderProcessError, "provider-nonzero"):
+            inspect_provider(
+                self.manifest("mutate-self"), self.adapter, snapshot(),
+                self.repo, policy(),
+            )
+        self.assertEqual(
+            hashlib.sha256(executable.read_bytes()).hexdigest(), before
+        )
 
     def test_network_is_denied_even_when_manifest_claims_it_is_not_needed(self) -> None:
         with socket.socket() as listener:
@@ -133,6 +150,39 @@ class ProviderProcessTests(unittest.TestCase):
         self.assertEqual(result.request_identity, request.request_identity)
         self.assertEqual(result.provider_identity, "fixture.graph")
         self.assertEqual(attempt.phase.value, "query")
+
+    def test_query_identity_citation_and_budget_violations_fail_closed(self) -> None:
+        wire = request_wire()
+        wire["provider_identity"] = "fixture.graph"
+        request = Level1Request.from_dict(wire)
+        cases = (
+            ("wrong-request", "query-identity-mismatch"),
+            ("wrong-repository", "query-identity-mismatch"),
+            ("wrong-worktree", "query-identity-mismatch"),
+            ("wrong-index", "query-index-mismatch"),
+            ("citation-range", "query-citation-invalid"),
+            ("citation-absolute", "invalid-query-output"),
+            ("citation-traversal", "invalid-query-output"),
+            ("budget-overflow", "query-model-budget-exceeded"),
+            ("too-many-results", "query-result-count-exceeded"),
+        )
+        for mode, reason in cases:
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                ProviderProcessError, reason
+            ):
+                query_provider(
+                    self.manifest(mode), self.adapter, request, self.repo,
+                    policy(),
+                )
+
+    def test_provider_diagnostics_are_reduced_to_byte_counts(self) -> None:
+        record, attempt = inspect_provider(
+            self.manifest("secret-stderr"), self.adapter, snapshot(),
+            self.repo, policy(),
+        )
+        self.assertEqual(record.provider_identity, "fixture.graph")
+        self.assertGreater(attempt.stderr_bytes, 0)
+        self.assertNotIn("must-not-escape", repr(attempt))
 
 
 class ProviderIsolationAvailabilityTests(unittest.TestCase):

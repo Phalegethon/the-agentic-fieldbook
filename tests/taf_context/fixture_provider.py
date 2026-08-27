@@ -13,12 +13,17 @@ request = json.loads(sys.stdin.buffer.readline())
 
 if mode == "timeout":
     time.sleep(5)
+if mode == "nonzero":
+    raise SystemExit(17)
 if mode == "write-repo":
     with open(os.path.join(request["repository_root"], "escape.txt"), "w") as handle:
         handle.write("escape")
 if mode == "network":
     connection = socket.create_connection(("127.0.0.1", int(sys.argv[2])), timeout=1)
     connection.close()
+if mode == "mutate-self":
+    with open(__file__, "a") as handle:
+        handle.write("# mutation")
 
 if request["phase"] == "inspect":
     snapshot = request["snapshot"]
@@ -74,14 +79,64 @@ else:
         "next_safe_action": "use-cited-evidence",
     }
 
+    if mode == "wrong-request":
+        result["request_identity"] = "wrong-request"
+    if mode == "wrong-repository":
+        result["repository_identity"] = "sha256:" + "e" * 64
+    if mode == "wrong-worktree":
+        result["worktree_identity"] = "sha256:" + "e" * 64
+    if mode == "wrong-index":
+        result["index_identity"] = "sha256:" + "e" * 64
+    if mode == "budget-overflow":
+        result["output_characters"] = 8000
+    if mode in {
+        "citation-range", "citation-absolute", "citation-traversal",
+        "too-many-results",
+    }:
+        count = 11 if mode == "too-many-results" else 1
+        findings = []
+        for rank in range(1, count + 1):
+            path = "README.md"
+            if mode == "citation-absolute":
+                path = "/etc/passwd"
+            elif mode == "citation-traversal":
+                path = "../README.md"
+            findings.append(
+                {
+                    "rank": rank,
+                    "result_identity": "sha256:" + format(rank, "064x"),
+                    "path": path,
+                    "start_line": 1,
+                    "end_line": 999 if mode == "citation-range" else 1,
+                    "language": "Markdown",
+                    "record_kind": "heading",
+                    "source_type": "document",
+                    "qualified_name": "Fixture",
+                    "extraction_method": "fixture",
+                    "evidence_class": "verified",
+                    "preview": "# Fixture",
+                }
+            )
+        result["findings"] = findings
+        result["returned_count"] = count
+        result["output_characters"] = 200
+
 wire = json.dumps(result, sort_keys=True, separators=(",", ":"))
 if mode == "wrong-identity":
     wire = wire.replace("fixture.graph", "wrong.provider")
 if mode == "duplicate":
     wire = wire.replace("{", '{"schema_version":"1",', 1)
+if mode == "nonfinite":
+    wire = wire.replace('"path_coverage":1.0', '"path_coverage":NaN')
 if mode == "oversized-stderr":
     sys.stderr.write("x" * 70000)
+if mode == "secret-stderr":
+    sys.stderr.write("token=must-not-escape")
+if mode == "oversized-stdout":
+    sys.stdout.write("x" * 270000 + "\n")
+elif mode == "invalid-utf8":
+    sys.stdout.buffer.write(b"\xff\n")
 if mode == "multiple":
     sys.stdout.write(wire + "\n" + wire + "\n")
-else:
+elif mode not in {"oversized-stdout", "invalid-utf8"}:
     sys.stdout.write(wire + "\n")
