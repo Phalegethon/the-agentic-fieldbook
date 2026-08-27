@@ -16,6 +16,7 @@ from pathlib import Path
 
 from .level1_models import Level1Request, Level1Result, parse_level1_result
 from .models import RepositorySnapshot
+from .provider_binding import AdapterBinding, validate_binding_for_repository
 from .provider_execution_models import (
     AdapterManifest,
     AdapterPhase,
@@ -41,6 +42,8 @@ def inspect_provider(
     snapshot: RepositorySnapshot,
     repository_root: Path,
     policy: ExecutionPolicy,
+    *,
+    binding: AdapterBinding | None = None,
 ) -> tuple[InspectionRecord, AttemptRecord]:
     """Inspect one explicitly configured provider without trusting its claims."""
     if AdapterPhase.INSPECT not in manifest.supported_phases:
@@ -50,9 +53,10 @@ def inspect_provider(
         "repository_root": str(repository_root.resolve()),
         "snapshot": snapshot.to_dict(),
     }
+    _attach_binding(envelope, manifest, adapter_root, repository_root, binding)
     wire, attempt = _execute(
         manifest, adapter_root, repository_root, policy,
-        AdapterPhase.INSPECT, envelope,
+        AdapterPhase.INSPECT, envelope, binding,
     )
     try:
         record = parse_inspection_record(wire)
@@ -73,6 +77,8 @@ def query_provider(
     request: Level1Request,
     repository_root: Path,
     policy: ExecutionPolicy,
+    *,
+    binding: AdapterBinding | None = None,
 ) -> tuple[Level1Result, AttemptRecord]:
     """Execute one bounded Level 1 query through an explicit adapter."""
     if AdapterPhase.QUERY not in manifest.supported_phases:
@@ -84,9 +90,10 @@ def query_provider(
         "repository_root": str(repository_root.resolve()),
         "request": request.to_dict(),
     }
+    _attach_binding(envelope, manifest, adapter_root, repository_root, binding)
     wire, attempt = _execute(
         manifest, adapter_root, repository_root, policy,
-        AdapterPhase.QUERY, envelope,
+        AdapterPhase.QUERY, envelope, binding,
     )
     try:
         result = parse_level1_result(wire)
@@ -121,6 +128,7 @@ def _execute(
     policy: ExecutionPolicy,
     phase: AdapterPhase,
     envelope: dict[str, object],
+    binding: AdapterBinding | None,
 ) -> tuple[bytes, AttemptRecord]:
     root = adapter_root.resolve()
     repo = repository_root.resolve()
@@ -130,6 +138,11 @@ def _execute(
     if manifest.network_required and not policy.network_allowed:
         raise ProviderProcessError("provider-network-denied")
     executable_digest = _digest_file(executable)
+    child_digest = (
+        _digest_file(binding.provider_executable)
+        if binding is not None
+        else None
+    )
     repository_state = _repository_state(repo)
     environment = {
         name: os.environ[name]
@@ -139,7 +152,6 @@ def _execute(
     payload = (
         json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
-    command = [str(executable), *manifest.arguments]
     started = time.monotonic_ns()
     with tempfile.TemporaryDirectory(prefix="taf-provider-state-") as state_name, tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
         command = _isolated_command(
@@ -148,6 +160,7 @@ def _execute(
             root,
             repo,
             Path(state_name),
+            binding,
         )
         process = subprocess.Popen(
             command,
@@ -174,6 +187,14 @@ def _execute(
         raise ProviderProcessError("repository-mutated")
     if not executable.exists() or _digest_file(executable) != executable_digest:
         raise ProviderProcessError("adapter-executable-mutated")
+    if (
+        binding is not None
+        and (
+            not binding.provider_executable.exists()
+            or _digest_file(binding.provider_executable) != child_digest
+        )
+    ):
+        raise ProviderProcessError("provider-executable-mutated")
     if len(stdout) > policy.maximum_stdout_bytes:
         raise ProviderProcessError("stdout-oversized")
     if len(stderr) > policy.maximum_stderr_bytes:
@@ -199,6 +220,7 @@ def _isolated_command(
     adapter_root: Path,
     repository_root: Path,
     state_root: Path,
+    binding: AdapterBinding | None = None,
 ) -> list[str]:
     sandbox = Path("/usr/bin/sandbox-exec")
     if sys.platform != "darwin" or not sandbox.is_file():
@@ -208,7 +230,7 @@ def _isolated_command(
         str(sandbox),
         "-p",
         _sandbox_profile(
-            runtime, adapter_root, repository_root, state_root
+            runtime, adapter_root, repository_root, state_root, binding
         ),
         str(runtime),
         *runtime_arguments,
@@ -242,6 +264,7 @@ def _sandbox_profile(
     adapter_root: Path,
     repository_root: Path,
     state_root: Path,
+    binding: AdapterBinding | None,
 ) -> str:
     read_roots = tuple(
         path.resolve()
@@ -253,6 +276,7 @@ def _sandbox_profile(
             Path("/usr"),
             Path("/Library"),
             Path("/dev"),
+            *(binding.provider_state_roots if binding is not None else ()),
         )
         if path.exists()
     )
@@ -273,14 +297,21 @@ def _sandbox_profile(
     subtree_reads = "\n".join(
         f'  (subpath "{_sandbox_escape(path)}")' for path in read_roots
     )
+    allowed_executables = {executable.resolve()}
+    if binding is not None:
+        allowed_executables.add(binding.provider_executable)
     process_rules = "\n".join(
         f'  (literal "{_sandbox_escape(path)}")'
-        for path in (executable.resolve(),)
+        for path in sorted(allowed_executables, key=str)
     )
     state = state_root.resolve()
+    process_fork_rule = (
+        "(allow process-fork)\n" if binding is not None else ""
+    )
     return (
         "(version 1)\n"
         "(deny default)\n"
+        f"{process_fork_rule}"
         "(allow sysctl-read)\n"
         "(allow mach-lookup)\n"
         "(allow ipc-posix-shm)\n"
@@ -298,6 +329,34 @@ def _sandbox_profile(
 
 def _sandbox_escape(path: Path) -> str:
     return str(path).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _attach_binding(
+    envelope: dict[str, object],
+    manifest: AdapterManifest,
+    adapter_root: Path,
+    repository_root: Path,
+    binding: AdapterBinding | None,
+) -> None:
+    if binding is None:
+        return
+    if (
+        binding.adapter_identity != manifest.adapter_identity
+        or binding.provider_identity != manifest.provider_identity
+        or binding.adapter_root != adapter_root.resolve()
+    ):
+        raise ProviderProcessError("adapter-binding-mismatch")
+    try:
+        validate_binding_for_repository(binding, repository_root)
+    except ValueError as error:
+        raise ProviderProcessError("adapter-binding-overlap") from error
+    envelope["provider_command"] = {
+        "executable": str(binding.provider_executable),
+        "arguments": list(binding.provider_arguments),
+        "state_roots": [str(path) for path in binding.provider_state_roots],
+        "environment": dict(binding.environment),
+        "binding_digest": binding.binding_digest,
+    }
 
 
 def _safe_executable(root: Path, relative: str) -> Path | None:
