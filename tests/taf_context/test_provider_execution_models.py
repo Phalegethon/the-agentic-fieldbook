@@ -16,9 +16,9 @@ from taf_context.provider_execution_models import (
 )
 
 
-SHA_A = "a" * 64
-SHA_B = "b" * 64
-SHA_C = "c" * 64
+SHA_A = "sha256:" + "a" * 64
+SHA_B = "sha256:" + "b" * 64
+SHA_C = "sha256:" + "c" * 64
 
 
 def valid_manifest() -> dict[str, object]:
@@ -48,7 +48,7 @@ def valid_inspection() -> dict[str, object]:
         "worktree_identity": SHA_B,
         "committed_head": "1" * 40,
         "dirty_overlay_fingerprint": SHA_C,
-        "index_identity": "d" * 64,
+        "index_identity": "sha256:" + "d" * 64,
         "readiness": "ready",
         "capabilities": ["repository-map", "search-symbols"],
         "path_coverage": 1.0,
@@ -102,6 +102,7 @@ class InspectionRecordTests(unittest.TestCase):
         variants = []
         for field, value in (
             ("repository_identity", "not-a-digest"),
+            ("worktree_identity", "b" * 64),
             ("committed_head", "123"),
             ("path_coverage", 1.1),
             ("storage_bytes", -1),

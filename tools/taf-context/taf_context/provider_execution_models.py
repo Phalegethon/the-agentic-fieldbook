@@ -18,7 +18,7 @@ _MAX_COLLECTION = 64
 _MAX_STRING = 256
 _MAX_COUNTER = 2**63 - 1
 _IDENTITY = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
-_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _E = TypeVar("_E", bound=Enum)
 
