@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from .benchmark_level1 import (
     BenchmarkSample,
@@ -13,12 +14,89 @@ from .benchmark_level1 import (
     main,
     retain_candidate_evidence,
     run_benchmark_schedule,
+    _load_vectors,
+    _query_observation,
+    _vector_request,
 )
+from taf_context.level1_models import CandidateManifest, Level1Result
 from .level1_scoring import GateStatus
 from .test_level1_scoring import evidence_lines
 
 
 class BenchmarkRetentionTests(unittest.TestCase):
+    def test_only_declared_state_vectors_preserve_mismatched_snapshot_fields(self) -> None:
+        vectors = _load_vectors()
+        snapshot = SimpleNamespace(
+            repository_identity="sha256:" + "a" * 64,
+            worktree_identity="sha256:" + "b" * 64,
+            head_sha="c" * 40,
+            dirty_fingerprint="sha256:" + "d" * 64,
+        )
+        manifest = CandidateManifest.from_dict({
+            "schema_version": "1", "candidate_identity": "python",
+            "candidate_version": "0.1.0", "language": "Python",
+            "protocol_version": "1", "availability": "ready",
+            "unsupported_reason_codes": [], "executable": "candidate.py",
+            "arguments": [], "environment_allowlist": [],
+            "declared_child_processes": [], "dependency_lock": "uv.lock",
+            "license_inventory": "licenses.json",
+        })
+        index_identity = "sha256:" + "e" * 64
+
+        dirty_symbol = _vector_request(vectors["L1-Q-012"], snapshot, manifest, index_identity, "query-L1-Q-012-0")
+        dirty_snippet = _vector_request(vectors["L1-Q-024"], snapshot, manifest, index_identity, "request-dirty-snippet")
+        stale_head = _vector_request(vectors["L1-Q-003"], snapshot, manifest, index_identity, "request-stale")
+
+        self.assertEqual(dirty_symbol.dirty_overlay_fingerprint, snapshot.dirty_fingerprint)
+        self.assertEqual(dirty_symbol.request_identity, "query-l1-q-012-0")
+        self.assertEqual(dirty_snippet.dirty_overlay_fingerprint, snapshot.dirty_fingerprint)
+        self.assertEqual(stale_head.committed_head, "e" * 40)
+
+    def test_safe_state_refusal_does_not_require_a_stale_citation(self) -> None:
+        vector = _load_vectors()["L1-Q-003"]
+        snapshot = SimpleNamespace(
+            repository_identity="sha256:" + "a" * 64,
+            worktree_identity="sha256:" + "b" * 64,
+            head_sha="c" * 40,
+            dirty_fingerprint="sha256:" + "d" * 64,
+        )
+        manifest = CandidateManifest.from_dict({
+            "schema_version": "1", "candidate_identity": "python",
+            "candidate_version": "0.1.0", "language": "Python",
+            "protocol_version": "1", "availability": "ready",
+            "unsupported_reason_codes": [], "executable": "candidate.py",
+            "arguments": [], "environment_allowlist": [],
+            "declared_child_processes": [], "dependency_lock": "uv.lock",
+            "license_inventory": "licenses.json",
+        })
+        request_value = _vector_request(vector, snapshot, manifest, "sha256:" + "e" * 64, "state-request")
+        result = Level1Result.from_dict({
+            "schema_version": "1", "request_identity": request_value.request_identity,
+            "operation": request_value.operation.value, "status": "stale",
+            "provider_identity": "python", "provider_version": "0.1.0",
+            "index_identity": request_value.index_identity,
+            "repository_identity": request_value.repository_identity,
+            "worktree_identity": request_value.worktree_identity,
+            "committed_head": request_value.committed_head,
+            "dirty_overlay_fingerprint": request_value.dirty_overlay_fingerprint,
+            "freshness": "structurally-stale", "parser_versions": {},
+            "coverage": {"path_coverage": 0.0, "language_coverage": 0.0,
+                "indexed_path_count": 0, "excluded_path_count": 0,
+                "unsupported_language_count": 0, "parse_failure_count": 0,
+                "exclusion_reason_counts": {}},
+            "findings": [], "returned_count": 0, "omitted_count": 0,
+            "truncated": False, "output_characters": 100, "warnings": [],
+            "next_safe_action": "rebuild-index",
+        })
+
+        observation = _query_observation(
+            vector, request_value, result,
+            SimpleNamespace(elapsed_ns=1, escape_counters={}),
+        )
+
+        self.assertTrue(observation["citation_match"])
+        self.assertTrue(observation["evidence_class_match"])
+
     def test_cli_retains_an_explicit_unsupported_candidate_decision(self) -> None:
         candidate = {
             "schema_version": "1",

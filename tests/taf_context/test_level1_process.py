@@ -22,6 +22,7 @@ from taf_context.models import Freshness
 from .level1_process import (
     CandidateProcessError,
     _request_wire_bytes,
+    _sandbox_profile,
     preflight_candidate,
     run_candidate,
 )
@@ -55,6 +56,7 @@ def candidate_script(payload: bytes, *, version_argument: Optional[str] = None) 
     return f'''#!{interpreter}
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -69,9 +71,16 @@ if "--version" in sys.argv:
 mode = sys.argv[1]
 payload = {payload!r}
 repo = sys.argv[sys.argv.index("--repo-root") + 1]
+state = sys.argv[sys.argv.index("--state-root") + 1]
 sys.stdin.buffer.readline()
 
 if mode == "valid":
+    sys.stdout.buffer.write(payload)
+elif mode == "sqlite-state":
+    connection = sqlite3.connect(os.path.join(state, "candidate.sqlite"))
+    connection.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    connection.commit()
+    connection.close()
     sys.stdout.buffer.write(payload)
 elif mode == "duplicate":
     sys.stdout.buffer.write(payload.replace(b'{{', b'{{"schema_version":"1",', 1))
@@ -137,6 +146,18 @@ def manifest(mode: str) -> CandidateManifest:
 
 
 class CandidateProcessBoundaryTests(unittest.TestCase):
+    def test_sandbox_permits_only_state_local_posix_shared_memory_for_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for path in (root / "repo", root / "candidate", root / "state"):
+                path.mkdir()
+            profile = _sandbox_profile(root / "repo", root / "candidate", root / "state")
+
+        self.assertIn("(allow ipc-posix-shm)", profile)
+        self.assertNotIn("(allow ipc-posix*)", profile)
+        self.assertIn(f'(literal "{root.resolve()}")', profile)
+        self.assertIn(f'(literal "{(root / "state").resolve()}")', profile)
+
     def test_preflight_passes_manifest_arguments_to_candidate_version_check(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -243,6 +264,19 @@ class CandidateProcessBoundaryTests(unittest.TestCase):
             self.assertNotIn("TAF_CANARY", diagnostics)
             self.assertNotIn("/Users/", diagnostics)
             self.assertTrue((evidence_root / "complete.json").is_file())
+
+    def test_candidate_can_create_sqlite_state_inside_the_bounded_state_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            candidate_root, repo_root, state_root, evidence_root = self.make_fixture(root, "sqlite-state")
+
+            result, _evidence = run_candidate(
+                manifest("sqlite-state"), request(), repo_root, state_root, 2.0,
+                evidence_root, candidate_root=candidate_root,
+            )
+
+            self.assertEqual(result.status, Level1ResultStatus.READY)
+            self.assertTrue((state_root / "candidate.sqlite").is_file())
 
     def test_ready_build_returns_the_new_controller_bound_index_identity(self) -> None:
         build_wire = request_wire("build")

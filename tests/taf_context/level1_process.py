@@ -529,20 +529,37 @@ def _sandbox_profile(
         Path("/dev"),
         *extra_read_roots,
     )
-    read_rules = "  (literal \"/\")\n" + "\n".join(
-        f'  (subpath "{_sbpl(path.resolve())}")'
-        for path in read_roots
-        if path.exists()
+    resolved_roots = tuple(path.resolve() for path in read_roots if path.exists())
+    ancestors = sorted(
+        {
+            ancestor
+            for root in resolved_roots
+            for ancestor in (root, *root.parents)
+            if ancestor != Path("/")
+        },
+        key=str,
     )
+    literal_rules = "\n".join(
+        f'  (literal "{_sbpl(path)}")'
+        for path in ancestors
+    )
+    read_rules = "  (literal \"/\")\n" + literal_rules + "\n" + "\n".join(
+        f'  (subpath "{_sbpl(path.resolve())}")'
+        for path in resolved_roots
+    )
+    resolved_state = state.resolve()
     return (
         "(version 1)\n"
         "(deny default)\n"
         "(allow process-exec)\n"
         "(allow sysctl-read)\n"
         "(allow mach-lookup)\n"
+        "(allow ipc-posix-shm)\n"
         "(allow file-read*\n"
         f"{read_rules})\n"
-        f'(allow file-write* (subpath "{_sbpl(state.resolve())}"))\n'
+        "(allow file-write*\n"
+        f'  (literal "{_sbpl(resolved_state)}")\n'
+        f'  (subpath "{_sbpl(resolved_state)}"))\n'
     )
 
 
