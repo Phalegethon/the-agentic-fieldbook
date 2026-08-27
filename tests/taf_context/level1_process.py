@@ -107,7 +107,13 @@ def preflight_candidate(
         root = Path(".").resolve()
     else:
         root = candidate_root.resolve()
-    executable = _safe_file(root, manifest.executable, executable=True)
+    toolchain_root = _trusted_python_toolchain_root(manifest, root, environment)
+    executable = _safe_file(
+        root,
+        manifest.executable,
+        executable=True,
+        trusted_external_root=toolchain_root,
+    )
     dependency_lock = _safe_file(root, manifest.dependency_lock)
     licenses = _safe_file(root, manifest.license_inventory)
     if executable is None:
@@ -131,12 +137,24 @@ def preflight_candidate(
                     [
                         "/usr/bin/sandbox-exec",
                         "-p",
-                        _sandbox_profile(root, root, preflight_state),
+                        _sandbox_profile(
+                            root,
+                            root,
+                            preflight_state,
+                            extra_read_roots=(toolchain_root,) if toolchain_root else (),
+                        ),
                         str(executable),
+                        *manifest.arguments,
                         "--version",
                     ],
                     cwd=root,
-                    env=_candidate_environment(manifest, environment, preflight_state),
+                    env=_candidate_environment(
+                        manifest,
+                        environment,
+                        preflight_state,
+                        candidate_root=root,
+                        trusted_python=toolchain_root is not None,
+                    ),
                     capture_output=True,
                     timeout=10,
                     check=False,
@@ -198,11 +216,25 @@ def run_candidate(
     state.mkdir(parents=True, exist_ok=True)
     evidence.mkdir(parents=True, exist_ok=True)
     before_repo = _tree_digest(repo)
-    executable = _safe_file(root, manifest.executable, executable=True)
+    toolchain_root = _trusted_python_toolchain_root(manifest, root, os.environ)
+    executable = _safe_file(
+        root,
+        manifest.executable,
+        executable=True,
+        trusted_external_root=toolchain_root,
+    )
     if executable is None or _digest_file(executable) != preflight.executable_digest:
         raise CandidateProcessError("executable-changed-after-preflight")
     profile = state / "candidate.sb"
-    profile.write_text(_sandbox_profile(repo, root, state), encoding="utf-8")
+    profile.write_text(
+        _sandbox_profile(
+            repo,
+            root,
+            state,
+            extra_read_roots=(toolchain_root,) if toolchain_root else (),
+        ),
+        encoding="utf-8",
+    )
     if type(permute_wire) is not bool:
         raise CandidateProcessError("invalid-wire-permutation")
     request_bytes = _request_wire_bytes(request, permute_wire) + b"\n"
@@ -219,7 +251,13 @@ def run_candidate(
         "--state-root",
         str(state),
     ]
-    environment = _candidate_environment(manifest, os.environ, state)
+    environment = _candidate_environment(
+        manifest,
+        os.environ,
+        state,
+        candidate_root=root,
+        trusted_python=toolchain_root is not None,
+    )
     started = time.monotonic_ns()
     process = subprocess.Popen(
         command,
@@ -369,19 +407,61 @@ def _isolation_capability() -> IsolationCapability:
     return IsolationCapability(ready, ready, ready, tuple(sorted(reasons)))
 
 
-def _safe_file(root: Path, relative: str, *, executable: bool = False) -> Optional[Path]:
+def _safe_file(
+    root: Path,
+    relative: str,
+    *,
+    executable: bool = False,
+    trusted_external_root: Optional[Path] = None,
+) -> Optional[Path]:
     try:
         lexical = root / relative
         resolved = lexical.resolve(strict=True)
     except (OSError, RuntimeError):
         return None
-    if lexical.is_symlink() or resolved.parent == resolved or not _is_below(resolved, root):
+    leaf_symlink = lexical.is_symlink()
+    if resolved.parent == resolved:
         return None
-    if any(part.is_symlink() for part in _parents_below(lexical, root)):
+    if leaf_symlink:
+        if trusted_external_root is None or not _is_below(resolved, trusted_external_root):
+            return None
+    elif not _is_below(resolved, root):
+        return None
+    if any(part.is_symlink() for part in _parents_below(lexical.parent, root)):
         return None
     if not resolved.is_file() or (executable and not os.access(resolved, os.X_OK)):
         return None
     return resolved
+
+
+def _trusted_python_toolchain_root(
+    manifest: CandidateManifest,
+    candidate_root: Path,
+    environment: Mapping[str, str],
+) -> Optional[Path]:
+    if manifest.language != "Python" or manifest.executable != ".venv/bin/python":
+        return None
+    lexical = candidate_root / manifest.executable
+    if not lexical.is_symlink():
+        return None
+    configured = environment.get("UV_PYTHON_INSTALL_DIR")
+    uv_root = (
+        Path(configured)
+        if configured
+        else Path.home() / ".local" / "share" / "uv" / "python"
+    )
+    try:
+        uv_root = uv_root.resolve(strict=True)
+        resolved = lexical.resolve(strict=True)
+        relative = resolved.relative_to(uv_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if len(relative.parts) < 3 or not relative.parts[0].startswith("cpython-"):
+        return None
+    toolchain_root = uv_root / relative.parts[0]
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        return None
+    return toolchain_root
 
 
 def _parents_below(path: Path, root: Path) -> tuple[Path, ...]:
@@ -405,6 +485,9 @@ def _candidate_environment(
     manifest: CandidateManifest,
     source: Mapping[str, str],
     state: Path,
+    *,
+    candidate_root: Optional[Path] = None,
+    trusted_python: bool = False,
 ) -> dict[str, str]:
     home = state / "home"
     cache = state / "cache"
@@ -420,10 +503,22 @@ def _candidate_environment(
             "XDG_CACHE_HOME": str(cache.resolve()),
         }
     )
+    if trusted_python and candidate_root is not None:
+        site_packages = tuple(
+            sorted((candidate_root / ".venv" / "lib").glob("python3.*/site-packages"))
+        )
+        if len(site_packages) == 1 and site_packages[0].is_dir():
+            environment["PYTHONPATH"] = str(site_packages[0].resolve())
     return environment
 
 
-def _sandbox_profile(repo: Path, candidate: Path, state: Path) -> str:
+def _sandbox_profile(
+    repo: Path,
+    candidate: Path,
+    state: Path,
+    *,
+    extra_read_roots: tuple[Path, ...] = (),
+) -> str:
     read_roots = (
         repo,
         candidate,
@@ -432,6 +527,7 @@ def _sandbox_profile(repo: Path, candidate: Path, state: Path) -> str:
         Path("/usr"),
         Path("/Library"),
         Path("/dev"),
+        *extra_read_roots,
     )
     read_rules = "  (literal \"/\")\n" + "\n".join(
         f'  (subpath "{_sbpl(path.resolve())}")'

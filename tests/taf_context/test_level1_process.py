@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional
 
 from taf_context.level1_models import (
     CandidateAvailability,
@@ -49,7 +50,7 @@ def valid_result_bytes(request_value: Level1Request) -> bytes:
     return (json.dumps(rendered.result.to_dict(), sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def candidate_script(payload: bytes) -> str:
+def candidate_script(payload: bytes, *, version_argument: Optional[str] = None) -> str:
     interpreter = Path(sys.executable).resolve()
     return f'''#!{interpreter}
 import os
@@ -58,7 +59,10 @@ import subprocess
 import sys
 import time
 
+required_version_argument = {version_argument!r}
 if "--version" in sys.argv:
+    if required_version_argument is not None and sys.argv[1:] != [required_version_argument, "--version"]:
+        raise SystemExit(64)
     print("0.1.0")
     raise SystemExit(0)
 
@@ -133,6 +137,48 @@ def manifest(mode: str) -> CandidateManifest:
 
 
 class CandidateProcessBoundaryTests(unittest.TestCase):
+    def test_preflight_passes_manifest_arguments_to_candidate_version_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            candidate_root, _repo, _state, _evidence = self.make_fixture(root, "valid")
+            executable = candidate_root / "candidate.py"
+            write(
+                executable,
+                candidate_script(
+                    valid_result_bytes(request()),
+                    version_argument="valid",
+                ),
+            )
+            executable.chmod(0o755)
+
+            preflight = preflight_candidate(manifest("valid"), candidate_root, os.environ)
+
+        self.assertIs(preflight.availability, CandidateAvailability.READY, preflight.reason_codes)
+
+    def test_preflight_allows_only_a_declared_uv_managed_python_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            candidate_root = root / "candidate"
+            uv_root = root / "uv-python"
+            interpreter = uv_root / "cpython-3.14.7-test" / "bin" / "python3.14"
+            interpreter.parent.mkdir(parents=True)
+            write(interpreter, candidate_script(valid_result_bytes(request())))
+            interpreter.chmod(0o755)
+            executable = candidate_root / ".venv" / "bin" / "python"
+            executable.parent.mkdir(parents=True)
+            executable.symlink_to(interpreter)
+            write(candidate_root / "fixture.lock", "fixture==1.0.0\n")
+            write(candidate_root / "licenses.json", '{"fixture":"MIT"}\n')
+            environment = dict(os.environ)
+            environment["UV_PYTHON_INSTALL_DIR"] = str(uv_root)
+            manifest_wire = manifest("valid").to_dict()
+            manifest_wire["executable"] = ".venv/bin/python"
+            uv_manifest = CandidateManifest.from_dict(manifest_wire)
+
+            preflight = preflight_candidate(uv_manifest, candidate_root, environment)
+
+        self.assertIs(preflight.availability, CandidateAvailability.READY, preflight.reason_codes)
+
     def test_permuted_wire_is_semantically_equal_but_byte_distinct(self) -> None:
         canonical = _request_wire_bytes(request(), False)
         permuted = _request_wire_bytes(request(), True)
