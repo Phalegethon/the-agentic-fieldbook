@@ -43,6 +43,7 @@ class AdapterBinding:
     provider_identity: str
     adapter_root: Path
     provider_executable: Path
+    provider_executable_digest: str
     provider_arguments: tuple[str, ...]
     provider_state_roots: tuple[Path, ...]
     environment: tuple[tuple[str, str], ...]
@@ -59,6 +60,13 @@ class AdapterBinding:
         provider_identity = _identity(value, "provider_identity")
         adapter_root = _directory(value, "adapter_root")
         provider_executable = _executable(value, "provider_executable")
+        provider_executable_digest = value["provider_executable_digest"]
+        if (
+            type(provider_executable_digest) is not str
+            or _DIGEST.fullmatch(provider_executable_digest) is None
+            or provider_executable_digest != _file_digest(provider_executable)
+        ):
+            raise ProviderBindingError("provider_executable_digest")
         arguments = _arguments(value, "provider_arguments")
         state_roots = _directories(value, "provider_state_roots")
         environment = _environment(value, "environment")
@@ -79,6 +87,7 @@ class AdapterBinding:
             provider_identity,
             adapter_root,
             provider_executable,
+            provider_executable_digest,
             arguments,
             state_roots,
             environment,
@@ -94,6 +103,7 @@ class AdapterBinding:
             "provider_identity": self.provider_identity,
             "adapter_root": str(self.adapter_root),
             "provider_executable": str(self.provider_executable),
+            "provider_executable_digest": self.provider_executable_digest,
             "provider_arguments": list(self.provider_arguments),
             "provider_state_roots": [
                 str(path) for path in self.provider_state_roots
@@ -190,6 +200,17 @@ def _binding_digest(value: dict[str, object]) -> str:
     except (TypeError, ValueError) as error:
         raise ProviderBindingError("binding_digest") from error
     return "sha256:" + hashlib.sha256(wire).hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(64 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise ProviderBindingError("provider_executable_digest") from error
+    return "sha256:" + digest.hexdigest()
 
 
 def _identity(value: dict[str, object], field: str) -> str:

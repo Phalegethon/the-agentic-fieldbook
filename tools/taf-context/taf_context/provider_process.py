@@ -138,11 +138,11 @@ def _execute(
     if manifest.network_required and not policy.network_allowed:
         raise ProviderProcessError("provider-network-denied")
     executable_digest = _digest_file(executable)
-    child_digest = (
-        _digest_file(binding.provider_executable)
-        if binding is not None
-        else None
-    )
+    child_digest = None
+    if binding is not None:
+        child_digest = "sha256:" + _digest_file(binding.provider_executable)
+        if child_digest != binding.provider_executable_digest:
+            raise ProviderProcessError("provider-executable-digest-mismatch")
     repository_state = _repository_state(repo)
     environment = {
         name: os.environ[name]
@@ -191,7 +191,7 @@ def _execute(
         binding is not None
         and (
             not binding.provider_executable.exists()
-            or _digest_file(binding.provider_executable) != child_digest
+            or "sha256:" + _digest_file(binding.provider_executable) != child_digest
         )
     ):
         raise ProviderProcessError("provider-executable-mutated")
@@ -352,10 +352,12 @@ def _attach_binding(
         raise ProviderProcessError("adapter-binding-overlap") from error
     envelope["provider_command"] = {
         "executable": str(binding.provider_executable),
+        "executable_digest": binding.provider_executable_digest,
         "arguments": list(binding.provider_arguments),
         "state_roots": [str(path) for path in binding.provider_state_roots],
         "environment": dict(binding.environment),
         "binding_digest": binding.binding_digest,
+        "transport": binding.transport.value,
     }
 
 

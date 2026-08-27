@@ -14,6 +14,8 @@ envelope = json.loads(sys.stdin.buffer.readline())
 
 if role == "adapter":
     command = envelope["provider_command"]
+    if command["transport"] != "cli-json":
+        raise SystemExit(3)
     executable = command["executable"]
     arguments = command["arguments"]
     if mode == "wrong-child":

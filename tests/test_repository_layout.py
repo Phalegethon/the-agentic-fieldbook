@@ -43,6 +43,11 @@ EXPECTED_LEVEL1_CONTRACT_FILES = {
     "contracts/level1/request.schema.json",
     "contracts/level1/result.schema.json",
 }
+EXPECTED_CONTEXT_ADAPTER_FILES = {
+    "adapters/_shared/adapter_runtime.py",
+    "adapters/codebase-memory/adapter.py",
+    "adapters/codebase-memory/manifest.json",
+}
 NONPRODUCTION_CONTEXT_DIRECTORIES = {
     "conformance",
     "fixture",
@@ -95,6 +100,10 @@ def _isolated_context_layout() -> Iterator[Path]:
             contract = root / "tools" / "taf-context" / relative
             contract.parent.mkdir(parents=True, exist_ok=True)
             contract.write_text("{}\n", encoding="utf-8")
+        for relative in EXPECTED_CONTEXT_ADAPTER_FILES:
+            adapter = root / "tools" / "taf-context" / relative
+            adapter.parent.mkdir(parents=True, exist_ok=True)
+            adapter.write_text("{}\n", encoding="utf-8")
         marketplace = root / ".claude-plugin" / "marketplace.json"
         marketplace.parent.mkdir()
         marketplace.write_text('{"plugins":[]}', encoding="utf-8")
@@ -351,6 +360,12 @@ class RepositoryLayoutTest(unittest.TestCase):
             if path.is_file()
         }
         self.assertEqual(EXPECTED_LEVEL1_CONTRACT_FILES, actual_contract_files)
+        actual_adapter_files = {
+            path.relative_to(ROOT / "tools" / "taf-context").as_posix()
+            for path in (ROOT / "tools" / "taf-context" / "adapters").rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts
+        }
+        self.assertEqual(EXPECTED_CONTEXT_ADAPTER_FILES, actual_adapter_files)
 
         self.assertFalse((ROOT / "tools" / "taf-context" / "SKILL.md").exists())
 
@@ -376,6 +391,8 @@ class RepositoryLayoutTest(unittest.TestCase):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
             relative = path.relative_to(context_tool)
+            if relative.as_posix() in EXPECTED_CONTEXT_ADAPTER_FILES:
+                continue
             if relative.as_posix() in EXPECTED_LEVEL1_CONTRACT_FILES or relative.as_posix() in {
                 "taf_context/level1_models.py",
                 "taf_context/level1_render.py",
@@ -439,6 +456,8 @@ class RepositoryLayoutTest(unittest.TestCase):
                 "tools/taf-context/taf_context/level1_models.py",
                 "tools/taf-context/taf_context/level1_render.py",
             }:
+                continue
+            if relative.as_posix().removeprefix("tools/taf-context/") in EXPECTED_CONTEXT_ADAPTER_FILES:
                 continue
             self.assertFalse(
                 _is_forbidden_context_production_surface(relative),

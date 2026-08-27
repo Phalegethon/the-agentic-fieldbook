@@ -30,6 +30,9 @@ def _binding_wire(adapter: Path, provider: Path, state: Path) -> dict[str, objec
         "provider_identity": "fixture.graph",
         "adapter_root": str(adapter.resolve()),
         "provider_executable": str(provider.resolve()),
+        "provider_executable_digest": "sha256:" + hashlib.sha256(
+            provider.read_bytes()
+        ).hexdigest(),
         "provider_arguments": ["cli", "--raw"],
         "provider_state_roots": [str(state.resolve())],
         "environment": {"LANG": "C", "LC_ALL": "C"},
@@ -83,6 +86,16 @@ class AdapterBindingTests(unittest.TestCase):
             parse_adapter_binding(b"{" + b" " * (64 * 1024))
         wire["transport"] = "mcp-stdio"
         with self.assertRaisesRegex(ProviderBindingError, "binding_digest"):
+            AdapterBinding.from_dict(wire)
+
+        wire = _binding_wire(self.adapter, self.provider, self.state)
+        wire["provider_executable_digest"] = "sha256:" + "0" * 64
+        wire["binding_digest"] = "sha256:" + hashlib.sha256(
+            _canonical({key: value for key, value in wire.items() if key != "binding_digest"})
+        ).hexdigest()
+        with self.assertRaisesRegex(
+            ProviderBindingError, "provider_executable_digest"
+        ):
             AdapterBinding.from_dict(wire)
 
     def test_paths_environment_and_transport_fail_closed(self) -> None:

@@ -59,6 +59,7 @@ def render(
     findings: tuple[Level1Finding, ...],
     *,
     warnings: tuple[str, ...] = (),
+    provider_omitted_count: int = 0,
 ):
     return render_level1_result(
         request_value,
@@ -69,6 +70,7 @@ def render(
         parser_versions=(("tree-sitter-python", "0.25.0"),),
         coverage=coverage(),
         ranked_findings=findings,
+        provider_omitted_count=provider_omitted_count,
         warnings=warnings,
         next_safe_action="use-cited-evidence",
     )
@@ -114,6 +116,18 @@ class ExactRenderingTests(unittest.TestCase):
 
 
 class BudgetRenderingTests(unittest.TestCase):
+    def test_provider_omissions_are_preserved_without_placeholder_records(self) -> None:
+        rendered = render(
+            request(maximum_results=2),
+            (finding(1), finding(2)),
+            provider_omitted_count=7,
+        )
+
+        self.assertEqual(rendered.result.returned_count, 2)
+        self.assertEqual(rendered.result.omitted_count, 7)
+        self.assertTrue(rendered.result.truncated)
+        self.assertIn("returned=2 omitted=7", rendered.model_text)
+
     def test_every_budget_is_hard_and_omission_counts_cover_all_eligible_records(self) -> None:
         findings = tuple(finding(rank, preview="π" * 500) for rank in range(1, 21))
 

@@ -52,9 +52,12 @@ def render_level1_result(
     ranked_findings: tuple[Level1Finding, ...],
     warnings: tuple[str, ...],
     next_safe_action: str,
+    provider_omitted_count: int = 0,
 ) -> RenderedLevel1Result:
     """Render a deterministic prefix without splitting a record or citation."""
     _validate_ranked_findings(ranked_findings)
+    if type(provider_omitted_count) is not int or provider_omitted_count < 0:
+        raise ValueError("invalid provider_omitted_count")
     _validate_sorted_pairs(parser_versions, "parser_versions")
     _validate_sorted_values(warnings, "warnings")
 
@@ -71,7 +74,7 @@ def render_level1_result(
             freshness,
             coverage,
             candidate,
-            len(ranked_findings) - count,
+            provider_omitted_count + len(ranked_findings) - count,
             len(warnings),
             next_safe_action,
         )
@@ -83,7 +86,9 @@ def render_level1_result(
         _finding_with_preview(item, "")
         for item in ranked_findings[:selected_count]
     )
-    omitted_count = len(ranked_findings) - selected_count
+    omitted_count = (
+        provider_omitted_count + len(ranked_findings) - selected_count
+    )
     base_text = _render_text(
         request,
         status,

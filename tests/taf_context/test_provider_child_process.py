@@ -30,6 +30,9 @@ def _binding(
         "provider_identity": "fixture.graph",
         "adapter_root": str(adapter.resolve()),
         "provider_executable": str(provider.resolve()),
+        "provider_executable_digest": "sha256:" + hashlib.sha256(
+            provider.read_bytes()
+        ).hexdigest(),
         "provider_arguments": arguments,
         "provider_state_roots": [str(state.resolve())],
         "environment": {"LANG": "C", "LC_ALL": "C"},
