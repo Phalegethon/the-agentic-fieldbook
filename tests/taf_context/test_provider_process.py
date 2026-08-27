@@ -4,14 +4,22 @@ from __future__ import annotations
 
 from dataclasses import replace
 import shutil
+import socket
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from taf_context.level1_models import Level1Request
 from taf_context.models import RepositorySnapshot
 from taf_context.provider_execution_models import AdapterManifest, ExecutionPolicy
-from taf_context.provider_process import ProviderProcessError, inspect_provider, query_provider
+from taf_context.provider_process import (
+    ProviderProcessError,
+    _isolated_command,
+    inspect_provider,
+    query_provider,
+)
 
 from .test_level1_models import request_wire
 
@@ -44,6 +52,8 @@ def policy(**changes: object) -> ExecutionPolicy:
 
 class ProviderProcessTests(unittest.TestCase):
     def setUp(self) -> None:
+        if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+            self.skipTest("macOS sandbox-exec is required for active provider tests")
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.adapter = root / "adapter"
@@ -59,12 +69,12 @@ class ProviderProcessTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def manifest(self, mode: str) -> AdapterManifest:
+    def manifest(self, mode: str, *arguments: str) -> AdapterManifest:
         return AdapterManifest.from_dict({
             "schema_version": "1", "adapter_identity": "fixture.stdio",
             "adapter_version": "1.0.0", "provider_identity": "fixture.graph",
             "provider_version": "2.0.0", "executable": "bin/provider",
-            "arguments": [mode],
+            "arguments": [mode, *arguments],
             "capabilities": ["repository-map", "search-symbols"],
             "supported_phases": ["describe", "inspect", "query"],
             "environment_allowlist": [], "locality": "local",
@@ -89,17 +99,29 @@ class ProviderProcessTests(unittest.TestCase):
             with self.subTest(mode=mode), self.assertRaisesRegex(ProviderProcessError, reason):
                 inspect_provider(self.manifest(mode), self.adapter, snapshot(), self.repo, policy())
 
-    def test_timeout_and_repository_mutation_fail_closed(self) -> None:
+    def test_timeout_and_repository_write_fail_closed(self) -> None:
         with self.assertRaisesRegex(ProviderProcessError, "provider-timeout"):
             inspect_provider(
                 self.manifest("timeout"), self.adapter, snapshot(), self.repo,
                 policy(timeout_seconds=0.05),
             )
-        with self.assertRaisesRegex(ProviderProcessError, "repository-mutated"):
+        with self.assertRaisesRegex(ProviderProcessError, "provider-nonzero"):
             inspect_provider(
                 self.manifest("write-repo"), self.adapter, snapshot(), self.repo,
                 policy(),
             )
+        self.assertFalse((self.repo / "escape.txt").exists())
+
+    def test_network_is_denied_even_when_manifest_claims_it_is_not_needed(self) -> None:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            with self.assertRaisesRegex(ProviderProcessError, "provider-nonzero"):
+                inspect_provider(
+                    self.manifest("network", str(port)), self.adapter,
+                    snapshot(), self.repo, policy(),
+                )
 
     def test_query_result_must_match_frozen_level1_request(self) -> None:
         wire = request_wire()
@@ -111,6 +133,16 @@ class ProviderProcessTests(unittest.TestCase):
         self.assertEqual(result.request_identity, request.request_identity)
         self.assertEqual(result.provider_identity, "fixture.graph")
         self.assertEqual(attempt.phase.value, "query")
+
+
+class ProviderIsolationAvailabilityTests(unittest.TestCase):
+    def test_unsupported_platform_fails_closed_before_execution(self) -> None:
+        root = Path("/nonexistent")
+        with mock.patch("taf_context.provider_process.sys.platform", "linux"):
+            with self.assertRaisesRegex(
+                ProviderProcessError, "provider-isolation-unavailable"
+            ):
+                _isolated_command(root, (), root, root, root)
 
 
 if __name__ == "__main__":

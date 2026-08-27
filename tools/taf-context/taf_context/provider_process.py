@@ -9,6 +9,7 @@ import resource
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -140,7 +141,14 @@ def _execute(
     ).encode("utf-8")
     command = [str(executable), *manifest.arguments]
     started = time.monotonic_ns()
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+    with tempfile.TemporaryDirectory(prefix="taf-provider-state-") as state_name, tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        command = _isolated_command(
+            executable,
+            manifest.arguments,
+            root,
+            repo,
+            Path(state_name),
+        )
         process = subprocess.Popen(
             command,
             cwd=root,
@@ -183,6 +191,113 @@ def _execute(
 
 def _limit_output_files() -> None:
     resource.setrlimit(resource.RLIMIT_FSIZE, (300 * 1024, 300 * 1024))
+
+
+def _isolated_command(
+    executable: Path,
+    arguments: tuple[str, ...],
+    adapter_root: Path,
+    repository_root: Path,
+    state_root: Path,
+) -> list[str]:
+    sandbox = Path("/usr/bin/sandbox-exec")
+    if sys.platform != "darwin" or not sandbox.is_file():
+        raise ProviderProcessError("provider-isolation-unavailable")
+    runtime, runtime_arguments = _runtime_command(executable)
+    return [
+        str(sandbox),
+        "-p",
+        _sandbox_profile(
+            runtime, adapter_root, repository_root, state_root
+        ),
+        str(runtime),
+        *runtime_arguments,
+        *arguments,
+    ]
+
+
+def _runtime_command(executable: Path) -> tuple[Path, tuple[str, ...]]:
+    try:
+        with executable.open("rb") as handle:
+            first_line = handle.readline(128).rstrip(b"\r\n")
+    except OSError as error:
+        raise ProviderProcessError("unsafe-adapter-executable") from error
+    if first_line != b"#!/usr/bin/python3":
+        return executable, ()
+    interpreter = Path(sys.executable).resolve()
+    trusted_root = Path("/Library/Developer/CommandLineTools").resolve()
+    if interpreter != trusted_root and trusted_root not in interpreter.parents:
+        raise ProviderProcessError("unsafe-adapter-interpreter")
+    python_app = (
+        interpreter.parent.parent
+        / "Resources/Python.app/Contents/MacOS/Python"
+    )
+    if not python_app.is_file() or not os.access(python_app, os.X_OK):
+        raise ProviderProcessError("unsafe-adapter-interpreter")
+    return python_app.resolve(), (str(executable),)
+
+
+def _sandbox_profile(
+    executable: Path,
+    adapter_root: Path,
+    repository_root: Path,
+    state_root: Path,
+) -> str:
+    read_roots = tuple(
+        path.resolve()
+        for path in (
+            adapter_root,
+            repository_root,
+            state_root,
+            Path("/System"),
+            Path("/usr"),
+            Path("/Library"),
+            Path("/dev"),
+        )
+        if path.exists()
+    )
+    ancestors = tuple(
+        sorted(
+            {
+                ancestor
+                for root in read_roots
+                for ancestor in (root, *root.parents)
+                if ancestor != Path("/")
+            },
+            key=str,
+        )
+    )
+    literal_reads = "\n".join(
+        f'  (literal "{_sandbox_escape(path)}")' for path in ancestors
+    )
+    subtree_reads = "\n".join(
+        f'  (subpath "{_sandbox_escape(path)}")' for path in read_roots
+    )
+    process_rules = "\n".join(
+        f'  (literal "{_sandbox_escape(path)}")'
+        for path in (executable.resolve(),)
+    )
+    state = state_root.resolve()
+    return (
+        "(version 1)\n"
+        "(deny default)\n"
+        "(allow sysctl-read)\n"
+        "(allow mach-lookup)\n"
+        "(allow ipc-posix-shm)\n"
+        "(allow process-exec\n"
+        f"{process_rules})\n"
+        "(allow file-read*\n"
+        "  (literal \"/\")\n"
+        f"{literal_reads}\n"
+        f"{subtree_reads})\n"
+        "(allow file-write*\n"
+        f'  (literal "{_sandbox_escape(state)}")\n'
+        f'  (subpath "{_sandbox_escape(state)}"))\n'
+    )
+
+
+def _sandbox_escape(path: Path) -> str:
+    return str(path).replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _safe_executable(root: Path, relative: str) -> Path | None:

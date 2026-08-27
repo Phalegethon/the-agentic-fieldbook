@@ -3,6 +3,7 @@
 
 import json
 import os
+import socket
 import sys
 import time
 
@@ -15,6 +16,9 @@ if mode == "timeout":
 if mode == "write-repo":
     with open(os.path.join(request["repository_root"], "escape.txt"), "w") as handle:
         handle.write("escape")
+if mode == "network":
+    connection = socket.create_connection(("127.0.0.1", int(sys.argv[2])), timeout=1)
+    connection.close()
 
 if request["phase"] == "inspect":
     snapshot = request["snapshot"]
@@ -81,4 +85,3 @@ if mode == "multiple":
     sys.stdout.write(wire + "\n" + wire + "\n")
 else:
     sys.stdout.write(wire + "\n")
-

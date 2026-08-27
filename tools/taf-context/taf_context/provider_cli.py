@@ -11,9 +11,13 @@ import stat
 import sys
 from typing import Callable, Mapping, TextIO
 
+from .bounded_fallback import FallbackPolicy, run_bounded_fallback
 from .consent import AuthorizationLedger, ConsentDisposition
 from .discovery import discover_providers
+from .level1_models import Level1Request
 from .models import ContextAction, RepositorySnapshot
+from .provider_broker import execute_broker_request
+from .provider_execution_models import ExecutionPolicy, parse_adapter_manifest
 from .provider_models import (
     BrokerRequest,
     ConsentRequest,
@@ -22,6 +26,7 @@ from .provider_models import (
     RoutingDecision,
     parse_host_inventory,
 )
+from .provider_process import inspect_provider, query_provider
 from .provider_state import (
     StateError,
     StatePaths,
@@ -56,6 +61,16 @@ def register_provider_commands(subparsers: argparse._SubParsersAction) -> None:
     route = provider_commands.add_parser("route")
     route.add_argument("--discovery", required=True)
     route.add_argument("--request", required=True)
+
+    execute = provider_commands.add_parser("execute")
+    execute.add_argument("--repo", required=True)
+    execute.add_argument("--snapshot", required=True)
+    execute.add_argument("--discovery", required=True)
+    execute.add_argument("--request", required=True)
+    execute.add_argument("--adapter-manifest", action="append", default=[])
+    execute.add_argument("--adapter-root", action="append", default=[])
+    execute.add_argument("--timeout-seconds", type=float, default=10.0)
+    execute.add_argument("--allow-fallback", action="store_true")
 
     consent = subparsers.add_parser("consent")
     consent_commands = consent.add_subparsers(dest="consent_command", required=True)
@@ -96,6 +111,8 @@ def run_provider_command(
         return _discover_command(args, environment)
     if args.command == "providers" and args.provider_command == "route":
         return _route_command(args, environment, utc_clock)
+    if args.command == "providers" and args.provider_command == "execute":
+        return _execute_command(args, environment, utc_clock)
     if args.command == "consent" and args.consent_command == "request":
         return _consent_request_command(args)
     if args.command == "consent" and args.consent_command == "list":
@@ -156,6 +173,114 @@ def _route_command(
         consent_state_usable=consent_state_usable,
     )
     return decision.to_dict()
+
+
+def _execute_command(
+    args: argparse.Namespace,
+    environment: Mapping[str, str],
+    utc_clock: Callable[[], datetime],
+) -> dict[str, object]:
+    if len(args.adapter_manifest) != len(args.adapter_root):
+        raise ProviderCLIError("adapter manifest and root counts must match")
+    repository = _resolved_directory(Path(args.repo), "repository unavailable")
+    snapshot = RepositorySnapshot.from_dict(
+        _read_json_object(Path(args.snapshot))
+    )
+    if repository != _resolved_directory(
+        Path(snapshot.canonical_root), "snapshot repository unavailable"
+    ):
+        raise ProviderCLIError("repository does not match snapshot root")
+    discovery = DiscoverySnapshot.from_dict(
+        _read_json_object(Path(args.discovery))
+    )
+    request = Level1Request.from_dict(_read_json_object(Path(args.request)))
+    if (
+        discovery.repository_identity != snapshot.repository_identity
+        or discovery.worktree_identity != snapshot.worktree_identity
+        or request.repository_identity != snapshot.repository_identity
+        or request.worktree_identity != snapshot.worktree_identity
+        or request.committed_head != snapshot.head_sha
+        or request.dirty_overlay_fingerprint != snapshot.dirty_fingerprint
+    ):
+        raise ProviderCLIError("execution inputs describe different snapshots")
+
+    adapters: dict[str, tuple[object, Path]] = {}
+    for manifest_path, root_path in zip(
+        args.adapter_manifest, args.adapter_root
+    ):
+        manifest = parse_adapter_manifest(
+            _read_control_bytes(Path(manifest_path))
+        )
+        adapter_root = _resolved_directory(
+            Path(root_path), "adapter root unavailable"
+        )
+        if manifest.provider_identity in adapters:
+            raise ProviderCLIError("duplicate adapter provider identity")
+        adapters[manifest.provider_identity] = (manifest, adapter_root)
+
+    try:
+        consent = read_consent(_state_paths(environment))
+    except StateError:
+        consent = AuthorizationLedger()
+    try:
+        policy = ExecutionPolicy.from_dict(
+            {
+                "schema_version": "1",
+                "timeout_seconds": args.timeout_seconds,
+                "maximum_stdout_bytes": 256 * 1024,
+                "maximum_stderr_bytes": 64 * 1024,
+                "network_allowed": False,
+                "fallback_allowed": bool(args.allow_fallback),
+                "maximum_inspections": 3,
+            }
+        )
+    except ValueError as error:
+        raise ProviderCLIError(str(error)) from error
+
+    def inspect_call(provider):
+        manifest, adapter_root = adapters[provider.provider_identity]
+        return inspect_provider(
+            manifest, adapter_root, snapshot, repository, policy
+        )
+
+    def query_call(provider, level1_request):
+        manifest, adapter_root = adapters[provider.provider_identity]
+        return query_provider(
+            manifest, adapter_root, level1_request, repository, policy
+        )
+
+    fallback_call = None
+    if policy.fallback_allowed:
+        candidate_paths = tuple(
+            sorted(
+                set(snapshot.tracked_paths)
+                | set(snapshot.staged_paths)
+                | set(snapshot.unstaged_paths)
+                | set(snapshot.untracked_paths)
+            )
+        )
+
+        def fallback_call(level1_request):
+            result, _evidence = run_bounded_fallback(
+                level1_request,
+                repository,
+                candidate_paths,
+                FallbackPolicy(32, 512 * 1024, 64 * 1024, 256),
+            )
+            return result
+
+    execution = execute_broker_request(
+        discovery,
+        request,
+        consent,
+        snapshot,
+        adapters,
+        inspect_call=inspect_call,
+        query_call=query_call,
+        fallback_call=fallback_call,
+        utc_now=_rfc3339(utc_clock()),
+    )
+    return execution.to_dict()
 
 
 def _consent_request_command(args: argparse.Namespace) -> dict[str, object]:

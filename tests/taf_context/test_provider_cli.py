@@ -8,6 +8,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from taf_context.cli import main
 from taf_context.git_snapshot import collect_snapshot
 
 from .repo_factory import init_committed_repo
+from .test_level1_models import request_wire
 
 
 FIXED_NOW = datetime(2026, 8, 26, 12, 34, 56, tzinfo=timezone.utc)
@@ -198,13 +200,14 @@ def _record(
     action: str,
     *,
     repository: str = "sha256:repo",
+    provider: str = "local.graph",
     disposition: str = "allow",
     digest: str | None = None,
 ) -> dict[str, str]:
     return {
         "action": action,
         "repository_identity": repository,
-        "provider_identity": "local.graph",
+        "provider_identity": provider,
         "provider_schema_version": "1",
         "disposition": disposition,
         "decided_at": FIXED_TIMESTAMP,
@@ -934,6 +937,215 @@ class ConsentCommandTests(unittest.TestCase):
             recorded = json.loads((explicit_state / "consent.json").read_text())
             self.assertEqual(recorded["records"][0]["decided_at"], FIXED_TIMESTAMP)
             self.assertEqual(stdout, _canonical(recorded))
+
+
+class ProviderExecutionCommandTests(unittest.TestCase):
+    @unittest.skipUnless(
+        sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(),
+        "macOS sandbox-exec is required for active provider execution",
+    )
+    def test_execute_inspects_and_queries_one_explicit_authorized_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            snapshot = collect_snapshot(repo)
+            adapter = root / "adapter"
+            (adapter / "bin").mkdir(parents=True)
+            executable = adapter / "bin/provider"
+            shutil.copyfile(
+                Path(__file__).with_name("fixture_provider.py"), executable
+            )
+            executable.chmod(0o700)
+            snapshot_file = root / "snapshot.json"
+            discovery_file = root / "discovery.json"
+            request_file = root / "request.json"
+            manifest_file = root / "adapter.json"
+            _write_json(snapshot_file, snapshot.to_dict())
+            provider = _descriptor(
+                identity="fixture.graph",
+                source="user-registry",
+                status_evidence="uninspected",
+            )
+            provider.update(
+                {
+                    "provider_version": "2.0.0",
+                    "capabilities": ["repository-map", "search-symbols"],
+                    "freshness": "unknown",
+                    "path_coverage": None,
+                    "language_coverage": None,
+                    "latency_ms": None,
+                    "confidence": "uncertain",
+                    "supported_actions": ["inspect", "query"],
+                    "required_actions": ["inspect", "query"],
+                }
+            )
+            discovery = _discovery(provider)
+            discovery.update(
+                {
+                    "repository_identity": snapshot.repository_identity,
+                    "worktree_identity": snapshot.worktree_identity,
+                }
+            )
+            _write_json(discovery_file, discovery)
+            request = request_wire()
+            request.update(
+                {
+                    "provider_identity": "fixture.graph",
+                    "repository_identity": snapshot.repository_identity,
+                    "worktree_identity": snapshot.worktree_identity,
+                    "committed_head": snapshot.head_sha,
+                    "dirty_overlay_fingerprint": snapshot.dirty_fingerprint,
+                }
+            )
+            _write_json(request_file, request)
+            _write_json(
+                manifest_file,
+                {
+                    "schema_version": "1",
+                    "adapter_identity": "fixture.stdio",
+                    "adapter_version": "1.0.0",
+                    "provider_identity": "fixture.graph",
+                    "provider_version": "2.0.0",
+                    "executable": "bin/provider",
+                    "arguments": ["valid"],
+                    "capabilities": ["repository-map", "search-symbols"],
+                    "supported_phases": ["describe", "inspect", "query"],
+                    "environment_allowlist": [],
+                    "locality": "local",
+                    "network_required": False,
+                },
+            )
+            state = root / "state"
+            _write_json(
+                state / "consent.json",
+                {
+                    "schema_version": "2",
+                    "records": [
+                        _record(
+                            "inspect",
+                            repository=snapshot.repository_identity,
+                            provider="fixture.graph",
+                        ),
+                        _record(
+                            "query",
+                            repository=snapshot.repository_identity,
+                            provider="fixture.graph",
+                        ),
+                    ],
+                },
+            )
+
+            code, stdout, stderr = _invoke(
+                "providers", "execute",
+                "--repo", str(repo),
+                "--snapshot", str(snapshot_file),
+                "--discovery", str(discovery_file),
+                "--request", str(request_file),
+                "--adapter-manifest", str(manifest_file),
+                "--adapter-root", str(adapter),
+                state_home=state,
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            execution = json.loads(stdout)
+            self.assertEqual(execution["route"], "fixture.graph")
+            self.assertEqual(
+                [attempt["phase"] for attempt in execution["attempts"]],
+                ["inspect", "query"],
+            )
+            self.assertEqual(
+                execution["result"]["provider_identity"], "fixture.graph"
+            )
+            self.assertNotIn(str(repo), stdout)
+
+    def test_execute_returns_canonical_bounded_result_without_local_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            (repo / "src.py").write_text(
+                "class RecoveryDossier:\n    pass\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ["git", "add", "src.py"], cwd=repo, check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "add source"], cwd=repo, check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            snapshot = collect_snapshot(repo)
+            snapshot_file = root / "snapshot.json"
+            discovery_file = root / "discovery.json"
+            request_file = root / "request.json"
+            _write_json(snapshot_file, snapshot.to_dict())
+            _write_json(
+                discovery_file,
+                {
+                    "schema_version": "1",
+                    "repository_identity": snapshot.repository_identity,
+                    "worktree_identity": snapshot.worktree_identity,
+                    "inventory_fingerprint": "sha256:" + "a" * 64,
+                    "providers": [],
+                    "rejected_provider_count": 0,
+                    "rejection_summaries": [],
+                    "omitted_provider_count": 0,
+                    "partial": False,
+                    "warnings": [],
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                },
+            )
+            request = request_wire()
+            request.update(
+                {
+                    "repository_identity": snapshot.repository_identity,
+                    "worktree_identity": snapshot.worktree_identity,
+                    "committed_head": snapshot.head_sha,
+                    "dirty_overlay_fingerprint": snapshot.dirty_fingerprint,
+                    "provider_identity": "missing.graph",
+                    "filters": {
+                        "path_prefixes": [],
+                        "languages": [],
+                        "symbol_kinds": [],
+                        "source_types": [],
+                    },
+                }
+            )
+            _write_json(request_file, request)
+
+            code, stdout, stderr = _invoke(
+                "providers", "execute",
+                "--repo", str(repo),
+                "--snapshot", str(snapshot_file),
+                "--discovery", str(discovery_file),
+                "--request", str(request_file),
+                "--allow-fallback",
+                state_home=root / "state",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            execution = json.loads(stdout)
+            self.assertEqual(stdout, _canonical(execution))
+            self.assertEqual(execution["route"], "bounded-fallback")
+            self.assertEqual(
+                execution["result"]["provider_identity"],
+                "taf.bounded-fallback",
+            )
+            self.assertEqual(execution["result"]["returned_count"], 1)
+            self.assertNotIn(str(repo), stdout)
+
+    def test_execute_requires_explicit_paired_adapter_roots(self) -> None:
+        code, stdout, stderr = _invoke(
+            "providers", "execute",
+            "--repo", "/missing",
+            "--snapshot", "/missing-snapshot",
+            "--discovery", "/missing-discovery",
+            "--request", "/missing-request",
+            "--adapter-manifest", "/missing-manifest",
+        )
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("adapter manifest and root counts must match", stderr)
 
 
 class CompatibilityAndPublicAPITests(unittest.TestCase):
