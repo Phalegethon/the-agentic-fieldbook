@@ -94,6 +94,8 @@ class BenchmarkSample:
         if self.record_type == "query":
             if self.vector_identity and self.vector_identity.startswith("L1-S-"):
                 fields["query_class"] = "state"
+            elif self.vector_identity in {"L1-Q-003", "L1-Q-004", "L1-Q-005", "L1-Q-006"}:
+                fields["query_class"] = "state"
             elif self.vector_identity in {"L1-Q-009", "L1-Q-015"}:
                 fields["query_class"] = "fuzzy"
             else:
@@ -876,15 +878,29 @@ def _vector_request(
     if type(raw) is not dict:
         raise ValueError("invalid vector request")
     wire = dict(raw)
+    baseline = {
+        "repository_identity": "sha256:" + "1" * 64,
+        "worktree_identity": "sha256:" + "2" * 64,
+        "committed_head": "a" * 40,
+        "dirty_overlay_fingerprint": "sha256:" + "3" * 64,
+        "index_identity": "sha256:" + "4" * 64,
+    }
+    actual = {
+        "repository_identity": getattr(snapshot, "repository_identity"),
+        "worktree_identity": getattr(snapshot, "worktree_identity"),
+        "committed_head": getattr(snapshot, "head_sha"),
+        "dirty_overlay_fingerprint": getattr(snapshot, "dirty_fingerprint"),
+        "index_identity": index_identity,
+    }
+    for field, placeholder in baseline.items():
+        if wire[field] == placeholder:
+            wire[field] = actual[field]
+    if vector.get("vector_identity") == "L1-Q-006":
+        wire["repository_identity"] = "sha256:" + "6" * 64
     wire.update(
         {
             "request_identity": request_identity,
-            "repository_identity": getattr(snapshot, "repository_identity"),
-            "worktree_identity": getattr(snapshot, "worktree_identity"),
-            "committed_head": getattr(snapshot, "head_sha"),
-            "dirty_overlay_fingerprint": getattr(snapshot, "dirty_fingerprint"),
             "provider_identity": manifest.candidate_identity,
-            "index_identity": index_identity,
         }
     )
     return Level1Request.from_dict(wire)
@@ -896,7 +912,12 @@ def _query_observation(
     result: Level1Result,
     process: ProcessEvidence,
 ) -> dict[str, object]:
-    expected = tuple(vector["expected_result_identities"])  # type: ignore[arg-type]
+    required_status = vector["required_status"]
+    expected = (
+        tuple(vector["expected_result_identities"])  # type: ignore[arg-type]
+        if required_status not in {"stale", "error"}
+        else ()
+    )
     forbidden = set(vector["forbidden_result_identities"])  # type: ignore[arg-type]
     actual = tuple(sorted(item.result_identity for item in result.findings))
     expected_citations = {
@@ -914,7 +935,6 @@ def _query_observation(
         if item.result_identity in set(expected)
     }
     expected_class = vector["expected_evidence_class"]
-    required_status = vector["required_status"]
     return {
         "elapsed_ns": process.elapsed_ns,
         "expected_result_identities": list(expected),

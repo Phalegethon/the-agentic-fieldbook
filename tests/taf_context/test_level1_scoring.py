@@ -96,7 +96,7 @@ def evidence_lines(candidate: str = "python", *, latency: int = 100_000_000) -> 
         )
     for vector in range(1, 25):
         vector_id = f"L1-Q-{vector:03d}"
-        query_class = "fuzzy" if vector in {9, 15} else "exact"
+        query_class = "state" if vector in {3, 4, 5, 6} else ("fuzzy" if vector in {9, 15} else "exact")
         for ordinal in range(0, 6):
             lines.append(
                 {

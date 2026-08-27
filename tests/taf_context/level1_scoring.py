@@ -412,7 +412,10 @@ def _validate_schedule(grouped: Mapping[str, list[Mapping[str, object]]]) -> Non
         queries = [item for item in grouped["query"] if item["vector_identity"] == vector]
         if {(item["ordinal"], item["retained"]) for item in queries} != {(0, False)} | {(sample, True) for sample in range(1, 6)} or len(queries) != 6:
             raise ValueError("incomplete query schedule")
-        expected_class = "fuzzy" if vector in {"L1-Q-009", "L1-Q-015"} else "exact"
+        if vector in {"L1-Q-003", "L1-Q-004", "L1-Q-005", "L1-Q-006"}:
+            expected_class = "state"
+        else:
+            expected_class = "fuzzy" if vector in {"L1-Q-009", "L1-Q-015"} else "exact"
         if any(item["query_class"] != expected_class for item in queries):
             raise ValueError("invalid query class schedule")
         determinism = [item for item in grouped["determinism"] if item["vector_identity"] == vector]

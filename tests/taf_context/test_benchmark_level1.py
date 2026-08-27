@@ -192,6 +192,15 @@ class BenchmarkRetentionTests(unittest.TestCase):
         self.assertEqual(sum(item.record_type == "update" for item in schedule), 6)
         self.assertEqual(sum(item.record_type == "query" for item in schedule), 147)
         self.assertEqual(sum(item.record_type == "determinism" for item in schedule), 96)
+        query_classes = {
+            item.vector_identity: item.controller_fields()["query_class"]
+            for item in schedule
+            if item.record_type == "query" and item.ordinal == 0
+        }
+        self.assertEqual(
+            {identity for identity, query_class in query_classes.items() if query_class == "state"},
+            {"L1-Q-003", "L1-Q-004", "L1-Q-005", "L1-Q-006"},
+        )
         self.assertEqual(evidence.candidate_identity, "python")
         self.assertIs(report.gate_statuses["correctness"], GateStatus.PASS)
 
