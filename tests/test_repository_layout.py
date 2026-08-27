@@ -67,6 +67,13 @@ CONTEXT_ENGINE_TERMS = (
     "watchers",
 )
 CONTEXT_SCOPE_PREFIXES = ("tafcontext", "contextual", "context")
+PRIVATE_BAKEOFF_ROOTS = {"evals", "experiments"}
+PRIVATE_BAKEOFF_FILENAMES = {
+    "candidate.json",
+    "cargo.lock",
+    "go.sum",
+    "uv.lock",
+}
 
 
 @contextmanager
@@ -170,7 +177,32 @@ def _is_forbidden_context_production_surface(relative: Path) -> bool:
     )
 
 
+def _is_private_bakeoff_artifact(relative: Path) -> bool:
+    return bool(
+        relative.parts
+        and (
+            relative.parts[0].lower() in PRIVATE_BAKEOFF_ROOTS
+            or relative.name.lower() in PRIVATE_BAKEOFF_FILENAMES
+            or relative.suffix.lower() == ".jsonl"
+        )
+    )
+
+
 class RepositoryLayoutTest(unittest.TestCase):
+    def test_private_bakeoff_artifacts_are_rejected_from_public_layout(self) -> None:
+        forbidden = (
+            Path("experiments/level1-bakeoff/python/candidate.json"),
+            Path("evals/level1-bakeoff/evidence/run/evidence.jsonl"),
+            Path("tools/taf-context/uv.lock"),
+            Path("tools/taf-context/candidate.json"),
+        )
+        allowed = (
+            Path("tests/taf_context/benchmark_level1.py"),
+            Path("tools/taf-context/contracts/level1/request.schema.json"),
+        )
+        self.assertTrue(all(_is_private_bakeoff_artifact(path) for path in forbidden))
+        self.assertFalse(any(_is_private_bakeoff_artifact(path) for path in allowed))
+
     def test_context_scope_predicate_distinguishes_compound_paths(self) -> None:
         context_paths = (
             "skills/contextbridge/SKILL.md",
@@ -389,6 +421,9 @@ class RepositoryLayoutTest(unittest.TestCase):
                 for path in ROOT.rglob("*")
                 if path.is_file() and ".git" not in path.relative_to(ROOT).parts
             )
+        )
+        self.assertFalse(
+            any(_is_private_bakeoff_artifact(path) for path in public_files)
         )
         for relative in public_files:
             if relative.as_posix() in {
