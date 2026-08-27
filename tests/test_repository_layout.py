@@ -25,6 +25,7 @@ EXPECTED_TAF_CONTEXT_FILES = {
     "level1_models.py",
     "level1_render.py",
     "models.py",
+    "mcp_stdio.py",
     "provider_cli.py",
     "provider_binding.py",
     "provider_broker.py",
