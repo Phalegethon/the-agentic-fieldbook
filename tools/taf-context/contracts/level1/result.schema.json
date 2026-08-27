@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-agentic-fieldbook.local/contracts/level1/result.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_identity",
+    "operation",
+    "status",
+    "provider_identity",
+    "provider_version",
+    "index_identity",
+    "repository_identity",
+    "worktree_identity",
+    "committed_head",
+    "dirty_overlay_fingerprint",
+    "freshness",
+    "parser_versions",
+    "coverage",
+    "findings",
+    "returned_count",
+    "omitted_count",
+    "truncated",
+    "output_characters",
+    "warnings",
+    "next_safe_action"
+  ],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "request_identity": {"$ref": "#/$defs/canonical_id"},
+    "operation": {
+      "enum": [
+        "estimate",
+        "build",
+        "update",
+        "status",
+        "metrics",
+        "repository-map",
+        "search-symbols",
+        "search-docs",
+        "source-snippets"
+      ]
+    },
+    "status": {"enum": ["ready", "partial", "stale", "unsupported", "error"]},
+    "provider_identity": {"$ref": "#/$defs/canonical_id"},
+    "provider_version": {"type": "string", "minLength": 1, "maxLength": 512},
+    "index_identity": {
+      "oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]
+    },
+    "repository_identity": {"$ref": "#/$defs/sha256"},
+    "worktree_identity": {"$ref": "#/$defs/sha256"},
+    "committed_head": {"pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+    "dirty_overlay_fingerprint": {"$ref": "#/$defs/sha256"},
+    "freshness": {
+      "enum": [
+        "exact",
+        "commit-fresh-worktree-stale",
+        "incrementally-stale",
+        "structurally-stale",
+        "partial",
+        "unknown",
+        "unusable"
+      ]
+    },
+    "parser_versions": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 512},
+      "maxProperties": 64
+    },
+    "coverage": {"$ref": "#/$defs/coverage"},
+    "findings": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {"$ref": "#/$defs/finding"}
+    },
+    "returned_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+    "omitted_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+    "truncated": {"type": "boolean"},
+    "output_characters": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+    "warnings": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 512}
+    },
+    "next_safe_action": {"$ref": "#/$defs/canonical_id"}
+  },
+  "$defs": {
+    "canonical_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rank",
+        "result_identity",
+        "path",
+        "start_line",
+        "end_line",
+        "language",
+        "record_kind",
+        "source_type",
+        "qualified_name",
+        "extraction_method",
+        "evidence_class",
+        "preview"
+      ],
+      "properties": {
+        "rank": {"type": "integer", "minimum": 1, "maximum": 64},
+        "result_identity": {"$ref": "#/$defs/sha256"},
+        "path": {"$ref": "#/$defs/relative_path"},
+        "start_line": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "end_line": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "language": {"type": "string", "minLength": 1, "maxLength": 512},
+        "record_kind": {
+          "enum": [
+            "module",
+            "definition",
+            "import",
+            "entry-point",
+            "configuration",
+            "heading",
+            "document-chunk"
+          ]
+        },
+        "source_type": {"enum": ["source", "document", "configuration"]},
+        "qualified_name": {"type": "string", "maxLength": 512},
+        "extraction_method": {"type": "string", "minLength": 1, "maxLength": 512},
+        "evidence_class": {"enum": ["verified", "inferred", "uncertain"]},
+        "preview": {"type": "string", "maxLength": 512}
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path_coverage",
+        "language_coverage",
+        "indexed_path_count",
+        "excluded_path_count",
+        "unsupported_language_count",
+        "parse_failure_count",
+        "exclusion_reason_counts"
+      ],
+      "properties": {
+        "path_coverage": {"type": "number", "minimum": 0, "maximum": 1},
+        "language_coverage": {"type": "number", "minimum": 0, "maximum": 1},
+        "indexed_path_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "excluded_path_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "unsupported_language_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "parse_failure_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "exclusion_reason_counts": {
+          "type": "object",
+          "maxProperties": 64,
+          "additionalProperties": {"type": "integer", "minimum": 0, "maximum": 2147483647}
+        }
+      }
+    }
+  }
+}

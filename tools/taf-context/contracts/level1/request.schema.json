@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://the-agentic-fieldbook.local/contracts/level1/request.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_identity",
+    "consumer_identity",
+    "operation",
+    "repository_identity",
+    "worktree_identity",
+    "committed_head",
+    "dirty_overlay_fingerprint",
+    "provider_identity",
+    "index_identity",
+    "required_capability",
+    "minimum_freshness",
+    "query",
+    "result_identities",
+    "filters",
+    "maximum_results",
+    "maximum_model_output_characters",
+    "allow_inferred"
+  ],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "request_identity": {"$ref": "#/$defs/canonical_id"},
+    "consumer_identity": {"$ref": "#/$defs/canonical_id"},
+    "operation": {
+      "enum": [
+        "estimate",
+        "build",
+        "update",
+        "status",
+        "metrics",
+        "repository-map",
+        "search-symbols",
+        "search-docs",
+        "source-snippets"
+      ]
+    },
+    "repository_identity": {"$ref": "#/$defs/sha256"},
+    "worktree_identity": {"$ref": "#/$defs/sha256"},
+    "committed_head": {"pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+    "dirty_overlay_fingerprint": {"$ref": "#/$defs/sha256"},
+    "provider_identity": {"$ref": "#/$defs/canonical_id"},
+    "index_identity": {
+      "oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]
+    },
+    "required_capability": {"$ref": "#/$defs/canonical_id"},
+    "minimum_freshness": {
+      "enum": [
+        "exact",
+        "commit-fresh-worktree-stale",
+        "incrementally-stale",
+        "structurally-stale",
+        "partial",
+        "unknown",
+        "unusable"
+      ]
+    },
+    "query": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 512}, {"type": "null"}]},
+    "result_identities": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/sha256"}
+    },
+    "filters": {"$ref": "#/$defs/filters"},
+    "maximum_results": {"type": "integer", "minimum": 1, "maximum": 64},
+    "maximum_model_output_characters": {"enum": [2000, 4000, 8000, 12000]},
+    "allow_inferred": {"type": "boolean"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"operation": {"enum": ["estimate", "build"]}},
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "index_identity": {"type": "null"},
+          "query": {"type": "null"},
+          "result_identities": {"maxItems": 0},
+          "filters": {
+            "properties": {
+              "path_prefixes": {"maxItems": 0},
+              "languages": {"maxItems": 0},
+              "symbol_kinds": {"maxItems": 0},
+              "source_types": {"maxItems": 0}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {"enum": ["update", "status", "metrics"]}
+        },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "index_identity": {"$ref": "#/$defs/sha256"},
+          "query": {"type": "null"},
+          "result_identities": {"maxItems": 0},
+          "filters": {
+            "properties": {
+              "path_prefixes": {"maxItems": 0},
+              "languages": {"maxItems": 0},
+              "symbol_kinds": {"maxItems": 0},
+              "source_types": {"maxItems": 0}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"operation": {"const": "repository-map"}},
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "index_identity": {"$ref": "#/$defs/sha256"},
+          "query": {"type": "null"},
+          "result_identities": {"maxItems": 0}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {"enum": ["search-symbols", "search-docs"]}
+        },
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "index_identity": {"$ref": "#/$defs/sha256"},
+          "query": {"type": "string", "minLength": 1},
+          "result_identities": {"maxItems": 0}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"operation": {"const": "source-snippets"}},
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "index_identity": {"$ref": "#/$defs/sha256"},
+          "query": {"type": "null"},
+          "result_identities": {"minItems": 1, "maxItems": 64}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "canonical_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "filters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path_prefixes", "languages", "symbol_kinds", "source_types"],
+      "properties": {
+        "path_prefixes": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/relative_path"}
+        },
+        "languages": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 512}
+        },
+        "symbol_kinds": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/canonical_id"}
+        },
+        "source_types": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"enum": ["source", "document", "configuration"]}
+        }
+      }
+    }
+  }
+}
