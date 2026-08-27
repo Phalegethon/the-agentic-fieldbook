@@ -26,6 +26,7 @@ EXPECTED_TAF_CONTEXT_FILES = {
     "level1_render.py",
     "models.py",
     "provider_cli.py",
+    "provider_binding.py",
     "provider_broker.py",
     "provider_execution_models.py",
     "provider_freshness.py",
