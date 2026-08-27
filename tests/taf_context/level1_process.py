@@ -19,6 +19,7 @@ from typing import Mapping, Optional
 from taf_context.level1_models import (
     CandidateAvailability,
     CandidateManifest,
+    Level1Operation,
     Level1Request,
     Level1Result,
     parse_level1_result,
@@ -174,6 +175,7 @@ def run_candidate(
     evidence_root: Path,
     *,
     candidate_root: Optional[Path] = None,
+    permute_wire: bool = False,
 ) -> tuple[Level1Result, ProcessEvidence]:
     """Run exactly one request and retain evidence only after full validation."""
     if not isinstance(request, Level1Request):
@@ -201,7 +203,9 @@ def run_candidate(
         raise CandidateProcessError("executable-changed-after-preflight")
     profile = state / "candidate.sb"
     profile.write_text(_sandbox_profile(repo, root, state), encoding="utf-8")
-    request_bytes = _canonical_json(request.to_dict()) + b"\n"
+    if type(permute_wire) is not bool:
+        raise CandidateProcessError("invalid-wire-permutation")
+    request_bytes = _request_wire_bytes(request, permute_wire) + b"\n"
     command = [
         "/usr/bin/time",
         "-l",
@@ -301,10 +305,14 @@ def _validate_result(
         (result.worktree_identity, request.worktree_identity),
         (result.committed_head, request.committed_head),
         (result.dirty_overlay_fingerprint, request.dirty_overlay_fingerprint),
-        (result.index_identity, request.index_identity),
         (result.provider_version, manifest.candidate_version),
     )
     if any(actual != expected for actual, expected in exact_pairs):
+        raise CandidateProcessError("result-identity-mismatch")
+    if (
+        request.operation not in {Level1Operation.BUILD, Level1Operation.UPDATE}
+        and result.index_identity != request.index_identity
+    ):
         raise CandidateProcessError("result-identity-mismatch")
     if result.returned_count > request.maximum_results:
         raise CandidateProcessError("result-count-exceeded")
@@ -324,6 +332,27 @@ def _validate_result(
         raise CandidateProcessError("output-character-mismatch")
     if len(model_text) > request.maximum_model_output_characters:
         raise CandidateProcessError("model-output-budget-exceeded")
+
+
+def _request_wire_bytes(request: Level1Request, permuted: bool) -> bytes:
+    value = request.to_dict()
+    if not permuted:
+        return _canonical_json(value)
+
+    def reverse(item: object) -> object:
+        if type(item) is dict:
+            return {key: reverse(item[key]) for key in reversed(tuple(item))}
+        if type(item) is list:
+            return [reverse(value) for value in item]
+        return item
+
+    return json.dumps(
+        reverse(value),
+        sort_keys=False,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
 
 
 def _isolation_capability() -> IsolationCapability:

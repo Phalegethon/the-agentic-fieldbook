@@ -21,6 +21,8 @@ EXPECTED_TAF_CONTEXT_FILES = {
     "dossier.py",
     "freshness.py",
     "git_snapshot.py",
+    "level1_models.py",
+    "level1_render.py",
     "models.py",
     "provider_cli.py",
     "provider_models.py",
@@ -29,6 +31,10 @@ EXPECTED_TAF_CONTEXT_FILES = {
     "recovery.py",
     "recovery_cli.py",
     "recovery_models.py",
+}
+EXPECTED_LEVEL1_CONTRACT_FILES = {
+    "contracts/level1/request.schema.json",
+    "contracts/level1/result.schema.json",
 }
 NONPRODUCTION_CONTEXT_DIRECTORIES = {
     "conformance",
@@ -71,6 +77,10 @@ def _isolated_context_layout() -> Iterator[Path]:
         package.mkdir(parents=True)
         for filename in EXPECTED_TAF_CONTEXT_FILES:
             (package / filename).write_text("", encoding="utf-8")
+        for relative in EXPECTED_LEVEL1_CONTRACT_FILES:
+            contract = root / "tools" / "taf-context" / relative
+            contract.parent.mkdir(parents=True, exist_ok=True)
+            contract.write_text("{}\n", encoding="utf-8")
         marketplace = root / ".claude-plugin" / "marketplace.json"
         marketplace.parent.mkdir()
         marketplace.write_text('{"plugins":[]}', encoding="utf-8")
@@ -296,6 +306,12 @@ class RepositoryLayoutTest(unittest.TestCase):
             if "__pycache__" not in path.relative_to(package).parts
         }
         self.assertEqual(EXPECTED_TAF_CONTEXT_FILES, actual_package_entries)
+        actual_contract_files = {
+            path.relative_to(ROOT / "tools" / "taf-context").as_posix()
+            for path in (ROOT / "tools" / "taf-context" / "contracts").rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(EXPECTED_LEVEL1_CONTRACT_FILES, actual_contract_files)
 
         self.assertFalse((ROOT / "tools" / "taf-context" / "SKILL.md").exists())
 
@@ -321,6 +337,11 @@ class RepositoryLayoutTest(unittest.TestCase):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
             relative = path.relative_to(context_tool)
+            if relative.as_posix() in EXPECTED_LEVEL1_CONTRACT_FILES or relative.as_posix() in {
+                "taf_context/level1_models.py",
+                "taf_context/level1_render.py",
+            }:
+                continue
             normalized_parts = {
                 part.lower().replace("-", "_").removesuffix(".py")
                 for part in relative.parts
@@ -370,6 +391,13 @@ class RepositoryLayoutTest(unittest.TestCase):
             )
         )
         for relative in public_files:
+            if relative.as_posix() in {
+                "tools/taf-context/contracts/level1/request.schema.json",
+                "tools/taf-context/contracts/level1/result.schema.json",
+                "tools/taf-context/taf_context/level1_models.py",
+                "tools/taf-context/taf_context/level1_render.py",
+            }:
+                continue
             self.assertFalse(
                 _is_forbidden_context_production_surface(relative),
                 relative.as_posix(),

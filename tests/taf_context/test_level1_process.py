@@ -18,7 +18,12 @@ from taf_context.level1_models import (
 from taf_context.level1_render import render_level1_result
 from taf_context.models import Freshness
 
-from .level1_process import CandidateProcessError, preflight_candidate, run_candidate
+from .level1_process import (
+    CandidateProcessError,
+    _request_wire_bytes,
+    preflight_candidate,
+    run_candidate,
+)
 from .repo_factory import write
 from .test_level1_models import INDEX_IDENTITY, request_wire
 from .test_level1_render import coverage, finding
@@ -128,6 +133,12 @@ def manifest(mode: str) -> CandidateManifest:
 
 
 class CandidateProcessBoundaryTests(unittest.TestCase):
+    def test_permuted_wire_is_semantically_equal_but_byte_distinct(self) -> None:
+        canonical = _request_wire_bytes(request(), False)
+        permuted = _request_wire_bytes(request(), True)
+        self.assertNotEqual(permuted, canonical)
+        self.assertEqual(json.loads(permuted), json.loads(canonical))
+
     def make_fixture(self, root: Path, mode: str) -> tuple[Path, Path, Path, Path]:
         candidate_root = root / "candidate"
         repo_root = root / "repo"
@@ -186,6 +197,28 @@ class CandidateProcessBoundaryTests(unittest.TestCase):
             self.assertNotIn("TAF_CANARY", diagnostics)
             self.assertNotIn("/Users/", diagnostics)
             self.assertTrue((evidence_root / "complete.json").is_file())
+
+    def test_ready_build_returns_the_new_controller_bound_index_identity(self) -> None:
+        build_wire = request_wire("build")
+        build_request = Level1Request.from_dict(build_wire)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            candidate_root, repo_root, state_root, evidence_root = self.make_fixture(root, "valid")
+            executable = candidate_root / "candidate.py"
+            write(executable, candidate_script(valid_result_bytes(build_request)))
+            executable.chmod(0o755)
+
+            result, _evidence = run_candidate(
+                manifest("valid"),
+                build_request,
+                repo_root,
+                state_root,
+                2.0,
+                evidence_root,
+                candidate_root=candidate_root,
+            )
+
+        self.assertEqual(result.index_identity, INDEX_IDENTITY)
 
     def test_hostile_candidates_fail_closed_and_never_overwrite_complete_evidence(self) -> None:
         hostile_modes = (
