@@ -960,6 +960,7 @@ class ProviderExecutionCommandTests(unittest.TestCase):
             discovery_file = root / "discovery.json"
             request_file = root / "request.json"
             manifest_file = root / "adapter.json"
+            binding_file = root / "binding.json"
             _write_json(snapshot_file, snapshot.to_dict())
             provider = _descriptor(
                 identity="fixture.graph",
@@ -1015,6 +1016,30 @@ class ProviderExecutionCommandTests(unittest.TestCase):
                     "network_required": False,
                 },
             )
+            provider_state = root / "provider-state"
+            provider_state.mkdir()
+            child = Path("/usr/bin/true").resolve()
+            binding: dict[str, object] = {
+                "schema_version": "1",
+                "adapter_identity": "fixture.stdio",
+                "provider_identity": "fixture.graph",
+                "adapter_root": str(adapter.resolve()),
+                "provider_executable": str(child),
+                "provider_executable_digest": "sha256:" + hashlib.sha256(
+                    child.read_bytes()
+                ).hexdigest(),
+                "provider_arguments": [],
+                "provider_state_roots": [str(provider_state.resolve())],
+                "environment": {},
+                "transport": "cli-json",
+            }
+            binding["binding_digest"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    binding, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            _write_json(binding_file, binding)
+            binding_file.chmod(0o600)
             state = root / "state"
             _write_json(
                 state / "consent.json",
@@ -1043,6 +1068,7 @@ class ProviderExecutionCommandTests(unittest.TestCase):
                 "--request", str(request_file),
                 "--adapter-manifest", str(manifest_file),
                 "--adapter-root", str(adapter),
+                "--adapter-binding", str(binding_file),
                 state_home=state,
             )
 
@@ -1057,6 +1083,58 @@ class ProviderExecutionCommandTests(unittest.TestCase):
                 execution["result"]["provider_identity"], "fixture.graph"
             )
             self.assertNotIn(str(repo), stdout)
+
+            binding["provider_identity"] = "other.graph"
+            material = {
+                key: value for key, value in binding.items()
+                if key != "binding_digest"
+            }
+            binding["binding_digest"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    material, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            _write_json(binding_file, binding)
+            binding_file.chmod(0o600)
+            code, stdout, stderr = _invoke(
+                "providers", "execute",
+                "--repo", str(repo),
+                "--snapshot", str(snapshot_file),
+                "--discovery", str(discovery_file),
+                "--request", str(request_file),
+                "--adapter-manifest", str(manifest_file),
+                "--adapter-root", str(adapter),
+                "--adapter-binding", str(binding_file),
+                state_home=state,
+            )
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn("adapter binding identities do not match", stderr)
+
+            binding["provider_identity"] = "fixture.graph"
+            material = {
+                key: value for key, value in binding.items()
+                if key != "binding_digest"
+            }
+            binding["binding_digest"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    material, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            _write_json(binding_file, binding)
+            binding_file.chmod(0o640)
+            code, stdout, stderr = _invoke(
+                "providers", "execute",
+                "--repo", str(repo),
+                "--snapshot", str(snapshot_file),
+                "--discovery", str(discovery_file),
+                "--request", str(request_file),
+                "--adapter-manifest", str(manifest_file),
+                "--adapter-root", str(adapter),
+                "--adapter-binding", str(binding_file),
+                state_home=state,
+            )
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn("binding_permissions", stderr)
 
     def test_execute_returns_canonical_bounded_result_without_local_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1135,17 +1213,26 @@ class ProviderExecutionCommandTests(unittest.TestCase):
             self.assertNotIn(str(repo), stdout)
 
     def test_execute_requires_explicit_paired_adapter_roots(self) -> None:
-        code, stdout, stderr = _invoke(
-            "providers", "execute",
-            "--repo", "/missing",
-            "--snapshot", "/missing-snapshot",
-            "--discovery", "/missing-discovery",
-            "--request", "/missing-request",
-            "--adapter-manifest", "/missing-manifest",
+        cases = (
+            ("--adapter-manifest", "/missing-manifest"),
+            ("--adapter-root", "/missing-root"),
+            ("--adapter-binding", "/missing-binding"),
         )
-
-        self.assertEqual((code, stdout), (2, ""))
-        self.assertIn("adapter manifest and root counts must match", stderr)
+        for option, value in cases:
+            with self.subTest(option=option):
+                code, stdout, stderr = _invoke(
+                    "providers", "execute",
+                    "--repo", "/missing",
+                    "--snapshot", "/missing-snapshot",
+                    "--discovery", "/missing-discovery",
+                    "--request", "/missing-request",
+                    option, value,
+                )
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn(
+                    "adapter manifest, root, and binding counts must match",
+                    stderr,
+                )
 
 
 class CompatibilityAndPublicAPITests(unittest.TestCase):

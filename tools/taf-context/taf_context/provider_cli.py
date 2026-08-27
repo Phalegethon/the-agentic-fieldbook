@@ -17,6 +17,10 @@ from .discovery import discover_providers
 from .level1_models import Level1Request
 from .models import ContextAction, RepositorySnapshot
 from .provider_broker import execute_broker_request
+from .provider_binding import (
+    ProviderBindingError,
+    read_adapter_binding,
+)
 from .provider_execution_models import ExecutionPolicy, parse_adapter_manifest
 from .provider_models import (
     BrokerRequest,
@@ -69,6 +73,7 @@ def register_provider_commands(subparsers: argparse._SubParsersAction) -> None:
     execute.add_argument("--request", required=True)
     execute.add_argument("--adapter-manifest", action="append", default=[])
     execute.add_argument("--adapter-root", action="append", default=[])
+    execute.add_argument("--adapter-binding", action="append", default=[])
     execute.add_argument("--timeout-seconds", type=float, default=10.0)
     execute.add_argument("--allow-fallback", action="store_true")
 
@@ -180,8 +185,14 @@ def _execute_command(
     environment: Mapping[str, str],
     utc_clock: Callable[[], datetime],
 ) -> dict[str, object]:
-    if len(args.adapter_manifest) != len(args.adapter_root):
-        raise ProviderCLIError("adapter manifest and root counts must match")
+    if not (
+        len(args.adapter_manifest)
+        == len(args.adapter_root)
+        == len(args.adapter_binding)
+    ):
+        raise ProviderCLIError(
+            "adapter manifest, root, and binding counts must match"
+        )
     repository = _resolved_directory(Path(args.repo), "repository unavailable")
     snapshot = RepositorySnapshot.from_dict(
         _read_json_object(Path(args.snapshot))
@@ -204,19 +215,46 @@ def _execute_command(
     ):
         raise ProviderCLIError("execution inputs describe different snapshots")
 
-    adapters: dict[str, tuple[object, Path]] = {}
-    for manifest_path, root_path in zip(
-        args.adapter_manifest, args.adapter_root
-    ):
+    manifests = {}
+    for manifest_path in args.adapter_manifest:
         manifest = parse_adapter_manifest(
             _read_control_bytes(Path(manifest_path))
         )
-        adapter_root = _resolved_directory(
-            Path(root_path), "adapter root unavailable"
-        )
+        identity = (manifest.adapter_identity, manifest.provider_identity)
+        if identity in manifests:
+            raise ProviderCLIError("duplicate adapter identity")
+        manifests[identity] = manifest
+
+    roots = tuple(
+        _resolved_directory(Path(root_path), "adapter root unavailable")
+        for root_path in args.adapter_root
+    )
+    bindings = {}
+    for binding_path in args.adapter_binding:
+        try:
+            binding = read_adapter_binding(Path(binding_path))
+        except ProviderBindingError as error:
+            raise ProviderCLIError(
+                f"invalid adapter binding: {error.field}"
+            ) from error
+        identity = (binding.adapter_identity, binding.provider_identity)
+        if identity in bindings:
+            raise ProviderCLIError("duplicate adapter binding identity")
+        bindings[identity] = binding
+
+    if set(manifests) != set(bindings) or sorted(map(str, roots)) != sorted(
+        str(binding.adapter_root) for binding in bindings.values()
+    ):
+        raise ProviderCLIError("adapter binding identities do not match")
+
+    adapters = {}
+    for identity, manifest in manifests.items():
+        binding = bindings[identity]
         if manifest.provider_identity in adapters:
             raise ProviderCLIError("duplicate adapter provider identity")
-        adapters[manifest.provider_identity] = (manifest, adapter_root)
+        adapters[manifest.provider_identity] = (
+            manifest, binding.adapter_root, binding
+        )
 
     try:
         consent = read_consent(_state_paths(environment))
@@ -238,15 +276,17 @@ def _execute_command(
         raise ProviderCLIError(str(error)) from error
 
     def inspect_call(provider):
-        manifest, adapter_root = adapters[provider.provider_identity]
+        manifest, adapter_root, binding = adapters[provider.provider_identity]
         return inspect_provider(
-            manifest, adapter_root, snapshot, repository, policy
+            manifest, adapter_root, snapshot, repository, policy,
+            binding=binding,
         )
 
     def query_call(provider, level1_request):
-        manifest, adapter_root = adapters[provider.provider_identity]
+        manifest, adapter_root, binding = adapters[provider.provider_identity]
         return query_provider(
-            manifest, adapter_root, level1_request, repository, policy
+            manifest, adapter_root, level1_request, repository, policy,
+            binding=binding,
         )
 
     fallback_call = None

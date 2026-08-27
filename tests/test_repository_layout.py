@@ -47,6 +47,8 @@ EXPECTED_CONTEXT_ADAPTER_FILES = {
     "adapters/_shared/adapter_runtime.py",
     "adapters/codebase-memory/adapter.py",
     "adapters/codebase-memory/manifest.json",
+    "adapters/graphify/adapter.py",
+    "adapters/graphify/manifest.json",
 }
 NONPRODUCTION_CONTEXT_DIRECTORIES = {
     "conformance",
