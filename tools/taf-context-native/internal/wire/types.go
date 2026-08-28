@@ -23,7 +23,10 @@ const (
 	SourceSnippets  Operation = "source-snippets"
 )
 
-var AllOperations = []Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets}
+var operations = [...]Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets}
+
+// Operations returns a copy of the frozen operation vocabulary.
+func Operations() []Operation { return append([]Operation(nil), operations[:]...) }
 
 type Status string
 

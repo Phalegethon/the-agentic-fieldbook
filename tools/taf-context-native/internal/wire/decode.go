@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -27,6 +28,9 @@ func DecodeEnvelope(reader io.Reader) (Envelope, error) {
 	if err := rejectDuplicateKeys(raw); err != nil {
 		return Envelope{}, err
 	}
+	if err := validateEnvelopeShape(raw); err != nil {
+		return Envelope{}, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	var envelope Envelope
@@ -36,18 +40,75 @@ func DecodeEnvelope(reader io.Reader) (Envelope, error) {
 	if err := requireEOF(decoder); err != nil {
 		return Envelope{}, err
 	}
+	if err := validateEnvelope(envelope); err != nil {
+		return Envelope{}, err
+	}
 	if err := ValidateRequest(envelope.Request); err != nil {
 		return Envelope{}, err
 	}
 	return envelope, nil
 }
 
+func validateEnvelopeShape(raw []byte) error {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidWire, err)
+	}
+	if err := requireKeys(envelope, []string{"phase", "repository_root", "state_root", "changed_paths_document", "request"}, nil); err != nil {
+		return err
+	}
+	for _, field := range []string{"phase", "repository_root", "state_root", "request"} {
+		if isNull(envelope[field]) {
+			return ErrInvalidWire
+		}
+	}
+	var request map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["request"], &request); err != nil {
+		return ErrInvalidWire
+	}
+	required := []string{"schema_version", "request_identity", "consumer_identity", "operation", "repository_identity", "worktree_identity", "committed_head", "dirty_overlay_fingerprint", "provider_identity", "index_identity", "required_capability", "minimum_freshness", "query", "result_identities", "filters", "maximum_results", "maximum_model_output_characters", "allow_inferred"}
+	if err := requireKeys(request, required, map[string]bool{"index_identity": true, "query": true}); err != nil {
+		return err
+	}
+	var filters map[string]json.RawMessage
+	if err := json.Unmarshal(request["filters"], &filters); err != nil {
+		return ErrInvalidWire
+	}
+	return requireKeys(filters, []string{"path_prefixes", "languages", "symbol_kinds", "source_types"}, nil)
+}
+
+func requireKeys(value map[string]json.RawMessage, required []string, nullable map[string]bool) error {
+	if len(value) != len(required) {
+		return ErrInvalidWire
+	}
+	for _, field := range required {
+		raw, ok := value[field]
+		if !ok || (!nullable[field] && isNull(raw)) {
+			return ErrInvalidWire
+		}
+	}
+	return nil
+}
+
+func isNull(raw json.RawMessage) bool { return len(raw) == 0 || bytes.Equal(raw, []byte("null")) }
+
+func validateEnvelope(envelope Envelope) error {
+	if envelope.Phase != "query" || !validText(envelope.RepositoryRoot, false) || !filepath.IsAbs(envelope.RepositoryRoot) || !validText(envelope.StateRoot, false) || !filepath.IsAbs(envelope.StateRoot) {
+		return ErrInvalidWire
+	}
+	if envelope.ChangedPathsDocument != nil && !validText(*envelope.ChangedPathsDocument, false) {
+		return ErrInvalidWire
+	}
+	return nil
+}
+
 func readFramed(reader io.Reader) ([]byte, error) {
-	raw, err := io.ReadAll(io.LimitReader(reader, int64(policy.ProductionV1.MaximumWireBytes)+1))
+	limits := policy.ProductionLimits()
+	raw, err := io.ReadAll(io.LimitReader(reader, int64(limits.MaximumWireBytes)+1))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidWire, err)
 	}
-	if len(raw) == 0 || len(raw) > policy.ProductionV1.MaximumWireBytes || !utf8.Valid(raw) || raw[len(raw)-1] != '\n' || bytes.Count(raw, []byte{'\n'}) != 1 || bytes.Contains(raw, []byte{'\r'}) {
+	if len(raw) == 0 || len(raw) > limits.MaximumWireBytes || !utf8.Valid(raw) || raw[len(raw)-1] != '\n' || bytes.Count(raw, []byte{'\n'}) != 1 || bytes.Contains(raw, []byte{'\r'}) {
 		return nil, ErrInvalidWire
 	}
 	return raw[:len(raw)-1], nil
@@ -126,7 +187,7 @@ func ValidateRequest(request Request) error {
 	if (request.IndexIdentity != nil && !validSHA(*request.IndexIdentity)) || (request.Query != nil && !validText(*request.Query, false)) {
 		return ErrInvalidWire
 	}
-	if request.MaximumResults < 1 || request.MaximumResults > policy.ProductionV1.MaximumCollectionItems || !validBudget(request.MaximumModelOutputCharacters) {
+	if request.MaximumResults < 1 || request.MaximumResults > policy.ProductionLimits().MaximumCollectionItems || !validBudget(request.MaximumModelOutputCharacters) {
 		return ErrInvalidWire
 	}
 	if err := validateFilters(request.Filters); err != nil {
@@ -170,7 +231,10 @@ func validateResult(result Result) error {
 	if result.IndexIdentity == nil && !(result.Operation == Estimate || (result.Operation == Build && result.Status != Ready)) {
 		return ErrInvalidWire
 	}
-	if len(result.ParserVersions) > policy.ProductionV1.MaximumCollectionItems || len(result.Findings) > policy.ProductionV1.MaximumCollectionItems || len(result.Warnings) > policy.ProductionV1.MaximumCollectionItems || result.ReturnedCount != len(result.Findings) || result.OmittedCount < 0 || result.Truncated != (result.OmittedCount > 0) {
+	if result.ParserVersions == nil || result.Coverage.ExclusionReasonCounts == nil || result.Findings == nil || result.Warnings == nil || len(result.ParserVersions) > policy.ProductionLimits().MaximumCollectionItems || len(result.Findings) > policy.ProductionLimits().MaximumCollectionItems || len(result.Warnings) > policy.ProductionLimits().MaximumCollectionItems || result.ReturnedCount != len(result.Findings) || !validCounter(result.ReturnedCount) || !validCounter(result.OmittedCount) || result.Truncated != (result.OmittedCount > 0) {
+		return ErrInvalidWire
+	}
+	if !validCounter(result.Coverage.IndexedPathCount) || !validCounter(result.Coverage.ExcludedPathCount) || !validCounter(result.Coverage.UnsupportedLanguageCount) || !validCounter(result.Coverage.ParseFailureCount) || len(result.Coverage.ExclusionReasonCounts) > policy.ProductionLimits().MaximumCollectionItems || !validCounter(result.OutputCharacters) || result.OutputCharacters != renderedOutputCharacters(result) || result.OutputCharacters > 12000 {
 		return ErrInvalidWire
 	}
 	if result.Coverage.PathCoverage < 0 || result.Coverage.PathCoverage > 1 || result.Coverage.LanguageCoverage < 0 || result.Coverage.LanguageCoverage > 1 || math.IsNaN(result.Coverage.PathCoverage) || math.IsInf(result.Coverage.PathCoverage, 0) || math.IsNaN(result.Coverage.LanguageCoverage) || math.IsInf(result.Coverage.LanguageCoverage, 0) {
@@ -184,8 +248,9 @@ func validateResult(result Result) error {
 			return ErrInvalidWire
 		}
 	}
+	identities := make(map[string]struct{}, len(result.Findings))
 	for key, value := range result.Coverage.ExclusionReasonCounts {
-		if !validID(key) || value < 0 {
+		if !validID(key) || !validCounter(value) {
 			return ErrInvalidWire
 		}
 	}
@@ -193,11 +258,31 @@ func validateResult(result Result) error {
 		if err := validateFinding(finding, index+1, result.Freshness); err != nil {
 			return err
 		}
+		if _, exists := identities[finding.ResultIdentity]; exists {
+			return ErrInvalidWire
+		}
+		identities[finding.ResultIdentity] = struct{}{}
 	}
 	if (result.Status == Stale || result.Status == Unsupported || result.Status == Error) && len(result.Findings) != 0 {
 		return ErrInvalidWire
 	}
 	return nil
+}
+
+func validCounter(value int) bool { return value >= 0 && value <= 1<<31-1 }
+
+func renderedOutputCharacters(result Result) int {
+	var text strings.Builder
+	fmt.Fprintf(&text, "LEVEL1 status=%s operation=%s freshness=%s returned=%d omitted=%d warnings=%d\n", result.Status, result.Operation, result.Freshness, len(result.Findings), result.OmittedCount, len(result.Warnings))
+	fmt.Fprintf(&text, "COVERAGE paths=%.3f languages=%.3f unsupported=%d parse_failures=%d\n", result.Coverage.PathCoverage, result.Coverage.LanguageCoverage, result.Coverage.UnsupportedLanguageCount, result.Coverage.ParseFailureCount)
+	for _, finding := range result.Findings {
+		fmt.Fprintf(&text, "FINDING %s %s %s:%d-%d %s %s method=%s\n", finding.EvidenceClass, finding.RecordKind, finding.Path, finding.StartLine, finding.EndLine, finding.Language, finding.QualifiedName, finding.ExtractionMethod)
+		if finding.Preview != "" {
+			fmt.Fprintf(&text, "PREVIEW %s\n", finding.Preview)
+		}
+	}
+	fmt.Fprintf(&text, "NEXT %s\n", result.NextSafeAction)
+	return utf8.RuneCountInString(text.String())
 }
 
 func validateFinding(finding Finding, rank int, freshness string) error {
@@ -220,7 +305,7 @@ func validPath(value string) bool {
 	return validText(value, false) && !strings.HasPrefix(value, "/") && !regexp.MustCompile(`^[A-Za-z]:`).MatchString(value) && !strings.Contains(value, `\\`) && !strings.Contains("/"+value+"/", "/../") && value == strings.TrimPrefix(value, "./")
 }
 func validOperation(value Operation) bool {
-	for _, item := range AllOperations {
+	for _, item := range operations {
 		if value == item {
 			return true
 		}
@@ -255,7 +340,7 @@ func sortedText(values []string) bool {
 }
 func sortedSHA(values []string) bool { return sortedUnique(values, validSHA) }
 func sortedUnique(values []string, valid func(string) bool) bool {
-	if len(values) > policy.ProductionV1.MaximumCollectionItems {
+	if len(values) > policy.ProductionLimits().MaximumCollectionItems {
 		return false
 	}
 	for index, value := range values {

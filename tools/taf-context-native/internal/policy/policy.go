@@ -22,7 +22,7 @@ type Limits struct {
 	StorageToSourceRatioMaximum float64 `json:"storage_to_source_ratio_maximum"`
 }
 
-var ProductionV1 = Limits{
+var productionV1 = Limits{
 	SchemaVersion: "1", MaximumWireBytes: 262144, MaximumStdoutBytes: 262144,
 	MaximumStderrBytes: 65536, MaximumCollectionItems: 64, MaximumEligiblePaths: 250000,
 	MaximumChangedPaths: 10000, MaximumEligibleSourceBytes: 4294967296,
@@ -32,3 +32,6 @@ var ProductionV1 = Limits{
 	UpdateLatencyNSMaximum: 2000000000, PeakMemoryBytesMaximum: 536870912,
 	StorageToSourceRatioMaximum: 1.5,
 }
+
+// ProductionLimits returns a copy of the frozen production policy.
+func ProductionLimits() Limits { return productionV1 }
