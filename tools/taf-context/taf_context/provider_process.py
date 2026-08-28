@@ -28,10 +28,42 @@ from .provider_execution_models import (
 )
 
 
+_PROVIDER_REASON_CODES = frozenset({
+    "adapter-binding-mismatch",
+    "adapter-binding-overlap",
+    "adapter-executable-mutated",
+    "inspection-identity-mismatch",
+    "inspection-unsupported",
+    "invalid-inspection-output",
+    "invalid-query-output",
+    "invalid-stdout-framing",
+    "provider-executable-digest-mismatch",
+    "provider-executable-mutated",
+    "provider-isolation-unavailable",
+    "provider-network-denied",
+    "provider-nonzero",
+    "provider-timeout",
+    "query-citation-invalid",
+    "query-identity-mismatch",
+    "query-index-mismatch",
+    "query-model-budget-exceeded",
+    "query-result-count-exceeded",
+    "query-unsupported",
+    "repository-mutated",
+    "request-provider-mismatch",
+    "stderr-oversized",
+    "stdout-oversized",
+    "unsafe-adapter-executable",
+    "unsafe-adapter-interpreter",
+})
+
+
 class ProviderProcessError(RuntimeError):
     """One stable reason code for a rejected provider attempt."""
 
     def __init__(self, reason_code: str) -> None:
+        if reason_code not in _PROVIDER_REASON_CODES:
+            raise ValueError("unregistered-provider-reason-code")
         self.reason_code = reason_code
         super().__init__(reason_code)
 

@@ -82,6 +82,16 @@ class ProviderProcessTests(unittest.TestCase):
             "network_required": False,
         })
 
+    def test_provider_error_rejects_unregistered_reason_codes(self) -> None:
+        with self.assertRaises(ValueError):
+            ProviderProcessError("/Users/private/provider-state")
+        with self.assertRaises(ValueError):
+            ProviderProcessError("provider-secret-detail")
+        self.assertEqual(
+            ProviderProcessError("provider-timeout").reason_code,
+            "provider-timeout",
+        )
+
     def test_valid_inspection_is_bounded_and_identity_checked(self) -> None:
         record, attempt = inspect_provider(
             self.manifest("valid"), self.adapter, snapshot(), self.repo, policy()
