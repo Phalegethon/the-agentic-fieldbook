@@ -13,6 +13,7 @@ from taf_context.models import ContextAction, Freshness
 from taf_context.provider_broker import execute_broker_request
 from taf_context.provider_execution_models import AttemptRecord, AttemptStatus, InspectionRecord, Readiness
 from taf_context.provider_models import ConsentRequest, DiscoverySnapshot, StatusEvidence
+from taf_context.provider_process import ProviderProcessError
 
 from .test_level1_models import request_wire, result_wire
 from .test_provider_freshness import descriptor, inspection, snapshot
@@ -76,7 +77,7 @@ class ProviderBrokerTests(unittest.TestCase):
         request = Level1Request.from_dict(wire)
         sentinel = object()
         fallback_requests = []
-        execution = execute_broker_request(discovery, request, consent(provider), snapshot(), {provider.provider_identity: object()}, inspect_call=lambda _p: (_ for _ in ()).throw(RuntimeError("provider-timeout")), query_call=lambda _p, _r: None, fallback_call=lambda fallback_request: fallback_requests.append(fallback_request) or sentinel, utc_now="2026-08-27T00:00:00Z")
+        execution = execute_broker_request(discovery, request, consent(provider), snapshot(), {provider.provider_identity: object()}, inspect_call=lambda _p: (_ for _ in ()).throw(ProviderProcessError("provider-timeout")), query_call=lambda _p, _r: None, fallback_call=lambda fallback_request: fallback_requests.append(fallback_request) or sentinel, utc_now="2026-08-27T00:00:00Z")
         self.assertIs(execution.result, sentinel)
         self.assertEqual(execution.route, "bounded-fallback")
         self.assertEqual(execution.reason_codes, ("provider-timeout",))
@@ -91,9 +92,6 @@ class ProviderBrokerTests(unittest.TestCase):
         request = Level1Request.from_dict(wire)
         sentinel = object()
 
-        class QueryFailure(RuntimeError):
-            reason_code = "invalid-query-output"
-
         execution = execute_broker_request(
             discovery,
             request,
@@ -101,7 +99,9 @@ class ProviderBrokerTests(unittest.TestCase):
             snapshot(),
             {provider.provider_identity: object()},
             inspect_call=lambda _provider: (inspection(), AttemptRecord("1", provider.provider_identity, "inspect", AttemptStatus.SUCCEEDED, (), 1, 1, 0)),
-            query_call=lambda _provider, _request: (_ for _ in ()).throw(QueryFailure()),
+            query_call=lambda _provider, _request: (
+                _ for _ in ()
+            ).throw(ProviderProcessError("invalid-query-output")),
             fallback_call=lambda _request: sentinel,
             utc_now="2026-08-27T00:00:00Z",
         )
@@ -109,6 +109,55 @@ class ProviderBrokerTests(unittest.TestCase):
         self.assertIs(execution.result, sentinel)
         self.assertEqual(execution.route, "bounded-fallback")
         self.assertEqual(execution.reason_codes, ("invalid-query-output",))
+
+    def test_arbitrary_exception_text_cannot_escape_into_reason_codes(self) -> None:
+        provider = descriptor()
+        discovery = DiscoverySnapshot(
+            "1", snapshot().repository_identity, snapshot().worktree_identity,
+            "sha256:inventory", (provider,), 0, (), 0, False, (), 1, 1,
+        )
+        wire = request_wire()
+        wire.update({
+            "provider_identity": provider.provider_identity,
+            "repository_identity": snapshot().repository_identity,
+            "worktree_identity": snapshot().worktree_identity,
+            "dirty_overlay_fingerprint": snapshot().dirty_fingerprint,
+            "committed_head": snapshot().head_sha,
+        })
+        request = Level1Request.from_dict(wire)
+
+        class UnsafeReason(RuntimeError):
+            reason_code = "/Users/private/provider-state"
+
+        for error in (
+            RuntimeError("query failed at /Users/private/provider-state"),
+            UnsafeReason(),
+        ):
+            with self.subTest(error=type(error).__name__):
+                execution = execute_broker_request(
+                    discovery,
+                    request,
+                    consent(provider),
+                    snapshot(),
+                    {provider.provider_identity: object()},
+                    inspect_call=lambda _provider: (
+                        inspection(),
+                        AttemptRecord(
+                            "1", provider.provider_identity, "inspect",
+                            AttemptStatus.SUCCEEDED, (), 1, 1, 0,
+                        ),
+                    ),
+                    query_call=lambda _provider, _request, failure=error: (
+                        _ for _ in ()
+                    ).throw(failure),
+                    fallback_call=lambda _request: object(),
+                    utc_now="2026-08-27T00:00:00Z",
+                )
+
+                self.assertEqual(
+                    execution.reason_codes,
+                    ("provider-query-failed",),
+                )
 
     def test_inspection_fanout_is_bounded_and_preferred_provider_is_first(self) -> None:
         providers = tuple(

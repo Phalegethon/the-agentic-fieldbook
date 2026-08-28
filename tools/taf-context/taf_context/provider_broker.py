@@ -12,6 +12,7 @@ from .models import ContextAction, Freshness, RepositorySnapshot
 from .provider_execution_models import AttemptRecord, InspectionRecord
 from .provider_freshness import derive_provider_freshness, refine_descriptor
 from .provider_models import BrokerRequest, DiscoverySnapshot, ProviderDescriptor, RoutingStatus
+from .provider_process import ProviderProcessError
 from .routing import route_provider
 
 
@@ -168,5 +169,6 @@ def _routed_request(
 
 
 def _reason_code(error: Exception, fallback: str) -> str:
-    code = getattr(error, "reason_code", str(error) or fallback)
-    return code if isinstance(code, str) and len(code) <= 256 else fallback
+    if isinstance(error, ProviderProcessError):
+        return error.reason_code
+    return fallback
