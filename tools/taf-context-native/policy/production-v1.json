@@ -1,0 +1,20 @@
+{
+  "schema_version": "1",
+  "maximum_wire_bytes": 262144,
+  "maximum_stdout_bytes": 262144,
+  "maximum_stderr_bytes": 65536,
+  "maximum_collection_items": 64,
+  "maximum_eligible_paths": 250000,
+  "maximum_changed_paths": 10000,
+  "maximum_eligible_source_bytes": 4294967296,
+  "maximum_source_file_bytes": 2097152,
+  "maximum_markdown_file_bytes": 8388608,
+  "maximum_lexical_candidates": 4096,
+  "maximum_fuzzy_terms": 64,
+  "maximum_fuzzy_distance": 2,
+  "build_latency_ns_maximum": 10000000000,
+  "query_latency_p95_ns_maximum": 150000000,
+  "update_latency_ns_maximum": 2000000000,
+  "peak_memory_bytes_maximum": 536870912,
+  "storage_to_source_ratio_maximum": 1.5
+}

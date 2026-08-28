@@ -86,6 +86,12 @@ PRIVATE_BAKEOFF_FILENAMES = {
     "go.sum",
     "uv.lock",
 }
+PUBLIC_NATIVE_LEVEL1_ROOT = "tools/taf-context-native"
+
+
+def _is_public_native_level1_path(relative: Path) -> bool:
+    root = Path(PUBLIC_NATIVE_LEVEL1_ROOT)
+    return relative == root or root in relative.parents
 
 
 @contextmanager
@@ -205,6 +211,23 @@ def _is_private_bakeoff_artifact(relative: Path) -> bool:
 
 
 class RepositoryLayoutTest(unittest.TestCase):
+    def test_native_level1_exception_is_limited_to_its_exact_root(self) -> None:
+        self.assertTrue(
+            _is_public_native_level1_path(
+                Path("tools/taf-context-native/internal/wire/types.go")
+            )
+        )
+        self.assertFalse(
+            _is_public_native_level1_path(
+                Path("tools/not-taf-context-native/internal/wire/types.go")
+            )
+        )
+        self.assertFalse(
+            _is_public_native_level1_path(
+                Path("tools/taf-context-native-copy/internal/wire/types.go")
+            )
+        )
+
     def test_private_bakeoff_artifacts_are_rejected_from_public_layout(self) -> None:
         forbidden = (
             Path("experiments/level1-bakeoff/python/candidate.json"),
@@ -451,9 +474,18 @@ class RepositoryLayoutTest(unittest.TestCase):
             )
         )
         self.assertFalse(
-            any(_is_private_bakeoff_artifact(path) for path in public_files)
+            any(
+                _is_private_bakeoff_artifact(path)
+                and not _is_public_native_level1_path(path)
+                for path in public_files
+            )
         )
         for relative in public_files:
+            # The production native engine is intentionally public, but only at
+            # this exact root. The general context-engine leakage policy still
+            # applies everywhere else in the repository.
+            if _is_public_native_level1_path(relative):
+                continue
             if relative.as_posix() in {
                 "tools/taf-context/contracts/level1/request.schema.json",
                 "tools/taf-context/contracts/level1/result.schema.json",
