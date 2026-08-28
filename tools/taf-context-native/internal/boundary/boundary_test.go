@@ -1100,6 +1100,65 @@ func TestOpenRepositoryFileRejectsGitMetadata(t *testing.T) {
 	}
 }
 
+func TestWalkRepositoryUsesCapturedRootAndDoesNotFollowLinks(t *testing.T) {
+	repository := makeRepository(t)
+	if err := os.WriteFile(filepath.Join(repository, "safe.go"), []byte("trusted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(repository, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "nested", "also.go"), []byte("also trusted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.go")
+	if err := os.WriteFile(outside, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, outside, filepath.Join(repository, "linked.go"))
+	roots, err := ValidateRoots(validEnvelope(repository, filepath.Join(t.TempDir(), "state")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roots.Close()
+	trusted := repository + "-trusted"
+	if err := os.Rename(repository, trusted); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(repository, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "attacker.go"), []byte("attacker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	err = roots.WalkRepository(func(entry RepositoryEntry) error {
+		got = append(got, entry.RelativePath)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []string{".git", "README.md", "linked.go", "nested", "nested/also.go", "safe.go"}) {
+		t.Fatalf("walk paths = %#v", got)
+	}
+}
+
+func TestReadRepositoryPrefixIsBoundedAndStable(t *testing.T) {
+	roots := makeRoots(t)
+	defer roots.Close()
+	if err := os.WriteFile(filepath.Join(roots.Repository, "prefix.go"), []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prefix, err := roots.ReadRepositoryPrefix("prefix.go", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefix.Size != 10 || string(prefix.Bytes) != "0123" {
+		t.Fatalf("prefix = %#v", prefix)
+	}
+}
+
 func makeRoots(t *testing.T) Roots {
 	t.Helper()
 	repo := makeRepository(t)

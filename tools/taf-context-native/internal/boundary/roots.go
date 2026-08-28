@@ -20,6 +20,9 @@ var (
 	ErrUnstableFile     = errors.New("repository file changed while being read")
 	ErrFileTooLarge     = errors.New("repository file exceeds maximum size")
 	ErrStateUnavailable = errors.New("state root has not been created")
+	// ErrSkipRepositoryDirectory lets a metadata consumer prune one safe
+	// directory without making the walker follow it.
+	ErrSkipRepositoryDirectory = errors.New("skip repository directory")
 )
 
 const maximumGitMetadataBytes = 4096
