@@ -214,7 +214,9 @@ class RepositoryLayoutTest(unittest.TestCase):
         )
         allowed = (
             Path("tests/taf_context/benchmark_level1.py"),
+            Path("tests/taf_context/level1_replacement_controller.py"),
             Path("tests/taf_context/level1_replacement_scoring.py"),
+            Path("tests/taf_context/test_level1_replacement_controller.py"),
             Path("tests/taf_context/test_level1_replacement_scoring.py"),
             Path("tools/taf-context/contracts/level1/request.schema.json"),
         )
