@@ -46,6 +46,20 @@ func TestDecodeEnvelopeRejectsDuplicateRequestKey(t *testing.T) {
 	}
 }
 
+func TestDecodeEnvelopeAcceptsCanonicalNullableChangedPathsDocument(t *testing.T) {
+	raw, err := json.Marshal(validEnvelope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := DecodeEnvelope(bytes.NewReader(append(raw, '\n')))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.ChangedPathsDocument != nil {
+		t.Fatalf("changed paths document = %q", *envelope.ChangedPathsDocument)
+	}
+}
+
 func TestDecodeEnvelopeRejectsUnknownInvalidAndWrongFraming(t *testing.T) {
 	for _, raw := range []string{
 		`{"phase":"query","repository_root":"/repo","state_root":"/state","changed_paths_document":null,"request":{},"unknown":true}` + "\n",
@@ -270,6 +284,22 @@ func TestEncodeResultRejectsNilCollectionsInvalidCountersAndDuplicateFindings(t 
 	for _, result := range cases {
 		if err := EncodeResult(ioDiscard{}, result); err == nil {
 			t.Fatalf("accepted invalid result: %+v", result)
+		}
+	}
+}
+
+func TestEncodeResultRejectsFindingLineInt32Overflow(t *testing.T) {
+	for _, field := range []string{"start", "end"} {
+		result := validResult()
+		if field == "start" {
+			result.Findings[0].StartLine = 1 << 31
+			result.Findings[0].EndLine = 1 << 31
+		} else {
+			result.Findings[0].EndLine = 1 << 31
+		}
+		result.OutputCharacters = renderedOutputCharacters(result)
+		if err := EncodeResult(ioDiscard{}, result); err == nil {
+			t.Fatalf("accepted %s line int32 overflow", field)
 		}
 	}
 }

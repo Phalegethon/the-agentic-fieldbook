@@ -54,7 +54,7 @@ func validateEnvelopeShape(raw []byte) error {
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidWire, err)
 	}
-	if err := requireKeys(envelope, []string{"phase", "repository_root", "state_root", "changed_paths_document", "request"}, nil); err != nil {
+	if err := requireKeys(envelope, []string{"phase", "repository_root", "state_root", "changed_paths_document", "request"}, map[string]bool{"changed_paths_document": true}); err != nil {
 		return err
 	}
 	for _, field := range []string{"phase", "repository_root", "state_root", "request"} {
@@ -286,7 +286,7 @@ func renderedOutputCharacters(result Result) int {
 }
 
 func validateFinding(finding Finding, rank int, freshness string) error {
-	if finding.Rank != rank || !validSHA(finding.ResultIdentity) || !validPath(finding.Path) || finding.StartLine < 1 || finding.EndLine < finding.StartLine || !validText(finding.Language, false) || !oneOf(finding.RecordKind, "module", "definition", "import", "entry-point", "configuration", "heading", "document-chunk") || !oneOf(finding.SourceType, "source", "document", "configuration") || !validText(finding.QualifiedName, true) || !validText(finding.ExtractionMethod, false) || !validText(finding.Preview, true) || !oneOf(finding.EvidenceClass, "verified", "inferred", "uncertain") {
+	if finding.Rank != rank || !validSHA(finding.ResultIdentity) || !validPath(finding.Path) || finding.StartLine < 1 || finding.EndLine < finding.StartLine || !validCounter(finding.StartLine) || !validCounter(finding.EndLine) || !validText(finding.Language, false) || !oneOf(finding.RecordKind, "module", "definition", "import", "entry-point", "configuration", "heading", "document-chunk") || !oneOf(finding.SourceType, "source", "document", "configuration") || !validText(finding.QualifiedName, true) || !validText(finding.ExtractionMethod, false) || !validText(finding.Preview, true) || !oneOf(finding.EvidenceClass, "verified", "inferred", "uncertain") {
 		return ErrInvalidWire
 	}
 	if freshness != "exact" && finding.EvidenceClass == "verified" {
