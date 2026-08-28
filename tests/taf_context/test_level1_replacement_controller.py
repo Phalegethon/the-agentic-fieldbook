@@ -89,7 +89,7 @@ class ReplacementScheduleTests(unittest.TestCase):
         self.assertEqual(stage_a, replacement_stage_a_schedule())
         self.assertEqual(stage_b, replacement_stage_b_schedule())
         self.assertEqual(len(stage_a), 52)
-        self.assertEqual(len(stage_b), 136)
+        self.assertEqual(len(stage_b), 130)
         for schedule in (stage_a, stage_b):
             identities = tuple(sample.sample_identity for sample in schedule)
             self.assertEqual(len(identities), len(set(identities)))
@@ -106,6 +106,10 @@ class ReplacementScheduleTests(unittest.TestCase):
         self.assertEqual(query.ordinal, 5)
         self.assertTrue(query.retained)
         self.assertFalse(any("l1-q-003" in sample.sample_identity for sample in schedule))
+        self.assertFalse(
+            any("l1-q-022" in sample.sample_identity for sample in schedule),
+            "safe-refusal vectors are not retrieval samples",
+        )
 
 
 class ReplacementControllerTests(unittest.TestCase):

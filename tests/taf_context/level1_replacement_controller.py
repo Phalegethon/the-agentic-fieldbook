@@ -131,7 +131,7 @@ def replacement_stage_b_schedule() -> tuple[ReplacementSample, ...]:
         )
     )
     for vector in range(1, 25):
-        if vector in {3, 4, 5, 6}:
+        if vector in {3, 4, 5, 6, 22}:
             continue
         query_class = "fuzzy" if vector in {9, 15} else "exact"
         vector_identity = f"L1-Q-{vector:03d}"
