@@ -17,7 +17,7 @@ ROOT = Path(__file__).parents[2]
 SKILL = ROOT / "skills" / "work-recovery"
 VENDOR = ROOT / "scripts" / "vendor-work-recovery-runtime"
 RUNTIME_SOURCES = {
-    "taf_context/__init__.py": "tools/taf-context/taf_context/__init__.py",
+    "taf_context/__init__.py": "scripts/work-recovery-runtime/__init__.py",
     "taf_context/git_snapshot.py": "tools/taf-context/taf_context/git_snapshot.py",
     "taf_context/models.py": "tools/taf-context/taf_context/models.py",
     "taf_context/recovery.py": "tools/taf-context/taf_context/recovery.py",
@@ -55,6 +55,36 @@ class SkillShapeTests(unittest.TestCase):
 
 
 class VendoredRuntimeTests(unittest.TestCase):
+    def test_standalone_runtime_exports_only_loadable_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            copied_skill = Path(directory) / "work-recovery"
+            shutil.copytree(SKILL, copied_skill)
+            script = (
+                "import json, taf_context\n"
+                "print(json.dumps(sorted(taf_context.__all__)))\n"
+                "for name in taf_context.__all__: getattr(taf_context, name)\n"
+            )
+            completed = subprocess.run(
+                ["python3", "-c", script],
+                cwd=copied_skill / "scripts",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                json.loads(completed.stdout),
+                [
+                    "EvidenceClass",
+                    "RecoveryClaim",
+                    "RecoveryCoverage",
+                    "RecoveryDossier",
+                    "WorkState",
+                    "WorkstreamState",
+                ],
+            )
+
     def test_manifest_and_vendored_bytes_match_the_allowlisted_engine_source(self) -> None:
         manifest = json.loads((SKILL / "scripts" / "runtime-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["schema_version"], "1")

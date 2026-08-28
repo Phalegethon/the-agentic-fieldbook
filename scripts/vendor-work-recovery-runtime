@@ -15,7 +15,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = ROOT / "skills" / "work-recovery" / "scripts"
 ALLOWLIST = {
-    "taf_context/__init__.py": "tools/taf-context/taf_context/__init__.py",
+    "taf_context/__init__.py": "scripts/work-recovery-runtime/__init__.py",
     "taf_context/git_snapshot.py": "tools/taf-context/taf_context/git_snapshot.py",
     "taf_context/models.py": "tools/taf-context/taf_context/models.py",
     "taf_context/recovery.py": "tools/taf-context/taf_context/recovery.py",
