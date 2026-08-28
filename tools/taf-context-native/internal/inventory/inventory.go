@@ -44,6 +44,10 @@ type Result struct {
 	EligibleSourceBytes uint64
 	Partial             bool
 	Warnings            []string
+	UnknownRemainder    bool
+	DirectoryEntries    int
+	PrefixBytes         uint64
+	FullBodyOpens       int
 }
 
 // Collect inventories source with the frozen production ceilings.
@@ -60,28 +64,41 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 		result.Partial = true
 		result.Warnings = append(result.Warnings, "coverage-estimated-not-parsed")
 	}
+	tracked, indexWarning := trackedRepositoryPaths(roots)
+	if indexWarning != "" {
+		result.Partial = true
+		addWarning(&result, indexWarning)
+	}
 	var ignores []ignoreRule
+	regularExclusions, languageSupported, languageUnsupported := 0, 0, 0
 	err := roots.WalkRepository(func(entry boundary.RepositoryEntry) error {
-		// Root ignore policy is deliberately the only parsed ignore file. Nested
-		// rules require directory-scoped push/pop semantics and are not silently
-		// treated as repository-wide rules.
-		if entry.RelativePath == ".gitignore" && entry.Mode.IsRegular() {
+		result.DirectoryEntries++
+		if strings.HasSuffix(entry.RelativePath, ".gitignore") && entry.Mode.IsRegular() {
 			prefix, prefixErr := roots.ReadRepositoryPrefix(entry.RelativePath, ignorePrefixBytes)
 			if prefixErr != nil {
 				result.Partial = true
 				addWarning(&result, "gitignore-unreadable")
 			} else {
-				ignores = append(ignores, parseIgnoreRules(prefix.Bytes)...)
+				base := strings.TrimSuffix(strings.TrimSuffix(entry.RelativePath, ".gitignore"), "/")
+				ignores = append(ignores, parseIgnoreRules(base, prefix.Bytes)...)
+				result.PrefixBytes += uint64(len(prefix.Bytes))
 				if prefix.Size > int64(len(prefix.Bytes)) {
 					result.Partial = true
 					addWarning(&result, "gitignore-prefix-truncated")
 				}
 			}
 		}
-		reason, prune := classifyMetadata(entry, ignores)
+		reason, prune := classifyMetadata(entry, ignores, tracked)
 		if reason != "" {
 			addExclusion(&result, entry.RelativePath, reason)
+			if entry.Mode.IsRegular() {
+				regularExclusions++
+			}
 			if prune {
+				if reason != ExcludedGit {
+					result.Partial, result.UnknownRemainder = true, true
+					addWarning(&result, "inventory-pruned-subtree")
+				}
 				return boundary.ErrSkipRepositoryDirectory
 			}
 			return nil
@@ -91,47 +108,56 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 		}
 		language := languageForPath(entry.RelativePath)
 		if language == "" {
+			languageUnsupported++
 			addExclusion(&result, entry.RelativePath, ExcludedUnsupported)
+			regularExclusions++
 			return nil
 		}
+		languageSupported++
 		maximum := int64(limits.MaximumSourceFileBytes)
-		if language == "markdown" {
+		if markdownLanguage(language) {
 			maximum = int64(limits.MaximumMarkdownFileBytes)
 		}
 		if entry.Size < 0 || entry.Size > maximum {
 			addExclusion(&result, entry.RelativePath, ExcludedOversized)
+			regularExclusions++
 			return nil
+		}
+		if len(result.Paths) >= limits.MaximumEligiblePaths || uint64(entry.Size) > limits.MaximumEligibleSourceBytes-result.EligibleSourceBytes {
+			result.Partial, result.UnknownRemainder = true, true
+			if len(result.Paths) >= limits.MaximumEligiblePaths {
+				addWarning(&result, "inventory-path-limit")
+			} else {
+				addWarning(&result, "inventory-byte-limit")
+			}
+			return boundary.ErrStopRepositoryWalk
 		}
 		prefix, prefixErr := roots.ReadRepositoryPrefix(entry.RelativePath, binaryPrefixBytes)
+		if prefixErr == nil {
+			result.PrefixBytes += uint64(len(prefix.Bytes))
+		}
 		if prefixErr != nil || prefix.Size != entry.Size {
 			addExclusion(&result, entry.RelativePath, ExcludedUnsafe)
+			regularExclusions++
 			return nil
 		}
-		if binary(prefix.Bytes) {
+		if binary(prefix.Bytes, prefix.Size > int64(len(prefix.Bytes))) {
 			addExclusion(&result, entry.RelativePath, ExcludedBinary)
-			return nil
-		}
-		if len(result.Paths) >= limits.MaximumEligiblePaths {
-			addExclusion(&result, entry.RelativePath, ExcludedLimit)
-			result.Partial = true
-			addWarning(&result, "inventory-path-limit")
-			return nil
-		}
-		if uint64(entry.Size) > limits.MaximumEligibleSourceBytes-result.EligibleSourceBytes {
-			addExclusion(&result, entry.RelativePath, ExcludedLimit)
-			result.Partial = true
-			addWarning(&result, "inventory-byte-limit")
+			regularExclusions++
 			return nil
 		}
 		candidate := Path{RelativePath: entry.RelativePath, Language: language, Size: entry.Size}
 		if mode == ModeBuild {
+			result.FullBodyOpens++
 			file, fileErr := roots.OpenRepositoryFile(entry.RelativePath, maximum)
 			if fileErr != nil || file.Size != entry.Size {
 				addExclusion(&result, entry.RelativePath, ExcludedUnsafe)
+				regularExclusions++
 				return nil
 			}
-			if binary(file.Bytes) {
+			if binary(file.Bytes, false) {
 				addExclusion(&result, entry.RelativePath, ExcludedBinary)
+				regularExclusions++
 				return nil
 			}
 			candidate.SHA256 = file.SHA256
@@ -140,7 +166,7 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 		result.EligibleSourceBytes += uint64(entry.Size)
 		return nil
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, boundary.ErrStopRepositoryWalk) {
 		return Result{}, err
 	}
 	sort.Slice(result.Paths, func(i, j int) bool { return result.Paths[i].RelativePath < result.Paths[j].RelativePath })
@@ -152,18 +178,24 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 	})
 	sort.Strings(result.Warnings)
 	result.Coverage.IndexedPathCount = len(result.Paths)
-	result.Coverage.ExcludedPathCount = len(result.Exclusions)
+	result.Coverage.ExcludedPathCount = regularExclusions
 	result.Coverage.UnsupportedLanguageCount = result.Coverage.ExclusionReasonCounts[ExcludedUnsupported]
 	result.Coverage.ParseFailureCount = 0
-	denominator := result.Coverage.IndexedPathCount + result.Coverage.ExcludedPathCount
-	if denominator > 0 {
+	denominator := result.Coverage.IndexedPathCount + regularExclusions
+	if denominator > 0 && !result.UnknownRemainder {
 		result.Coverage.PathCoverage = float64(result.Coverage.IndexedPathCount) / float64(denominator)
-		result.Coverage.LanguageCoverage = result.Coverage.PathCoverage
+	}
+	languageDenominator := languageSupported + languageUnsupported
+	if languageDenominator > 0 && !result.UnknownRemainder {
+		result.Coverage.LanguageCoverage = float64(languageSupported) / float64(languageDenominator)
 	}
 	return result, nil
 }
 
-func classifyMetadata(entry boundary.RepositoryEntry, ignores []ignoreRule) (reason string, prune bool) {
+func classifyMetadata(entry boundary.RepositoryEntry, ignores []ignoreRule, tracked map[string]struct{}) (reason string, prune bool) {
+	if entry.GitMetadata {
+		return ExcludedGit, entry.Mode.IsDir()
+	}
 	if entry.Mode&os.ModeSymlink != 0 || (!entry.Mode.IsDir() && !entry.Mode.IsRegular()) {
 		return ExcludedUnsafe, false
 	}
@@ -171,15 +203,12 @@ func classifyMetadata(entry boundary.RepositoryEntry, ignores []ignoreRule) (rea
 		return reason, entry.Mode.IsDir()
 	}
 	if entry.Mode.IsDir() {
-		if ignoredBy(ignores, entry.RelativePath, true) {
-			return ExcludedIgnored, true
-		}
 		return "", false
 	}
 	if !entry.Mode.IsRegular() {
 		return ExcludedUnsafe, false
 	}
-	if ignoredBy(ignores, entry.RelativePath, false) {
+	if _, isTracked := tracked[entry.RelativePath]; !isTracked && ignoredBy(ignores, entry.RelativePath, false) {
 		return ExcludedIgnored, false
 	}
 	if strings.HasSuffix(strings.ToLower(entry.RelativePath), ".generated.go") || strings.HasSuffix(strings.ToLower(entry.RelativePath), ".gen.go") || strings.HasSuffix(strings.ToLower(entry.RelativePath), ".pb.go") {
@@ -188,8 +217,22 @@ func classifyMetadata(entry boundary.RepositoryEntry, ignores []ignoreRule) (rea
 	return "", false
 }
 
-func binary(contents []byte) bool {
-	return bytes.IndexByte(contents, 0) >= 0 || !utf8.Valid(contents)
+func binary(contents []byte, truncated bool) bool {
+	if bytes.IndexByte(contents, 0) >= 0 {
+		return true
+	}
+	if utf8.Valid(contents) {
+		return false
+	}
+	if truncated {
+		for suffix := 1; suffix <= 3 && suffix < len(contents); suffix++ {
+			prefix, tail := contents[:len(contents)-suffix], contents[len(contents)-suffix:]
+			if utf8.Valid(prefix) && utf8.RuneStart(tail[0]) && !utf8.FullRune(tail) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func addExclusion(result *Result, relative, reason string) {

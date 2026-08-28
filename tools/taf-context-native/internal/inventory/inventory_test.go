@@ -2,7 +2,11 @@ package inventory
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"crypto/sha256"
+	endian "encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -74,7 +78,7 @@ func TestCollectClassifiesAndBoundsFilesDeterministically(t *testing.T) {
 	assertExclusion(t, result, "vendor", ExcludedVendored)
 	assertExclusion(t, result, "node_modules", ExcludedVendored)
 	assertExclusion(t, result, "target", ExcludedGenerated)
-	assertExclusion(t, result, "ignored", ExcludedIgnored)
+	assertExclusion(t, result, "ignored/code.py", ExcludedIgnored)
 	assertExclusion(t, result, "too-large.go", ExcludedOversized)
 	assertExclusion(t, result, "too-large.md", ExcludedOversized)
 	assertExclusion(t, result, "linked.go", ExcludedUnsafe)
@@ -109,6 +113,9 @@ func TestCollectEstimateUsesOnlyBoundedPrefixesAndIsPartial(t *testing.T) {
 	if result.Paths[0].SHA256 != "" {
 		t.Fatalf("estimate calculated a full-body digest: %#v", result.Paths[0])
 	}
+	if result.FullBodyOpens != 0 || result.PrefixBytes > 2*uint64(binaryPrefixBytes) {
+		t.Fatalf("estimate read complete eligible bodies or exceeded prefixes: %#v", result)
+	}
 	assertExclusion(t, result, "binary.py", ExcludedBinary)
 }
 
@@ -135,19 +142,17 @@ func TestCollectExcludesLinkedAndNestedGitMetadata(t *testing.T) {
 	}
 }
 
-func TestCollectDoesNotApplyNestedGitIgnoreRulesRepositoryWide(t *testing.T) {
+func TestCollectAppliesNestedGitIgnoreRulesOnlyWithinTheirDirectory(t *testing.T) {
 	repository := newRepository(t)
 	writeFile(t, repository, "a/.gitignore", "*.go\n")
 	writeFile(t, repository, "a/one.go", "package a\n")
 	writeFile(t, repository, "b/two.go", "package b\n")
 
 	result := mustCollect(t, repository, ModeBuild)
-	if got, want := result.Paths, []Path{
-		{RelativePath: "a/one.go", Language: "go", Size: 10},
-		{RelativePath: "b/two.go", Language: "go", Size: 10},
-	}; !samePathsIgnoringDigest(got, want) {
-		t.Fatalf("paths = %#v, want nested ignore not to leak", got)
+	if got, want := result.Paths, []Path{{RelativePath: "b/two.go", Language: "go", Size: 10}}; !samePathsIgnoringDigest(got, want) {
+		t.Fatalf("paths = %#v, want only b/two.go", got)
 	}
+	assertExclusion(t, result, "a/one.go", ExcludedIgnored)
 }
 
 func TestCollectEstimateDoesNotCreateStateOrMutateRepository(t *testing.T) {
@@ -171,6 +176,88 @@ func TestCollectEstimateDoesNotCreateStateOrMutateRepository(t *testing.T) {
 	}
 }
 
+func TestCollectHonorsGitIndexOverIgnoreRules(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, ".gitignore", "ignored.go\n")
+	writeFile(t, repository, "ignored.go", "package ignored\n")
+	writeGitIndex(t, repository, []string{"ignored.go"})
+	result := mustCollect(t, repository, ModeBuild)
+	if got, want := result.Paths, []Path{{RelativePath: "ignored.go", Language: "go", Size: 16}}; !samePathsIgnoringDigest(got, want) {
+		t.Fatalf("paths = %#v, want tracked ignored file included", got)
+	}
+}
+
+func TestCollectUsesLinkedWorktreeGitIndex(t *testing.T) {
+	repository := newRepository(t)
+	if err := os.Remove(filepath.Join(repository, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	gitDirectory := filepath.Join(t.TempDir(), "worktree-git")
+	if err := os.Mkdir(gitDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repository, ".git", "gitdir: "+gitDirectory+"\n")
+	writeFile(t, repository, ".gitignore", "tracked.go\n")
+	writeFile(t, repository, "tracked.go", "package tracked\n")
+	writeGitIndexIn(t, gitDirectory, []string{"tracked.go"})
+	result := mustCollect(t, repository, ModeBuild)
+	if got, want := result.Paths, []Path{{RelativePath: "tracked.go", Language: "go", Size: 16}}; !samePathsIgnoringDigest(got, want) {
+		t.Fatalf("linked-worktree tracked result = %#v", result)
+	}
+}
+
+func TestCollectMarksMalformedGitIndexPartial(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, "source.go", "package source\n")
+	if err := os.WriteFile(filepath.Join(repository, ".git", "index"), []byte("DIRCbroken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := mustCollect(t, repository, ModeBuild)
+	if !result.Partial || !contains(result.Warnings, "git-index-invalid") {
+		t.Fatalf("malformed index result = %#v", result)
+	}
+}
+
+func TestBinaryPrefixAllowsOnlyTrailingPartialRune(t *testing.T) {
+	validSplit := append(bytes.Repeat([]byte("a"), 8191), 0xe2)
+	if binary(validSplit, true) {
+		t.Fatal("truncated final UTF-8 rune classified as binary")
+	}
+	invalidInterior := append([]byte{0xff}, bytes.Repeat([]byte("a"), 8191)...)
+	if !binary(invalidInterior, true) || !binary([]byte("ok\x00no"), false) {
+		t.Fatal("invalid UTF-8 or NUL content not classified as binary")
+	}
+}
+
+func TestExtensionRegistryIncludesBoundedConfigFormats(t *testing.T) {
+	registry := ExtensionRegistry()
+	seen := map[string]bool{}
+	for _, metadata := range registry {
+		seen[metadata.Language] = true
+	}
+	for _, language := range []string{"json", "toml", "yaml", "ini"} {
+		if !seen[language] {
+			t.Fatalf("registry missing %s: %#v", language, registry)
+		}
+	}
+	for _, relative := range []string{"config.json", "config.toml", "config.yaml", "config.ini"} {
+		if languageForPath(relative) == "" {
+			t.Fatalf("registry/inventory mismatch for %s", relative)
+		}
+	}
+}
+
+func TestCollectBuildSHA256MatchesBytes(t *testing.T) {
+	repository := newRepository(t)
+	contents := "package digest\n"
+	writeFile(t, repository, "digest.go", contents)
+	result := mustCollect(t, repository, ModeBuild)
+	digest := sha256.Sum256([]byte(contents))
+	if got, want := result.Paths[0].SHA256, fmt.Sprintf("%x", digest); got != want {
+		t.Fatalf("SHA256 = %s, want %s", got, want)
+	}
+}
+
 func TestCollectStopsAtPathAndByteLimitsWithoutClaimingCompleteness(t *testing.T) {
 	repository := newRepository(t)
 	writeFile(t, repository, "a.go", "package a\n")
@@ -189,11 +276,11 @@ func TestCollectStopsAtPathAndByteLimitsWithoutClaimingCompleteness(t *testing.T
 	if !result.Partial || !contains(result.Warnings, "inventory-path-limit") || len(result.Paths) != 2 {
 		t.Fatalf("path-limited result = %#v", result)
 	}
-	if got := result.Coverage.ExclusionReasonCounts[ExcludedLimit]; got != 3 {
-		t.Fatalf("path-limit exclusions = %d, want all 3 omitted source paths", got)
+	if result.Coverage.ExclusionReasonCounts[ExcludedLimit] != 0 || !result.UnknownRemainder || result.Coverage.PathCoverage != 0 {
+		t.Fatalf("path-limit result must represent an unknown conservative remainder: %#v", result)
 	}
-	if got, want := result.Coverage.PathCoverage, 2.0/6.0; got != want {
-		t.Fatalf("path coverage = %v, want %v", got, want)
+	if result.DirectoryEntries != 4 || result.PrefixBytes != uint64(2*len("package a\n")) || result.FullBodyOpens != 2 || len(result.Paths) > limits.MaximumEligiblePaths {
+		t.Fatalf("path ceiling performed unbounded work: %#v", result)
 	}
 
 	limits.MaximumEligiblePaths = 10
@@ -331,4 +418,32 @@ func repositorySnapshot(t *testing.T, repository string) map[string]string {
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func writeGitIndex(t *testing.T, repository string, names []string) {
+	t.Helper()
+	writeGitIndexIn(t, filepath.Join(repository, ".git"), names)
+}
+
+func writeGitIndexIn(t *testing.T, gitDirectory string, names []string) {
+	t.Helper()
+	var raw bytes.Buffer
+	raw.WriteString("DIRC")
+	_ = endian.Write(&raw, endian.BigEndian, uint32(2))
+	_ = endian.Write(&raw, endian.BigEndian, uint32(len(names)))
+	for _, name := range names {
+		start := raw.Len()
+		raw.Write(make([]byte, 60))
+		_ = endian.Write(&raw, endian.BigEndian, uint16(len(name)))
+		raw.WriteString(name)
+		raw.WriteByte(0)
+		for (raw.Len()-start)%8 != 0 {
+			raw.WriteByte(0)
+		}
+	}
+	digest := sha1.Sum(raw.Bytes())
+	raw.Write(digest[:])
+	if err := os.WriteFile(filepath.Join(gitDirectory, "index"), raw.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }

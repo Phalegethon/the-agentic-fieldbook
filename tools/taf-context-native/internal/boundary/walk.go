@@ -16,6 +16,7 @@ type RepositoryEntry struct {
 	RelativePath string
 	Mode         os.FileMode
 	Size         int64
+	GitMetadata  bool
 }
 
 // StablePrefix is a post-validated bounded read of a regular repository file.
@@ -25,6 +26,10 @@ type StablePrefix struct {
 	Bytes        []byte
 	Size         int64
 }
+
+// directoryReadHook provides a deterministic mutation seam for boundary
+// tests. Production leaves it nil.
+var directoryReadHook func()
 
 // WalkRepository enumerates repository metadata through the captured root
 // capability. It never follows symlinks and never descends into Git metadata.
@@ -57,14 +62,15 @@ func (r *Roots) walkRepositoryDirectory(current *os.Root, parent string, ancesto
 		if parent != "" {
 			relative = path.Join(parent, name)
 		}
-		if err := visit(RepositoryEntry{RelativePath: relative, Mode: info.Mode(), Size: info.Size()}); err != nil {
+		isGitMetadata := r.isGitMetadata(info)
+		if err := visit(RepositoryEntry{RelativePath: relative, Mode: info.Mode(), Size: info.Size(), GitMetadata: isGitMetadata}); err != nil {
 			if errors.Is(err, ErrSkipRepositoryDirectory) && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
 				continue
 			}
 			return err
 		}
 		// A .git component is repository metadata even for nested repositories.
-		if strings.EqualFold(name, ".git") || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		if isGitMetadata || strings.EqualFold(name, ".git") || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			continue
 		}
 		if descendBeforeOpenHook != nil {
@@ -96,6 +102,12 @@ func (r *Roots) walkRepositoryDirectory(current *os.Root, parent string, ancesto
 	return nil
 }
 
+func (r *Roots) isGitMetadata(info os.FileInfo) bool {
+	return (r.gitDirectoryInfo != nil && sameIdentity(info, r.gitDirectoryInfo)) ||
+		(r.gitCommonInfo != nil && sameIdentity(info, r.gitCommonInfo)) ||
+		(r.gitMetadataInfo != nil && sameIdentity(info, r.gitMetadataInfo))
+}
+
 func readRootDirectory(root *os.Root) ([]os.DirEntry, error) {
 	before, err := root.Stat(".")
 	if err != nil || !before.IsDir() {
@@ -114,6 +126,13 @@ func readRootDirectory(root *os.Root) ([]os.DirEntry, error) {
 	entries, err := directory.ReadDir(-1)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUnsafePath, err)
+	}
+	if directoryReadHook != nil {
+		directoryReadHook()
+	}
+	afterRead, afterReadErr := root.Stat(".")
+	if afterReadErr != nil || !sameSnapshot(before, afterRead) || !sameSnapshot(opened, afterRead) {
+		return nil, ErrUnsafePath
 	}
 	return entries, nil
 }

@@ -1159,6 +1159,25 @@ func TestReadRepositoryPrefixIsBoundedAndStable(t *testing.T) {
 	}
 }
 
+func TestWalkRepositoryRejectsDirectoryMutationDuringListing(t *testing.T) {
+	roots := makeRoots(t)
+	defer roots.Close()
+	if err := os.WriteFile(filepath.Join(roots.Repository, "safe.go"), []byte("package safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	directoryReadHook = func() {
+		directoryReadHook = nil
+		if err := os.WriteFile(filepath.Join(roots.Repository, "added.go"), []byte("package added"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { directoryReadHook = nil })
+	err := roots.WalkRepository(func(RepositoryEntry) error { return nil })
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("WalkRepository mutation error = %v, want ErrUnsafePath", err)
+	}
+}
+
 func makeRoots(t *testing.T) Roots {
 	t.Helper()
 	repo := makeRepository(t)

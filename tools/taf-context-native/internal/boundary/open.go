@@ -3,6 +3,7 @@ package boundary
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -57,6 +58,48 @@ func (r *Roots) OpenRepositoryFile(relative string, maximum int64) (StableFile, 
 	}
 	if repositoryOpenHook != nil {
 		repositoryOpenHook()
+	}
+	file, err := current.Open(name)
+	if err != nil {
+		return StableFile{}, fmt.Errorf("%w: %v", ErrUnsafePath, err)
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !sameSnapshot(before, opened) {
+		return StableFile{}, ErrUnstableFile
+	}
+	contents, err := readAtMost(file, maximum)
+	if err != nil {
+		return StableFile{}, err
+	}
+	after, err := file.Stat()
+	pathAfter, pathErr := current.Lstat(name)
+	if err != nil || pathErr != nil || pathAfter.Mode()&os.ModeSymlink != 0 || !pathAfter.Mode().IsRegular() || !sameSnapshot(before, after) || !sameSnapshot(before, pathAfter) {
+		return StableFile{}, ErrUnstableFile
+	}
+	digest := sha256.Sum256(contents)
+	return StableFile{RelativePath: relative, Bytes: contents, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(contents))}, nil
+}
+
+// OpenGitMetadataFile reads a regular Git-control file through the retained
+// worktree Git-directory capability. It never consults a pathname root.
+func (r *Roots) OpenGitMetadataFile(relative string, maximum int64) (StableFile, error) {
+	components, err := safeComponents(relative, false)
+	if err != nil || r.gitDirectoryRoot == nil || maximum < 0 {
+		return StableFile{}, ErrUnsafePath
+	}
+	current, closers, err := descend(r.gitDirectoryRoot, components[:len(components)-1])
+	if err != nil {
+		return StableFile{}, err
+	}
+	defer closeRoots(closers)
+	name := components[len(components)-1]
+	before, err := current.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return StableFile{}, ErrGitMetadataNotFound
+	}
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || before.Size() > maximum {
+		return StableFile{}, ErrUnsafePath
 	}
 	file, err := current.Open(name)
 	if err != nil {
