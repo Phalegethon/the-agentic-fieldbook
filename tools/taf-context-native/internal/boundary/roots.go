@@ -27,6 +27,7 @@ var (
 	ErrSkipRepositoryDirectory    = errors.New("skip repository directory")
 	ErrStopRepositoryWalk         = errors.New("stop repository walk")
 	ErrRepositoryEnumerationLimit = errors.New("repository directory enumeration limit")
+	ErrRepositoryTraversalLimit   = errors.New("repository traversal structure limit")
 )
 
 const maximumGitMetadataBytes = 4096

@@ -1277,6 +1277,99 @@ func TestWalkRepositoryRejectsMutationAfterChildCallbacks(t *testing.T) {
 	}
 }
 
+func TestWalkRepositoryGloballyRejectsLaterSiblingMutationOfEarlierSubtree(t *testing.T) {
+	roots := makeRoots(t)
+	defer roots.Close()
+	earlier := filepath.Join(roots.Repository, "a", "early.go")
+	if err := os.MkdirAll(filepath.Dir(earlier), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(earlier, []byte("package early\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(roots.Repository, "z.go"), []byte("package z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := roots.WalkRepository(100, func(entry RepositoryEntry) error {
+		if entry.RelativePath == "z.go" {
+			if err := os.WriteFile(earlier, []byte("package changed\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return nil
+	})
+	if !errors.Is(err, ErrRepositoryChanged) {
+		t.Fatalf("global subtree mutation error = %v, want ErrRepositoryChanged", err)
+	}
+}
+
+func TestWalkRepositoryStopsAtBoundedDepthWithoutLeakingDescriptors(t *testing.T) {
+	roots := makeRoots(t)
+	defer roots.Close()
+	current := roots.Repository
+	for depth := 0; depth < 257; depth++ {
+		current = filepath.Join(current, "d")
+		if err := os.Mkdir(current, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := openDescriptorCount(t)
+	err := roots.WalkRepository(1024, func(RepositoryEntry) error { return nil })
+	if err == nil {
+		t.Fatal("deep repository walk completed without a stable traversal limit")
+	}
+	after := openDescriptorCount(t)
+	if before >= 0 && after > before+3 {
+		t.Fatalf("deep traversal leaked descriptors: before=%d after=%d", before, after)
+	}
+}
+
+func TestRepositoryWalkStateBoundsIndividualAndCumulativeRelativePaths(t *testing.T) {
+	individual := &repositoryWalkState{path: bytes.Repeat([]byte{'a'}, maximumRepositoryPathBytes)}
+	if individual.pushPath("b") {
+		t.Fatal("walk state accepted a relative path beyond the normalized byte bound")
+	}
+	cumulative := &repositoryWalkState{emittedPathBytes: maximumRepositoryEmittedPathBytes - 1}
+	if cumulative.pushPath("ab") {
+		t.Fatal("walk state accepted a path beyond the cumulative emitted byte bound")
+	}
+}
+
+func TestWalkRepositoryBoundsGlobalVerificationWorkAndObservations(t *testing.T) {
+	roots := makeRoots(t)
+	defer roots.Close()
+	current := roots.Repository
+	for depth := 0; depth < 10; depth++ {
+		current = filepath.Join(current, "d")
+		if err := os.Mkdir(current, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const discoveryMaximum = 20
+	before := roots.IOObservation()
+	err := roots.WalkRepository(discoveryMaximum, func(RepositoryEntry) error { return nil })
+	after := roots.IOObservation()
+	if !errors.Is(err, ErrRepositoryEnumerationLimit) {
+		t.Fatalf("verification work error = %v, want ErrRepositoryEnumerationLimit", err)
+	}
+	observed := after.ReadDirectoryEntries - before.ReadDirectoryEntries
+	if observed > discoveryMaximum*(1+repositoryVerificationWorkFactor) {
+		t.Fatalf("verification observed %d entries beyond fixed total factor", observed)
+	}
+}
+
+func openDescriptorCount(t *testing.T) int {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return -1
+	}
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(entries)
+}
+
 func TestBoundaryIOHookReportsActualDirectoryPrefixAndBodyReads(t *testing.T) {
 	roots := makeRoots(t)
 	defer roots.Close()

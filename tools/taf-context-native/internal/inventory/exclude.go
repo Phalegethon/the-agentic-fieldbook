@@ -4,6 +4,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -24,14 +25,41 @@ type ignoreRule struct {
 	negated   bool
 	directory bool
 	anchored  bool
+	slash     bool
 	matcher   *regexp.Regexp
 }
 
 const (
-	maximumIgnoreRules        = 256
-	maximumIgnorePatternBytes = 64 << 10
-	maximumIgnorePatternSize  = 1024
+	maximumIgnoreRules           = 256
+	maximumIgnorePatternBytes    = 64 << 10
+	maximumIgnorePatternSize     = 1024
+	maximumIgnoreRuleEvaluations = 1_000_000
+	maximumIgnoreMatchWork       = 64 << 20
 )
+
+type ignoreMatchBudget struct {
+	remainingEvaluations int
+	remainingWork        int
+}
+
+func newIgnoreMatchBudget(evaluations, work int) *ignoreMatchBudget {
+	return &ignoreMatchBudget{remainingEvaluations: evaluations, remainingWork: work}
+}
+
+func (budget *ignoreMatchBudget) consume(rule ignoreRule, candidate string) bool {
+	if budget == nil {
+		return true
+	}
+	patternWork := len(rule.pattern) + 1
+	candidateWork := len(candidate) + 1
+	if budget.remainingEvaluations <= 0 || patternWork > budget.remainingWork/candidateWork {
+		return false
+	}
+	cost := patternWork * candidateWork
+	budget.remainingEvaluations--
+	budget.remainingWork -= cost
+	return true
+}
 
 // LanguageMetadata is immutable extension metadata shared by inventory and
 // later extractor registration. ExtensionRegistry returns a defensive copy.
@@ -79,15 +107,19 @@ func parseIgnoreRules(base string, contents []byte, availableRules, availablePat
 		} else if rule.negated {
 			line = strings.TrimPrefix(line, "!")
 		}
+		if line == "" {
+			continue
+		}
 		rule.directory = strings.HasSuffix(line, "/") && !escapedByte(line, len(line)-1)
 		rule.anchored = strings.HasPrefix(line, "/")
 		if rule.anchored {
 			line = line[1:]
 		}
-		if rule.directory {
+		if rule.directory && strings.HasSuffix(line, "/") {
 			line = line[:len(line)-1]
 		}
 		rule.pattern = line
+		rule.slash = strings.Contains(line, "/")
 		if rule.pattern == "" {
 			continue
 		}
@@ -105,109 +137,134 @@ func parseIgnoreRules(base string, contents []byte, availableRules, availablePat
 	return rules, patternBytes, false
 }
 
-func ignoredBy(rules []ignoreRule, relative string, directory bool) bool {
-	parent := path.Dir(relative)
-	if parent != "." {
-		components := strings.Split(parent, "/")
-		for index := range components {
-			ancestor := strings.Join(components[:index+1], "/")
-			if ignoredDirectlyBy(rules, ancestor, true) {
-				return true
-			}
+func ignoredBy(rules []ignoreRule, relative string, directory bool, budget *ignoreMatchBudget) (bool, bool) {
+	lastSlash := strings.LastIndexByte(relative, '/')
+	for index := 0; index <= lastSlash; index++ {
+		if relative[index] != '/' {
+			continue
+		}
+		ignored, limited := ignoredDirectlyBy(rules, relative[:index], true, budget)
+		if limited || ignored {
+			return ignored, limited
 		}
 	}
-	return ignoredDirectlyBy(rules, relative, directory)
+	return ignoredDirectlyBy(rules, relative, directory, budget)
 }
 
-func ignoredDirectlyBy(rules []ignoreRule, relative string, directory bool) bool {
+func ignoredDirectlyBy(rules []ignoreRule, relative string, directory bool, budget *ignoreMatchBudget) (bool, bool) {
 	ignored := false
 	for _, rule := range rules {
+		if !budget.consume(rule, relative) {
+			return false, true
+		}
 		if ignoreRuleMatches(rule, relative, directory) {
 			ignored = !rule.negated
 		}
 	}
-	return ignored
+	return ignored, false
 }
 
 func ignoreRuleMatches(rule ignoreRule, relative string, directory bool) bool {
 	if rule.base != "" {
-		if relative == rule.base {
+		if len(relative) <= len(rule.base) || relative[:len(rule.base)] != rule.base || relative[len(rule.base)] != '/' {
 			return false
 		}
-		prefix := rule.base + "/"
-		if !strings.HasPrefix(relative, prefix) {
-			return false
-		}
-		relative = strings.TrimPrefix(relative, prefix)
+		relative = relative[len(rule.base)+1:]
 	}
-	pattern := rule.pattern
 	if rule.directory {
-		if strings.Contains(pattern, "/") {
-			candidate := relative
+		if rule.slash {
 			if !directory {
-				candidate = path.Dir(relative)
+				return false
 			}
+			candidate := relative
 			for candidate != "." && candidate != "" {
 				if rule.matcher.MatchString(candidate) {
 					return true
 				}
-				candidate = path.Dir(candidate)
+				slash := strings.LastIndexByte(candidate, '/')
+				if slash < 0 {
+					break
+				}
+				candidate = candidate[:slash]
 			}
 			return false
 		}
-		for _, component := range strings.Split(relative, "/") {
-			if rule.matcher.MatchString(component) {
-				return true
-			}
+		if !directory {
+			return false
 		}
-		return false
+		if rule.anchored {
+			return rule.matcher.MatchString(relative)
+		}
+		return matcherMatchesComponent(rule.matcher, relative)
 	}
-	if strings.Contains(pattern, "/") || rule.anchored {
+	if rule.slash || rule.anchored {
 		return rule.matcher.MatchString(relative)
 	}
-	for _, component := range strings.Split(relative, "/") {
-		if rule.matcher.MatchString(component) {
+	return matcherMatchesComponent(rule.matcher, relative)
+}
+
+func matcherMatchesComponent(matcher *regexp.Regexp, relative string) bool {
+	start := 0
+	for index := 0; index <= len(relative); index++ {
+		if index != len(relative) && relative[index] != '/' {
+			continue
+		}
+		if matcher.MatchString(relative[start:index]) {
 			return true
 		}
+		start = index + 1
 	}
 	return false
 }
 
 func compileGitGlob(pattern string) (*regexp.Regexp, bool) {
+	if !utf8.ValidString(pattern) {
+		return nil, false
+	}
+	runes := []rune(pattern)
 	var expression strings.Builder
 	expression.WriteString("^")
-	for index := 0; index < len(pattern); index++ {
-		switch pattern[index] {
+	for index := 0; index < len(runes); index++ {
+		switch runes[index] {
 		case '\\':
-			if index+1 < len(pattern) {
+			if index+1 < len(runes) {
 				index++
-				expression.WriteString(regexp.QuoteMeta(string(pattern[index])))
+				expression.WriteString(regexp.QuoteMeta(string(runes[index])))
 			} else {
 				expression.WriteString(`\\`)
 			}
 		case '*':
-			if index+1 < len(pattern) && pattern[index+1] == '*' {
-				index++
-				if index+1 < len(pattern) && pattern[index+1] == '/' {
-					index++
-					expression.WriteString("(?:.*/)?")
-				} else {
-					expression.WriteString(".*")
-				}
-			} else {
+			end := index + 1
+			for end < len(runes) && runes[end] == '*' {
+				end++
+			}
+			runLength := end - index
+			leading := runLength == 2 && index == 0 && end < len(runes) && runes[end] == '/'
+			trailing := runLength == 2 && index > 0 && runes[index-1] == '/' && end == len(runes)
+			betweenSlashes := runLength == 2 && index > 0 && runes[index-1] == '/' && end < len(runes) && runes[end] == '/'
+			switch {
+			case leading, betweenSlashes:
+				expression.WriteString("(?:[^/]+/)*")
+				end++ // The special form owns its following slash.
+			case trailing:
+				expression.WriteString(".*")
+			default:
+				// Consecutive stars outside Git's three documented ** forms
+				// are equivalent to one ordinary star and cannot match '/'.
 				expression.WriteString("[^/]*")
 			}
+			index = end - 1
 		case '?':
 			expression.WriteString("[^/]")
 		case '[':
-			class, end, ok := compileGitBracket(pattern, index)
+			class, end, ok := compileGitBracket(runes, index)
 			if !ok {
 				return nil, false
 			}
 			expression.WriteString(class)
 			index = end
 		default:
-			expression.WriteString(regexp.QuoteMeta(string(pattern[index])))
+			expression.WriteString(regexp.QuoteMeta(string(runes[index])))
 		}
 	}
 	expression.WriteString("$")
@@ -215,7 +272,7 @@ func compileGitGlob(pattern string) (*regexp.Regexp, bool) {
 	return compiled, err == nil
 }
 
-func compileGitBracket(pattern string, start int) (string, int, bool) {
+func compileGitBracket(pattern []rune, start int) (string, int, bool) {
 	end := start + 1
 	escaped := false
 	for ; end < len(pattern); end++ {
@@ -239,6 +296,9 @@ func compileGitBracket(pattern string, start int) (string, int, bool) {
 		expression.WriteByte('^')
 		index++
 	}
+	if index == len(contents) {
+		return "", 0, false
+	}
 	for ; index < len(contents); index++ {
 		character := contents[index]
 		if character == '\\' && index+1 < len(contents) {
@@ -246,17 +306,17 @@ func compileGitBracket(pattern string, start int) (string, int, bool) {
 			character = contents[index]
 		}
 		switch character {
-		case '\\', ']', '^':
+		case '\\', '[', ']', '^':
 			expression.WriteByte('\\')
-			expression.WriteByte(character)
+			expression.WriteRune(character)
 		case '-':
 			if index == 0 || index == len(contents)-1 {
 				expression.WriteString(`\-`)
 			} else {
-				expression.WriteByte('-')
+				expression.WriteRune('-')
 			}
 		default:
-			expression.WriteByte(character)
+			expression.WriteRune(character)
 		}
 	}
 	expression.WriteByte(']')

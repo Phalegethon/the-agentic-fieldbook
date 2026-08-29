@@ -251,6 +251,91 @@ func TestCollectHonorsAnchoredSlashDirectoryAndOrderedNegationRules(t *testing.T
 	assertExclusion(t, result, "drop.py", ExcludedIgnored)
 }
 
+func TestParseIgnoreRulesSkipsEmptyAndSlashOnlyPatternsWithoutPanicking(t *testing.T) {
+	for _, pattern := range []string{"/", "!/", `\/`, "!", `\`, "//"} {
+		t.Run(fmt.Sprintf("%q", pattern), func(t *testing.T) {
+			rules, _, limited := parseIgnoreRules("", []byte(pattern+"\n"), maximumIgnoreRules, maximumIgnorePatternBytes)
+			if limited {
+				t.Fatalf("pattern %q unexpectedly exhausted policy budget", pattern)
+			}
+			for _, rule := range rules {
+				if rule.pattern == "" || rule.matcher == nil {
+					t.Fatalf("pattern %q produced no-op rule %#v", pattern, rule)
+				}
+			}
+		})
+	}
+}
+
+func FuzzParseIgnoreRulesNeverPanics(f *testing.F) {
+	for _, seed := range [][]byte{[]byte("/"), []byte("!/"), []byte(`\/`), []byte("!"), []byte(`\`), []byte("["), {0xff, '/', '\n'}} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, contents []byte) {
+		_, _, _ = parseIgnoreRules("", contents, maximumIgnoreRules, maximumIgnorePatternBytes)
+	})
+}
+
+func TestCollectAnchoredDirectoryPatternDoesNotMatchNestedBasename(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, ".gitignore", "/foo/\n")
+	writeFile(t, repository, "foo/ignored.go", "package ignored\n")
+	writeFile(t, repository, "nested/foo/kept.go", "package kept\n")
+
+	result := mustCollect(t, repository, ModeBuild)
+	if got, want := result.Paths, []Path{{RelativePath: "nested/foo/kept.go", Language: "go", Size: 13}}; !samePathsIgnoringDigest(got, want) {
+		t.Fatalf("anchored directory result = %#v, want %#v", result, want)
+	}
+	assertExclusion(t, result, "foo", ExcludedIgnored)
+}
+
+func TestCollectMatchesUnicodeIgnoreLiteralsAndRanges(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, ".gitignore", "café.go\ncaf[é-ê].py\n")
+	writeFile(t, repository, "café.go", "package ignored\n")
+	writeFile(t, repository, "cafê.py", "ignored = 1\n")
+	writeFile(t, repository, "cafe.go", "package kept\n")
+
+	result := mustCollect(t, repository, ModeBuild)
+	if got, want := result.Paths, []Path{{RelativePath: "cafe.go", Language: "go", Size: 13}}; !samePathsIgnoringDigest(got, want) {
+		t.Fatalf("Unicode ignore result = %#v, want %#v", result, want)
+	}
+	assertExclusion(t, result, "café.go", ExcludedIgnored)
+	assertExclusion(t, result, "cafê.py", ExcludedIgnored)
+}
+
+func TestCollectOnlyTreatsDocumentedDoubleStarsAsSlashCrossing(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, ".gitignore", "foo/***/bar.go\nleading***/deep.py\nspecial/**/drop.rs\n**/everywhere.ts\ntail/**\n")
+	for _, relative := range []string{
+		"foo/one/bar.go",
+		"foo/one/two/bar.go",
+		"leading-one/deep.py",
+		"leading-one/two/deep.py",
+		"special/drop.rs",
+		"special/one/two/drop.rs",
+		"nested/everywhere.ts",
+		"tail/one.go",
+		"tail/one/two.py",
+	} {
+		writeFile(t, repository, relative, "fixture\n")
+	}
+
+	result := mustCollect(t, repository, ModeBuild)
+	for _, relative := range []string{"foo/one/bar.go", "leading-one/deep.py", "special/drop.rs", "special/one/two/drop.rs", "nested/everywhere.ts", "tail/one.go", "tail/one"} {
+		assertExclusion(t, result, relative, ExcludedIgnored)
+	}
+	for _, relative := range []string{"foo/one/two/bar.go", "leading-one/two/deep.py"} {
+		found := false
+		for _, candidate := range result.Paths {
+			found = found || candidate.RelativePath == relative
+		}
+		if !found {
+			t.Fatalf("ordinary consecutive stars crossed a slash for %q: %#v", relative, result)
+		}
+	}
+}
+
 func TestCollectEstimateDoesNotCreateStateOrMutateRepository(t *testing.T) {
 	repository := newRepository(t)
 	writeFile(t, repository, "source.go", strings.Repeat("x", 32*1024))
@@ -331,8 +416,13 @@ func TestParseGitIndexValidatesV2V3AndCompressedV4Entries(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(parsed.modes, test.want) {
-				t.Fatalf("parsed modes = %#v, want %#v", parsed.modes, test.want)
+			if len(parsed.paths) != len(test.want) {
+				t.Fatalf("parsed paths = %#v, want modes %#v", parsed.paths, test.want)
+			}
+			for relative, wantMode := range test.want {
+				if gotMode, ok := parsed.mode(relative); !ok || gotMode != wantMode {
+					t.Fatalf("mode(%q) = %06o/%t, want %06o/true", relative, gotMode, ok, wantMode)
+				}
 			}
 		})
 	}
@@ -361,8 +451,10 @@ func TestParseGitIndexAcceptsRealGitV4WithMultiByteCompression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.modes[longName] != 0o100644 || parsed.modes["b.go"] != 0o100644 {
-		t.Fatalf("real v4 modes = %#v", parsed.modes)
+	longMode, longOK := parsed.mode(longName)
+	shortMode, shortOK := parsed.mode("b.go")
+	if !longOK || longMode != 0o100644 || !shortOK || shortMode != 0o100644 {
+		t.Fatalf("real v4 paths/modes = %#v/%#v", parsed.paths, parsed.modes)
 	}
 }
 
@@ -415,6 +507,59 @@ func TestParseGitIndexValidatesExtensionsChecksumAndEntryCount(t *testing.T) {
 	rewriteGitIndexChecksum(badCount)
 	if _, err := parseGitIndex(badCount); err == nil {
 		t.Fatal("mismatched entry count accepted")
+	}
+}
+
+func TestParseGitIndexRejectsBoundedDecodedPathsAndUnsafeComponents(t *testing.T) {
+	tests := map[string]string{
+		"individual-decoded-path": strings.Repeat("a", 4094) + ".go",
+		"component-depth":         strings.Repeat("a/", 256) + "file.go",
+		"root-git-component":      ".git/config",
+		"nested-git-component":    "src/.GIT/config",
+		"dot-component":           "src/./file.go",
+		"parent-component":        "src/../file.go",
+		"empty-component":         "src//file.go",
+		"invalid-utf8":            "src/bad-\xff.go",
+	}
+	for name, relative := range tests {
+		t.Run(name, func(t *testing.T) {
+			raw := buildGitIndex(t, 4, []gitIndexFixtureEntry{{name: relative, mode: 0o100644}}, nil)
+			if _, err := parseGitIndex(raw); err == nil {
+				t.Fatalf("unsafe or unbounded decoded pathname accepted (bytes=%d)", len(relative))
+			}
+		})
+	}
+}
+
+func TestParseGitIndexRejectsCompressedV4ExpansionBeforeConcatenation(t *testing.T) {
+	first := strings.Repeat("a", 4088) + ".go"
+	second := first + strings.Repeat("b", 128)
+	raw := buildGitIndex(t, 4, []gitIndexFixtureEntry{
+		{name: first, mode: 0o100644},
+		{name: second, mode: 0o100644},
+	}, nil)
+	if _, err := parseGitIndex(raw); err == nil {
+		t.Fatal("compressed v4 pathname expansion beyond the decoded-path bound was accepted")
+	}
+}
+
+func TestParseGitIndexRejectsAggregateCompressedV4DecodedPathBytes(t *testing.T) {
+	const decodedPathByteLimit = 16 << 20
+	prefix := strings.Repeat("a", 3980) + "/"
+	entryCount := decodedPathByteLimit/(len(prefix)+len("00000.go")) + 2
+	entries := make([]gitIndexFixtureEntry, 0, entryCount)
+	for index := 0; index < entryCount; index++ {
+		entries = append(entries, gitIndexFixtureEntry{
+			name: fmt.Sprintf("%s%05d.go", prefix, index),
+			mode: 0o100644,
+		})
+	}
+	raw := buildGitIndex(t, 4, entries, nil)
+	if len(raw) >= decodedPathByteLimit/4 {
+		t.Fatalf("hostile fixture is not meaningfully compressed: raw=%d decoded>%d", len(raw), decodedPathByteLimit)
+	}
+	if _, err := parseGitIndex(raw); err == nil {
+		t.Fatal("aggregate compressed v4 decoded pathname expansion was accepted")
 	}
 }
 
@@ -491,6 +636,28 @@ func TestCollectMarksPostChildMutationPartial(t *testing.T) {
 	}
 }
 
+func TestCollectBuildAndEstimateAreUnknownAfterGlobalSubtreeMutation(t *testing.T) {
+	for _, mode := range []Mode{ModeBuild, ModeEstimate} {
+		t.Run(string(mode), func(t *testing.T) {
+			repository := newRepository(t)
+			writeFile(t, repository, "a/early.go", "package early\n")
+			writeFile(t, repository, "z.go", "package z\n")
+			inventoryEntryHook = func(entry boundary.RepositoryEntry) {
+				if entry.RelativePath == "z.go" {
+					inventoryEntryHook = nil
+					writeFile(t, repository, "a/early.go", "package changed\n")
+				}
+			}
+			t.Cleanup(func() { inventoryEntryHook = nil })
+
+			result := mustCollect(t, repository, mode)
+			if !result.Partial || !result.UnknownRemainder || !contains(result.Warnings, "repository-changed-during-inventory") || result.Coverage.PathCoverage != 0 || result.Coverage.LanguageCoverage != 0 {
+				t.Fatalf("%s global mutation result claimed exactness: %#v", mode, result)
+			}
+		})
+	}
+}
+
 func TestCollectReportsActualBoundedRawIO(t *testing.T) {
 	repository := newRepository(t)
 	writeFile(t, repository, "source.go", strings.Repeat("x", 32*1024))
@@ -522,6 +689,51 @@ func TestCollectBoundsIgnoreRulesAndPatternWork(t *testing.T) {
 	result := mustCollect(t, repository, ModeBuild)
 	if !result.Partial || !result.UnknownRemainder || !contains(result.Warnings, "gitignore-rule-limit") || result.Coverage.PathCoverage != 0 {
 		t.Fatalf("bounded ignore policy result = %#v", result)
+	}
+}
+
+func TestCollectStopsDeterministicallyAtAggregateIgnoreMatchBudget(t *testing.T) {
+	repository := newRepository(t)
+	var policyContents strings.Builder
+	for index := 0; index < 64; index++ {
+		fmt.Fprintf(&policyContents, "never-match-%03d.go\n", index)
+	}
+	writeFile(t, repository, ".gitignore", policyContents.String())
+	for index := 0; index < 10; index++ {
+		writeFile(t, repository, fmt.Sprintf("source-%02d.go", index), "package source\n")
+	}
+	collectOnce := func() Result {
+		roots := validatedRoots(t, repository)
+		defer roots.Close()
+		result, err := collectWithIgnoreLimits(roots, ModeBuild, policy.ProductionLimits(), 100, 1<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	first := collectOnce()
+	second := collectOnce()
+	if diff := cmpInventory(first, second); diff != "" {
+		t.Fatalf("match-budget stop is nondeterministic: %s", diff)
+	}
+	if !first.Partial || !first.UnknownRemainder || !contains(first.Warnings, "gitignore-match-limit") || len(first.Paths) != 0 || first.FullBodyOpens != 0 {
+		t.Fatalf("bounded ignore-match result = %#v", first)
+	}
+}
+
+func TestCollectDeepTraversalReturnsStablePartial(t *testing.T) {
+	repository := newRepository(t)
+	current := repository
+	for depth := 0; depth < 257; depth++ {
+		current = filepath.Join(current, "d")
+		if err := os.Mkdir(current, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, current, "too-deep.go", "package deep\n")
+	result := mustCollect(t, repository, ModeBuild)
+	if !result.Partial || !result.UnknownRemainder || !contains(result.Warnings, "inventory-traversal-limit") || result.Coverage.PathCoverage != 0 {
+		t.Fatalf("deep traversal result = %#v", result)
 	}
 }
 

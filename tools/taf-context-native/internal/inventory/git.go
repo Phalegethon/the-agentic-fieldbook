@@ -4,40 +4,59 @@ import (
 	"crypto/sha1"
 	endian "encoding/binary"
 	"errors"
-	"path"
+	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
 )
 
-const maximumGitIndexBytes int64 = 32 << 20
-const maximumGitIndexEntries = 250000
+const (
+	maximumGitIndexBytes                int64 = 32 << 20
+	maximumGitIndexEntries                    = 250000
+	maximumGitIndexPathBytes                  = 4096
+	maximumGitIndexDecodedPathBytes           = 16 << 20
+	maximumGitIndexPathComponents             = 256
+	maximumGitIndexDecodedComponents          = 1 << 20
+	maximumGitIndexDerivedMetadataBytes       = 32 << 20
+	gitIndexDerivedBytesPerPath               = 24 // string header, mode, and bounded slice overhead.
+)
 
 var errSplitIndex = errors.New("split Git index is unsupported")
 
 type gitIndex struct {
-	modes              map[string]uint32
-	trackedDirectories map[string]struct{}
+	paths []string
+	modes []uint32
 }
 
 func (index gitIndex) isTracked(relative string) bool {
-	_, ok := index.modes[relative]
+	_, ok := index.mode(relative)
 	return ok
 }
 
 func (index gitIndex) isGitlink(relative string) bool {
-	return index.modes[relative] == 0o160000
+	mode, ok := index.mode(relative)
+	return ok && mode == 0o160000
 }
 
 func (index gitIndex) hasTrackedDescendant(directory string) bool {
-	_, ok := index.trackedDirectories[directory]
-	return ok
+	prefix := directory + "/"
+	position := sort.SearchStrings(index.paths, prefix)
+	return position < len(index.paths) && strings.HasPrefix(index.paths[position], prefix)
+}
+
+func (index gitIndex) mode(relative string) (uint32, bool) {
+	position := sort.SearchStrings(index.paths, relative)
+	if position >= len(index.paths) || index.paths[position] != relative {
+		return 0, false
+	}
+	return index.modes[position], true
 }
 
 func trackedRepositoryPaths(roots boundary.Roots) (gitIndex, string) {
 	index, err := roots.OpenGitMetadataFile("index", maximumGitIndexBytes)
 	if errors.Is(err, boundary.ErrGitMetadataNotFound) {
-		return gitIndex{modes: map[string]uint32{}, trackedDirectories: map[string]struct{}{}}, ""
+		return gitIndex{}, ""
 	}
 	if err != nil {
 		return gitIndex{}, "git-index-unreadable"
@@ -53,7 +72,7 @@ func trackedRepositoryPaths(roots boundary.Roots) (gitIndex, string) {
 }
 
 func parseGitIndex(contents []byte) (gitIndex, error) {
-	if len(contents) < 12+20 || string(contents[:4]) != "DIRC" {
+	if int64(len(contents)) > maximumGitIndexBytes || len(contents) < 12+20 || string(contents[:4]) != "DIRC" {
 		return gitIndex{}, errors.New("invalid index header")
 	}
 	if digest := sha1.Sum(contents[:len(contents)-20]); string(digest[:]) != string(contents[len(contents)-20:]) {
@@ -66,10 +85,13 @@ func parseGitIndex(contents []byte) (gitIndex, error) {
 	if count > maximumGitIndexEntries || uint64(count) > uint64((len(contents)-32)/64) {
 		return gitIndex{}, errors.New("unbounded index entry count")
 	}
-	tracked := gitIndex{modes: make(map[string]uint32, int(count)), trackedDirectories: make(map[string]struct{})}
+	tracked := gitIndex{paths: make([]string, 0, int(count)), modes: make([]uint32, 0, int(count))}
 	offset := 12
 	previous := ""
 	previousStage := uint16(0)
+	decodedPathBytes := 0
+	decodedComponents := 0
+	derivedMetadataBytes := 0
 	for entry := uint32(0); entry < count; entry++ {
 		start := offset
 		if offset+62 > len(contents)-20 {
@@ -107,12 +129,24 @@ func parseGitIndex(contents []byte) (gitIndex, error) {
 			if end < 0 {
 				return gitIndex{}, errors.New("unterminated v4 pathname")
 			}
-			name = previous[:len(previous)-strip] + string(contents[offset:end])
+			kept := len(previous) - strip
+			suffix := contents[offset:end]
+			if kept > maximumGitIndexPathBytes || len(suffix) > maximumGitIndexPathBytes-kept {
+				return gitIndex{}, errors.New("decoded index pathname too long")
+			}
+			var decoded strings.Builder
+			decoded.Grow(kept + len(suffix))
+			decoded.WriteString(previous[:kept])
+			_, _ = decoded.Write(suffix)
+			name = decoded.String()
 			offset = end + 1
 		} else {
 			end := indexNUL(contents, offset)
 			if end < 0 {
 				return gitIndex{}, errors.New("unterminated pathname")
+			}
+			if end-offset > maximumGitIndexPathBytes {
+				return gitIndex{}, errors.New("decoded index pathname too long")
 			}
 			name = string(contents[offset:end])
 			offset = end + 1
@@ -130,19 +164,32 @@ func parseGitIndex(contents []byte) (gitIndex, error) {
 		if (nameLength != 0x0fff && len(name) != nameLength) || (nameLength == 0x0fff && len(name) < 0x0fff) {
 			return gitIndex{}, errors.New("invalid index pathname length")
 		}
-		if !safeIndexPath(name) {
+		components, safe := safeIndexPath(name)
+		if !safe {
 			return gitIndex{}, errors.New("unsafe tracked pathname")
 		}
+		if decodedPathBytes > maximumGitIndexDecodedPathBytes-len(name) {
+			return gitIndex{}, errors.New("aggregate decoded index path limit")
+		}
+		if decodedComponents > maximumGitIndexDecodedComponents-components {
+			return gitIndex{}, errors.New("aggregate decoded index component limit")
+		}
+		decodedPathBytes += len(name)
+		decodedComponents += components
 		if entry > 0 && (name < previous || (name == previous && stage <= previousStage)) {
 			return gitIndex{}, errors.New("unordered index entries")
 		}
-		if existing, ok := tracked.modes[name]; !ok || stage == 0 || existing != 0o160000 {
-			tracked.modes[name] = mode
-		}
-		for index := 0; index < len(name); index++ {
-			if name[index] == '/' {
-				tracked.trackedDirectories[name[:index]] = struct{}{}
+		if len(tracked.paths) == 0 || tracked.paths[len(tracked.paths)-1] != name {
+			derived := len(name) + gitIndexDerivedBytesPerPath
+			if derivedMetadataBytes > maximumGitIndexDerivedMetadataBytes-derived {
+				return gitIndex{}, errors.New("derived index metadata limit")
 			}
+			derivedMetadataBytes += derived
+			tracked.paths = append(tracked.paths, name)
+			tracked.modes = append(tracked.modes, mode)
+		} else if mode == 0o160000 {
+			// Any unmerged gitlink stage is conservatively a subtree boundary.
+			tracked.modes[len(tracked.modes)-1] = mode
 		}
 		previous = name
 		previousStage = stage
@@ -192,6 +239,22 @@ func gitIndexVarint(contents []byte) (int, int, bool) {
 	return 0, 0, false
 }
 
-func safeIndexPath(value string) bool {
-	return value != "" && !strings.ContainsAny(value, "\\\x00") && !strings.HasPrefix(value, "/") && path.Clean(value) == value && value != "." && value != ".." && !strings.HasPrefix(value, "../")
+func safeIndexPath(value string) (int, bool) {
+	if value == "" || len(value) > maximumGitIndexPathBytes || !utf8.ValidString(value) || value[0] == '/' || strings.ContainsAny(value, "\\\x00") {
+		return 0, false
+	}
+	components := 0
+	start := 0
+	for index := 0; index <= len(value); index++ {
+		if index != len(value) && value[index] != '/' {
+			continue
+		}
+		component := value[start:index]
+		components++
+		if component == "" || component == "." || component == ".." || strings.EqualFold(component, ".git") || components > maximumGitIndexPathComponents {
+			return 0, false
+		}
+		start = index + 1
+	}
+	return components, true
 }

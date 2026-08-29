@@ -62,6 +62,10 @@ func Collect(roots boundary.Roots, mode Mode) (Result, error) {
 }
 
 func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, error) {
+	return collectWithIgnoreLimits(roots, mode, limits, maximumIgnoreRuleEvaluations, maximumIgnoreMatchWork)
+}
+
+func collectWithIgnoreLimits(roots boundary.Roots, mode Mode, limits policy.Limits, maximumMatchEvaluations, maximumMatchWork int) (Result, error) {
 	if mode != ModeBuild && mode != ModeEstimate {
 		return Result{}, errors.New("unsupported inventory mode")
 	}
@@ -99,6 +103,7 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 		addWarning(&result, "git-info-exclude-unreadable")
 	}
 	regularExclusions, languageSupported, languageUnsupported := 0, 0, 0
+	matchBudget := newIgnoreMatchBudget(maximumMatchEvaluations, maximumMatchWork)
 	err := roots.WalkRepository(policy.ProductionLimits().MaximumEligiblePaths, func(entry boundary.RepositoryEntry) error {
 		if inventoryEntryHook != nil {
 			inventoryEntryHook(entry)
@@ -117,7 +122,12 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 				}
 			}
 		}
-		reason, prune := classifyMetadata(entry, ignores, tracked)
+		reason, prune, matchLimited := classifyMetadata(entry, ignores, tracked, matchBudget)
+		if matchLimited {
+			result.Partial, result.UnknownRemainder = true, true
+			addWarning(&result, "gitignore-match-limit")
+			return boundary.ErrStopRepositoryWalk
+		}
 		if reason != "" {
 			addExclusion(&result, entry.RelativePath, reason)
 			if entry.Mode.IsRegular() && reason != ExcludedGit {
@@ -194,6 +204,9 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 	if errors.Is(err, boundary.ErrRepositoryEnumerationLimit) {
 		result.Partial, result.UnknownRemainder = true, true
 		addWarning(&result, "inventory-entry-limit")
+	} else if errors.Is(err, boundary.ErrRepositoryTraversalLimit) {
+		result.Partial, result.UnknownRemainder = true, true
+		addWarning(&result, "inventory-traversal-limit")
 	} else if errors.Is(err, boundary.ErrRepositoryChanged) {
 		result.Partial, result.UnknownRemainder = true, true
 		addWarning(&result, "repository-changed-during-inventory")
@@ -228,35 +241,45 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 	return result, nil
 }
 
-func classifyMetadata(entry boundary.RepositoryEntry, ignores []ignoreRule, tracked gitIndex) (reason string, prune bool) {
+func classifyMetadata(entry boundary.RepositoryEntry, ignores []ignoreRule, tracked gitIndex, matchBudget *ignoreMatchBudget) (reason string, prune, matchLimited bool) {
 	if entry.GitMetadata {
-		return ExcludedGit, entry.Mode.IsDir()
+		return ExcludedGit, entry.Mode.IsDir(), false
 	}
 	if entry.Mode&os.ModeSymlink != 0 || (!entry.Mode.IsDir() && !entry.Mode.IsRegular()) {
-		return ExcludedUnsafe, false
+		return ExcludedUnsafe, false, false
 	}
 	if tracked.isGitlink(entry.RelativePath) {
-		return ExcludedGit, entry.Mode.IsDir()
+		return ExcludedGit, entry.Mode.IsDir(), false
 	}
 	if reason := excludedDirectory(entry.RelativePath); reason != "" {
-		return reason, entry.Mode.IsDir()
+		return reason, entry.Mode.IsDir(), false
 	}
 	if entry.Mode.IsDir() {
-		if ignoredBy(ignores, entry.RelativePath, true) && !tracked.hasTrackedDescendant(entry.RelativePath) {
-			return ExcludedIgnored, true
+		ignored, limited := ignoredBy(ignores, entry.RelativePath, true, matchBudget)
+		if limited {
+			return "", false, true
 		}
-		return "", false
+		if ignored && !tracked.hasTrackedDescendant(entry.RelativePath) {
+			return ExcludedIgnored, true, false
+		}
+		return "", false, false
 	}
 	if !entry.Mode.IsRegular() {
-		return ExcludedUnsafe, false
+		return ExcludedUnsafe, false, false
 	}
-	if !tracked.isTracked(entry.RelativePath) && ignoredBy(ignores, entry.RelativePath, false) {
-		return ExcludedIgnored, false
+	if !tracked.isTracked(entry.RelativePath) {
+		ignored, limited := ignoredBy(ignores, entry.RelativePath, false, matchBudget)
+		if limited {
+			return "", false, true
+		}
+		if ignored {
+			return ExcludedIgnored, false, false
+		}
 	}
 	if strings.HasSuffix(strings.ToLower(entry.RelativePath), ".generated.go") || strings.HasSuffix(strings.ToLower(entry.RelativePath), ".gen.go") || strings.HasSuffix(strings.ToLower(entry.RelativePath), ".pb.go") {
-		return ExcludedGenerated, false
+		return ExcludedGenerated, false, false
 	}
-	return "", false
+	return "", false, false
 }
 
 func binary(contents []byte, truncated bool) bool {
