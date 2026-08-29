@@ -1,6 +1,7 @@
 package boundary
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -220,6 +221,60 @@ func (directory *StateDirectory) ReadFile(name string, maximum int64) ([]byte, e
 		return nil, ErrStateEntryChanged
 	}
 	return contents, nil
+}
+
+// VerifyFile compares one immutable owner-only state file with the exact
+// expected bytes through a stable descriptor without allocating a second
+// whole-file representation.
+func (directory *StateDirectory) VerifyFile(name string, expected []byte) error {
+	if !directory.validName(name) {
+		return directoryError(directory)
+	}
+	before, err := directory.root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return ErrStateEntryNotFound
+	}
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || before.Size() != int64(len(expected)) {
+		return ErrUnsafeRoot
+	}
+	file, err := directory.OpenFile(name)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	var buffer [32 * 1024]byte
+	for offset := 0; offset < len(expected); {
+		readSize := min(len(buffer), len(expected)-offset)
+		count, readErr := file.Read(buffer[:readSize])
+		if count > 0 {
+			if count > readSize || !bytes.Equal(buffer[:count], expected[offset:offset+count]) {
+				return ErrUnsafeRoot
+			}
+			offset += count
+		}
+		if readErr != nil {
+			if readErr == io.EOF && offset == len(expected) {
+				break
+			}
+			return ErrUnsafeRoot
+		}
+		if count == 0 {
+			return ErrUnsafeRoot
+		}
+	}
+	var extra [1]byte
+	if count, readErr := file.Read(extra[:]); count != 0 || readErr != io.EOF {
+		return ErrUnsafeRoot
+	}
+	opened, openErr := file.Stat()
+	after, afterErr := directory.root.Lstat(name)
+	if openErr != nil || safeStateFile(file) != nil || afterErr != nil || after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() {
+		return ErrUnsafeRoot
+	}
+	if !sameSnapshot(before, opened) || !sameSnapshot(before, after) {
+		return ErrStateEntryChanged
+	}
+	return nil
 }
 
 // ReadAtomicCurrent reads the sole mutable state pointer, which trusted code

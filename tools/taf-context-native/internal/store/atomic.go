@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -144,8 +143,10 @@ func (filesystem boundaryFilesystem) verifyFile(directory *boundary.StateDirecto
 	if err := filesystem.before(point); err != nil {
 		return err
 	}
-	contents, err := filesystem.readFile(directory, name, maximum)
-	if err != nil || !bytes.Equal(contents, expected) {
+	if int64(len(expected)) > maximum {
+		return ErrStoreCorrupt
+	}
+	if err := directory.VerifyFile(name, expected); err != nil {
 		return ErrStoreCorrupt
 	}
 	return nil

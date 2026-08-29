@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -48,11 +47,21 @@ type Status struct {
 }
 
 type generationArtifacts struct {
-	payload  []byte
-	manifest []byte
-	ready    []byte
-	snapshot Snapshot
-	token    string
+	payload        []byte
+	manifest       []byte
+	ready          []byte
+	manifestValue  model.Manifest
+	token          string
+	installedBytes int64
+}
+
+type buildHooks struct{ materialized func() }
+
+func (hooks buildHooks) decodeIndex(payload []byte) ([]model.Record, map[string][]uint32, error) {
+	if hooks.materialized != nil {
+		hooks.materialized()
+	}
+	return decodeIndex(payload)
 }
 
 // Build stages, verifies, installs, and atomically selects one immutable
@@ -67,6 +76,10 @@ func BuildWithFaults(roots *boundary.Roots, manifest model.Manifest, records []m
 }
 
 func buildWithFilesystem(filesystem storeFilesystem, roots *boundary.Roots, manifest model.Manifest, records []model.Record) (Snapshot, error) {
+	return buildWithFilesystemObserved(filesystem, roots, manifest, records, buildHooks{})
+}
+
+func buildWithFilesystemObserved(filesystem storeFilesystem, roots *boundary.Roots, manifest model.Manifest, records []model.Record, hooks buildHooks) (Snapshot, error) {
 	if roots == nil {
 		return Snapshot{}, ErrStoreCorrupt
 	}
@@ -101,15 +114,16 @@ func buildWithFilesystem(filesystem storeFilesystem, roots *boundary.Roots, mani
 		}
 	}
 	defer filesystem.closeDirectory(generations)
-	var previousSnapshot Snapshot
-	if previousExists {
-		previousSnapshot, err = loadGeneration(filesystem, generations, previousToken)
-		if err != nil {
+	if previousExists && previousToken == artifacts.token {
+		if err := verifyGenerationArtifacts(filesystem, generations, artifacts); err != nil {
 			return Snapshot{}, err
 		}
+		return materializeArtifacts(artifacts, hooks)
 	}
-	if previousExists && previousSnapshot.Manifest.GenerationIdentity == artifacts.snapshot.Manifest.GenerationIdentity {
-		return previousSnapshot, nil
+	if previousExists {
+		if err := validateGenerationMetadata(filesystem, generations, previousToken); err != nil {
+			return Snapshot{}, err
+		}
 	}
 
 	stagingName, err := randomEntryName(".stage-")
@@ -137,25 +151,11 @@ func buildWithFilesystem(filesystem storeFilesystem, roots *boundary.Roots, mani
 	if err := filesystem.verifyFile(staging, indexFilename, artifacts.payload, maximumEncodedIndexBytes, faultBeforePayloadReopen); err != nil {
 		return Snapshot{}, err
 	}
-	reopenedPayload, err := filesystem.readFile(staging, indexFilename, maximumEncodedIndexBytes)
-	if err != nil {
-		return Snapshot{}, corrupt(err)
-	}
-	if _, _, err := decodeIndex(reopenedPayload); err != nil {
-		return Snapshot{}, corrupt(err)
-	}
 	if err := filesystem.writeSyncedFile(staging, manifestFilename, artifacts.manifest, faultBeforeManifestSync); err != nil {
 		return Snapshot{}, err
 	}
 	if err := filesystem.verifyFile(staging, manifestFilename, artifacts.manifest, maximumManifestBytes, faultBeforeManifestReopen); err != nil {
 		return Snapshot{}, err
-	}
-	reopenedManifest, err := filesystem.readFile(staging, manifestFilename, maximumManifestBytes)
-	if err != nil {
-		return Snapshot{}, corrupt(err)
-	}
-	if _, err := decodeManifest(reopenedManifest); err != nil {
-		return Snapshot{}, corrupt(err)
 	}
 	if err := filesystem.writeSyncedFile(staging, readyFilename, artifacts.ready, faultBeforeReadySync); err != nil {
 		return Snapshot{}, err
@@ -174,8 +174,7 @@ func buildWithFilesystem(filesystem storeFilesystem, roots *boundary.Roots, mani
 		if isInjectedFilesystemFault(err) {
 			return Snapshot{}, err
 		}
-		existing, loadErr := loadGeneration(filesystem, generations, artifacts.token)
-		if loadErr != nil || !reflect.DeepEqual(existing, artifacts.snapshot) {
+		if verifyErr := verifyGenerationArtifacts(filesystem, generations, artifacts); verifyErr != nil {
 			return Snapshot{}, fmt.Errorf("%w: immutable bytes differ", ErrGenerationCollision)
 		}
 	}
@@ -185,15 +184,29 @@ func buildWithFilesystem(filesystem storeFilesystem, roots *boundary.Roots, mani
 		}
 		return Snapshot{}, corrupt(err)
 	}
-	installed, err := loadGeneration(filesystem, generations, artifacts.token)
-	if err != nil || !reflect.DeepEqual(installed, artifacts.snapshot) {
+	if err := verifyGenerationArtifacts(filesystem, generations, artifacts); err != nil {
 		return Snapshot{}, corrupt(err)
 	}
 	if err := publishCurrent(filesystem, state, artifacts.token, previousCurrent); err != nil {
 		return Snapshot{}, err
 	}
-	selected, currentBytes, exists, err := loadCurrentOptional(filesystem, state, generations)
-	if err != nil || !exists || !bytes.Equal(currentBytes, []byte(artifacts.token+"\n")) || !reflect.DeepEqual(selected, installed) {
+	selectedToken, currentBytes, exists, err := readCurrentPointer(filesystem, state)
+	if err != nil || !exists || selectedToken != artifacts.token || !bytes.Equal(currentBytes, []byte(artifacts.token+"\n")) {
+		original := corrupt(err)
+		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, previousCurrent, original); rollbackErr != nil {
+			return Snapshot{}, rollbackErr
+		}
+		return Snapshot{}, original
+	}
+	if err := verifyGenerationArtifacts(filesystem, generations, artifacts); err != nil {
+		original := corrupt(err)
+		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, previousCurrent, original); rollbackErr != nil {
+			return Snapshot{}, rollbackErr
+		}
+		return Snapshot{}, original
+	}
+	selected, err := materializeArtifacts(artifacts, hooks)
+	if err != nil {
 		original := corrupt(err)
 		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, previousCurrent, original); rollbackErr != nil {
 			return Snapshot{}, rollbackErr
@@ -295,18 +308,15 @@ func prepareGeneration(input model.Manifest, inputRecords []model.Record) (gener
 	if input.FormatVersion != "1" {
 		return generationArtifacts{}, ErrInvalidManifest
 	}
-	payload, err := encodeIndex(inputRecords)
-	if err != nil {
-		return generationArtifacts{}, err
-	}
-	records, postings, err := decodeIndex(payload)
+	postingCount := 0
+	payload, err := encodeIndexObservedStats(inputRecords, nil, &postingCount)
 	if err != nil {
 		return generationArtifacts{}, err
 	}
 	manifest := cloneManifest(input)
 	manifest.FormatVersion = "1"
-	manifest.RecordCount = len(records)
-	manifest.PostingCount = len(postings)
+	manifest.RecordCount = len(inputRecords)
+	manifest.PostingCount = postingCount
 	manifest.PayloadDigest = sha256ID(payload)
 	manifest.IndexIdentity = manifest.PayloadDigest
 	manifest.GenerationIdentity = zeroSHA256Identity
@@ -327,8 +337,98 @@ func prepareGeneration(input model.Manifest, inputRecords []model.Record) (gener
 	installedBytes := int64(len(payload)) + int64(len(manifestBytes)) + int64(len(ready))
 	return generationArtifacts{
 		payload: payload, manifest: manifestBytes, ready: ready, token: token,
-		snapshot: Snapshot{Manifest: manifest, Records: records, Postings: postings, IndexIdentity: manifest.IndexIdentity, InstalledBytes: installedBytes},
+		manifestValue: manifest, installedBytes: installedBytes,
 	}, nil
+}
+
+func materializeArtifacts(artifacts generationArtifacts, hooks buildHooks) (Snapshot, error) {
+	records, postings, err := hooks.decodeIndex(artifacts.payload)
+	if err != nil || len(records) != artifacts.manifestValue.RecordCount || len(postings) != artifacts.manifestValue.PostingCount {
+		return Snapshot{}, ErrStoreCorrupt
+	}
+	return Snapshot{
+		Manifest: artifacts.manifestValue, Records: records, Postings: postings,
+		IndexIdentity: artifacts.manifestValue.IndexIdentity, InstalledBytes: artifacts.installedBytes,
+	}, nil
+}
+
+func verifyGenerationArtifacts(filesystem storeFilesystem, generations *boundary.StateDirectory, artifacts generationArtifacts) error {
+	if !generationNamePattern.MatchString(artifacts.token) {
+		return ErrStoreCorrupt
+	}
+	directory, err := filesystem.openDirectory(generations, artifacts.token)
+	if err != nil {
+		return fmt.Errorf("open generation: %w", corrupt(err))
+	}
+	defer filesystem.closeDirectory(directory)
+	wantNames := []string{readyFilename, indexFilename, manifestFilename}
+	names, err := filesystem.names(directory, len(wantNames))
+	if err != nil || !slices.Equal(names, wantNames) {
+		return ErrStoreCorrupt
+	}
+	for _, file := range []struct {
+		name    string
+		value   []byte
+		maximum int64
+	}{
+		{name: indexFilename, value: artifacts.payload, maximum: maximumEncodedIndexBytes},
+		{name: manifestFilename, value: artifacts.manifest, maximum: maximumManifestBytes},
+		{name: readyFilename, value: artifacts.ready, maximum: 72},
+	} {
+		if err := filesystem.verifyFile(directory, file.name, file.value, file.maximum, faultNone); err != nil {
+			return ErrStoreCorrupt
+		}
+	}
+	names, err = filesystem.names(directory, len(wantNames))
+	if err != nil || !slices.Equal(names, wantNames) {
+		return ErrStoreCorrupt
+	}
+	return nil
+}
+
+func validateGenerationMetadata(filesystem storeFilesystem, generations *boundary.StateDirectory, token string) error {
+	if !generationNamePattern.MatchString(token) {
+		return ErrStoreCorrupt
+	}
+	directory, err := filesystem.openDirectory(generations, token)
+	if err != nil {
+		return fmt.Errorf("open generation: %w", corrupt(err))
+	}
+	defer filesystem.closeDirectory(directory)
+	wantNames := []string{readyFilename, indexFilename, manifestFilename}
+	names, err := filesystem.names(directory, len(wantNames))
+	if err != nil || !slices.Equal(names, wantNames) {
+		return ErrStoreCorrupt
+	}
+	manifestBytes, err := filesystem.readFile(directory, manifestFilename, maximumManifestBytes)
+	if err != nil {
+		return ErrStoreCorrupt
+	}
+	manifest, err := decodeManifest(manifestBytes)
+	if err != nil || tokenFromIdentity(manifest.GenerationIdentity) != token {
+		return ErrStoreCorrupt
+	}
+	ready, err := filesystem.readFile(directory, readyFilename, 72)
+	if err != nil || !bytes.Equal(ready, []byte(manifest.GenerationIdentity+"\n")) {
+		return ErrStoreCorrupt
+	}
+	payload, err := filesystem.readFile(directory, indexFilename, maximumEncodedIndexBytes)
+	if err != nil || sha256ID(payload) != manifest.PayloadDigest || manifest.IndexIdentity != manifest.PayloadDigest {
+		return ErrStoreCorrupt
+	}
+	recordCount, postingCount, err := validateIndex(payload)
+	if err != nil || recordCount != manifest.RecordCount || postingCount != manifest.PostingCount {
+		return ErrStoreCorrupt
+	}
+	identity, err := computeGenerationIdentity(manifest)
+	if err != nil || identity != manifest.GenerationIdentity {
+		return ErrStoreCorrupt
+	}
+	names, err = filesystem.names(directory, len(wantNames))
+	if err != nil || !slices.Equal(names, wantNames) {
+		return ErrStoreCorrupt
+	}
+	return nil
 }
 
 func computeGenerationIdentity(manifest model.Manifest) (string, error) {

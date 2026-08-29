@@ -13,10 +13,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
@@ -140,6 +142,62 @@ func TestEncodeIndexUsesBoundedRepresentationsWithoutPerRecordClones(t *testing.
 	}
 }
 
+func TestEncodeIndexRejectsMillionUniqueTermsBeforeCanonicalPostingSort(t *testing.T) {
+	const termCount = 1_000_000
+	records := make([]model.Record, termCount/maximumTermsPerRecord)
+	nextTerm := 0
+	for recordIndex := range records {
+		terms := make([]string, maximumTermsPerRecord)
+		for termIndex := range terms {
+			terms[termIndex] = fmt.Sprintf("term-%027d", nextTerm)
+			nextTerm++
+		}
+		records[recordIndex] = testRecord(
+			fmt.Sprintf("sha256:%064x", recordIndex),
+			fmt.Sprintf("bulk/%05d.go", recordIndex),
+			fmt.Sprintf("Bulk%05d", recordIndex),
+			terms,
+		)
+	}
+	if nextTerm != termCount {
+		t.Fatalf("fixture terms = %d, want %d", nextTerm, termCount)
+	}
+
+	postingSorts := 0
+	_, err := encodeIndexObserved(records, func() { postingSorts++ })
+	if !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("encode error = %v, want ErrInvalidIndex", err)
+	}
+	if postingSorts != 0 {
+		t.Fatalf("canonical posting sorts = %d, want 0", postingSorts)
+	}
+}
+
+func TestEncodeIndexPreflightAcceptsSharedTermsAcrossRecordsExactly(t *testing.T) {
+	records := []model.Record{
+		testRecord(testRecordB, "b.go", "B", []string{"unique-b", "shared"}),
+		testRecord(testRecordA, "a.go", "A", []string{"shared", "unique-a"}),
+	}
+	want := cloneRecords(records)
+	encoded, err := encodeIndex(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, postings, err := decodeIndex(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) != 2 || len(postings) != 3 ||
+		!slices.Equal(postings["shared"], []uint32{0, 1}) ||
+		!slices.Equal(postings["unique-a"], []uint32{0}) ||
+		!slices.Equal(postings["unique-b"], []uint32{1}) {
+		t.Fatalf("decoded=%#v postings=%#v", decoded, postings)
+	}
+	if !recordsEqual(records, want) {
+		t.Fatal("encodeIndex mutated caller-owned shared terms")
+	}
+}
+
 func TestDecodeIndexRejectsVersionLengthsTrailingDataAndBombs(t *testing.T) {
 	valid, err := encodeIndex([]model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
 	if err != nil {
@@ -242,6 +300,28 @@ func TestDecodeIndexUsesSingleLinearPostingRepresentation(t *testing.T) {
 	}
 	if allocations > 410_000 {
 		t.Fatalf("decode allocations = %.0f, want <= 410000", allocations)
+	}
+}
+
+func TestValidateIndexWithoutMaterializationEnforcesCanonicalExactness(t *testing.T) {
+	records := []model.Record{
+		testRecord(testRecordA, "a.go", "A", []string{"a", "shared"}),
+		testRecord(testRecordB, "b.go", "B", []string{"b", "shared"}),
+	}
+	encoded, err := encodeIndex(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recordCount, postingCount, err := validateIndex(encoded); err != nil || recordCount != 2 || postingCount != 3 {
+		t.Fatalf("validateIndex = %d, %d, %v", recordCount, postingCount, err)
+	}
+	invalid := rawIndex(t, records, []postingFixture{
+		{term: "a", ordinals: []uint32{0}},
+		{term: "b", ordinals: []uint32{1}},
+		{term: "missing", ordinals: []uint32{0, 1}},
+	})
+	if _, _, err := validateIndex(invalid); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("invalid posting error = %v, want ErrInvalidIndex", err)
 	}
 }
 
@@ -381,6 +461,189 @@ func TestBuildLoadInspectAreContentAddressedDeterministicAndExact(t *testing.T) 
 	repeated := mustBuild(t, leftRoots, testManifest(), records)
 	if !reflect.DeepEqual(repeated, left) || !bytes.Equal(generationBytes(t, leftState, left.Manifest.GenerationIdentity), leftBytes) {
 		t.Fatal("idempotent build changed snapshot or installed generation bytes")
+	}
+}
+
+func TestBuildMaterializesOnlyTheReturnedGeneration(t *testing.T) {
+	recordA := []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})}
+	recordB := []model.Record{testRecord(testRecordB, "b.go", "B", []string{"b"})}
+
+	t.Run("new generation", func(t *testing.T) {
+		roots, _ := storeRoots(t)
+		count := 0
+		snapshot, err := buildWithFilesystemObserved(boundaryFilesystem{}, roots, testManifest(), recordA, buildHooks{materialized: func() { count++ }})
+		if err != nil || snapshot.IndexIdentity == "" {
+			t.Fatalf("Build = %#v, %v", snapshot, err)
+		}
+		if count != 1 {
+			t.Fatalf("materializations = %d, want 1", count)
+		}
+	})
+
+	t.Run("same current", func(t *testing.T) {
+		roots, _ := storeRoots(t)
+		first := mustBuild(t, roots, testManifest(), recordA)
+		count := 0
+		snapshot, err := buildWithFilesystemObserved(boundaryFilesystem{}, roots, testManifest(), recordA, buildHooks{materialized: func() { count++ }})
+		if err != nil || snapshot.IndexIdentity != first.IndexIdentity {
+			t.Fatalf("Build = %#v, %v", snapshot, err)
+		}
+		if count != 1 {
+			t.Fatalf("materializations = %d, want 1", count)
+		}
+	})
+
+	t.Run("existing immutable generation reuse", func(t *testing.T) {
+		roots, _ := storeRoots(t)
+		first := mustBuild(t, roots, testManifest(), recordA)
+		mustBuild(t, roots, manifestVariant("b"), recordB)
+		count := 0
+		snapshot, err := buildWithFilesystemObserved(boundaryFilesystem{}, roots, testManifest(), recordA, buildHooks{materialized: func() { count++ }})
+		if err != nil || snapshot.IndexIdentity != first.IndexIdentity {
+			t.Fatalf("Build = %#v, %v", snapshot, err)
+		}
+		if count != 1 {
+			t.Fatalf("materializations = %d, want 1", count)
+		}
+	})
+
+	t.Run("rollback before return", func(t *testing.T) {
+		roots, _ := storeRoots(t)
+		mustBuild(t, roots, testManifest(), recordA)
+		injected := errors.New("state sync failure")
+		count := 0
+		_, err := buildWithFilesystemObserved(
+			boundaryFilesystem{faults: Faults{BeforeStateSync: injected}}, roots, manifestVariant("b"), recordB,
+			buildHooks{materialized: func() { count++ }},
+		)
+		if !errors.Is(err, injected) {
+			t.Fatalf("Build error = %v, want injected failure", err)
+		}
+		if count != 0 {
+			t.Fatalf("materializations = %d, want 0", count)
+		}
+	})
+
+	t.Run("corrupt current generation", func(t *testing.T) {
+		roots, state := storeRoots(t)
+		first := mustBuild(t, roots, testManifest(), recordA)
+		writeExisting(t, installedPath(state, first.Manifest.GenerationIdentity, readyFilename), []byte("corrupt\n"))
+		count := 0
+		_, err := buildWithFilesystemObserved(boundaryFilesystem{}, roots, manifestVariant("b"), recordB, buildHooks{materialized: func() { count++ }})
+		if !errors.Is(err, ErrStoreCorrupt) {
+			t.Fatalf("Build error = %v, want ErrStoreCorrupt", err)
+		}
+		if count != 0 {
+			t.Fatalf("materializations = %d, want 0", count)
+		}
+	})
+
+	t.Run("generation collision", func(t *testing.T) {
+		roots, state := storeRoots(t)
+		mustBuild(t, roots, testManifest(), recordA)
+		otherRoots, otherState := storeRoots(t)
+		secondManifest := manifestVariant("b")
+		second := mustBuild(t, otherRoots, secondManifest, recordB)
+		copyGeneration(t, otherState, state, second.Manifest.GenerationIdentity)
+		path := installedPath(state, second.Manifest.GenerationIdentity, indexFilename)
+		data := mustRead(t, path)
+		data[len(data)-1] ^= 0xff
+		writeExisting(t, path, data)
+		count := 0
+		_, err := buildWithFilesystemObserved(boundaryFilesystem{}, roots, secondManifest, recordB, buildHooks{materialized: func() { count++ }})
+		if !errors.Is(err, ErrGenerationCollision) {
+			t.Fatalf("Build error = %v, want ErrGenerationCollision", err)
+		}
+		if count != 0 {
+			t.Fatalf("materializations = %d, want 0", count)
+		}
+	})
+}
+
+func TestBuildReviewerShapePeakMemoryStaysBelowBudget(t *testing.T) {
+	if raceEnabled {
+		t.Skip("heap-peak accounting is a non-race resource regression")
+	}
+	const recordCount = 300_000
+	records := make([]model.Record, recordCount)
+	for index := range records {
+		records[index] = model.Record{
+			Identity:         fmt.Sprintf("sha256:%064x", index),
+			Path:             "a",
+			StartLine:        1,
+			EndLine:          1,
+			Language:         "g",
+			RecordKind:       model.Module,
+			SourceType:       "source",
+			QualifiedName:    "a",
+			ExtractionMethod: "a",
+			EvidenceClass:    model.Verified,
+			SourceDigest:     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		}
+	}
+	preflight, err := preflightEncodeIndex(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preflight.plainSize != 65_400_018 {
+		t.Fatalf("reviewer-shape plain bytes = %d, want 65400018", preflight.plainSize)
+	}
+
+	for _, test := range []struct {
+		name      string
+		gcPercent int
+	}{
+		{name: "default GOGC", gcPercent: 100},
+		{name: "GOGC=1", gcPercent: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			previousGC := debug.SetGCPercent(test.gcPercent)
+			defer debug.SetGCPercent(previousGC)
+			runtime.GC()
+			var baseline runtime.MemStats
+			runtime.ReadMemStats(&baseline)
+			stop := make(chan struct{})
+			peak := make(chan uint64, 1)
+			go samplePeakHeap(stop, peak, baseline.HeapAlloc)
+			roots, _ := storeRoots(t)
+			snapshot, err := Build(roots, testManifest(), records)
+			close(stop)
+			used := <-peak
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snapshot.Records) != recordCount {
+				t.Fatalf("records = %d, want %d", len(snapshot.Records), recordCount)
+			}
+			t.Logf("Build peak heap = %d bytes", used)
+			if used >= maximumIndexPeakBytes {
+				t.Fatalf("Build peak heap = %d bytes, want < %d", used, maximumIndexPeakBytes)
+			}
+		})
+	}
+	runtime.KeepAlive(records)
+}
+
+func samplePeakHeap(stop <-chan struct{}, result chan<- uint64, baseline uint64) {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	maximum := uint64(0)
+	observe := func() {
+		var memory runtime.MemStats
+		runtime.ReadMemStats(&memory)
+		if memory.HeapAlloc > baseline && memory.HeapAlloc-baseline > maximum {
+			maximum = memory.HeapAlloc - baseline
+		}
+	}
+	for {
+		select {
+		case <-stop:
+			observe()
+			result <- maximum
+			return
+		case <-ticker.C:
+			observe()
+		}
 	}
 }
 
@@ -794,7 +1057,7 @@ func TestConcurrentBuilderAndInspectorsExposeOnlyReadyGenerations(t *testing.T) 
 				errorsSeen <- fmt.Errorf("builder: %w", err)
 				return
 			}
-			if snapshot.IndexIdentity != second.snapshot.IndexIdentity {
+			if snapshot.IndexIdentity != second.manifestValue.IndexIdentity {
 				errorsSeen <- errors.New("builder returned wrong index")
 				return
 			}
@@ -820,7 +1083,7 @@ func TestConcurrentBuilderAndInspectorsExposeOnlyReadyGenerations(t *testing.T) 
 					errorsSeen <- fmt.Errorf("inspector: %w", err)
 					return
 				}
-				if status.IndexIdentity != first.IndexIdentity && status.IndexIdentity != second.snapshot.IndexIdentity {
+				if status.IndexIdentity != first.IndexIdentity && status.IndexIdentity != second.manifestValue.IndexIdentity {
 					errorsSeen <- errors.New("inspector observed unknown index")
 					return
 				}
@@ -912,6 +1175,7 @@ func FuzzDecodeIndex(f *testing.F) {
 	f.Add(compressedBytes(f, bytes.Repeat([]byte{'x'}, 1024)))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _, _ = decodeIndex(data)
+		_, _, _ = validateIndex(data)
 	})
 }
 

@@ -86,6 +86,12 @@ func TestStateDirectoryRejectsUnsafeEntriesAndSupportsAtomicRename(t *testing.T)
 		t.Fatal(err)
 	}
 	_ = opened.Close()
+	if err := staging.VerifyFile("index.bin", []byte("index")); err != nil {
+		t.Fatalf("VerifyFile exact bytes: %v", err)
+	}
+	if err := staging.VerifyFile("index.bin", []byte("other")); !errors.Is(err, ErrUnsafeRoot) {
+		t.Fatalf("VerifyFile mismatch = %v, want ErrUnsafeRoot", err)
+	}
 	if err := staging.Sync(); err != nil {
 		t.Fatal(err)
 	}

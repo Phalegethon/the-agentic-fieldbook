@@ -44,11 +44,20 @@ const (
 	maximumIndexPeakBytes                       = 512 << 20
 	conservativeZlibWorkspaceBytes              = 4 << 20
 	conservativeRecordMemoryBytes               = 512
-	conservativeTermMemoryBytes                 = 32
+	conservativeCallerTermMemoryBytes           = 16
 	conservativeStringAllocationOverhead        = 16
+	conservativePostingGroupMemoryBytes         = 160
 )
 
 func encodeIndex(input []model.Record) ([]byte, error) {
+	return encodeIndexObserved(input, nil)
+}
+
+func encodeIndexObserved(input []model.Record, beforeCanonicalPostingSort func()) ([]byte, error) {
+	return encodeIndexObservedStats(input, beforeCanonicalPostingSort, nil)
+}
+
+func encodeIndexObservedStats(input []model.Record, beforeCanonicalPostingSort func(), postingCount *int) ([]byte, error) {
 	preflight, err := preflightEncodeIndex(input)
 	if err != nil {
 		return nil, err
@@ -65,52 +74,58 @@ func encodeIndex(input []model.Record) ([]byte, error) {
 			return nil, ErrInvalidIndex
 		}
 	}
-	postingReferences := make([]postingReference, 0, preflight.totalTerms)
+	postingTerms := make([]string, 0, len(preflight.postings))
+	for term := range preflight.postings {
+		postingTerms = append(postingTerms, term)
+	}
+	if beforeCanonicalPostingSort != nil {
+		beforeCanonicalPostingSort()
+	}
+	sort.Strings(postingTerms)
+	nextOffset := 0
+	for _, term := range postingTerms {
+		posting := preflight.postings[term]
+		posting.offset = uint32(nextOffset)
+		nextOffset += int(posting.count)
+		preflight.postings[term] = posting
+	}
+	if nextOffset != preflight.totalTerms {
+		return nil, ErrInvalidIndex
+	}
+	ordinals := make([]uint32, preflight.totalTerms)
 	for ordinal, inputIndex := range recordOrder {
-		record := input[inputIndex]
-		for termIndex := range record.SearchTerms {
-			postingReferences = append(postingReferences, postingReference{recordOrdinal: uint32(ordinal), termIndex: uint8(termIndex)})
+		for _, term := range input[inputIndex].SearchTerms {
+			posting := preflight.postings[term]
+			if posting.next >= posting.count {
+				return nil, ErrInvalidIndex
+			}
+			ordinals[int(posting.offset+posting.next)] = uint32(ordinal)
+			posting.next++
+			preflight.postings[term] = posting
 		}
-	}
-	postingTerm := func(reference postingReference) string {
-		record := input[recordOrder[reference.recordOrdinal]]
-		return record.SearchTerms[reference.termIndex]
-	}
-	sort.Slice(postingReferences, func(i, j int) bool {
-		left, right := postingTerm(postingReferences[i]), postingTerm(postingReferences[j])
-		if left != right {
-			return left < right
-		}
-		return postingReferences[i].recordOrdinal < postingReferences[j].recordOrdinal
-	})
-
-	plainSize, postingCount, err := encodedCanonicalPlainSize(preflight.recordBytes, postingReferences, postingTerm)
-	if err != nil {
-		return nil, err
 	}
 	var plain bytes.Buffer
-	plain.Grow(plainSize)
+	plain.Grow(preflight.plainSize)
 	plain.Write(indexMagic)
 	writeUint16(&plain, indexFormatVersion)
 	writeUint32(&plain, uint32(len(recordOrder)))
 	for _, inputIndex := range recordOrder {
 		writeCanonicalRecord(&plain, input[inputIndex])
 	}
-	writeUint32(&plain, uint32(postingCount))
-	for start := 0; start < len(postingReferences); {
-		term := postingTerm(postingReferences[start])
-		end := start + 1
-		for end < len(postingReferences) && postingTerm(postingReferences[end]) == term {
-			end++
+	writeUint32(&plain, uint32(len(postingTerms)))
+	for _, term := range postingTerms {
+		posting := preflight.postings[term]
+		if posting.next != posting.count {
+			return nil, ErrInvalidIndex
 		}
 		writeString(&plain, term)
-		writeUint32(&plain, uint32(end-start))
-		for _, reference := range postingReferences[start:end] {
-			writeUint32(&plain, reference.recordOrdinal)
+		writeUint32(&plain, posting.count)
+		start, end := int(posting.offset), int(posting.offset+posting.count)
+		for _, ordinal := range ordinals[start:end] {
+			writeUint32(&plain, ordinal)
 		}
-		start = end
 	}
-	if plain.Len() != plainSize || plain.Len() > maximumDecompressedIndexBytes {
+	if plain.Len() != preflight.plainSize || plain.Len() > maximumDecompressedIndexBytes {
 		return nil, ErrInvalidIndex
 	}
 
@@ -129,41 +144,23 @@ func encodeIndex(input []model.Record) ([]byte, error) {
 	if encoded.Len() == 0 || encoded.Len() > maximumEncodedIndexBytes {
 		return nil, ErrInvalidIndex
 	}
+	if postingCount != nil {
+		*postingCount = len(postingTerms)
+	}
 	return encoded.Bytes(), nil
 }
 
-type postingReference struct {
-	recordOrdinal uint32
-	termIndex     uint8
-}
-
-func encodedCanonicalPlainSize(recordBytes int64, references []postingReference, term func(postingReference) string) (int, int, error) {
-	total := recordBytes
-	postingCount := 0
-	for start := 0; start < len(references); {
-		value := term(references[start])
-		end := start + 1
-		for end < len(references) && term(references[end]) == value {
-			end++
-		}
-		if !addEncodeSize(&total, 8+int64(len(value))+4*int64(end-start), maximumDecompressedIndexBytes) {
-			return 0, 0, ErrInvalidIndex
-		}
-		postingCount++
-		if postingCount > maximumPostingTerms {
-			return 0, 0, ErrInvalidIndex
-		}
-		start = end
-	}
-	if total < 0 || total > math.MaxInt {
-		return 0, 0, ErrInvalidIndex
-	}
-	return int(total), postingCount, nil
+type postingMetadata struct {
+	count             uint32
+	offset            uint32
+	next              uint32
+	lastRecordPlusOne uint32
 }
 
 type encodeIndexPreflight struct {
-	recordBytes int64
-	totalTerms  int
+	plainSize  int
+	totalTerms int
+	postings   map[string]postingMetadata
 }
 
 // preflightEncodeIndex rejects inputs that cannot fit the wire or conservative
@@ -199,41 +196,53 @@ func preflightEncodeIndex(input []model.Record) (encodeIndexPreflight, error) {
 		}
 	}
 	recordBytes := serialized
-	// Every occurrence requires one posting ordinal even before accounting for
-	// its term and group header. This lower bound is sufficient for early wire
-	// rejection without constructing a postings representation.
-	if !addEncodeSize(&serialized, 4*int64(totalTerms), maximumDecompressedIndexBytes) {
-		return encodeIndexPreflight{}, ErrInvalidIndex
-	}
 	// The encoded bytes.Buffer may retain growth slack while the complete plain
 	// buffer is still live, so charge twice the encoded ceiling.
 	peak := int64(maximumDecompressedIndexBytes + 2*maximumEncodedIndexBytes + conservativeZlibWorkspaceBytes)
 	for _, amount := range []int64{
-		serialized,
+		recordBytes,
 		int64(len(input)) * conservativeRecordMemoryBytes,
-		int64(totalTerms) * conservativeTermMemoryBytes,
+		int64(totalTerms) * (conservativeCallerTermMemoryBytes + 4),
 	} {
 		if amount < 0 || peak > maximumIndexPeakBytes-amount {
 			return encodeIndexPreflight{}, ErrInvalidIndex
 		}
 		peak += amount
 	}
-	for _, record := range input {
+	postings := make(map[string]postingMetadata)
+	for recordIndex, record := range input {
 		if !validRecord(record) {
 			return encodeIndexPreflight{}, ErrInvalidIndex
 		}
-		for termIndex, term := range record.SearchTerms {
+		for _, term := range record.SearchTerms {
 			if !validTerm(term) {
 				return encodeIndexPreflight{}, ErrInvalidIndex
 			}
-			for prior := 0; prior < termIndex; prior++ {
-				if record.SearchTerms[prior] == term {
+			posting, exists := postings[term]
+			if exists && posting.lastRecordPlusOne == uint32(recordIndex+1) {
+				return encodeIndexPreflight{}, ErrInvalidIndex
+			}
+			if !exists {
+				if len(postings) == maximumPostingTerms || peak > maximumIndexPeakBytes-conservativePostingGroupMemoryBytes {
+					return encodeIndexPreflight{}, ErrInvalidIndex
+				}
+				peak += conservativePostingGroupMemoryBytes
+				if !addEncodeSize(&serialized, 8+int64(len(term)), maximumDecompressedIndexBytes) {
 					return encodeIndexPreflight{}, ErrInvalidIndex
 				}
 			}
+			if posting.count == math.MaxUint32 || !addEncodeSize(&serialized, 4, maximumDecompressedIndexBytes) {
+				return encodeIndexPreflight{}, ErrInvalidIndex
+			}
+			posting.count++
+			posting.lastRecordPlusOne = uint32(recordIndex + 1)
+			postings[term] = posting
 		}
 	}
-	return encodeIndexPreflight{recordBytes: recordBytes, totalTerms: totalTerms}, nil
+	if serialized < 0 || serialized > math.MaxInt {
+		return encodeIndexPreflight{}, ErrInvalidIndex
+	}
+	return encodeIndexPreflight{plainSize: int(serialized), totalTerms: totalTerms, postings: postings}, nil
 }
 
 func addEncodeSize(total *int64, amount, maximum int64) bool {
@@ -333,6 +342,292 @@ func decodeIndex(encoded []byte) ([]model.Record, map[string][]uint32, error) {
 		return nil, nil, ErrInvalidIndex
 	}
 	return records, postings, nil
+}
+
+type rawRecordTerms struct {
+	offset uint32
+	count  uint8
+}
+
+// validateIndex verifies the complete canonical index without materializing
+// records, copied strings, or postings. The only representation beyond the
+// bounded plain bytes is one compact term-section locator per record.
+func validateIndex(encoded []byte) (int, int, error) {
+	if len(encoded) == 0 || len(encoded) > maximumEncodedIndexBytes {
+		return 0, 0, ErrInvalidIndex
+	}
+	compressed := bytes.NewReader(encoded)
+	reader, err := zlib.NewReader(compressed)
+	if err != nil {
+		return 0, 0, ErrInvalidIndex
+	}
+	plain, readErr := io.ReadAll(io.LimitReader(reader, maximumDecompressedIndexBytes+1))
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || len(plain) > maximumDecompressedIndexBytes || compressed.Len() != 0 {
+		return 0, 0, ErrInvalidIndex
+	}
+	decoder := rawBinaryDecoder{value: plain}
+	magic, err := decoder.readBytes(len(indexMagic))
+	if err != nil || !bytes.Equal(magic, indexMagic) {
+		return 0, 0, ErrInvalidIndex
+	}
+	version, err := decoder.readUint16()
+	if err != nil || version != indexFormatVersion {
+		return 0, 0, ErrInvalidIndex
+	}
+	recordCount, err := decoder.readCount(maximumIndexRecords)
+	if err != nil || !decoder.canContain(recordCount, minimumEncodedRecordBytes()) {
+		return 0, 0, ErrInvalidIndex
+	}
+	peak := int64(cap(encoded) + cap(plain) + conservativeZlibWorkspaceBytes)
+	if locations := int64(recordCount) * 8; peak < 0 || locations < 0 || peak > maximumIndexPeakBytes-locations {
+		return 0, 0, ErrInvalidIndex
+	}
+	recordTerms := make([]rawRecordTerms, recordCount)
+	var previousIdentity []byte
+	totalOrdinals := 0
+	for recordIndex := 0; recordIndex < recordCount; recordIndex++ {
+		identity, err := decoder.readString(71)
+		if err != nil || !validSHA256IdentityBytes(identity) || (recordIndex > 0 && bytes.Compare(previousIdentity, identity) >= 0) {
+			return 0, 0, ErrInvalidIndex
+		}
+		previousIdentity = identity
+		pathValue, err := decoder.readString(maximumIndexStringBytes)
+		if err != nil || !validRelativePathBytes(pathValue) {
+			return 0, 0, ErrInvalidIndex
+		}
+		start, startErr := decoder.readUint32()
+		end, endErr := decoder.readUint32()
+		if startErr != nil || endErr != nil || start < 1 || end < start || uint64(end) > uint64(math.MaxInt) {
+			return 0, 0, ErrInvalidIndex
+		}
+		language, err := decoder.readString(128)
+		if err != nil || !validTextBytes(language, 128, false) {
+			return 0, 0, ErrInvalidIndex
+		}
+		kind, err := decoder.readString(32)
+		if err != nil || !validRecordKindBytes(kind) {
+			return 0, 0, ErrInvalidIndex
+		}
+		sourceType, err := decoder.readString(32)
+		if err != nil || !validSourceTypeBytes(sourceType) {
+			return 0, 0, ErrInvalidIndex
+		}
+		qualified, err := decoder.readString(512)
+		if err != nil || !validTextBytes(qualified, 512, false) {
+			return 0, 0, ErrInvalidIndex
+		}
+		extraction, err := decoder.readString(512)
+		if err != nil || !validTextBytes(extraction, 512, false) {
+			return 0, 0, ErrInvalidIndex
+		}
+		evidence, err := decoder.readString(16)
+		if err != nil || !validEvidenceClassBytes(evidence) {
+			return 0, 0, ErrInvalidIndex
+		}
+		termCount, err := decoder.readCount(maximumTermsPerRecord)
+		if err != nil || !decoder.canContain(termCount, 4) || totalOrdinals > maximumPostingOrdinals-termCount {
+			return 0, 0, ErrInvalidIndex
+		}
+		totalOrdinals += termCount
+		recordTerms[recordIndex] = rawRecordTerms{offset: uint32(decoder.offset), count: uint8(termCount)}
+		var previousTerm []byte
+		for termIndex := 0; termIndex < termCount; termIndex++ {
+			term, err := decoder.readString(128)
+			if err != nil || !validTermBytes(term) || (termIndex > 0 && bytes.Compare(previousTerm, term) >= 0) {
+				return 0, 0, ErrInvalidIndex
+			}
+			previousTerm = term
+		}
+		digest, err := decoder.readString(71)
+		if err != nil || !validSHA256IdentityBytes(digest) {
+			return 0, 0, ErrInvalidIndex
+		}
+		preview, err := decoder.readString(maximumIndexStringBytes)
+		if err != nil || !validTextBytes(preview, maximumIndexStringBytes, true) {
+			return 0, 0, ErrInvalidIndex
+		}
+	}
+	postingCount, err := decoder.readCount(maximumPostingTerms)
+	if err != nil || !decoder.canContain(postingCount, 8) {
+		return 0, 0, ErrInvalidIndex
+	}
+	decodedOrdinals := 0
+	var previousPostingTerm []byte
+	for postingIndex := 0; postingIndex < postingCount; postingIndex++ {
+		term, err := decoder.readString(128)
+		if err != nil || !validTermBytes(term) || (postingIndex > 0 && bytes.Compare(previousPostingTerm, term) >= 0) {
+			return 0, 0, ErrInvalidIndex
+		}
+		previousPostingTerm = term
+		ordinalCount, err := decoder.readCount(recordCount)
+		if err != nil || ordinalCount == 0 || !decoder.canContain(ordinalCount, 4) || decodedOrdinals > maximumPostingOrdinals-ordinalCount {
+			return 0, 0, ErrInvalidIndex
+		}
+		decodedOrdinals += ordinalCount
+		var previousOrdinal uint32
+		for ordinalIndex := 0; ordinalIndex < ordinalCount; ordinalIndex++ {
+			ordinal, err := decoder.readUint32()
+			if err != nil || uint64(ordinal) >= uint64(recordCount) || (ordinalIndex > 0 && previousOrdinal >= ordinal) ||
+				!rawRecordContainsTerm(plain, recordTerms[ordinal], term) {
+				return 0, 0, ErrInvalidIndex
+			}
+			previousOrdinal = ordinal
+		}
+	}
+	if decoder.remaining() != 0 || decodedOrdinals != totalOrdinals {
+		return 0, 0, ErrInvalidIndex
+	}
+	return recordCount, postingCount, nil
+}
+
+type rawBinaryDecoder struct {
+	value  []byte
+	offset int
+}
+
+func (decoder *rawBinaryDecoder) remaining() int { return len(decoder.value) - decoder.offset }
+
+func (decoder *rawBinaryDecoder) canContain(count, minimum int) bool {
+	return count >= 0 && minimum >= 0 && (count == 0 || count <= decoder.remaining()/minimum)
+}
+
+func (decoder *rawBinaryDecoder) readBytes(length int) ([]byte, error) {
+	if length < 0 || length > decoder.remaining() {
+		return nil, ErrInvalidIndex
+	}
+	result := decoder.value[decoder.offset : decoder.offset+length]
+	decoder.offset += length
+	return result, nil
+}
+
+func (decoder *rawBinaryDecoder) readUint16() (uint16, error) {
+	raw, err := decoder.readBytes(2)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint16(raw), nil
+}
+
+func (decoder *rawBinaryDecoder) readUint32() (uint32, error) {
+	raw, err := decoder.readBytes(4)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(raw), nil
+}
+
+func (decoder *rawBinaryDecoder) readCount(maximum int) (int, error) {
+	value, err := decoder.readUint32()
+	if err != nil || uint64(value) > uint64(maximum) || uint64(value) > uint64(math.MaxInt) {
+		return 0, ErrInvalidIndex
+	}
+	return int(value), nil
+}
+
+func (decoder *rawBinaryDecoder) readString(maximum int) ([]byte, error) {
+	length, err := decoder.readCount(maximum)
+	if err != nil || length > decoder.remaining() {
+		return nil, ErrInvalidIndex
+	}
+	value, err := decoder.readBytes(length)
+	if err != nil || !utf8.Valid(value) {
+		return nil, ErrInvalidIndex
+	}
+	return value, nil
+}
+
+func rawRecordContainsTerm(plain []byte, section rawRecordTerms, term []byte) bool {
+	decoder := rawBinaryDecoder{value: plain, offset: int(section.offset)}
+	for index := 0; index < int(section.count); index++ {
+		candidate, err := decoder.readString(128)
+		if err != nil {
+			return false
+		}
+		comparison := bytes.Compare(candidate, term)
+		if comparison == 0 {
+			return true
+		}
+		if comparison > 0 {
+			return false
+		}
+	}
+	return false
+}
+
+func validSHA256IdentityBytes(value []byte) bool {
+	if len(value) != 71 || !bytes.Equal(value[:7], []byte("sha256:")) {
+		return false
+	}
+	for _, character := range value[7:] {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validRecordKindBytes(value []byte) bool {
+	return bytes.Equal(value, []byte(model.Module)) || bytes.Equal(value, []byte(model.Definition)) ||
+		bytes.Equal(value, []byte(model.Import)) || bytes.Equal(value, []byte(model.EntryPoint)) ||
+		bytes.Equal(value, []byte(model.Configuration)) || bytes.Equal(value, []byte(model.Heading)) ||
+		bytes.Equal(value, []byte(model.DocumentChunk))
+}
+
+func validEvidenceClassBytes(value []byte) bool {
+	return bytes.Equal(value, []byte(model.Verified)) || bytes.Equal(value, []byte(model.Inferred)) || bytes.Equal(value, []byte(model.Uncertain))
+}
+
+func validSourceTypeBytes(value []byte) bool {
+	return bytes.Equal(value, []byte("source")) || bytes.Equal(value, []byte("document")) || bytes.Equal(value, []byte("configuration"))
+}
+
+func validTermBytes(value []byte) bool {
+	if !validTextBytes(value, 128, false) || !bytes.Equal(bytes.TrimSpace(value), value) {
+		return false
+	}
+	for remaining := value; len(remaining) != 0; {
+		runeValue, size := utf8.DecodeRune(remaining)
+		if unicode.ToLower(runeValue) != runeValue {
+			return false
+		}
+		remaining = remaining[size:]
+	}
+	return true
+}
+
+func validRelativePathBytes(value []byte) bool {
+	if !validTextBytes(value, maximumIndexStringBytes, false) || bytes.ContainsRune(value, '\\') || bytes.ContainsRune(value, ':') || value[0] == '/' {
+		return false
+	}
+	for start := 0; start <= len(value); {
+		end := start
+		for end < len(value) && value[end] != '/' {
+			end++
+		}
+		if end == start || (end-start == 1 && value[start] == '.') || (end-start == 2 && value[start] == '.' && value[start+1] == '.') {
+			return false
+		}
+		if end == len(value) {
+			break
+		}
+		start = end + 1
+	}
+	return true
+}
+
+func validTextBytes(value []byte, maximum int, empty bool) bool {
+	if !utf8.Valid(value) || len(value) > maximum || (!empty && len(value) == 0) {
+		return false
+	}
+	for len(value) != 0 {
+		runeValue, size := utf8.DecodeRune(value)
+		if unicode.IsControl(runeValue) {
+			return false
+		}
+		value = value[size:]
+	}
+	return true
 }
 
 func validRecord(record model.Record) bool {
