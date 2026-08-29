@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"path"
 	"regexp"
 	"slices"
 	"sort"
@@ -33,46 +32,59 @@ var (
 )
 
 const (
-	indexFormatVersion            uint16 = 1
-	maximumDecompressedIndexBytes        = 64 << 20
-	maximumEncodedIndexBytes             = 64 << 20
-	maximumManifestBytes                 = 256 << 10
-	maximumIndexStringBytes              = 4096
-	maximumIndexRecords                  = 1_000_000
-	maximumPostingTerms                  = 1_000_000
-	maximumPostingOrdinals               = 8_000_000
-	maximumTermsPerRecord                = 64
+	indexFormatVersion                   uint16 = 1
+	maximumDecompressedIndexBytes               = 64 << 20
+	maximumEncodedIndexBytes                    = 64 << 20
+	maximumManifestBytes                        = 256 << 10
+	maximumIndexStringBytes                     = 4096
+	maximumIndexRecords                         = 1_000_000
+	maximumPostingTerms                         = 1_000_000
+	maximumPostingOrdinals                      = 8_000_000
+	maximumTermsPerRecord                       = 64
+	maximumIndexPeakBytes                       = 512 << 20
+	conservativeZlibWorkspaceBytes              = 4 << 20
+	conservativeRecordMemoryBytes               = 512
+	conservativeTermMemoryBytes                 = 32
+	conservativeStringAllocationOverhead        = 16
 )
 
 func encodeIndex(input []model.Record) ([]byte, error) {
-	if len(input) > maximumIndexRecords {
-		return nil, ErrInvalidIndex
-	}
-	records := make([]model.Record, len(input))
-	totalOrdinals := 0
-	for index, record := range input {
-		normalized, err := normalizeRecord(record)
-		if err != nil {
-			return nil, err
-		}
-		if totalOrdinals > maximumPostingOrdinals-len(normalized.SearchTerms) {
-			return nil, ErrInvalidIndex
-		}
-		totalOrdinals += len(normalized.SearchTerms)
-		records[index] = normalized
-	}
-	sort.Slice(records, func(i, j int) bool { return records[i].Identity < records[j].Identity })
-	for index := 1; index < len(records); index++ {
-		if records[index-1].Identity == records[index].Identity {
-			return nil, ErrInvalidIndex
-		}
-	}
-	postings, terms, err := buildPostings(records)
+	preflight, err := preflightEncodeIndex(input)
 	if err != nil {
 		return nil, err
 	}
+	recordOrder := make([]uint32, len(input))
+	for index := range recordOrder {
+		recordOrder[index] = uint32(index)
+	}
+	sort.Slice(recordOrder, func(i, j int) bool {
+		return input[recordOrder[i]].Identity < input[recordOrder[j]].Identity
+	})
+	for index := 1; index < len(recordOrder); index++ {
+		if input[recordOrder[index-1]].Identity == input[recordOrder[index]].Identity {
+			return nil, ErrInvalidIndex
+		}
+	}
+	postingReferences := make([]postingReference, 0, preflight.totalTerms)
+	for ordinal, inputIndex := range recordOrder {
+		record := input[inputIndex]
+		for termIndex := range record.SearchTerms {
+			postingReferences = append(postingReferences, postingReference{recordOrdinal: uint32(ordinal), termIndex: uint8(termIndex)})
+		}
+	}
+	postingTerm := func(reference postingReference) string {
+		record := input[recordOrder[reference.recordOrdinal]]
+		return record.SearchTerms[reference.termIndex]
+	}
+	sort.Slice(postingReferences, func(i, j int) bool {
+		left, right := postingTerm(postingReferences[i]), postingTerm(postingReferences[j])
+		if left != right {
+			return left < right
+		}
+		return postingReferences[i].recordOrdinal < postingReferences[j].recordOrdinal
+	})
 
-	plainSize, err := encodedPlainSize(records, terms, postings)
+	plainSize, postingCount, err := encodedCanonicalPlainSize(preflight.recordBytes, postingReferences, postingTerm)
 	if err != nil {
 		return nil, err
 	}
@@ -80,18 +92,23 @@ func encodeIndex(input []model.Record) ([]byte, error) {
 	plain.Grow(plainSize)
 	plain.Write(indexMagic)
 	writeUint16(&plain, indexFormatVersion)
-	writeUint32(&plain, uint32(len(records)))
-	for _, record := range records {
-		writeRecord(&plain, record)
+	writeUint32(&plain, uint32(len(recordOrder)))
+	for _, inputIndex := range recordOrder {
+		writeCanonicalRecord(&plain, input[inputIndex])
 	}
-	writeUint32(&plain, uint32(len(terms)))
-	for _, term := range terms {
-		writeString(&plain, term)
-		ordinals := postings[term]
-		writeUint32(&plain, uint32(len(ordinals)))
-		for _, ordinal := range ordinals {
-			writeUint32(&plain, ordinal)
+	writeUint32(&plain, uint32(postingCount))
+	for start := 0; start < len(postingReferences); {
+		term := postingTerm(postingReferences[start])
+		end := start + 1
+		for end < len(postingReferences) && postingTerm(postingReferences[end]) == term {
+			end++
 		}
+		writeString(&plain, term)
+		writeUint32(&plain, uint32(end-start))
+		for _, reference := range postingReferences[start:end] {
+			writeUint32(&plain, reference.recordOrdinal)
+		}
+		start = end
 	}
 	if plain.Len() != plainSize || plain.Len() > maximumDecompressedIndexBytes {
 		return nil, ErrInvalidIndex
@@ -115,6 +132,118 @@ func encodeIndex(input []model.Record) ([]byte, error) {
 	return encoded.Bytes(), nil
 }
 
+type postingReference struct {
+	recordOrdinal uint32
+	termIndex     uint8
+}
+
+func encodedCanonicalPlainSize(recordBytes int64, references []postingReference, term func(postingReference) string) (int, int, error) {
+	total := recordBytes
+	postingCount := 0
+	for start := 0; start < len(references); {
+		value := term(references[start])
+		end := start + 1
+		for end < len(references) && term(references[end]) == value {
+			end++
+		}
+		if !addEncodeSize(&total, 8+int64(len(value))+4*int64(end-start), maximumDecompressedIndexBytes) {
+			return 0, 0, ErrInvalidIndex
+		}
+		postingCount++
+		if postingCount > maximumPostingTerms {
+			return 0, 0, ErrInvalidIndex
+		}
+		start = end
+	}
+	if total < 0 || total > math.MaxInt {
+		return 0, 0, ErrInvalidIndex
+	}
+	return int(total), postingCount, nil
+}
+
+type encodeIndexPreflight struct {
+	recordBytes int64
+	totalTerms  int
+}
+
+// preflightEncodeIndex rejects inputs that cannot fit the wire or conservative
+// process-memory budget before encodeIndex allocates its compact index arrays.
+func preflightEncodeIndex(input []model.Record) (encodeIndexPreflight, error) {
+	if len(input) > maximumIndexRecords {
+		return encodeIndexPreflight{}, ErrInvalidIndex
+	}
+	serialized := int64(len(indexMagic) + 2 + 4 + 4)
+	totalTerms := 0
+	for _, record := range input {
+		termCount := len(record.SearchTerms)
+		if termCount > maximumTermsPerRecord || totalTerms > maximumPostingOrdinals-termCount {
+			return encodeIndexPreflight{}, ErrInvalidIndex
+		}
+		totalTerms += termCount
+		values := [...]string{
+			record.Identity, record.Path, record.Language, string(record.RecordKind), record.SourceType,
+			record.QualifiedName, record.ExtractionMethod, string(record.EvidenceClass), record.SourceDigest, record.Preview,
+		}
+		if !addEncodeSize(&serialized, 12+4*int64(termCount), maximumDecompressedIndexBytes) {
+			return encodeIndexPreflight{}, ErrInvalidIndex
+		}
+		for _, value := range values {
+			if !addEncodeSize(&serialized, 4+int64(len(value)), maximumDecompressedIndexBytes) {
+				return encodeIndexPreflight{}, ErrInvalidIndex
+			}
+		}
+		for _, term := range record.SearchTerms {
+			if !addEncodeSize(&serialized, int64(len(term)), maximumDecompressedIndexBytes) {
+				return encodeIndexPreflight{}, ErrInvalidIndex
+			}
+		}
+	}
+	recordBytes := serialized
+	// Every occurrence requires one posting ordinal even before accounting for
+	// its term and group header. This lower bound is sufficient for early wire
+	// rejection without constructing a postings representation.
+	if !addEncodeSize(&serialized, 4*int64(totalTerms), maximumDecompressedIndexBytes) {
+		return encodeIndexPreflight{}, ErrInvalidIndex
+	}
+	// The encoded bytes.Buffer may retain growth slack while the complete plain
+	// buffer is still live, so charge twice the encoded ceiling.
+	peak := int64(maximumDecompressedIndexBytes + 2*maximumEncodedIndexBytes + conservativeZlibWorkspaceBytes)
+	for _, amount := range []int64{
+		serialized,
+		int64(len(input)) * conservativeRecordMemoryBytes,
+		int64(totalTerms) * conservativeTermMemoryBytes,
+	} {
+		if amount < 0 || peak > maximumIndexPeakBytes-amount {
+			return encodeIndexPreflight{}, ErrInvalidIndex
+		}
+		peak += amount
+	}
+	for _, record := range input {
+		if !validRecord(record) {
+			return encodeIndexPreflight{}, ErrInvalidIndex
+		}
+		for termIndex, term := range record.SearchTerms {
+			if !validTerm(term) {
+				return encodeIndexPreflight{}, ErrInvalidIndex
+			}
+			for prior := 0; prior < termIndex; prior++ {
+				if record.SearchTerms[prior] == term {
+					return encodeIndexPreflight{}, ErrInvalidIndex
+				}
+			}
+		}
+	}
+	return encodeIndexPreflight{recordBytes: recordBytes, totalTerms: totalTerms}, nil
+}
+
+func addEncodeSize(total *int64, amount, maximum int64) bool {
+	if total == nil || amount < 0 || *total < 0 || amount > maximum-*total {
+		return false
+	}
+	*total += amount
+	return true
+}
+
 func decodeIndex(encoded []byte) ([]model.Record, map[string][]uint32, error) {
 	if len(encoded) == 0 || len(encoded) > maximumEncodedIndexBytes {
 		return nil, nil, ErrInvalidIndex
@@ -129,7 +258,11 @@ func decodeIndex(encoded []byte) ([]model.Record, map[string][]uint32, error) {
 	if readErr != nil || closeErr != nil || len(plain) > maximumDecompressedIndexBytes || compressed.Len() != 0 {
 		return nil, nil, ErrInvalidIndex
 	}
-	decoder := binaryDecoder{value: plain}
+	budget := decodeMemoryBudget{used: int64(cap(encoded) + cap(plain) + conservativeZlibWorkspaceBytes)}
+	if budget.used < 0 || budget.used > maximumIndexPeakBytes {
+		return nil, nil, ErrInvalidIndex
+	}
+	decoder := binaryDecoder{value: plain, budget: &budget}
 	magic, err := decoder.readBytes(len(indexMagic))
 	if err != nil || !bytes.Equal(magic, indexMagic) {
 		return nil, nil, ErrInvalidIndex
@@ -142,9 +275,13 @@ func decodeIndex(encoded []byte) ([]model.Record, map[string][]uint32, error) {
 	if err != nil || !decoder.canContain(recordCount, minimumEncodedRecordBytes()) {
 		return nil, nil, ErrInvalidIndex
 	}
-	records := make([]model.Record, recordCount)
+	if budget.reserve(int64(recordCount)*conservativeRecordMemoryBytes) != nil {
+		return nil, nil, ErrInvalidIndex
+	}
+	initialRecordCapacity := min(recordCount, 1024)
+	records := make([]model.Record, 0, initialRecordCapacity)
 	totalOrdinals := 0
-	for index := range records {
+	for index := 0; index < recordCount; index++ {
 		record, err := decoder.readRecord()
 		if err != nil || (index > 0 && records[index-1].Identity >= record.Identity) {
 			return nil, nil, ErrInvalidIndex
@@ -153,10 +290,13 @@ func decodeIndex(encoded []byte) ([]model.Record, map[string][]uint32, error) {
 			return nil, nil, ErrInvalidIndex
 		}
 		totalOrdinals += len(record.SearchTerms)
-		records[index] = record
+		records = append(records, record)
 	}
 	postingCount, err := decoder.readCount(maximumPostingTerms)
 	if err != nil || !decoder.canContain(postingCount, 8) {
+		return nil, nil, ErrInvalidIndex
+	}
+	if budget.reserve(int64(postingCount)*64) != nil {
 		return nil, nil, ErrInvalidIndex
 	}
 	postings := make(map[string][]uint32, postingCount)
@@ -172,10 +312,16 @@ func decodeIndex(encoded []byte) ([]model.Record, map[string][]uint32, error) {
 			return nil, nil, ErrInvalidIndex
 		}
 		decodedOrdinals += ordinalCount
+		if budget.reserve(int64(ordinalCount)*4) != nil {
+			return nil, nil, ErrInvalidIndex
+		}
 		ordinals := make([]uint32, ordinalCount)
 		for ordinalIndex := range ordinals {
 			ordinal, err := decoder.readUint32()
 			if err != nil || uint64(ordinal) >= uint64(len(records)) || (ordinalIndex > 0 && ordinals[ordinalIndex-1] >= ordinal) {
+				return nil, nil, ErrInvalidIndex
+			}
+			if _, found := slices.BinarySearch(records[ordinal].SearchTerms, term); !found {
 				return nil, nil, ErrInvalidIndex
 			}
 			ordinals[ordinalIndex] = ordinal
@@ -186,38 +332,7 @@ func decodeIndex(encoded []byte) ([]model.Record, map[string][]uint32, error) {
 	if decoder.remaining() != 0 || decodedOrdinals != totalOrdinals {
 		return nil, nil, ErrInvalidIndex
 	}
-	expected, terms, err := buildPostings(records)
-	if err != nil || len(terms) != len(postings) {
-		return nil, nil, ErrInvalidIndex
-	}
-	for _, term := range terms {
-		if !slices.Equal(expected[term], postings[term]) {
-			return nil, nil, ErrInvalidIndex
-		}
-	}
 	return records, postings, nil
-}
-
-func normalizeRecord(record model.Record) (model.Record, error) {
-	record.SearchTerms = slices.Clone(record.SearchTerms)
-	if len(record.SearchTerms) > maximumTermsPerRecord {
-		return model.Record{}, ErrInvalidIndex
-	}
-	for _, term := range record.SearchTerms {
-		if !validTerm(term) {
-			return model.Record{}, ErrInvalidIndex
-		}
-	}
-	sort.Strings(record.SearchTerms)
-	for index := 1; index < len(record.SearchTerms); index++ {
-		if record.SearchTerms[index-1] == record.SearchTerms[index] {
-			return model.Record{}, ErrInvalidIndex
-		}
-	}
-	if !validRecord(record) {
-		return model.Record{}, ErrInvalidIndex
-	}
-	return record, nil
 }
 
 func validRecord(record model.Record) bool {
@@ -251,13 +366,21 @@ func validTerm(value string) bool {
 }
 
 func validRelativePath(value string) bool {
-	if !validText(value, maximumIndexStringBytes, false) || strings.Contains(value, `\`) || strings.Contains(value, ":") || strings.HasPrefix(value, "/") || path.Clean(value) != value {
+	if !validText(value, maximumIndexStringBytes, false) || strings.Contains(value, `\`) || strings.Contains(value, ":") || strings.HasPrefix(value, "/") {
 		return false
 	}
-	for _, component := range strings.Split(value, "/") {
-		if component == "" || component == "." || component == ".." {
+	for start := 0; start <= len(value); {
+		end := start
+		for end < len(value) && value[end] != '/' {
+			end++
+		}
+		if end == start || (end-start == 1 && value[start] == '.') || (end-start == 2 && value[start] == '.' && value[start+1] == '.') {
 			return false
 		}
+		if end == len(value) {
+			break
+		}
+		start = end + 1
 	}
 	return true
 }
@@ -265,65 +388,6 @@ func validRelativePath(value string) bool {
 func validText(value string, maximum int, empty bool) bool {
 	return utf8.ValidString(value) && len(value) <= maximum && (empty || value != "") &&
 		strings.IndexFunc(value, unicode.IsControl) < 0
-}
-
-func buildPostings(records []model.Record) (map[string][]uint32, []string, error) {
-	postings := make(map[string][]uint32)
-	total := 0
-	for ordinal, record := range records {
-		if ordinal > math.MaxUint32 {
-			return nil, nil, ErrInvalidIndex
-		}
-		for _, term := range record.SearchTerms {
-			if total == maximumPostingOrdinals {
-				return nil, nil, ErrInvalidIndex
-			}
-			postings[term] = append(postings[term], uint32(ordinal))
-			total++
-		}
-	}
-	if len(postings) > maximumPostingTerms {
-		return nil, nil, ErrInvalidIndex
-	}
-	terms := make([]string, 0, len(postings))
-	for term := range postings {
-		terms = append(terms, term)
-	}
-	sort.Strings(terms)
-	return postings, terms, nil
-}
-
-func encodedPlainSize(records []model.Record, terms []string, postings map[string][]uint32) (int, error) {
-	size := len(indexMagic) + 2 + 4 + 4
-	add := func(amount int) bool {
-		if amount < 0 || size > maximumDecompressedIndexBytes-amount {
-			return false
-		}
-		size += amount
-		return true
-	}
-	for _, record := range records {
-		values := []string{record.Identity, record.Path, record.Language, string(record.RecordKind), record.SourceType, record.QualifiedName, record.ExtractionMethod, string(record.EvidenceClass), record.SourceDigest, record.Preview}
-		for _, value := range values {
-			if !add(4 + len(value)) {
-				return 0, ErrInvalidIndex
-			}
-		}
-		if !add(12 + 4*len(record.SearchTerms)) {
-			return 0, ErrInvalidIndex
-		}
-		for _, term := range record.SearchTerms {
-			if !add(len(term)) {
-				return 0, ErrInvalidIndex
-			}
-		}
-	}
-	for _, term := range terms {
-		if !add(8 + len(term) + 4*len(postings[term])) {
-			return 0, ErrInvalidIndex
-		}
-	}
-	return size, nil
 }
 
 func minimumEncodedRecordBytes() int { return 10*4 + 3*4 }
@@ -347,6 +411,39 @@ func writeRecord(writer *bytes.Buffer, record model.Record) {
 	writeString(writer, record.Preview)
 }
 
+func writeCanonicalRecord(writer *bytes.Buffer, record model.Record) {
+	writeString(writer, record.Identity)
+	writeString(writer, record.Path)
+	writeUint32(writer, uint32(record.StartLine))
+	writeUint32(writer, uint32(record.EndLine))
+	writeString(writer, record.Language)
+	writeString(writer, string(record.RecordKind))
+	writeString(writer, record.SourceType)
+	writeString(writer, record.QualifiedName)
+	writeString(writer, record.ExtractionMethod)
+	writeString(writer, string(record.EvidenceClass))
+	writeUint32(writer, uint32(len(record.SearchTerms)))
+	order := canonicalTermOrder(record.SearchTerms)
+	for _, termIndex := range order[:len(record.SearchTerms)] {
+		writeString(writer, record.SearchTerms[termIndex])
+	}
+	writeString(writer, record.SourceDigest)
+	writeString(writer, record.Preview)
+}
+
+func canonicalTermOrder(terms []string) [maximumTermsPerRecord]uint8 {
+	var order [maximumTermsPerRecord]uint8
+	for index := range terms {
+		position := index
+		for position > 0 && terms[order[position-1]] > terms[index] {
+			order[position] = order[position-1]
+			position--
+		}
+		order[position] = uint8(index)
+	}
+	return order
+}
+
 func writeUint16(writer *bytes.Buffer, value uint16) {
 	var raw [2]byte
 	binary.BigEndian.PutUint16(raw[:], value)
@@ -367,6 +464,17 @@ func writeString(writer *bytes.Buffer, value string) {
 type binaryDecoder struct {
 	value  []byte
 	offset int
+	budget *decodeMemoryBudget
+}
+
+type decodeMemoryBudget struct{ used int64 }
+
+func (budget *decodeMemoryBudget) reserve(amount int64) error {
+	if budget == nil || amount < 0 || budget.used < 0 || amount > maximumIndexPeakBytes-budget.used {
+		return ErrInvalidIndex
+	}
+	budget.used += amount
+	return nil
 }
 
 func (decoder *binaryDecoder) remaining() int { return len(decoder.value) - decoder.offset }
@@ -414,7 +522,7 @@ func (decoder *binaryDecoder) readString(maximum int) (string, error) {
 		return "", ErrInvalidIndex
 	}
 	raw, err := decoder.readBytes(length)
-	if err != nil || !utf8.Valid(raw) {
+	if err != nil || !utf8.Valid(raw) || decoder.budget.reserve(int64(length)+conservativeStringAllocationOverhead) != nil {
 		return "", ErrInvalidIndex
 	}
 	return string(raw), nil
@@ -462,6 +570,9 @@ func (decoder *binaryDecoder) readRecord() (model.Record, error) {
 	record.EvidenceClass = model.EvidenceClass(evidence)
 	termCount, err := decoder.readCount(maximumTermsPerRecord)
 	if err != nil || !decoder.canContain(termCount, 4) {
+		return model.Record{}, ErrInvalidIndex
+	}
+	if decoder.budget.reserve(int64(termCount)*16) != nil {
 		return model.Record{}, ErrInvalidIndex
 	}
 	record.SearchTerms = make([]string, termCount)

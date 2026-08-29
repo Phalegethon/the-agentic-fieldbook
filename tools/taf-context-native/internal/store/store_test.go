@@ -12,10 +12,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
@@ -91,6 +93,50 @@ func TestEncodeIndexRejectsDuplicateAndInvalidRecords(t *testing.T) {
 				t.Fatalf("error = %v, want ErrInvalidIndex", err)
 			}
 		})
+	}
+}
+
+func TestEncodeIndexRejectsOversizedInputBeforePerRecordAllocation(t *testing.T) {
+	preview := strings.Repeat("p", maximumIndexStringBytes)
+	sharedTerms := []string{"term"}
+	record := testRecord(testRecordA, "oversized.go", "Oversized", sharedTerms)
+	record.Preview = preview
+	records := make([]model.Record, 17_000)
+	for index := range records {
+		records[index] = record
+	}
+
+	var encodeErr error
+	allocations := testing.AllocsPerRun(1, func() {
+		_, encodeErr = encodeIndex(records)
+	})
+	if !errors.Is(encodeErr, ErrInvalidIndex) {
+		t.Fatalf("encode error = %v, want ErrInvalidIndex", encodeErr)
+	}
+	if allocations > 32 {
+		t.Fatalf("oversized preflight allocations = %.0f, want <= 32", allocations)
+	}
+}
+
+func TestEncodeIndexUsesBoundedRepresentationsWithoutPerRecordClones(t *testing.T) {
+	sharedTerms := []string{"term-b", "term-a"}
+	records := make([]model.Record, 20_000)
+	for index := range records {
+		records[index] = testRecord(fmt.Sprintf("sha256:%064x", index), "bounded.go", "Bounded", sharedTerms)
+	}
+
+	var encodeErr error
+	allocations := testing.AllocsPerRun(1, func() {
+		_, encodeErr = encodeIndex(records)
+	})
+	if encodeErr != nil {
+		t.Fatal(encodeErr)
+	}
+	// Race instrumentation accounts for roughly ten thousand bookkeeping
+	// allocations here. The former per-record cloning implementation exceeded
+	// sixty thousand allocations even without race instrumentation.
+	if allocations > 20_000 {
+		t.Fatalf("valid encode allocations = %.0f, want <= 20000", allocations)
 	}
 }
 
@@ -170,6 +216,74 @@ func TestDecodeIndexRejectsNoncanonicalRecordsAndPostings(t *testing.T) {
 	validPlain = append(validPlain, 0)
 	if _, _, err := decodeIndex(mustCompress(validPlain)); !errors.Is(err, ErrInvalidIndex) {
 		t.Fatalf("trailing plain byte error = %v", err)
+	}
+}
+
+func TestDecodeIndexUsesSingleLinearPostingRepresentation(t *testing.T) {
+	records := make([]model.Record, 2_000)
+	for recordIndex := range records {
+		terms := make([]string, maximumTermsPerRecord)
+		for termIndex := range terms {
+			terms[termIndex] = fmt.Sprintf("term-%04d-%02d", recordIndex, termIndex)
+		}
+		records[recordIndex] = testRecord(fmt.Sprintf("sha256:%064x", recordIndex), "linear.go", "Linear", terms)
+	}
+	encoded, err := encodeIndex(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var decodeErr error
+	allocations := testing.AllocsPerRun(1, func() {
+		_, _, decodeErr = decodeIndex(encoded)
+	})
+	if decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if allocations > 410_000 {
+		t.Fatalf("decode allocations = %.0f, want <= 410000", allocations)
+	}
+}
+
+func TestDecodeIndexRejectsHostileMaximumCountBeforeLargeRecordAllocation(t *testing.T) {
+	plain := make([]byte, len(indexMagic)+2+4+maximumIndexRecords*minimumEncodedRecordBytes())
+	copy(plain, indexMagic)
+	binary.BigEndian.PutUint16(plain[len(indexMagic):], indexFormatVersion)
+	binary.BigEndian.PutUint32(plain[len(indexMagic)+2:], maximumIndexRecords)
+	encoded := mustCompress(plain)
+	plain = nil
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, _, err := decodeIndex(encoded); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("decode error = %v, want ErrInvalidIndex", err)
+	}
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	// Race instrumentation increases zlib and slice-allocation accounting by
+	// about 32 MiB. The eager million-record allocation exceeded 300 MiB even
+	// without race instrumentation.
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 256<<20 {
+		t.Fatalf("hostile decode allocated %d bytes, want <= %d", allocated, 256<<20)
+	}
+}
+
+func TestDecodeMemoryBudgetCoversRecordSliceGrowth(t *testing.T) {
+	minimum := 2 * int(unsafe.Sizeof(model.Record{}))
+	if conservativeRecordMemoryBytes < minimum {
+		t.Fatalf("record memory budget = %d, want at least %d", conservativeRecordMemoryBytes, minimum)
+	}
+}
+
+func TestDecodeMemoryBudgetChargesStringAllocationOverhead(t *testing.T) {
+	budget := decodeMemoryBudget{}
+	decoder := binaryDecoder{value: []byte{0, 0, 0, 1, 'a'}, budget: &budget}
+	if value, err := decoder.readString(1); err != nil || value != "a" {
+		t.Fatalf("readString = %q, %v", value, err)
+	}
+	want := int64(1 + conservativeStringAllocationOverhead)
+	if budget.used != want {
+		t.Fatalf("string memory budget = %d, want %d", budget.used, want)
 	}
 }
 
@@ -608,6 +722,54 @@ func TestBuildRollsBackIndeterminateCurrentRenameFailure(t *testing.T) {
 	}
 }
 
+func TestBuildSyncsGenerationAfterIndeterminateRename(t *testing.T) {
+	t.Run("sync succeeds before current publication", func(t *testing.T) {
+		roots, _ := storeRoots(t)
+		mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+		syncCalls := 0
+		filesystem := errorAfterGenerationRenameFilesystem{
+			storeFilesystem: boundaryFilesystem{},
+			cause:           errors.New("error reported after generation rename"),
+			generationSyncs: &syncCalls,
+		}
+		snapshot, err := buildWithFilesystem(filesystem, roots, manifestVariant("b"), []model.Record{testRecord(testRecordB, "b.go", "B", []string{"b"})})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.IndexIdentity == "" || syncCalls != 1 {
+			t.Fatalf("snapshot=%#v generation sync calls=%d, want 1", snapshot, syncCalls)
+		}
+	})
+
+	t.Run("sync failure preserves previous current", func(t *testing.T) {
+		roots, state := storeRoots(t)
+		first := mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+		currentBefore := mustRead(t, filepath.Join(state, currentFilename))
+		syncFailure := errors.New("generation sync failed")
+		syncCalls := 0
+		filesystem := errorAfterGenerationRenameFilesystem{
+			storeFilesystem: boundaryFilesystem{faults: Faults{BeforeGenerationsSync: syncFailure}},
+			cause:           errors.New("error reported after generation rename"),
+			generationSyncs: &syncCalls,
+		}
+		_, err := buildWithFilesystem(filesystem, roots, manifestVariant("b"), []model.Record{testRecord(testRecordB, "b.go", "B", []string{"b"})})
+		if !errors.Is(err, syncFailure) {
+			t.Fatalf("build error = %v, want generation sync failure", err)
+		}
+		if syncCalls != 1 {
+			t.Fatalf("generation sync calls = %d, want 1", syncCalls)
+		}
+		if currentAfter := mustRead(t, filepath.Join(state, currentFilename)); !bytes.Equal(currentBefore, currentAfter) {
+			t.Fatalf("CURRENT changed: before=%q after=%q", currentBefore, currentAfter)
+		}
+		assertNoTemporaryEntries(t, state)
+		loaded, loadErr := Load(roots, first.IndexIdentity)
+		if loadErr != nil || loaded.IndexIdentity != first.IndexIdentity {
+			t.Fatalf("previous generation = %#v, %v", loaded, loadErr)
+		}
+	})
+}
+
 func TestConcurrentBuilderAndInspectorsExposeOnlyReadyGenerations(t *testing.T) {
 	roots, _ := storeRoots(t)
 	firstManifest := testManifest()
@@ -677,6 +839,68 @@ func TestConcurrentBuilderAndInspectorsExposeOnlyReadyGenerations(t *testing.T) 
 	}
 }
 
+func TestAtomicCurrentExtremeChurnNeverFalseCorrupts(t *testing.T) {
+	roots, state := storeRoots(t)
+	first := mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	second := mustBuild(t, roots, manifestVariant("b"), []model.Record{testRecord(testRecordB, "b.go", "B", []string{"b"})})
+	mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	currentValues := [][]byte{
+		[]byte(generationToken(first.Manifest.GenerationIdentity) + "\n"),
+		[]byte(generationToken(second.Manifest.GenerationIdentity) + "\n"),
+	}
+
+	start := make(chan struct{})
+	done := make(chan struct{})
+	errorsSeen := make(chan error, 16)
+	var wait sync.WaitGroup
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		defer close(done)
+		<-start
+		for iteration := range 50_000 {
+			temporary := filepath.Join(state, fmt.Sprintf(".CURRENT-churn-%d", iteration))
+			if err := os.WriteFile(temporary, currentValues[iteration&1], 0o600); err != nil {
+				errorsSeen <- fmt.Errorf("write churn pointer: %w", err)
+				return
+			}
+			if err := os.Rename(temporary, filepath.Join(state, currentFilename)); err != nil {
+				errorsSeen <- fmt.Errorf("rename churn pointer: %w", err)
+				return
+			}
+		}
+	}()
+	for range 8 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				status, err := Inspect(roots)
+				if err != nil {
+					errorsSeen <- fmt.Errorf("inspect during churn: %w", err)
+					return
+				}
+				if status.IndexIdentity != first.IndexIdentity && status.IndexIdentity != second.IndexIdentity {
+					errorsSeen <- fmt.Errorf("inspect observed unknown index %q", status.IndexIdentity)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errorsSeen)
+	for err := range errorsSeen {
+		t.Error(err)
+	}
+}
+
 func FuzzDecodeIndex(f *testing.F) {
 	valid, err := encodeIndex([]model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
 	if err != nil {
@@ -704,6 +928,29 @@ type postingFixture struct {
 type errorAfterCurrentRenameFilesystem struct {
 	storeFilesystem
 	cause error
+}
+
+type errorAfterGenerationRenameFilesystem struct {
+	storeFilesystem
+	cause           error
+	generationSyncs *int
+}
+
+func (filesystem errorAfterGenerationRenameFilesystem) renameNew(directory *boundary.StateDirectory, source, destination string, point faultPoint) error {
+	if err := filesystem.storeFilesystem.renameNew(directory, source, destination, point); err != nil {
+		return err
+	}
+	if point == faultBeforeGenerationRename {
+		return filesystem.cause
+	}
+	return nil
+}
+
+func (filesystem errorAfterGenerationRenameFilesystem) syncDirectory(directory *boundary.StateDirectory, point faultPoint) error {
+	if point == faultBeforeGenerationsSync {
+		*filesystem.generationSyncs++
+	}
+	return filesystem.storeFilesystem.syncDirectory(directory, point)
 }
 
 func (filesystem errorAfterCurrentRenameFilesystem) replaceFile(directory *boundary.StateDirectory, source, destination string, point faultPoint) error {

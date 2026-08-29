@@ -223,9 +223,10 @@ func (directory *StateDirectory) ReadFile(name string, maximum int64) ([]byte, e
 }
 
 // ReadAtomicCurrent reads the sole mutable state pointer, which trusted code
-// replaces only by atomic rename. The opened file may be the complete old or
-// new entry; both it and the live CURRENT entry must have exactLength bytes.
-// Immutable generation files must continue to use ReadFile.
+// replaces only by atomic rename. os.Root.Open rejects a terminal symlink, and
+// the opened descriptor must remain an owner-only, non-hardlinked, exact-size
+// regular file throughout the read. It may be any complete prior or next inode
+// opened during churn. Immutable generation files must continue to use ReadFile.
 func (directory *StateDirectory) ReadAtomicCurrent(exactLength int64) ([]byte, error) {
 	const name = "CURRENT"
 	if exactLength < 0 {
@@ -255,54 +256,10 @@ func (directory *StateDirectory) ReadAtomicCurrent(exactLength int64) ([]byte, e
 		return nil, fmt.Errorf("%w: atomic pointer read", ErrUnsafeRoot)
 	}
 	openedAfter, openErr := file.Stat()
-	pathAfter, pathErr := directory.root.Lstat(name)
-	if openErr != nil || !sameSnapshot(openedBefore, openedAfter) {
+	if openErr != nil || safeAtomicStateFile(file) != nil || !sameSnapshot(openedBefore, openedAfter) {
 		return nil, fmt.Errorf("%w: atomic pointer handle changed", ErrUnsafeRoot)
 	}
-	if errors.Is(pathErr, os.ErrNotExist) {
-		return nil, ErrStateEntryChanged
-	}
-	if pathErr != nil || pathAfter.Mode()&os.ModeSymlink != 0 || pathAfter.Size() != exactLength {
-		return nil, fmt.Errorf("%w: atomic pointer live entry", ErrUnsafeRoot)
-	}
-	if liveErr := safeLiveStateEntry(pathAfter); liveErr != nil {
-		if errors.Is(liveErr, ErrStateEntryChanged) {
-			return nil, ErrStateEntryChanged
-		}
-		latest, latestErr := directory.root.Lstat(name)
-		if errors.Is(latestErr, os.ErrNotExist) || (latestErr == nil && latest.Mode()&os.ModeSymlink == 0 && latest.Mode().IsRegular() && (!sameSnapshot(pathAfter, latest) || safeLiveStateEntry(latest) == nil)) {
-			return nil, ErrStateEntryChanged
-		}
-		return nil, fmt.Errorf("%w: atomic pointer live entry: %v", ErrUnsafeRoot, liveErr)
-	}
-	if err := directory.validateAtomicLiveFile(name, pathAfter); err != nil {
-		return nil, err
-	}
-	openedMatchesBefore := sameSnapshot(openedBefore, before)
-	openedMatchesAfter := sameSnapshot(openedBefore, pathAfter)
-	if !openedMatchesBefore && !openedMatchesAfter {
-		return nil, ErrStateEntryChanged
-	}
 	return contents, nil
-}
-
-func (directory *StateDirectory) validateAtomicLiveFile(name string, expected os.FileInfo) error {
-	live, err := directory.OpenFile(name)
-	if errors.Is(err, ErrStateEntryNotFound) || errors.Is(err, ErrStateEntryChanged) {
-		return ErrStateEntryChanged
-	}
-	if err != nil {
-		return fmt.Errorf("%w: atomic pointer live handle", ErrUnsafeRoot)
-	}
-	actual, statErr := live.Stat()
-	closeErr := live.Close()
-	if statErr != nil || closeErr != nil {
-		return fmt.Errorf("%w: atomic pointer live handle", ErrUnsafeRoot)
-	}
-	if !sameSnapshot(expected, actual) {
-		return ErrStateEntryChanged
-	}
-	return nil
 }
 
 // RenameNew atomically renames one validated file or directory to a name that

@@ -170,24 +170,20 @@ func buildWithFilesystem(filesystem storeFilesystem, roots *boundary.Roots, mani
 		return Snapshot{}, corrupt(err)
 	}
 	stagingOpen = false
-	installedNew := true
 	if err := filesystem.renameNew(generations, stagingName, artifacts.token, faultBeforeGenerationRename); err != nil {
 		if isInjectedFilesystemFault(err) {
 			return Snapshot{}, err
 		}
-		installedNew = false
 		existing, loadErr := loadGeneration(filesystem, generations, artifacts.token)
 		if loadErr != nil || !reflect.DeepEqual(existing, artifacts.snapshot) {
 			return Snapshot{}, fmt.Errorf("%w: immutable bytes differ", ErrGenerationCollision)
 		}
 	}
-	if installedNew {
-		if err := filesystem.syncDirectory(generations, faultBeforeGenerationsSync); err != nil {
-			if isInjectedFilesystemFault(err) {
-				return Snapshot{}, err
-			}
-			return Snapshot{}, corrupt(err)
+	if err := filesystem.syncDirectory(generations, faultBeforeGenerationsSync); err != nil {
+		if isInjectedFilesystemFault(err) {
+			return Snapshot{}, err
 		}
+		return Snapshot{}, corrupt(err)
 	}
 	installed, err := loadGeneration(filesystem, generations, artifacts.token)
 	if err != nil || !reflect.DeepEqual(installed, artifacts.snapshot) {
@@ -361,14 +357,7 @@ func loadCurrentOptional(filesystem storeFilesystem, state, generations *boundar
 }
 
 func readCurrentPointer(filesystem storeFilesystem, state *boundary.StateDirectory) (string, []byte, bool, error) {
-	var current []byte
-	var err error
-	for attempt := 0; attempt < 16; attempt++ {
-		current, err = filesystem.readAtomicCurrent(state, 65)
-		if !errors.Is(err, boundary.ErrStateEntryChanged) {
-			break
-		}
-	}
+	current, err := filesystem.readAtomicCurrent(state, 65)
 	if errors.Is(err, boundary.ErrStateEntryNotFound) {
 		return "", nil, false, nil
 	}
