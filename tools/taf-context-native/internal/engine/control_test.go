@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -9,6 +10,35 @@ import (
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
+
+func TestBoundedWarningOverflowIsDeterministic(t *testing.T) {
+	warnings := make([]string, 65)
+	for index := range warnings {
+		warnings[index] = fmt.Sprintf("warning-%03d", 64-index)
+	}
+	got := appendBoundedWarnings(nil, warnings...)
+	if len(got) != 64 || got[63] != "warning-limit" || got[0] != "warning-000" || got[62] != "warning-062" {
+		t.Fatalf("warnings = %#v", got)
+	}
+	for repeat := 0; repeat < 20; repeat++ {
+		if !reflect.DeepEqual(got, appendBoundedWarnings(nil, warnings...)) {
+			t.Fatal("warning retention changed")
+		}
+	}
+	chunks := appendBoundedWarnings(nil, warnings[:17]...)
+	chunks = appendBoundedWarnings(chunks, warnings[17:43]...)
+	chunks = appendBoundedWarnings(chunks, warnings[43:]...)
+	if !reflect.DeepEqual(got, chunks) {
+		t.Fatalf("batch merge = %#v, want %#v", chunks, got)
+	}
+	reversed := append([]string(nil), warnings...)
+	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
+		reversed[left], reversed[right] = reversed[right], reversed[left]
+	}
+	if !reflect.DeepEqual(got, appendBoundedWarnings(nil, reversed...)) {
+		t.Fatal("reverse permutation changed retention")
+	}
+}
 
 const engineSHA = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 

@@ -5,11 +5,13 @@ import (
 	endian "encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"path"
 	"regexp"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/policy"
 )
 
@@ -121,7 +123,7 @@ func policyIdentities(limits policy.Limits) (string, string) {
 		}
 	}
 	inclusion = append(inclusion, string(limitBytes))
-	exclusion := []string{"taf-level1-exclusion-v1", string(limitBytes), ExcludedGit, ExcludedGenerated, ExcludedVendored, ExcludedIgnored, ExcludedBinary, ExcludedOversized, ExcludedUnsupported, ExcludedUnsafe, ExcludedLimit}
+	exclusion := []string{"taf-level1-exclusion-v1", string(limitBytes), boundary.PolicyDescriptor(), fmt.Sprintf("ignore=%d,%d,%d,%d,%d prefix=%d,%d git=%d,%d,%d,%d,%d,%d,%d,%d", maximumIgnoreRules, maximumIgnorePatternBytes, maximumIgnorePatternSize, maximumIgnoreRuleEvaluations, maximumIgnoreMatchWork, binaryPrefixBytes, ignorePrefixBytes, maximumGitIndexBytes, maximumGitIndexEntries, maximumGitIndexPathBytes, maximumGitIndexDecodedPathBytes, maximumGitIndexPathComponents, maximumGitIndexDecodedComponents, maximumGitIndexDerivedMetadataBytes, gitIndexDerivedBytesPerPath), ExcludedGit, ExcludedGenerated, ExcludedVendored, ExcludedIgnored, ExcludedBinary, ExcludedOversized, ExcludedUnsupported, ExcludedUnsafe, ExcludedLimit}
 	for _, rule := range excludedDirectoryPolicy {
 		exclusion = append(exclusion, rule.component, rule.reason)
 	}

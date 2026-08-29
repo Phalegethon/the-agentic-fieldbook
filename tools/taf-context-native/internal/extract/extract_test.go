@@ -14,6 +14,17 @@ import (
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
 )
 
+func TestReportIncompleteVocabularyFailsClosed(t *testing.T) {
+	if (Report{WarningCodes: []string{"go-unsupported-receiver"}}).Incomplete() {
+		t.Fatal("harmless warning marked incomplete")
+	}
+	for _, warning := range []string{"go-record-limit", "markdown-line-too-long", "unknown-new-warning"} {
+		if !(Report{WarningCodes: []string{warning}}).Incomplete() {
+			t.Fatalf("%s did not fail closed", warning)
+		}
+	}
+}
+
 func TestGoExtractorUsesASTRangesAndAliases(t *testing.T) {
 	file := stableFile("internal/api/service.go", `package api
 import (

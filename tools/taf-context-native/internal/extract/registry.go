@@ -45,6 +45,44 @@ type Report struct {
 	WarningCodes  []string
 }
 
+// Incomplete reports whether this extraction omitted potential records. Keep
+// this vocabulary exhaustive: adding a limiting/failure warning requires an
+// explicit decision here, so it cannot silently become complete evidence.
+func (report Report) Incomplete() bool {
+	if report.ParseFailures != 0 {
+		return true
+	}
+	for _, warning := range report.WarningCodes {
+		incomplete, known := extractorWarningCompleteness[warning]
+		if !known || incomplete {
+			return true
+		}
+	}
+	return false
+}
+
+// Every emitted warning must be listed here. Unknown vocabulary fails closed.
+var extractorWarningCompleteness = map[string]bool{
+	"go-record-limit": true, "go-parse-failure": true, "go-unsupported-receiver": false,
+	"markdown-invalid-utf8": true, "markdown-unterminated-fence": false, "markdown-heading-limit": true, "markdown-line-too-long": true, "markdown-record-limit": true,
+	"invalid-stable-file": true, "invalid-extractor-record": true, "extractor-panic": true, "warning-limit": true,
+	"tree-sitter-cancelled": true, "tree-sitter-capture-limit": true, "tree-sitter-depth-limit": true, "tree-sitter-import-limit": true, "tree-sitter-match-limit": true, "tree-sitter-invalid-range": true, "tree-sitter-record-limit": true,
+	"json-depth-limit": true, "json-collection-limit": true, "json-record-limit": true, "toml-record-limit": true, "toml-parse-failure": true,
+	"javascript-generated-name": false, "javascript-dynamic-lookup": false, "typescript-generated-name": false, "typescript-dynamic-lookup": false,
+	"python-generated-name": false, "python-dynamic-lookup": false, "rust-generated-name": false,
+	"json-parse-failure": true, "unsupported-language": true,
+	"python-parse-failure": true, "python-query-failure": true, "python-syntax-error": true,
+	"javascript-parse-failure": true, "javascript-query-failure": true, "javascript-syntax-error": true,
+	"typescript-parse-failure": true, "typescript-query-failure": true, "typescript-syntax-error": true,
+	"rust-parse-failure": true, "rust-query-failure": true, "rust-syntax-error": true,
+}
+
+// PolicyDescriptor binds registry/path validation ceilings that affect whether
+// a source reaches an extractor. Inputs are constants owned by this package.
+func PolicyDescriptor() string {
+	return fmt.Sprintf("extract-v1 path=%d components=%d warnings=%d", maximumStableRelativePathBytes, maximumStableRelativePathComponents, maximumExtractorWarnings)
+}
+
 type Registry struct {
 	byExtension map[string]Extractor
 }

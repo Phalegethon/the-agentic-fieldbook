@@ -39,6 +39,23 @@ func TestBuildContextCancelledBeforePreparationCreatesNoState(t *testing.T) {
 	}
 }
 
+func TestBuildContextSameGenerationCancellationDuringMaterializationReturnsError(t *testing.T) {
+	roots, _ := storeRoots(t)
+	first := mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := buildWithFilesystemObservedContext(ctx, boundaryFilesystem{}, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})}, buildHooks{materialized: cancel})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+	loaded, loadErr := Load(roots, first.IndexIdentity)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if loaded.IndexIdentity != first.IndexIdentity {
+		t.Fatalf("CURRENT changed: %s", loaded.IndexIdentity)
+	}
+}
+
 const (
 	testRecordA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	testRecordB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

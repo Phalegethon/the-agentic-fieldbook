@@ -134,10 +134,6 @@ func collectWithIgnoreLimits(roots boundary.Roots, mode Mode, limits policy.Limi
 				regularExclusions++
 			}
 			if prune {
-				if reason != ExcludedGit {
-					result.Partial, result.UnknownRemainder = true, true
-					addWarning(&result, "inventory-pruned-subtree")
-				}
 				return boundary.ErrSkipRepositoryDirectory
 			}
 			return nil

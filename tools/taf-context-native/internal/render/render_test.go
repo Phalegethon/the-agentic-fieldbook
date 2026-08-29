@@ -112,6 +112,23 @@ func TestFitReducesInitiallyOversizedJSONAndCharacterResults(t *testing.T) {
 	}
 }
 
+func TestFinalTransportRejectsOverTwelveThousandCharacters(t *testing.T) {
+	findings := make([]wire.Finding, 0, 64)
+	for index := 0; index < 64; index++ {
+		findings = append(findings, renderFinding(index+1, string(rune('a'+index)), strings.Repeat("é", 256)))
+	}
+	result := renderResult(findings)
+	result.ReturnedCount = len(findings)
+	result.OutputCharacters = wire.OutputCharacters(result)
+	if result.OutputCharacters < 19834 {
+		t.Fatalf("fixture too small: %d", result.OutputCharacters)
+	}
+	var encoded strings.Builder
+	if err := wire.EncodeResult(&encoded, result); !errors.Is(err, wire.ErrInvalidWire) {
+		t.Fatalf("EncodeResult error = %v", err)
+	}
+}
+
 func renderRequest(budget, maximumResults int) wire.Request {
 	return wire.Request{MaximumModelOutputCharacters: budget, MaximumResults: maximumResults}
 }

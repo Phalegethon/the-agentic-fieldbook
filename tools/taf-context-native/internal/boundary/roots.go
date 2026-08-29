@@ -34,6 +34,12 @@ var (
 
 const maximumGitMetadataBytes = 4096
 
+// RootPolicyDescriptor binds retained-root Git discovery/read ceilings. It is
+// separate from capability APIs and exposes no filesystem path or handle.
+func RootPolicyDescriptor() string {
+	return fmt.Sprintf("roots-v1 git-metadata=%d", maximumGitMetadataBytes)
+}
+
 // Roots owns the directory handles captured during validation. It must be
 // closed once the request finishes; copies share those handles.
 type Roots struct {

@@ -136,7 +136,17 @@ func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFil
 		if err := verifyGenerationArtifacts(filesystem, generations, artifacts); err != nil {
 			return Snapshot{}, err
 		}
-		return materializeArtifacts(artifacts, hooks)
+		if err := ctx.Err(); err != nil {
+			return Snapshot{}, err
+		}
+		selected, materializeErr := materializeArtifacts(artifacts, hooks)
+		if materializeErr != nil {
+			return Snapshot{}, materializeErr
+		}
+		if err := ctx.Err(); err != nil {
+			return Snapshot{}, err
+		}
+		return selected, nil
 	}
 	if previousExists {
 		if err := validateGenerationMetadata(filesystem, generations, previousToken); err != nil {

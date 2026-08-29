@@ -98,6 +98,12 @@ const (
 	repositoryVerificationWorkFactor = 2
 )
 
+// PolicyDescriptor exposes only immutable walk ceilings/tokens for consumers
+// binding inventory policy; it never exposes root capabilities.
+func PolicyDescriptor() string {
+	return fmt.Sprintf("%s walk-v3 depth=%d batch=%d snapshot=%d path=%d emitted=%d overhead=%d verify=%d", RootPolicyDescriptor(), maximumRepositoryDepth, maximumDirectoryBatch, maximumRepositorySnapshotBytes, maximumRepositoryPathBytes, maximumRepositoryEmittedPathBytes, repositorySnapshotEntryOverheadBytes, repositoryVerificationWorkFactor)
+}
+
 type repositoryObservationBudget struct {
 	remaining int
 }

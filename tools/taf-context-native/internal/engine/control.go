@@ -40,6 +40,9 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 		return wire.Result{}, err
 	}
 	coverage := cloneCoverage(inventoryResult.Coverage)
+	if inventoryResult.Partial {
+		coverage.ExclusionReasonCounts["incomplete-inventory"]++
+	}
 	warnings := append([]string(nil), inventoryResult.Warnings...)
 	records := make([]model.Record, 0)
 	aggregateBytes := 0
@@ -64,6 +67,10 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 			return engine.result(request, wire.Error, "unknown", nil, coverage, "rebuild-index"), nil
 		}
 		coverage.ParseFailureCount += report.ParseFailures
+		if report.Incomplete() && report.ParseFailures == 0 {
+			coverage.ParseFailureCount++
+			coverage.ExclusionReasonCounts["incomplete-extraction"]++
+		}
 		warnings = appendBoundedWarnings(warnings, report.WarningCodes...)
 		for _, record := range fileRecords {
 			cost := recordFootprint(record)
@@ -76,6 +83,10 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 			aggregateBytes += cost
 		}
 		records = append(records, fileRecords...)
+	}
+	if hasBoundedWarning(warnings, "warning-limit") {
+		coverage.ExclusionReasonCounts["warning-limit"]++
+		coverage.ParseFailureCount++
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Identity < records[j].Identity })
 	for index := 1; index < len(records); index++ {
@@ -92,10 +103,13 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 	}
 	snapshot, buildErr := engine.dependencies.Build(ctx, roots, manifest, records)
 	if buildErr != nil {
+		if errors.Is(buildErr, context.Canceled) || errors.Is(buildErr, context.DeadlineExceeded) {
+			return wire.Result{}, buildErr
+		}
 		return engine.result(request, wire.Error, "unknown", nil, coverage, "rebuild-index"), nil
 	}
 	status, freshness, action := wire.Ready, "exact", "use-index"
-	if !completeCoverage(coverage, inventoryResult.Partial) {
+	if !completeCoverage(coverage, false) {
 		status, freshness, action = wire.Partial, "partial", "rebuild-index"
 	}
 	result := engine.result(request, status, freshness, ptr(snapshot.IndexIdentity), coverage, action)
@@ -185,7 +199,15 @@ func semanticBinding(records []model.Record) string {
 }
 
 func completeCoverage(coverage model.Coverage, inventoryPartial bool) bool {
-	return !inventoryPartial && coverage.IndexedPathCount > 0 && coverage.ParseFailureCount == 0 && coverage.PathCoverage == 1 && coverage.LanguageCoverage == 1
+	if inventoryPartial || coverage.IndexedPathCount == 0 || coverage.ParseFailureCount != 0 {
+		return false
+	}
+	for _, marker := range []string{"incomplete-inventory", "incomplete-extraction", "engine-aggregate-limit", "warning-limit"} {
+		if coverage.ExclusionReasonCounts[marker] != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func recordFootprint(record model.Record) int {
@@ -200,25 +222,43 @@ func recordFootprint(record model.Record) int {
 
 func appendBoundedWarnings(current []string, added ...string) []string {
 	seen := make(map[string]struct{}, len(current)+len(added))
-	for _, warning := range current {
-		seen[warning] = struct{}{}
-	}
-	for _, warning := range added {
-		if len(seen) < 64 {
-			seen[warning] = struct{}{}
+	overflow := false
+	for _, warning := range append(append([]string(nil), current...), added...) {
+		if warning == "warning-limit" {
+			overflow = true
+			continue
 		}
+		seen[warning] = struct{}{}
 	}
 	output := make([]string, 0, len(seen))
 	for warning := range seen {
 		output = append(output, warning)
 	}
 	sort.Strings(output)
+	if len(output) > 63 {
+		overflow = true
+		output = output[:63]
+	}
+	if !overflow {
+		return output
+	}
+	output = append(output, "warning-limit")
+	sort.Strings(output)
 	return output
+}
+
+func hasBoundedWarning(warnings []string, want string) bool {
+	for _, warning := range warnings {
+		if warning == want {
+			return true
+		}
+	}
+	return false
 }
 
 func currentInclusionPolicyIdentity() string {
 	inclusion, _ := inventory.PolicyIdentities()
-	return inclusion
+	return hashParts([]string{"taf-level1-inclusion-composite-v1", inclusion, extract.PolicyDescriptor()})
 }
 func currentExclusionPolicyIdentity() string {
 	_, exclusion := inventory.PolicyIdentities()

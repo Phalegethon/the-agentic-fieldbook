@@ -9,9 +9,12 @@ import (
 )
 
 func EncodeResult(writer io.Writer, result Result) error {
-	encoded, err := MarshalResult(result)
-	if err != nil {
+	if err := validateResult(result); err != nil {
 		return err
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidWire, err)
 	}
 	if len(encoded)+1 > policy.ProductionLimits().MaximumStdoutBytes {
 		return ErrInvalidWire
@@ -20,18 +23,17 @@ func EncodeResult(writer io.Writer, result Result) error {
 	return err
 }
 
-// MarshalResult validates every structural invariant and returns canonical JSON
-// without applying output budgets. It is intentionally for bounded renderers;
-// final transport must still use EncodeResult.
-func MarshalResult(result Result) ([]byte, error) {
+// MeasureResult validates all non-budget invariants and returns only the two
+// measurements a bounded renderer needs; it never exposes transport bytes.
+func MeasureResult(result Result) (int, int, error) {
 	if err := validateResultWithoutBudgets(result); err != nil {
-		return nil, err
+		return 0, 0, err
 	}
 	encoded, err := json.Marshal(result)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidWire, err)
+		return 0, 0, fmt.Errorf("%w: %v", ErrInvalidWire, err)
 	}
-	return encoded, nil
+	return len(encoded) + 1, renderedOutputCharacters(result), nil
 }
 
 // OutputCharacters returns the frozen model-visible character calculation.
