@@ -122,9 +122,9 @@ func TestStatusAndMetricsRefuseMismatchedWorktreeAndAbsentState(t *testing.T) {
 	}
 }
 
-func TestUpdateRemainsBoundedUnsupportedResult(t *testing.T) {
-	// This catches an unimplemented lifecycle operation that starts fallback
-	// work instead of returning the frozen representable unsupported response.
+func TestUpdateWithoutChangeDocumentReturnsBoundedStaleResult(t *testing.T) {
+	// A missing control document must be stale/rebuild rather than a fallback
+	// build or an unsupported response now that update is implemented.
 	repository, state := controlRoots(t)
 	engine := New(ProductionDependencies())
 	envelope := controlEnvelope(wire.Update, repository, state, testPtr(engineSHA))
@@ -132,8 +132,8 @@ func TestUpdateRemainsBoundedUnsupportedResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != wire.Unsupported || result.Freshness != "unknown" || result.NextSafeAction != "rebuild-index" || len(result.Findings) != 0 {
-		t.Fatalf("unsupported = %#v", result)
+	if result.Status != wire.Stale || result.Freshness != "structurally-stale" || result.NextSafeAction != "rebuild-index" || len(result.Findings) != 0 {
+		t.Fatalf("missing document = %#v", result)
 	}
 }
 

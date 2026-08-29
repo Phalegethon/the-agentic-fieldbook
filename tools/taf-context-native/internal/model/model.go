@@ -53,6 +53,34 @@ type Binding struct {
 	DirtyOverlayFingerprint string
 }
 
+// SourceCatalog is the canonical, compact source-classification witness kept
+// with an immutable generation. It lets update mutate only declared paths
+// while retaining build-equivalent coverage and source binding.
+type SourcePath struct {
+	RelativePath string
+	Language     string
+	Size         int64
+	SHA256       string
+}
+
+type SourceExclusion struct {
+	RelativePath string
+	Reason       string
+}
+
+type SourceWarning struct {
+	RelativePath string
+	Codes        []string
+}
+
+type SourceCatalog struct {
+	Paths              []SourcePath
+	Exclusions         []SourceExclusion
+	ExtractionWarnings []SourceWarning
+	Partial            bool
+	Warnings           []string
+}
+
 type Manifest struct {
 	FormatVersion           string
 	EngineVersion           string
@@ -68,6 +96,9 @@ type Manifest struct {
 	IndexIdentity           string
 	GenerationIdentity      string
 	SemanticDigest          string
+	// SourceCatalog is serialized inside the authenticated index payload, not
+	// the bounded public manifest JSON.
+	SourceCatalog SourceCatalog
 }
 
 type WorkCounters struct {

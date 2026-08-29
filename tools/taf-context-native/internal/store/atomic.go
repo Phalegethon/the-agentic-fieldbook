@@ -1,11 +1,13 @@
 package store
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
 )
@@ -61,6 +63,7 @@ type storeFilesystem interface {
 	syncDirectory(*boundary.StateDirectory, faultPoint) error
 	renameNew(*boundary.StateDirectory, string, string, faultPoint) error
 	replaceFile(*boundary.StateDirectory, string, string, faultPoint) error
+	replaceFileAfterBarrier(*boundary.StateDirectory, string, string, faultPoint, func() error) error
 	names(*boundary.StateDirectory, int) ([]string, error)
 	removeFile(*boundary.StateDirectory, string) error
 	removeEmptyDirectory(*boundary.StateDirectory, string) error
@@ -68,9 +71,20 @@ type storeFilesystem interface {
 
 type boundaryFilesystem struct{ faults Faults }
 
+// currentPublicationLock makes the repository-witness callback and CURRENT
+// replacement one indivisible publication decision. The lock is intentionally
+// process-wide: StateDirectory is an opaque retained capability, so using its
+// pathname as a lock key would reintroduce ambient path authority.
+var currentPublicationLock sync.Mutex
+
 var _ storeFilesystem = boundaryFilesystem{}
 
 type injectedFilesystemFault struct{ cause error }
+
+type publicationBarrierError struct{ cause error }
+
+func (failure publicationBarrierError) Error() string { return failure.cause.Error() }
+func (failure publicationBarrierError) Unwrap() error { return failure.cause }
 
 func (fault injectedFilesystemFault) Error() string { return fault.cause.Error() }
 func (fault injectedFilesystemFault) Unwrap() error { return fault.cause }
@@ -173,6 +187,18 @@ func (filesystem boundaryFilesystem) replaceFile(directory *boundary.StateDirect
 	return directory.ReplaceFile(source, destination)
 }
 
+func (filesystem boundaryFilesystem) replaceFileAfterBarrier(directory *boundary.StateDirectory, source, destination string, point faultPoint, barrier func() error) error {
+	if err := filesystem.before(point); err != nil {
+		return err
+	}
+	if barrier != nil {
+		if err := barrier(); err != nil {
+			return publicationBarrierError{cause: err}
+		}
+	}
+	return directory.ReplaceFile(source, destination)
+}
+
 func (filesystem boundaryFilesystem) names(directory *boundary.StateDirectory, maximum int) ([]string, error) {
 	return directory.Names(maximum)
 }
@@ -250,31 +276,68 @@ func cleanupFile(filesystem storeFilesystem, directory *boundary.StateDirectory,
 	_ = filesystem.removeFile(directory, name)
 }
 
-func publishCurrent(filesystem storeFilesystem, state *boundary.StateDirectory, generationToken string, previous []byte) error {
+func publishCurrent(filesystem storeFilesystem, state *boundary.StateDirectory, generationToken string, barrier func() error) ([]byte, func(), error) {
 	contents := []byte(generationToken + "\n")
 	temporary, err := randomEntryName(".CURRENT-")
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	defer cleanupFile(filesystem, state, temporary)
 	if err := filesystem.writeSyncedFile(state, temporary, contents, faultBeforeCurrentSync); err != nil {
-		return err
+		return nil, nil, err
 	}
 	if err := filesystem.verifyFile(state, temporary, contents, int64(len(contents)), faultBeforeCurrentReopen); err != nil {
-		return err
+		return nil, nil, err
 	}
-	if err := filesystem.replaceFile(state, temporary, currentFilename, faultBeforeCurrentRename); err != nil {
+	currentPublicationLock.Lock()
+	unlock := currentPublicationLock.Unlock
+	_, previous, _, err := readCurrentPointer(filesystem, state)
+	if err != nil {
+		unlock()
+		return nil, nil, err
+	}
+	if err := filesystem.replaceFileAfterBarrier(state, temporary, currentFilename, faultBeforeCurrentRename, barrier); err != nil {
 		if isInjectedFilesystemFault(err) {
-			return err
+			unlock()
+			return nil, nil, err
 		}
-		return rollbackCurrentWithFilesystem(filesystem, state, previous, fmt.Errorf("%w: %v", ErrStoreCorrupt, err))
+		var barrierFailure publicationBarrierError
+		if errors.As(err, &barrierFailure) {
+			unlock()
+			return nil, nil, barrierFailure
+		}
+		rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, previous, fmt.Errorf("%w: %v", ErrStoreCorrupt, err))
+		unlock()
+		return nil, nil, rollbackErr
 	}
 	if err := filesystem.syncDirectory(state, faultBeforeStateSync); err != nil {
 		original := error(err)
 		if !isInjectedFilesystemFault(err) {
 			original = fmt.Errorf("%w: %v", ErrStoreCorrupt, err)
 		}
-		return rollbackCurrentWithFilesystem(filesystem, state, previous, original)
+		rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, previous, original)
+		unlock()
+		return nil, nil, rollbackErr
+	}
+	return previous, unlock, nil
+}
+
+// validateSelectedCurrent serializes same-generation reuse with every CURRENT
+// replacement. The caller has already verified and materialized the immutable
+// generation; after the locked CURRENT check, barrier is the final fallible
+// validation before that exact snapshot is exposed.
+func validateSelectedCurrent(filesystem storeFilesystem, state *boundary.StateDirectory, generationToken string, barrier func() error) error {
+	currentPublicationLock.Lock()
+	defer currentPublicationLock.Unlock()
+	selectedToken, current, exists, err := readCurrentPointer(filesystem, state)
+	if err != nil {
+		return err
+	}
+	if !exists || selectedToken != generationToken || !bytes.Equal(current, []byte(generationToken+"\n")) {
+		return ErrIndexMismatch
+	}
+	if barrier != nil {
+		return barrier()
 	}
 	return nil
 }

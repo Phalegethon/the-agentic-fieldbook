@@ -19,6 +19,18 @@ type StableFile struct {
 	Bytes        []byte
 	SHA256       string
 	Size         int64
+	Identity     FileIdentity
+}
+
+// FileIdentity carries the real filesystem identity and stable snapshot facts
+// observed through a retained capability. Its representation stays opaque so
+// callers cannot substitute a pathname-derived approximation.
+type FileIdentity struct{ info os.FileInfo }
+
+func (identity FileIdentity) Valid() bool { return identity.info != nil }
+
+func (identity FileIdentity) Same(other FileIdentity) bool {
+	return identity.Valid() && other.Valid() && sameSnapshot(identity.info, other.info)
 }
 
 // repositoryOpenHook provides a deterministic adversarial stat/open seam for
@@ -48,14 +60,14 @@ func (r *Roots) OpenRepositoryFile(relative string, maximum int64) (StableFile, 
 	}
 	name := components[len(components)-1]
 	before, err := current.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return StableFile{}, ErrRepositoryPathNotFound
+	}
 	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
 		return StableFile{}, ErrUnsafePath
 	}
 	if r.gitMetadataInfo != nil && sameIdentity(before, r.gitMetadataInfo) {
 		return StableFile{}, ErrUnsafePath
-	}
-	if before.Size() > maximum {
-		return StableFile{}, ErrFileTooLarge
 	}
 	if repositoryOpenHook != nil {
 		repositoryOpenHook()
@@ -73,19 +85,52 @@ func (r *Roots) OpenRepositoryFile(relative string, maximum int64) (StableFile, 
 	if repositoryBeforeReadHook != nil {
 		repositoryBeforeReadHook()
 	}
-	contents, err := readAtMost(file, maximum, func(count int) {
+	contents, readErr := readAtMost(file, maximum, func(count int) {
 		r.observeIO(IOObservation{FullBodyBytes: uint64(count)})
 	})
-	if err != nil {
-		return StableFile{}, err
+	if readErr != nil && !errors.Is(readErr, ErrFileTooLarge) {
+		return StableFile{}, readErr
 	}
 	after, err := file.Stat()
 	pathAfter, pathErr := current.Lstat(name)
 	if err != nil || pathErr != nil || pathAfter.Mode()&os.ModeSymlink != 0 || !pathAfter.Mode().IsRegular() || !sameSnapshot(before, after) || !sameSnapshot(before, pathAfter) {
+		if errors.Is(readErr, ErrFileTooLarge) {
+			return StableFile{}, ErrFileTooLarge
+		}
 		return StableFile{}, ErrUnstableFile
 	}
 	digest := sha256.Sum256(contents)
-	return StableFile{RelativePath: relative, Bytes: contents, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(contents))}, nil
+	witness := StableFile{RelativePath: relative, Bytes: contents, SHA256: hex.EncodeToString(digest[:]), Size: before.Size(), Identity: FileIdentity{info: before}}
+	if errors.Is(readErr, ErrFileTooLarge) {
+		return witness, ErrFileTooLarge
+	}
+	return witness, nil
+}
+
+// RepositoryDirectoryIdentity witnesses a declared directory without opening
+// any source body. It is used to retain compact ancestor exclusions safely.
+func (r *Roots) RepositoryDirectoryIdentity(relative string) (FileIdentity, error) {
+	components, err := safeComponents(relative, true)
+	if err != nil || r.repositoryRoot == nil || protectedRepositoryPath(r, relative) {
+		return FileIdentity{}, ErrUnsafePath
+	}
+	current, closers, err := descend(r.repositoryRoot, components)
+	if err != nil {
+		return FileIdentity{}, err
+	}
+	defer closeRoots(closers)
+	if r.entersGitDirectory(append(closers, current)) {
+		return FileIdentity{}, ErrUnsafePath
+	}
+	first, err := current.Stat(".")
+	if err != nil || !first.IsDir() {
+		return FileIdentity{}, ErrUnsafePath
+	}
+	second, err := current.Stat(".")
+	if err != nil || !sameSnapshot(first, second) {
+		return FileIdentity{}, ErrUnstableFile
+	}
+	return FileIdentity{info: first}, nil
 }
 
 // OpenGitMetadataFile reads a regular Git-control file through the retained
@@ -188,14 +233,22 @@ func safeComponents(relative string, rejectGit bool) ([]string, error) {
 }
 
 func descend(root *os.Root, components []string) (*os.Root, []*os.Root, error) {
-	return descendChecked(root, components, nil)
+	return descendWithMissing(root, components, nil, ErrRepositoryPathNotFound)
 }
 
 func descendChecked(root *os.Root, components []string, validate func(os.FileInfo) error) (*os.Root, []*os.Root, error) {
+	return descendWithMissing(root, components, validate, ErrUnsafePath)
+}
+
+func descendWithMissing(root *os.Root, components []string, validate func(os.FileInfo) error, missing error) (*os.Root, []*os.Root, error) {
 	current := root
 	var closers []*os.Root
 	for _, component := range components {
 		info, err := current.Lstat(component)
+		if errors.Is(err, os.ErrNotExist) {
+			closeRoots(closers)
+			return nil, nil, missing
+		}
 		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			closeRoots(closers)
 			return nil, nil, ErrUnsafePath
@@ -272,7 +325,7 @@ func readAtMost(file *os.File, maximum int64, observe func(int)) ([]byte, error)
 				if observe != nil {
 					observe(n)
 				}
-				return nil, ErrFileTooLarge
+				return append(contents, extra[:n]...), ErrFileTooLarge
 			}
 			if err == io.EOF {
 				return contents, nil

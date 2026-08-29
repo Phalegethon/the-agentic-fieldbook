@@ -105,6 +105,13 @@ func BuildContext(ctx context.Context, roots *boundary.Roots, manifest model.Man
 	return buildWithFilesystemObservedContext(ctx, boundaryFilesystem{}, roots, manifest, records, buildHooks{})
 }
 
+// BuildContextWithBarrier invokes barrier after every fallible generation
+// preparation step and immediately before CURRENT selection. It is used by
+// incremental update to make repository witnesses a publication invariant.
+func BuildContextWithBarrier(ctx context.Context, roots *boundary.Roots, manifest model.Manifest, records []model.Record, barrier func() error) (Snapshot, error) {
+	return buildWithFilesystemObservedContextBarrier(ctx, boundaryFilesystem{}, roots, manifest, records, buildHooks{}, barrier)
+}
+
 // BuildWithFaults is the deterministic durability-test entry point.
 func BuildWithFaults(roots *boundary.Roots, manifest model.Manifest, records []model.Record, faults Faults) (Snapshot, error) {
 	return buildWithFilesystem(boundaryFilesystem{faults: faults}, roots, manifest, records)
@@ -119,6 +126,10 @@ func buildWithFilesystemObserved(filesystem storeFilesystem, roots *boundary.Roo
 }
 
 func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFilesystem, roots *boundary.Roots, manifest model.Manifest, records []model.Record, hooks buildHooks) (Snapshot, error) {
+	return buildWithFilesystemObservedContextBarrier(ctx, filesystem, roots, manifest, records, hooks, nil)
+}
+
+func buildWithFilesystemObservedContextBarrier(ctx context.Context, filesystem storeFilesystem, roots *boundary.Roots, manifest model.Manifest, records []model.Record, hooks buildHooks, barrier func() error) (Snapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
@@ -142,7 +153,7 @@ func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFil
 		return Snapshot{}, corrupt(err)
 	}
 	defer filesystem.closeDirectory(state)
-	previousToken, previousCurrent, previousExists, err := readCurrentPointer(filesystem, state)
+	previousToken, _, previousExists, err := readCurrentPointer(filesystem, state)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -171,6 +182,19 @@ func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFil
 			return Snapshot{}, materializeErr
 		}
 		if err := ctx.Err(); err != nil {
+			return Snapshot{}, err
+		}
+		if err := validateSelectedCurrent(filesystem, state, artifacts.token, func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if barrier != nil {
+				if err := barrier(); err != nil {
+					return err
+				}
+			}
+			return ctx.Err()
+		}); err != nil {
 			return Snapshot{}, err
 		}
 		return selected, nil
@@ -245,20 +269,22 @@ func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFil
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
-	if err := publishCurrent(filesystem, state, artifacts.token, previousCurrent); err != nil {
+	publicationPrevious, unlockPublication, err := publishCurrent(filesystem, state, artifacts.token, barrier)
+	if err != nil {
 		return Snapshot{}, err
 	}
+	defer unlockPublication()
 	selectedToken, currentBytes, exists, err := readCurrentPointer(filesystem, state)
 	if err != nil || !exists || selectedToken != artifacts.token || !bytes.Equal(currentBytes, []byte(artifacts.token+"\n")) {
 		original := corrupt(err)
-		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, previousCurrent, original); rollbackErr != nil {
+		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, publicationPrevious, original); rollbackErr != nil {
 			return Snapshot{}, rollbackErr
 		}
 		return Snapshot{}, original
 	}
 	if err := verifyGenerationArtifacts(filesystem, generations, artifacts); err != nil {
 		original := corrupt(err)
-		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, previousCurrent, original); rollbackErr != nil {
+		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, publicationPrevious, original); rollbackErr != nil {
 			return Snapshot{}, rollbackErr
 		}
 		return Snapshot{}, original
@@ -266,13 +292,13 @@ func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFil
 	selected, err := materializeArtifacts(ctx, artifacts, hooks)
 	if err != nil {
 		original := corrupt(err)
-		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, previousCurrent, original); rollbackErr != nil {
+		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, publicationPrevious, original); rollbackErr != nil {
 			return Snapshot{}, rollbackErr
 		}
 		return Snapshot{}, original
 	}
 	if err := ctx.Err(); err != nil {
-		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, previousCurrent, err); rollbackErr != nil {
+		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, publicationPrevious, err); rollbackErr != nil {
 			return Snapshot{}, rollbackErr
 		}
 		return Snapshot{}, err
@@ -411,8 +437,13 @@ func prepareGenerationContext(ctx context.Context, input model.Manifest, inputRe
 	if input.FormatVersion != "2" || !manifestVariableBounds(input) {
 		return generationArtifacts{}, ErrInvalidManifest
 	}
+	normalizedCatalog, _, catalogErr := preflightSourceCatalog(input.SourceCatalog)
+	if catalogErr != nil {
+		return generationArtifacts{}, catalogErr
+	}
+	input.SourceCatalog = normalizedCatalog
 	postingCount := 0
-	payload, err := encodeIndexObservedStatsContext(ctx, inputRecords, nil, &postingCount, observed)
+	payload, err := encodeIndexCatalogObservedStatsContext(ctx, inputRecords, input.SourceCatalog, nil, &postingCount, observed)
 	if err != nil {
 		return generationArtifacts{}, err
 	}
@@ -715,7 +746,7 @@ func loadGenerationContextObserved(ctx context.Context, filesystem storeFilesyst
 	if err != nil || sha256ID(payload) != manifest.PayloadDigest || manifest.IndexIdentity != manifest.PayloadDigest {
 		return Snapshot{}, fmt.Errorf("read index payload: %w", corrupt(err))
 	}
-	records, postings, queryIndex, err := decodeIndexContextWithQueryObserved(ctx, payload, observed)
+	records, postings, queryIndex, err := decodeIndexContextWithCatalogObserved(ctx, payload, observed, &manifest.SourceCatalog)
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return Snapshot{}, err
 	}
@@ -737,6 +768,13 @@ func loadGenerationContextObserved(ctx context.Context, filesystem storeFilesyst
 func cloneManifest(manifest model.Manifest) model.Manifest {
 	manifest.ParserIdentities = cloneStringMap(manifest.ParserIdentities)
 	manifest.Coverage.ExclusionReasonCounts = cloneIntMap(manifest.Coverage.ExclusionReasonCounts)
+	manifest.SourceCatalog.Paths = append([]model.SourcePath{}, manifest.SourceCatalog.Paths...)
+	manifest.SourceCatalog.Exclusions = append([]model.SourceExclusion{}, manifest.SourceCatalog.Exclusions...)
+	manifest.SourceCatalog.ExtractionWarnings = append([]model.SourceWarning{}, manifest.SourceCatalog.ExtractionWarnings...)
+	for index := range manifest.SourceCatalog.ExtractionWarnings {
+		manifest.SourceCatalog.ExtractionWarnings[index].Codes = append([]string{}, manifest.SourceCatalog.ExtractionWarnings[index].Codes...)
+	}
+	manifest.SourceCatalog.Warnings = append([]string{}, manifest.SourceCatalog.Warnings...)
 	return manifest
 }
 

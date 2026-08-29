@@ -1069,12 +1069,20 @@ func TestOpenRepositoryFileRejectsOversizedFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(roots.Repository, "large.go"), []byte("012345"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	before := roots.IOObservation()
 	file, err := roots.OpenRepositoryFile("large.go", 5)
 	if !errors.Is(err, ErrFileTooLarge) {
 		t.Fatalf("error = %v, want ErrFileTooLarge", err)
 	}
-	if file.Bytes != nil {
-		t.Fatalf("oversized read returned bytes: %q", file.Bytes)
+	if string(file.Bytes) != "012345" || file.Size != 6 || file.SHA256 == "" || !file.Identity.Valid() {
+		t.Fatalf("oversized witness = %#v", file)
+	}
+	after := roots.IOObservation()
+	if opens := after.FullBodyOpens - before.FullBodyOpens; opens != 1 {
+		t.Fatalf("oversized opens = %d, want 1", opens)
+	}
+	if bytes := after.FullBodyBytes - before.FullBodyBytes; bytes != 6 {
+		t.Fatalf("oversized bytes = %d, want maximum+1", bytes)
 	}
 }
 

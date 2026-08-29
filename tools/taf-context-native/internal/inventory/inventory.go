@@ -298,6 +298,10 @@ func binary(contents []byte, truncated bool) bool {
 	return true
 }
 
+// IsBinary is the shared source-content classification used by localized
+// updates after the boundary has supplied one declared stable file.
+func IsBinary(contents []byte) bool { return binary(contents, false) }
+
 func addExclusion(result *Result, relative, reason string) {
 	result.Exclusions = append(result.Exclusions, Exclusion{RelativePath: relative, Reason: reason})
 	result.Coverage.ExclusionReasonCounts[reason]++

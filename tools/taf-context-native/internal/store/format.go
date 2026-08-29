@@ -16,6 +16,7 @@ import (
 	"math"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -25,31 +26,38 @@ import (
 )
 
 var (
-	ErrInvalidIndex    = errors.New("invalid level1 index")
-	ErrInvalidManifest = errors.New("invalid level1 manifest")
-	indexMagic         = []byte("TAFL1IDX")
-	canonicalName      = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+	ErrInvalidIndex             = errors.New("invalid level1 index")
+	ErrInvalidManifest          = errors.New("invalid level1 manifest")
+	errSourceCatalogRawTooLarge = fmt.Errorf("%w: raw source catalog exceeds 8 MiB", ErrInvalidIndex)
+	indexMagic                  = []byte("TAFL1IDX")
+	canonicalName               = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 )
 
 const (
-	indexFormatVersion                   uint16 = 2
-	maximumDecompressedIndexBytes               = 96 << 20
-	maximumEncodedIndexBytes                    = 64 << 20
-	maximumManifestBytes                        = 256 << 10
-	maximumIndexStringBytes                     = 4096
-	maximumIndexRecords                         = 1_000_000
-	maximumPostingTerms                         = 1_000_000
-	maximumPostingOrdinals                      = 8_000_000
-	maximumTermsPerRecord                       = 64
-	maximumIndexPeakBytes                       = 512 << 20
-	conservativeZlibWorkspaceBytes              = 4 << 20
-	conservativeRecordMemoryBytes               = 512
-	conservativeCallerTermMemoryBytes           = 16
-	conservativeStringAllocationOverhead        = 16
-	conservativePostingGroupMemoryBytes         = 160
-	contextCheckInterval                        = 1024
-	validationByteCheckInterval                 = 256
-	exactDecompressionSizingThreshold           = 1 << 20
+	indexFormatVersion            uint16 = 3
+	maximumDecompressedIndexBytes        = 96 << 20
+	maximumEncodedIndexBytes             = 64 << 20
+	maximumManifestBytes                 = 256 << 10
+	maximumIndexStringBytes              = 4096
+	maximumIndexRecords                  = 1_000_000
+	maximumPostingTerms                  = 1_000_000
+	maximumPostingOrdinals               = 8_000_000
+	maximumTermsPerRecord                = 64
+	maximumIndexPeakBytes                = 512 << 20
+	// Source catalogs are authenticated index input, not an unbounded sidecar.
+	// The inventory walker has the same total entry ceiling; keep the catalog
+	// considerably below the plain-index ceiling so its JSON and the complete
+	// index buffers can be live together within the frozen 512 MiB peak.
+	maximumSourceCatalogEntries          = 250_000
+	maximumSourceCatalogBytes            = 8 << 20
+	conservativeZlibWorkspaceBytes       = 4 << 20
+	conservativeRecordMemoryBytes        = 512
+	conservativeCallerTermMemoryBytes    = 16
+	conservativeStringAllocationOverhead = 16
+	conservativePostingGroupMemoryBytes  = 160
+	contextCheckInterval                 = 1024
+	validationByteCheckInterval          = 256
+	exactDecompressionSizingThreshold    = 1 << 20
 )
 
 func encodeIndex(input []model.Record) ([]byte, error) {
@@ -65,9 +73,24 @@ func encodeIndexObservedStats(input []model.Record, beforeCanonicalPostingSort f
 }
 
 func encodeIndexObservedStatsContext(ctx context.Context, input []model.Record, beforeCanonicalPostingSort func(), postingCount *int, observed func(buildPhase)) ([]byte, error) {
-	preflight, err := preflightEncodeIndexContext(ctx, input, observed)
+	return encodeIndexCatalogObservedStatsContext(ctx, input, model.SourceCatalog{}, beforeCanonicalPostingSort, postingCount, observed)
+}
+
+func encodeIndexCatalogObservedStatsContext(ctx context.Context, input []model.Record, catalog model.SourceCatalog, beforeCanonicalPostingSort func(), postingCount *int, observed func(buildPhase)) ([]byte, error) {
+	normalizedCatalog, catalogSize, err := preflightSourceCatalog(catalog)
 	if err != nil {
 		return nil, err
+	}
+	preflight, err := preflightEncodeIndexCatalogContext(ctx, input, catalogSize, sourceCatalogRetainedBytes(normalizedCatalog), observed)
+	if err != nil {
+		return nil, err
+	}
+	// The catalog's exact JSON length was bounded and calculated above before
+	// marshaling.  Marshal only after the index + catalog joint preflight has
+	// reserved its simultaneous-live-buffer budget.
+	catalogBytes, err := json.Marshal(normalizedCatalog)
+	if err != nil || len(catalogBytes) != catalogSize {
+		return nil, ErrInvalidIndex
 	}
 	recordOrder := make([]uint32, len(input))
 	for index := range recordOrder {
@@ -300,6 +323,8 @@ func encodeIndexObservedStatsContext(ctx context.Context, input []model.Record, 
 	} else {
 		writeUint32(&plain, 0)
 	}
+	writeUint32(&plain, uint32(len(catalogBytes)))
+	plain.Write(catalogBytes)
 	if plain.Len() > preflight.plainSize || plain.Len() > maximumDecompressedIndexBytes {
 		return nil, ErrInvalidIndex
 	}
@@ -451,17 +476,21 @@ func postingRangeCountContext(ctx context.Context, ordinals []uint32, observed f
 // preflightEncodeIndex rejects inputs that cannot fit the wire or conservative
 // process-memory budget before encodeIndex allocates its compact index arrays.
 func preflightEncodeIndex(input []model.Record) (encodeIndexPreflight, error) {
-	return preflightEncodeIndexContext(context.Background(), input, nil)
+	return preflightEncodeIndexCatalogContext(context.Background(), input, 0, 0, nil)
 }
 
 func preflightEncodeIndexContext(ctx context.Context, input []model.Record, observed func(buildPhase)) (encodeIndexPreflight, error) {
+	return preflightEncodeIndexCatalogContext(ctx, input, 0, 0, observed)
+}
+
+func preflightEncodeIndexCatalogContext(ctx context.Context, input []model.Record, catalogBytes int, catalogRetainedBytes int64, observed func(buildPhase)) (encodeIndexPreflight, error) {
 	if err := observeBuildContext(ctx, observed, buildPhasePreflight); err != nil {
 		return encodeIndexPreflight{}, err
 	}
-	if len(input) > maximumIndexRecords {
+	if len(input) > maximumIndexRecords || catalogBytes < 0 || catalogBytes > maximumSourceCatalogBytes {
 		return encodeIndexPreflight{}, ErrInvalidIndex
 	}
-	serialized := int64(len(indexMagic) + 2 + 4 + 4)
+	serialized := int64(len(indexMagic) + 2 + 4 + 4 + 4 + catalogBytes)
 	totalTerms := 0
 	preflightVisits := 0
 	for recordIndex, record := range input {
@@ -505,6 +534,8 @@ func preflightEncodeIndexContext(ctx context.Context, input []model.Record, obse
 	peak := int64(maximumDecompressedIndexBytes + 2*maximumEncodedIndexBytes + conservativeZlibWorkspaceBytes)
 	for _, amount := range []int64{
 		recordBytes,
+		int64(catalogBytes) * 2,
+		catalogRetainedBytes * 2,
 		int64(len(input)) * conservativeRecordMemoryBytes,
 		int64(totalTerms) * (conservativeCallerTermMemoryBytes + 4),
 	} {
@@ -704,6 +735,18 @@ func decodeIndexContext(ctx context.Context, encoded []byte) ([]model.Record, ma
 }
 
 func decodeIndexContextWithQueryObserved(ctx context.Context, encoded []byte, observed func()) ([]model.Record, map[string][]uint32, QueryIndex, error) {
+	return decodeIndexContextWithCatalogObserved(ctx, encoded, observed, nil)
+}
+
+func decodeIndexContextWithCatalogObserved(ctx context.Context, encoded []byte, observed func(), catalogOut *model.SourceCatalog) ([]model.Record, map[string][]uint32, QueryIndex, error) {
+	return decodeIndexContextWithCatalogLiveBytesObserved(ctx, encoded, 0, observed, catalogOut)
+}
+
+func decodeIndexContextWithCatalogLiveBytes(ctx context.Context, encoded []byte, additionalLiveBytes int64, catalogOut *model.SourceCatalog) ([]model.Record, map[string][]uint32, QueryIndex, error) {
+	return decodeIndexContextWithCatalogLiveBytesObserved(ctx, encoded, additionalLiveBytes, nil, catalogOut)
+}
+
+func decodeIndexContextWithCatalogLiveBytesObserved(ctx context.Context, encoded []byte, additionalLiveBytes int64, observed func(), catalogOut *model.SourceCatalog) ([]model.Record, map[string][]uint32, QueryIndex, error) {
 	invalid := func(err error) ([]model.Record, map[string][]uint32, QueryIndex, error) {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, nil, QueryIndex{}, err
@@ -714,8 +757,8 @@ func decodeIndexContextWithQueryObserved(ctx context.Context, encoded []byte, ob
 	if err != nil {
 		return invalid(err)
 	}
-	budget := decodeMemoryBudget{used: int64(cap(encoded) + cap(plain) + conservativeZlibWorkspaceBytes)}
-	if budget.used < 0 || budget.used > maximumIndexPeakBytes {
+	budget := decodeMemoryBudget{}
+	if budget.reserve(int64(cap(encoded))+int64(cap(plain))+conservativeZlibWorkspaceBytes) != nil || budget.reserve(additionalLiveBytes) != nil {
 		return invalid(ErrInvalidIndex)
 	}
 	decoder := binaryDecoder{value: plain, budget: &budget}
@@ -917,8 +960,23 @@ func decodeIndexContextWithQueryObserved(ctx context.Context, encoded []byte, ob
 		}
 	}
 	partial, err := decoder.readUint32()
-	if err != nil || partial > 1 || (partial == 1) != expectedPartial || decoder.remaining() != 0 {
+	if err != nil || partial > 1 || (partial == 1) != expectedPartial {
 		return invalid(err)
+	}
+	catalogSize, err := decoder.readCount(maximumSourceCatalogBytes)
+	if err != nil || !decoder.canContain(catalogSize, 1) {
+		return invalid(err)
+	}
+	catalogBytes, err := decoder.readBytes(catalogSize)
+	if err != nil {
+		return invalid(err)
+	}
+	catalog, err := decodeAliasedSourceCatalogBudgeted(catalogBytes, &budget)
+	if err != nil || decoder.remaining() != 0 {
+		return invalid(err)
+	}
+	if catalogOut != nil {
+		*catalogOut = catalog
 	}
 	if err := ctx.Err(); err != nil {
 		return invalid(err)
@@ -1089,6 +1147,10 @@ func validateIndex(encoded []byte) (int, int, error) {
 }
 
 func validateIndexContext(ctx context.Context, encoded []byte) (int, int, error) {
+	return validateIndexContextWithLiveBytes(ctx, encoded, 0)
+}
+
+func validateIndexContextWithLiveBytes(ctx context.Context, encoded []byte, additionalLiveBytes int64) (int, int, error) {
 	plain, err := decompressIndexContext(ctx, encoded)
 	if err != nil {
 		return 0, 0, err
@@ -1106,8 +1168,9 @@ func validateIndexContext(ctx context.Context, encoded []byte) (int, int, error)
 	if err != nil || !decoder.canContain(recordCount, minimumEncodedRecordBytes()) {
 		return 0, 0, ErrInvalidIndex
 	}
-	peak := int64(cap(encoded) + cap(plain) + conservativeZlibWorkspaceBytes)
-	if locations := int64(recordCount) * 72; peak < 0 || locations < 0 || peak > maximumIndexPeakBytes-locations {
+	budget := decodeMemoryBudget{}
+	if budget.reserve(int64(cap(encoded))+int64(cap(plain))+conservativeZlibWorkspaceBytes) != nil ||
+		budget.reserve(additionalLiveBytes) != nil || budget.reserve(int64(recordCount)*72) != nil {
 		return 0, 0, ErrInvalidIndex
 	}
 	records := make([]rawRecordMetadata, recordCount)
@@ -1296,7 +1359,7 @@ func validateIndexContext(ctx context.Context, encoded []byte) (int, int, error)
 		return 0, 0, ErrInvalidIndex
 	}
 	pathCount, err := decoder.readCount(recordCount)
-	if err != nil || pathCount != recordCount || !decoder.canContain(pathCount, 4) || peak > maximumIndexPeakBytes-int64(pathCount)*5 {
+	if err != nil || pathCount != recordCount || !decoder.canContain(pathCount, 4) || budget.reserve(int64(pathCount)*5) != nil {
 		return 0, 0, ErrInvalidIndex
 	}
 	seen := make([]byte, pathCount)
@@ -1315,6 +1378,10 @@ func validateIndexContext(ctx context.Context, encoded []byte) (int, int, error)
 		seen[ordinal] = 1
 		previousPathOrdinal = ordinal
 		pathOrdinals = append(pathOrdinals, ordinal)
+	}
+	maximumGroups := min(pathCount, policy.ProductionLimits().MaximumLexicalCandidates)
+	if budget.reserve(int64(maximumGroups)*32) != nil {
+		return 0, 0, ErrInvalidIndex
 	}
 	expectedGroups, expectedPartial, err := rawMapGroupsContext(ctx, plain, records, pathOrdinals, pathCount, policy.ProductionLimits().MaximumLexicalCandidates)
 	if err != nil {
@@ -1344,7 +1411,18 @@ func validateIndexContext(ctx context.Context, encoded []byte) (int, int, error)
 		}
 	}
 	partial, err := decoder.readUint32()
-	if err != nil || partial > 1 || (partial == 1) != expectedPartial || decoder.remaining() != 0 {
+	if err != nil || partial > 1 || (partial == 1) != expectedPartial {
+		return 0, 0, ErrInvalidIndex
+	}
+	catalogSize, err := decoder.readCount(maximumSourceCatalogBytes)
+	if err != nil || !decoder.canContain(catalogSize, 1) {
+		return 0, 0, ErrInvalidIndex
+	}
+	catalogBytes, err := decoder.readBytes(catalogSize)
+	if err != nil || decoder.remaining() != 0 {
+		return 0, 0, ErrInvalidIndex
+	}
+	if _, err := decodeAliasedSourceCatalogBudgeted(catalogBytes, &budget); err != nil {
 		return 0, 0, ErrInvalidIndex
 	}
 	if err := ctx.Err(); err != nil {
@@ -2055,6 +2133,642 @@ type coverageJSON struct {
 	UnsupportedLanguageCount int            `json:"unsupported_language_count"`
 	ParseFailureCount        int            `json:"parse_failure_count"`
 	ExclusionReasonCounts    map[string]int `json:"exclusion_reason_counts"`
+}
+
+func encodeSourceCatalog(catalog model.SourceCatalog) ([]byte, error) {
+	normalized, encodedSize, err := preflightSourceCatalog(catalog)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil || len(encoded) != encodedSize {
+		return nil, ErrInvalidIndex
+	}
+	return encoded, nil
+}
+
+// preflightSourceCatalog validates canonical ordering, uniqueness, lexical
+// safety, per-value ceilings and the exact JSON byte size before json.Marshal
+// can allocate a caller-controlled aggregate. Nil and empty collections have
+// one canonical on-disk representation: empty arrays.
+func preflightSourceCatalog(catalog model.SourceCatalog) (model.SourceCatalog, int, error) {
+	if len(catalog.Paths)+len(catalog.Exclusions)+len(catalog.ExtractionWarnings) > maximumSourceCatalogEntries || len(catalog.Warnings) > policy.ProductionLimits().MaximumCollectionItems {
+		return model.SourceCatalog{}, 0, ErrInvalidIndex
+	}
+	normalized := model.SourceCatalog{
+		Paths:              catalog.Paths,
+		Exclusions:         catalog.Exclusions,
+		ExtractionWarnings: catalog.ExtractionWarnings,
+		Partial:            catalog.Partial,
+		Warnings:           catalog.Warnings,
+	}
+	if normalized.Paths == nil {
+		normalized.Paths = []model.SourcePath{}
+	}
+	if normalized.Exclusions == nil {
+		normalized.Exclusions = []model.SourceExclusion{}
+	}
+	if normalized.ExtractionWarnings == nil {
+		normalized.ExtractionWarnings = []model.SourceWarning{}
+	}
+	if normalized.Warnings == nil {
+		normalized.Warnings = []string{}
+	}
+	for index, item := range normalized.Paths {
+		if !validCatalogPath(item.RelativePath) || !canonicalName.MatchString(item.Language) || !validSHA256IdentityString("sha256:"+item.SHA256) || item.Size < 0 || (index > 0 && normalized.Paths[index-1].RelativePath >= item.RelativePath) {
+			return model.SourceCatalog{}, 0, ErrInvalidIndex
+		}
+	}
+	for index, item := range normalized.Exclusions {
+		if !validCatalogPath(item.RelativePath) || !canonicalName.MatchString(item.Reason) || (index > 0 && normalized.Exclusions[index-1].RelativePath >= item.RelativePath) {
+			return model.SourceCatalog{}, 0, ErrInvalidIndex
+		}
+	}
+	for index, item := range normalized.ExtractionWarnings {
+		if !validCatalogPath(item.RelativePath) || len(item.Codes) == 0 || len(item.Codes) > policy.ProductionLimits().MaximumCollectionItems || (index > 0 && normalized.ExtractionWarnings[index-1].RelativePath >= item.RelativePath) {
+			return model.SourceCatalog{}, 0, ErrInvalidIndex
+		}
+		for codeIndex, code := range item.Codes {
+			if !canonicalName.MatchString(code) || (codeIndex > 0 && item.Codes[codeIndex-1] >= code) {
+				return model.SourceCatalog{}, 0, ErrInvalidIndex
+			}
+		}
+	}
+	pathIndex := 0
+	for _, item := range normalized.ExtractionWarnings {
+		for pathIndex < len(normalized.Paths) && normalized.Paths[pathIndex].RelativePath < item.RelativePath {
+			pathIndex++
+		}
+		if pathIndex == len(normalized.Paths) || normalized.Paths[pathIndex].RelativePath != item.RelativePath {
+			return model.SourceCatalog{}, 0, ErrInvalidIndex
+		}
+	}
+	for index, warning := range normalized.Warnings {
+		if !canonicalName.MatchString(warning) || (index > 0 && normalized.Warnings[index-1] >= warning) {
+			return model.SourceCatalog{}, 0, ErrInvalidIndex
+		}
+	}
+	// A path cannot simultaneously be an indexed body and an exclusion. This
+	// also prevents ambiguous ancestor bookkeeping during an incremental delta.
+	paths, exclusions := 0, 0
+	for paths < len(normalized.Paths) && exclusions < len(normalized.Exclusions) {
+		left, right := normalized.Paths[paths].RelativePath, normalized.Exclusions[exclusions].RelativePath
+		if left == right {
+			return model.SourceCatalog{}, 0, ErrInvalidIndex
+		}
+		if left < right {
+			paths++
+		} else {
+			exclusions++
+		}
+	}
+	size := sourceCatalogJSONSize(normalized)
+	if size < 0 || size > maximumSourceCatalogBytes || size > maximumDecompressedIndexBytes-4 {
+		return model.SourceCatalog{}, 0, ErrInvalidIndex
+	}
+	return normalized, size, nil
+}
+
+func validCatalogPath(value string) bool {
+	return validRelativePathBytes([]byte(value)) && len(value) <= maximumIndexStringBytes
+}
+
+// sourceCatalogJSONSize exactly mirrors encoding/json's compact object output
+// for these fixed structs. All strings have already passed validTextBytes, so
+// only JSON's stable quote/HTML/unicode escapes need accounting.
+func sourceCatalogJSONSize(catalog model.SourceCatalog) int {
+	size := len(`{"Paths":[`)
+	for index, item := range catalog.Paths {
+		if index != 0 {
+			size++
+		}
+		size += len(`{"RelativePath":`) + jsonStringSize(item.RelativePath) + len(`,"Language":`) + jsonStringSize(item.Language) + len(`,"Size":`) + len(strconv.FormatInt(item.Size, 10)) + len(`,"SHA256":`) + jsonStringSize(item.SHA256) + 1
+		if size > maximumSourceCatalogBytes {
+			return -1
+		}
+	}
+	size += len(`],"Exclusions":[`)
+	for index, item := range catalog.Exclusions {
+		if index != 0 {
+			size++
+		}
+		size += len(`{"RelativePath":`) + jsonStringSize(item.RelativePath) + len(`,"Reason":`) + jsonStringSize(item.Reason) + 1
+		if size > maximumSourceCatalogBytes {
+			return -1
+		}
+	}
+	size += len(`],"ExtractionWarnings":[`)
+	for index, item := range catalog.ExtractionWarnings {
+		if index != 0 {
+			size++
+		}
+		size += len(`{"RelativePath":`) + jsonStringSize(item.RelativePath) + len(`,"Codes":[`)
+		for codeIndex, code := range item.Codes {
+			if codeIndex != 0 {
+				size++
+			}
+			size += jsonStringSize(code)
+		}
+		size += len(`]}`)
+		if size > maximumSourceCatalogBytes {
+			return -1
+		}
+	}
+	size += len(`],"Partial":`) + len(strconv.FormatBool(catalog.Partial)) + len(`,"Warnings":[`)
+	for index, warning := range catalog.Warnings {
+		if index != 0 {
+			size++
+		}
+		size += jsonStringSize(warning)
+		if size > maximumSourceCatalogBytes {
+			return -1
+		}
+	}
+	return size + len(`]}`)
+}
+
+func jsonStringSize(value string) int {
+	size := 2
+	for _, character := range value {
+		switch character {
+		case '"', '\\':
+			size += 2
+		case '<', '>', '&', '\u2028', '\u2029':
+			size += 6
+		default:
+			size += utf8.RuneLen(character)
+		}
+	}
+	return size
+}
+
+type sourceCatalogJSONPreflight struct{ decodedBytes int64 }
+
+type sourceCatalogJSONField uint8
+
+const (
+	sourceCatalogFieldUnknown sourceCatalogJSONField = iota
+	sourceCatalogFieldPaths
+	sourceCatalogFieldExclusions
+	sourceCatalogFieldExtractionWarnings
+	sourceCatalogFieldWarnings
+	sourceCatalogFieldRelativePath
+	sourceCatalogFieldLanguage
+	sourceCatalogFieldSize
+	sourceCatalogFieldSHA256
+	sourceCatalogFieldReason
+	sourceCatalogFieldCodes
+	sourceCatalogFieldPartial
+	maximumSourceCatalogJSONFieldNameBytes = len("ExtractionWarnings")
+)
+
+type sourceCatalogJSONFieldName struct {
+	value     [maximumSourceCatalogJSONFieldNameBytes]byte
+	length    int
+	ascii     bool
+	canonical bool
+}
+
+func (name *sourceCatalogJSONFieldName) appendASCII(value byte) {
+	if name == nil {
+		return
+	}
+	if value >= utf8.RuneSelf || name.length >= len(name.value) {
+		name.ascii = false
+		return
+	}
+	name.value[name.length] = value
+	name.length++
+}
+
+func (name *sourceCatalogJSONFieldName) appendRune(value rune) {
+	if name == nil {
+		return
+	}
+	if value < 0 || value >= utf8.RuneSelf {
+		name.ascii = false
+		return
+	}
+	name.appendASCII(byte(value))
+}
+
+func (name sourceCatalogJSONFieldName) field() sourceCatalogJSONField {
+	if !name.ascii {
+		return sourceCatalogFieldUnknown
+	}
+	value := name.value[:name.length]
+	switch {
+	case bytes.Equal(value, []byte("Paths")):
+		return sourceCatalogFieldPaths
+	case bytes.Equal(value, []byte("Exclusions")):
+		return sourceCatalogFieldExclusions
+	case bytes.Equal(value, []byte("ExtractionWarnings")):
+		return sourceCatalogFieldExtractionWarnings
+	case bytes.Equal(value, []byte("Warnings")):
+		return sourceCatalogFieldWarnings
+	case bytes.Equal(value, []byte("RelativePath")):
+		return sourceCatalogFieldRelativePath
+	case bytes.Equal(value, []byte("Language")):
+		return sourceCatalogFieldLanguage
+	case bytes.Equal(value, []byte("Size")):
+		return sourceCatalogFieldSize
+	case bytes.Equal(value, []byte("SHA256")):
+		return sourceCatalogFieldSHA256
+	case bytes.Equal(value, []byte("Reason")):
+		return sourceCatalogFieldReason
+	case bytes.Equal(value, []byte("Codes")):
+		return sourceCatalogFieldCodes
+	case bytes.Equal(value, []byte("Partial")):
+		return sourceCatalogFieldPartial
+	default:
+		return sourceCatalogFieldUnknown
+	}
+}
+
+type catalogJSONScanner struct {
+	value   []byte
+	offset  int
+	objects int
+	entries int
+	decoded int64
+}
+
+func preflightSourceCatalogJSON(encoded []byte) (sourceCatalogJSONPreflight, error) {
+	if len(encoded) > maximumSourceCatalogBytes {
+		return sourceCatalogJSONPreflight{}, errSourceCatalogRawTooLarge
+	}
+	scanner := catalogJSONScanner{value: encoded}
+	scanner.space()
+	if err := scanner.valueToken(0, sourceCatalogFieldUnknown); err != nil {
+		return sourceCatalogJSONPreflight{}, ErrInvalidIndex
+	}
+	scanner.space()
+	if scanner.offset != len(scanner.value) {
+		return sourceCatalogJSONPreflight{}, ErrInvalidIndex
+	}
+	return sourceCatalogJSONPreflight{decodedBytes: scanner.decoded}, nil
+}
+
+func (scanner *catalogJSONScanner) space() {
+	for scanner.offset < len(scanner.value) {
+		switch scanner.value[scanner.offset] {
+		case ' ', '\n', '\r', '\t':
+			scanner.offset++
+		default:
+			return
+		}
+	}
+}
+
+func (scanner *catalogJSONScanner) valueToken(depth int, field sourceCatalogJSONField) error {
+	if depth > 16 {
+		return ErrInvalidIndex
+	}
+	scanner.space()
+	if scanner.offset >= len(scanner.value) {
+		return ErrInvalidIndex
+	}
+	switch scanner.value[scanner.offset] {
+	case '{':
+		return scanner.object(depth)
+	case '[':
+		return scanner.array(depth, field)
+	case '"':
+		_, err := scanner.stringToken(sourceCatalogJSONStringMaximum(field), nil)
+		return err
+	case 't':
+		return scanner.literal("true")
+	case 'f':
+		return scanner.literal("false")
+	case 'n':
+		return scanner.literal("null")
+	default:
+		return scanner.number()
+	}
+}
+
+func sourceCatalogJSONStringMaximum(field sourceCatalogJSONField) int {
+	switch field {
+	case sourceCatalogFieldLanguage, sourceCatalogFieldReason, sourceCatalogFieldCodes, sourceCatalogFieldWarnings:
+		return 128
+	case sourceCatalogFieldSHA256:
+		return 64
+	default:
+		return maximumIndexStringBytes
+	}
+}
+
+func (scanner *catalogJSONScanner) object(depth int) error {
+	scanner.offset++
+	if depth != 0 {
+		scanner.objects++
+		if scanner.objects > maximumSourceCatalogEntries {
+			return ErrInvalidIndex
+		}
+	}
+	scanner.decoded += 64
+	scanner.space()
+	if scanner.offset < len(scanner.value) && scanner.value[scanner.offset] == '}' {
+		scanner.offset++
+		return nil
+	}
+	for {
+		name := sourceCatalogJSONFieldName{ascii: true, canonical: true}
+		if _, err := scanner.stringToken(maximumSourceCatalogJSONFieldNameBytes, &name); err != nil {
+			return err
+		}
+		// encoding/json accepts Unicode SimpleFold field aliases, but the
+		// authenticated catalog contract later requires byte-for-byte json.Marshal
+		// canonicality. Reject every escaped, non-ASCII, case-folded, or unknown
+		// spelling here so no alias can allocate the field's object graph first.
+		field := name.field()
+		if !name.canonical || field == sourceCatalogFieldUnknown {
+			return ErrInvalidIndex
+		}
+		scanner.space()
+		if scanner.offset >= len(scanner.value) || scanner.value[scanner.offset] != ':' {
+			return ErrInvalidIndex
+		}
+		scanner.offset++
+		if err := scanner.valueToken(depth+1, field); err != nil {
+			return err
+		}
+		scanner.space()
+		if scanner.offset >= len(scanner.value) {
+			return ErrInvalidIndex
+		}
+		if scanner.value[scanner.offset] == '}' {
+			scanner.offset++
+			return nil
+		}
+		if scanner.value[scanner.offset] != ',' {
+			return ErrInvalidIndex
+		}
+		scanner.offset++
+		scanner.space()
+	}
+}
+
+func (scanner *catalogJSONScanner) array(depth int, field sourceCatalogJSONField) error {
+	scanner.offset++
+	scanner.decoded += 24
+	limit := maximumSourceCatalogEntries
+	if field == sourceCatalogFieldWarnings || field == sourceCatalogFieldCodes {
+		limit = policy.ProductionLimits().MaximumCollectionItems
+	}
+	scanner.space()
+	if scanner.offset < len(scanner.value) && scanner.value[scanner.offset] == ']' {
+		scanner.offset++
+		return nil
+	}
+	for count := 0; ; count++ {
+		if count >= limit {
+			return ErrInvalidIndex
+		}
+		if sourceCatalogJSONEntryArray(field) {
+			if scanner.entries >= maximumSourceCatalogEntries {
+				return ErrInvalidIndex
+			}
+			scanner.entries++
+		}
+		if err := scanner.valueToken(depth+1, field); err != nil {
+			return err
+		}
+		scanner.space()
+		if scanner.offset >= len(scanner.value) {
+			return ErrInvalidIndex
+		}
+		if scanner.value[scanner.offset] == ']' {
+			scanner.offset++
+			return nil
+		}
+		if scanner.value[scanner.offset] != ',' {
+			return ErrInvalidIndex
+		}
+		scanner.offset++
+		scanner.space()
+	}
+}
+
+func sourceCatalogJSONEntryArray(field sourceCatalogJSONField) bool {
+	return field == sourceCatalogFieldPaths || field == sourceCatalogFieldExclusions || field == sourceCatalogFieldExtractionWarnings
+}
+
+func (scanner *catalogJSONScanner) stringToken(maximum int, captured *sourceCatalogJSONFieldName) (int, error) {
+	if scanner.offset >= len(scanner.value) || scanner.value[scanner.offset] != '"' {
+		return 0, ErrInvalidIndex
+	}
+	scanner.offset++
+	decoded := 0
+	for scanner.offset < len(scanner.value) {
+		character := scanner.value[scanner.offset]
+		if character == '"' {
+			scanner.offset++
+			if decoded > maximum {
+				return 0, ErrInvalidIndex
+			}
+			scanner.decoded += int64(decoded + conservativeStringAllocationOverhead)
+			return decoded, nil
+		}
+		if character < 0x20 {
+			return 0, ErrInvalidIndex
+		}
+		if character == '\\' {
+			if captured != nil {
+				captured.canonical = false
+			}
+			scanner.offset++
+			if scanner.offset >= len(scanner.value) {
+				return 0, ErrInvalidIndex
+			}
+			escape := scanner.value[scanner.offset]
+			scanner.offset++
+			switch escape {
+			case '"', '\\', '/':
+				decoded++
+				captured.appendASCII(escape)
+			case 'b', 'f', 'n', 'r', 't':
+				decoded++
+				captured.appendASCII(mapSourceCatalogJSONEscape(escape))
+			case 'u':
+				value, ok := decodeSourceCatalogJSONHex(scanner.value, scanner.offset)
+				if !ok {
+					return 0, ErrInvalidIndex
+				}
+				scanner.offset += 4
+				runeValue := rune(value)
+				if value >= 0xd800 && value <= 0xdbff {
+					if scanner.offset+6 <= len(scanner.value) && scanner.value[scanner.offset] == '\\' && scanner.value[scanner.offset+1] == 'u' {
+						low, lowOK := decodeSourceCatalogJSONHex(scanner.value, scanner.offset+2)
+						if lowOK && low >= 0xdc00 && low <= 0xdfff {
+							scanner.offset += 6
+							runeValue = 0x10000 + (rune(value)-0xd800)<<10 + rune(low) - 0xdc00
+						} else {
+							runeValue = utf8.RuneError
+						}
+					} else {
+						runeValue = utf8.RuneError
+					}
+				} else if value >= 0xdc00 && value <= 0xdfff {
+					runeValue = utf8.RuneError
+				}
+				size := utf8.RuneLen(runeValue)
+				if size < 0 {
+					return 0, ErrInvalidIndex
+				}
+				decoded += size
+				captured.appendRune(runeValue)
+			default:
+				return 0, ErrInvalidIndex
+			}
+		} else if character < utf8.RuneSelf {
+			scanner.offset++
+			decoded++
+			captured.appendASCII(character)
+		} else {
+			if captured != nil {
+				captured.canonical = false
+			}
+			runeValue, size := utf8.DecodeRune(scanner.value[scanner.offset:])
+			if runeValue == utf8.RuneError && size == 1 {
+				return 0, ErrInvalidIndex
+			}
+			scanner.offset += size
+			decoded += size
+			captured.appendRune(runeValue)
+		}
+		if decoded > maximum {
+			return 0, ErrInvalidIndex
+		}
+	}
+	return 0, ErrInvalidIndex
+}
+
+func mapSourceCatalogJSONEscape(value byte) byte {
+	switch value {
+	case 'b':
+		return '\b'
+	case 'f':
+		return '\f'
+	case 'n':
+		return '\n'
+	case 'r':
+		return '\r'
+	case 't':
+		return '\t'
+	default:
+		return value
+	}
+}
+
+func decodeSourceCatalogJSONHex(value []byte, offset int) (uint16, bool) {
+	if offset < 0 || offset+4 > len(value) {
+		return 0, false
+	}
+	var decoded uint16
+	for _, digit := range value[offset : offset+4] {
+		decoded <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			decoded |= uint16(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			decoded |= uint16(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			decoded |= uint16(digit-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return decoded, true
+}
+
+func (scanner *catalogJSONScanner) literal(value string) error {
+	if len(scanner.value)-scanner.offset < len(value) || string(scanner.value[scanner.offset:scanner.offset+len(value)]) != value {
+		return ErrInvalidIndex
+	}
+	scanner.offset += len(value)
+	return nil
+}
+
+func (scanner *catalogJSONScanner) number() error {
+	start := scanner.offset
+	if scanner.offset < len(scanner.value) && scanner.value[scanner.offset] == '-' {
+		scanner.offset++
+	}
+	if scanner.offset >= len(scanner.value) {
+		return ErrInvalidIndex
+	}
+	if scanner.value[scanner.offset] == '0' {
+		scanner.offset++
+	} else {
+		if scanner.value[scanner.offset] < '1' || scanner.value[scanner.offset] > '9' {
+			return ErrInvalidIndex
+		}
+		for scanner.offset < len(scanner.value) && scanner.value[scanner.offset] >= '0' && scanner.value[scanner.offset] <= '9' {
+			scanner.offset++
+		}
+	}
+	if scanner.offset == start {
+		return ErrInvalidIndex
+	}
+	return nil
+}
+
+func decodeSourceCatalog(encoded []byte) (model.SourceCatalog, error) {
+	return decodeSourceCatalogBudgeted(encoded, &decodeMemoryBudget{})
+}
+
+func decodeSourceCatalogBudgeted(encoded []byte, budget *decodeMemoryBudget) (model.SourceCatalog, error) {
+	return decodeSourceCatalogWithRawBudget(encoded, budget, int64(cap(encoded)))
+}
+
+func decodeAliasedSourceCatalogBudgeted(encoded []byte, budget *decodeMemoryBudget) (model.SourceCatalog, error) {
+	return decodeSourceCatalogWithRawBudget(encoded, budget, 0)
+}
+
+func decodeSourceCatalogWithRawBudget(encoded []byte, budget *decodeMemoryBudget, ownedRawBytes int64) (model.SourceCatalog, error) {
+	preflight, err := preflightSourceCatalogJSON(encoded)
+	// Decoder token storage, the decoded object graph, and the canonical
+	// re-encode buffer coexist at the byte-equality check. Direct callers also
+	// own the raw backing; integrated callers pass a slice of the already
+	// charged plain index and therefore add no second raw-buffer reservation.
+	if err != nil || budget.reserve(ownedRawBytes+2*int64(len(encoded))+preflight.decodedBytes) != nil {
+		return model.SourceCatalog{}, ErrInvalidIndex
+	}
+	var catalog model.SourceCatalog
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&catalog); err != nil {
+		return model.SourceCatalog{}, ErrInvalidIndex
+	}
+	if token, err := decoder.Token(); err != io.EOF || token != nil {
+		return model.SourceCatalog{}, ErrInvalidIndex
+	}
+	canonical, err := encodeSourceCatalog(catalog)
+	if err != nil || !bytes.Equal(canonical, encoded) {
+		return model.SourceCatalog{}, ErrInvalidIndex
+	}
+	return catalog, nil
+}
+
+func sourceCatalogRetainedBytes(catalog model.SourceCatalog) int64 {
+	size := int64(len(catalog.Paths))*128 + int64(len(catalog.Exclusions))*80 + int64(len(catalog.ExtractionWarnings))*64 + int64(len(catalog.Warnings))*32
+	for _, item := range catalog.Paths {
+		size += int64(len(item.RelativePath) + len(item.Language) + len(item.SHA256))
+	}
+	for _, item := range catalog.Exclusions {
+		size += int64(len(item.RelativePath) + len(item.Reason))
+	}
+	for _, item := range catalog.ExtractionWarnings {
+		size += int64(len(item.RelativePath)) + int64(len(item.Codes))*32
+		for _, code := range item.Codes {
+			size += int64(len(code))
+		}
+	}
+	for _, warning := range catalog.Warnings {
+		size += int64(len(warning))
+	}
+	return size
 }
 
 func encodeManifest(manifest model.Manifest) ([]byte, error) {

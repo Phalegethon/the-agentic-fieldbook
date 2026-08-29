@@ -2,6 +2,8 @@
 package boundary
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -14,16 +16,19 @@ import (
 )
 
 var (
-	ErrRootOverlap         = errors.New("repository and state roots overlap")
-	ErrUnsafeRoot          = errors.New("unsafe repository or state root")
-	ErrUnsafePath          = errors.New("unsafe repository path")
-	ErrUnstableFile        = errors.New("repository file changed while being read")
-	ErrFileTooLarge        = errors.New("repository file exceeds maximum size")
-	ErrStateUnavailable    = errors.New("state root has not been created")
-	ErrStateEntryNotFound  = errors.New("state entry not found")
-	ErrStateEntryChanged   = errors.New("state entry changed during access")
-	ErrGitMetadataNotFound = errors.New("Git metadata file not found")
-	ErrRepositoryChanged   = errors.New("repository changed during enumeration")
+	ErrRootOverlap = errors.New("repository and state roots overlap")
+	ErrUnsafeRoot  = errors.New("unsafe repository or state root")
+	ErrUnsafePath  = errors.New("unsafe repository path")
+	// ErrRepositoryPathNotFound distinguishes an authorized declared deletion
+	// from an unsafe/replaced repository entry for incremental replacement.
+	ErrRepositoryPathNotFound = errors.New("repository path not found")
+	ErrUnstableFile           = errors.New("repository file changed while being read")
+	ErrFileTooLarge           = errors.New("repository file exceeds maximum size")
+	ErrStateUnavailable       = errors.New("state root has not been created")
+	ErrStateEntryNotFound     = errors.New("state entry not found")
+	ErrStateEntryChanged      = errors.New("state entry changed during access")
+	ErrGitMetadataNotFound    = errors.New("Git metadata file not found")
+	ErrRepositoryChanged      = errors.New("repository changed during enumeration")
 	// ErrSkipRepositoryDirectory lets a metadata consumer prune one safe
 	// directory without making the walker follow it.
 	ErrSkipRepositoryDirectory    = errors.New("skip repository directory")
@@ -72,6 +77,10 @@ var metadataOpenHook func(name string)
 var metadataTargetCaptureHook func(name string)
 var gitDiscoveryBeforeOpenHook func()
 var stateEnsureBeforeOpenHook func(component string)
+
+// stateControlBeforeReadHook deterministically exercises the final state-file
+// replacement window. Production leaves it nil.
+var stateControlBeforeReadHook func()
 var identityEqualHook func(first, second os.FileInfo) bool
 
 func sameIdentity(first, second os.FileInfo) bool {
@@ -227,6 +236,50 @@ func (r *Roots) OpenStateFile(relative string) (*os.File, error) {
 	return file, nil
 }
 
+// OpenStateControlFile reads bounded controller-owned transport data through
+// the retained state-root capability. It deliberately has no repository
+// fallback: update control documents are state-root data, never source.
+func (r *Roots) OpenStateControlFile(relative string, maximum int64) (StableFile, error) {
+	if maximum < 0 {
+		return StableFile{}, ErrUnsafeRoot
+	}
+	current, closers, name, err := r.stateFileLocation(relative)
+	if err != nil {
+		return StableFile{}, err
+	}
+	defer closeRoots(closers)
+	before, err := current.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return StableFile{}, ErrStateEntryNotFound
+	}
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || before.Size() > maximum {
+		return StableFile{}, ErrUnsafeRoot
+	}
+	file, err := current.Open(name)
+	if err != nil {
+		return StableFile{}, ErrUnsafeRoot
+	}
+	defer file.Close()
+	opened, statErr := file.Stat()
+	if statErr != nil || !sameSnapshot(before, opened) || safeStateFile(file) != nil {
+		return StableFile{}, ErrUnsafeRoot
+	}
+	if stateControlBeforeReadHook != nil {
+		stateControlBeforeReadHook()
+	}
+	contents, err := readAtMost(file, maximum, nil)
+	if err != nil {
+		return StableFile{}, ErrUnsafeRoot
+	}
+	after, statErr := file.Stat()
+	latest, latestErr := current.Lstat(name)
+	if statErr != nil || latestErr != nil || latest.Mode()&os.ModeSymlink != 0 || !latest.Mode().IsRegular() || !sameSnapshot(before, after) || !sameSnapshot(before, latest) {
+		return StableFile{}, ErrStateEntryChanged
+	}
+	digest := sha256.Sum256(contents)
+	return StableFile{RelativePath: relative, Bytes: contents, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(contents))}, nil
+}
+
 // CreateStateFile creates a new owner-only file without ever reopening or
 // truncating an existing name.
 func (r *Roots) CreateStateFile(relative string) (*os.File, error) {
@@ -318,10 +371,13 @@ func (r *Roots) stateFileLocation(relative string) (*os.Root, []*os.Root, string
 	if err != nil {
 		return nil, nil, "", err
 	}
-	current, closers, err := descendChecked(r.stateRoot, components[:len(components)-1], func(info os.FileInfo) error {
+	current, closers, err := descendWithMissing(r.stateRoot, components[:len(components)-1], func(info os.FileInfo) error {
 		return r.rejectProtectedDirectory(info)
-	})
+	}, ErrStateEntryNotFound)
 	if err != nil {
+		if errors.Is(err, ErrUnsafePath) {
+			return nil, nil, "", ErrUnsafeRoot
+		}
 		return nil, nil, "", err
 	}
 	return current, closers, components[len(components)-1], nil

@@ -167,3 +167,108 @@ func TestStateDirectoryRejectsTraversalAndClosedCapabilities(t *testing.T) {
 		t.Fatalf("closed Sync error = %v", err)
 	}
 }
+
+func TestStateControlMissingNestedParentUsesStateSentinel(t *testing.T) {
+	roots := makeRoots(t)
+	if err := roots.EnsureState(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := roots.OpenStateControlFile("missing/control.json", 1024)
+	if !errors.Is(err, ErrStateEntryNotFound) || errors.Is(err, ErrRepositoryPathNotFound) {
+		t.Fatalf("missing state parent error = %v", err)
+	}
+}
+
+func TestStateControlReaderRejectsHostileEntries(t *testing.T) {
+	writeControl := func(t *testing.T, roots *Roots, relative string, contents []byte, mode os.FileMode) string {
+		t.Helper()
+		location := filepath.Join(roots.State, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(location), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(location, contents, mode); err != nil {
+			t.Fatal(err)
+		}
+		return location
+	}
+	for name, arrange := range map[string]func(*testing.T, *Roots){
+		"final-symlink": func(t *testing.T, roots *Roots) {
+			location := filepath.Join(roots.State, "control.json")
+			if err := os.Symlink(filepath.Join(t.TempDir(), "outside"), location); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"intermediate-symlink": func(t *testing.T, roots *Roots) {
+			if err := os.Symlink(t.TempDir(), filepath.Join(roots.State, "controls")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"hardlink": func(t *testing.T, roots *Roots) {
+			outside := filepath.Join(t.TempDir(), "outside.json")
+			if err := os.WriteFile(outside, []byte("{}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Link(outside, filepath.Join(roots.State, "control.json")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"insecure-permissions": func(t *testing.T, roots *Roots) {
+			location := writeControl(t, roots, "control.json", []byte("{}"), 0o600)
+			if err := os.Chmod(location, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"oversized": func(t *testing.T, roots *Roots) {
+			writeControl(t, roots, "control.json", []byte("oversized"), 0o600)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			roots := makeRoots(t)
+			if err := roots.EnsureState(); err != nil {
+				t.Fatal(err)
+			}
+			arrange(t, &roots)
+			relative, maximum := "control.json", int64(1024)
+			if name == "intermediate-symlink" {
+				relative = "controls/control.json"
+			}
+			if name == "oversized" {
+				maximum = 3
+			}
+			if _, err := roots.OpenStateControlFile(relative, maximum); !errors.Is(err, ErrUnsafeRoot) {
+				t.Fatalf("OpenStateControlFile(%q) error = %v, want ErrUnsafeRoot", relative, err)
+			}
+		})
+	}
+
+	t.Run("stat-open-read-replacement", func(t *testing.T) {
+		roots := makeRoots(t)
+		if err := roots.EnsureState(); err != nil {
+			t.Fatal(err)
+		}
+		location := writeControl(t, &roots, "control.json", []byte("old"), 0o600)
+		replacement := filepath.Join(roots.State, "replacement.json")
+		if err := os.WriteFile(replacement, []byte("new"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stateControlBeforeReadHook = func() {
+			if err := os.Rename(replacement, location); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Cleanup(func() { stateControlBeforeReadHook = nil })
+		if _, err := roots.OpenStateControlFile("control.json", 1024); !errors.Is(err, ErrStateEntryChanged) {
+			t.Fatalf("replacement error = %v, want ErrStateEntryChanged", err)
+		}
+	})
+
+	roots := makeRoots(t)
+	if err := roots.EnsureState(); err != nil {
+		t.Fatal(err)
+	}
+	for _, relative := range []string{"../escape.json", "/absolute.json", `back\\slash.json`} {
+		if _, err := roots.OpenStateControlFile(relative, 1024); !errors.Is(err, ErrUnsafePath) {
+			t.Fatalf("lexical control path %q error = %v", relative, err)
+		}
+	}
+}

@@ -25,6 +25,7 @@ import (
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/policy"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
 
@@ -329,24 +330,37 @@ func TestEncodeIndexIsDeterministicAndDoesNotMutateInputs(t *testing.T) {
 	}
 }
 
-func TestIndexV2PersistsCanonicalQueryStructures(t *testing.T) {
+func TestIndexV3PersistsCanonicalQueryStructuresAndAuthenticatedSourceCatalog(t *testing.T) {
 	records := []model.Record{
 		testRecord(testRecordB, "docs/guide.md", "Guide Setup", []string{"guide", "setup"}),
 		testRecord(testRecordA, "pkg/service.go", "pkg.Service", []string{"alias", "service"}),
 	}
 	records[0].RecordKind, records[0].SourceType, records[0].Language = model.Heading, "document", "markdown"
 
-	encoded, err := encodeIndex(records)
+	catalog := model.SourceCatalog{
+		Paths:              []model.SourcePath{{RelativePath: "docs/guide.md", Language: "markdown", Size: 12, SHA256: strings.Repeat("a", 64)}},
+		Exclusions:         []model.SourceExclusion{{RelativePath: "vendor", Reason: "vendored"}},
+		ExtractionWarnings: []model.SourceWarning{},
+		Warnings:           []string{},
+	}
+	encoded, err := encodeIndexCatalogObservedStatsContext(context.Background(), records, catalog, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	plain := mustDecompress(t, encoded)
-	if version := binary.BigEndian.Uint16(plain[len(indexMagic):]); version != 2 {
-		t.Fatalf("index version = %d, want 2", version)
+	if indexFormatVersion != 3 {
+		t.Fatalf("format constant = %d, want authenticated catalog format 3", indexFormatVersion)
 	}
-	decoded, postings, queryIndex, err := decodeIndexContextWithQueryObserved(context.Background(), encoded, nil)
+	if version := binary.BigEndian.Uint16(plain[len(indexMagic):]); version != indexFormatVersion {
+		t.Fatalf("index version = %d, want authenticated catalog format %d", version, indexFormatVersion)
+	}
+	var decodedCatalog model.SourceCatalog
+	decoded, postings, queryIndex, err := decodeIndexContextWithCatalogObserved(context.Background(), encoded, nil, &decodedCatalog)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decodedCatalog, catalog) {
+		t.Fatalf("source catalog = %#v, want %#v", decodedCatalog, catalog)
 	}
 	if len(decoded) != 2 || !slices.Equal(postings["service"], []uint32{0}) {
 		t.Fatalf("decoded records/postings = %#v %#v", decoded, postings)
@@ -369,6 +383,309 @@ func TestIndexV2PersistsCanonicalQueryStructures(t *testing.T) {
 	groups, partial := queryIndex.MapGroups()
 	if partial || len(groups) != 2 || groups[0].Path != "docs/guide.md" || groups[1].Path != "pkg/service.go" {
 		t.Fatalf("map groups = %#v partial=%v", groups, partial)
+	}
+}
+
+func TestSourceCatalogRejectsNonCanonicalAndOversizedInputsBeforeMarshal(t *testing.T) {
+	validPath := model.SourcePath{RelativePath: "a.go", Language: "go", Size: 1, SHA256: strings.Repeat("a", 64)}
+	validExclusion := model.SourceExclusion{RelativePath: "vendor", Reason: "vendored"}
+	for name, catalog := range map[string]model.SourceCatalog{
+		"unsorted-paths": {
+			Paths: []model.SourcePath{
+				{RelativePath: "z.go", Language: "go", Size: 1, SHA256: strings.Repeat("a", 64)}, validPath,
+			},
+		},
+		"duplicate-paths": {Paths: []model.SourcePath{validPath, validPath}},
+		"unsafe-path":     {Paths: []model.SourcePath{{RelativePath: "../a.go", Language: "go", Size: 1, SHA256: strings.Repeat("a", 64)}}},
+		"unsorted-exclusions": {
+			Exclusions: []model.SourceExclusion{
+				{RelativePath: "z", Reason: "ignored"}, validExclusion,
+			},
+		},
+		"duplicate-exclusions": {Exclusions: []model.SourceExclusion{validExclusion, validExclusion}},
+		"unsafe-exclusion":     {Exclusions: []model.SourceExclusion{{RelativePath: "a/../b", Reason: "ignored"}}},
+		"warning-without-path": {ExtractionWarnings: []model.SourceWarning{{RelativePath: "a.go", Codes: []string{"python-dynamic-lookup"}}}},
+		"duplicate-warning-codes": {
+			Paths: []model.SourcePath{validPath}, ExtractionWarnings: []model.SourceWarning{{RelativePath: "a.go", Codes: []string{"python-dynamic-lookup", "python-dynamic-lookup"}}},
+		},
+		"unsafe-warning-path": {
+			Paths: []model.SourcePath{validPath}, ExtractionWarnings: []model.SourceWarning{{RelativePath: "../a.go", Codes: []string{"python-dynamic-lookup"}}},
+		},
+		"oversized-path": {Paths: []model.SourcePath{{RelativePath: strings.Repeat("a", maximumIndexStringBytes+1), Language: "go", Size: 1, SHA256: strings.Repeat("a", 64)}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := encodeSourceCatalog(catalog); !errors.Is(err, ErrInvalidIndex) {
+				t.Fatalf("encodeSourceCatalog(%#v) error = %v, want ErrInvalidIndex", catalog, err)
+			}
+		})
+	}
+
+	// The frozen catalog byte limit must reject a hostile count before json.Marshal
+	// is allowed to allocate the aggregate JSON buffer.
+	oversized := model.SourceCatalog{Paths: make([]model.SourcePath, maximumSourceCatalogEntries)}
+	for index := range oversized.Paths {
+		oversized.Paths[index] = model.SourcePath{RelativePath: fmt.Sprintf("p/%06d.go", index), Language: "go", Size: 1, SHA256: strings.Repeat("a", 64)}
+	}
+	if _, err := encodeSourceCatalog(oversized); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("oversized source catalog error = %v, want ErrInvalidIndex", err)
+	}
+}
+
+func TestSourceCatalogRawPreflightEnforcesEightMiBBeforeMaterialization(t *testing.T) {
+	exact := bytes.Repeat([]byte{' '}, maximumSourceCatalogBytes)
+	if _, err := preflightSourceCatalogJSON(exact); errors.Is(err, errSourceCatalogRawTooLarge) {
+		t.Fatalf("exact %d-byte catalog rejected as raw oversize", len(exact))
+	}
+	over := append(exact, ' ')
+	if _, err := preflightSourceCatalogJSON(over); !errors.Is(err, errSourceCatalogRawTooLarge) {
+		t.Fatalf("%d-byte catalog error = %v, want raw-size refusal", len(over), err)
+	}
+
+	// This raw count is under 8 MiB but would materialize more than the frozen
+	// entry ceiling if the decoder built []SourcePath before token preflight.
+	var hugeArray bytes.Buffer
+	hugeArray.WriteString(`{"Paths":[`)
+	for index := 0; index <= maximumSourceCatalogEntries; index++ {
+		if index != 0 {
+			hugeArray.WriteByte(',')
+		}
+		hugeArray.WriteString(`{}`)
+	}
+	hugeArray.WriteString(`],"Exclusions":[],"Partial":false,"Warnings":[]}`)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := preflightSourceCatalogJSON(hugeArray.Bytes()); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("huge-array preflight error = %v, want ErrInvalidIndex", err)
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 2<<20 {
+		t.Fatalf("huge-array preflight allocated %d bytes", allocated)
+	}
+
+	hugeString := []byte(`{"Paths":[{"RelativePath":"` + strings.Repeat("a", maximumIndexStringBytes+1) + `","Language":"go","Size":1,"SHA256":"` + strings.Repeat("a", 64) + `"}],"Exclusions":[],"Partial":false,"Warnings":[]}`)
+	if _, err := preflightSourceCatalogJSON(hugeString); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("huge-string preflight error = %v, want ErrInvalidIndex", err)
+	}
+	tooManyWarnings := []byte(`{"Paths":[],"Exclusions":[],"ExtractionWarnings":[],"Partial":false,"Warnings":["a"` + strings.Repeat(`,"a"`, policy.ProductionLimits().MaximumCollectionItems) + `]}`)
+	if _, err := preflightSourceCatalogJSON(tooManyWarnings); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("warning-count preflight error = %v, want ErrInvalidIndex", err)
+	}
+}
+
+func TestSourceCatalogRawPreflightRejectsNonCanonicalFieldAliases(t *testing.T) {
+	tooManyWarnings := []byte(`{"Paths":[],"Exclusions":[],"ExtractionWarnings":[],"Partial":false,"W\u0061rnings":["a"` + strings.Repeat(`,"a"`, policy.ProductionLimits().MaximumCollectionItems) + `]}`)
+	if _, err := preflightSourceCatalogJSON(tooManyWarnings); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("escaped Warnings count error = %v, want ErrInvalidIndex", err)
+	}
+	caseFoldedWarnings := []byte(`{"Paths":[],"Exclusions":[],"ExtractionWarnings":[],"Partial":false,"w\u0061rnings":["a"` + strings.Repeat(`,"a"`, policy.ProductionLimits().MaximumCollectionItems) + `]}`)
+	if _, err := preflightSourceCatalogJSON(caseFoldedWarnings); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("case-folded escaped Warnings count error = %v, want ErrInvalidIndex", err)
+	}
+	tooManyCodes := []byte(`{"Paths":[],"Exclusions":[],"ExtractionWarnings":[{"RelativePath":"a.go","C\u006fdes":["a"` + strings.Repeat(`,"a"`, policy.ProductionLimits().MaximumCollectionItems) + `]}],"Partial":false,"Warnings":[]}`)
+	if _, err := preflightSourceCatalogJSON(tooManyCodes); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("escaped Codes count error = %v, want ErrInvalidIndex", err)
+	}
+	simpleFoldWarnings := []byte(`{"Paths":[],"Exclusions":[],"ExtractionWarnings":[],"Partial":false,"Warning\u017f":["a"` + strings.Repeat(`,"a"`, policy.ProductionLimits().MaximumCollectionItems) + `]}`)
+	if _, err := preflightSourceCatalogJSON(simpleFoldWarnings); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("SimpleFold Warnings alias error = %v, want ErrInvalidIndex", err)
+	}
+	simpleFoldCodes := []byte(`{"Paths":[],"Exclusions":[],"ExtractionWarnings":[{"RelativePath":"a.go","Code\u017f":["a"` + strings.Repeat(`,"a"`, policy.ProductionLimits().MaximumCollectionItems) + `]}],"Partial":false,"Warnings":[]}`)
+	if _, err := preflightSourceCatalogJSON(simpleFoldCodes); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("SimpleFold Codes alias error = %v, want ErrInvalidIndex", err)
+	}
+	firstHalf := maximumSourceCatalogEntries / 2
+	escapedCombinedEntries := []byte(`{"P\u0061ths":[null` + strings.Repeat(`,null`, firstHalf-1) + `],"Excl\u0075sions":[null` + strings.Repeat(`,null`, maximumSourceCatalogEntries-firstHalf) + `]}`)
+	if _, err := preflightSourceCatalogJSON(escapedCombinedEntries); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("escaped combined entry count error = %v, want ErrInvalidIndex", err)
+	}
+
+	tests := []struct {
+		name      string
+		alias     string
+		canonical string
+		value     string
+		maximum   int
+	}{
+		{name: "relative path", alias: `Rel\u0061tivePath`, canonical: "RelativePath", value: "a", maximum: maximumIndexStringBytes},
+		{name: "language", alias: `L\u0061nguage`, canonical: "Language", value: "a", maximum: 128},
+		{name: "sha256", alias: `SH\u0041256`, canonical: "SHA256", value: "a", maximum: 64},
+		{name: "reason", alias: `Re\u0061son`, canonical: "Reason", value: "a", maximum: 128},
+		{name: "warning", alias: `W\u0061rnings`, canonical: "Warnings", value: "a", maximum: 128},
+		{name: "code", alias: `C\u006fdes`, canonical: "Codes", value: "a", maximum: 128},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var alias, exact, over []byte
+			switch test.name {
+			case "warning", "code":
+				alias = []byte(`{"` + test.alias + `":["a"]}`)
+				exact = []byte(`{"` + test.canonical + `":["` + strings.Repeat(test.value, test.maximum) + `"]}`)
+				over = []byte(`{"` + test.canonical + `":["` + strings.Repeat(test.value, test.maximum+1) + `"]}`)
+			default:
+				alias = []byte(`{"` + test.alias + `":"a"}`)
+				exact = []byte(`{"` + test.canonical + `":"` + strings.Repeat(test.value, test.maximum) + `"}`)
+				over = []byte(`{"` + test.canonical + `":"` + strings.Repeat(test.value, test.maximum+1) + `"}`)
+			}
+			if _, err := preflightSourceCatalogJSON(alias); !errors.Is(err, ErrInvalidIndex) {
+				t.Fatalf("noncanonical alias error = %v, want ErrInvalidIndex", err)
+			}
+			if _, err := preflightSourceCatalogJSON(exact); err != nil {
+				t.Fatalf("exact canonical boundary error = %v", err)
+			}
+			if _, err := preflightSourceCatalogJSON(over); !errors.Is(err, ErrInvalidIndex) {
+				t.Fatalf("canonical maximum+1 error = %v, want ErrInvalidIndex", err)
+			}
+		})
+	}
+	for _, field := range []string{"Warnings", "Codes"} {
+		exact := []byte(`{"` + field + `":["a"` + strings.Repeat(`,"a"`, policy.ProductionLimits().MaximumCollectionItems-1) + `]}`)
+		if _, err := preflightSourceCatalogJSON(exact); err != nil {
+			t.Fatalf("exact canonical %s count error = %v", field, err)
+		}
+	}
+	hostileEscapedString := []byte(`{"L\u0061nguage":"` + strings.Repeat("a", 1<<20) + `"}`)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := preflightSourceCatalogJSON(hostileEscapedString); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("hostile escaped string error = %v, want ErrInvalidIndex", err)
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 1<<20 {
+		t.Fatalf("hostile escaped string preflight allocated %d bytes", allocated)
+	}
+}
+
+func TestSourceCatalogDecodeChargesRawCapacityAgainstCurrentLiveBudget(t *testing.T) {
+	catalog := model.SourceCatalog{
+		Paths:              []model.SourcePath{},
+		Exclusions:         []model.SourceExclusion{},
+		ExtractionWarnings: []model.SourceWarning{},
+		Warnings:           []string{},
+	}
+	encoded, err := encodeSourceCatalog(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preflight, err := preflightSourceCatalogJSON(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backing := make([]byte, len(encoded), len(encoded)+(2<<20))
+	copy(backing, encoded)
+	// Raw capacity, decoder token storage, canonical re-encode bytes, and the
+	// decoded object graph are all live at canonicality comparison.
+	catalogLive := int64(cap(backing)+2*len(backing)) + preflight.decodedBytes
+	budget := decodeMemoryBudget{used: maximumIndexPeakBytes - catalogLive}
+	if _, err := decodeSourceCatalogBudgeted(backing, &budget); err != nil {
+		t.Fatalf("exact cumulative live budget error = %v", err)
+	}
+	budget = decodeMemoryBudget{used: maximumIndexPeakBytes - catalogLive + 1}
+	if _, err := decodeSourceCatalogBudgeted(backing, &budget); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("cumulative live budget maximum+1 error = %v, want ErrInvalidIndex", err)
+	}
+}
+
+func TestIntegratedIndexCatalogBudgetCountsAliasedRawBytesOnce(t *testing.T) {
+	encoded, err := encodeIndex(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := mustDecompress(t, encoded)
+	emptyCatalog := []byte(`{"Paths":[],"Exclusions":[],"ExtractionWarnings":[],"Partial":false,"Warnings":[]}`)
+	if !bytes.HasSuffix(plain, emptyCatalog) {
+		t.Fatalf("empty index does not end in canonical empty catalog: %q", plain)
+	}
+	// Hand-derived preflight object bytes: one 64-byte root object, five
+	// key strings (decoded lengths plus 16-byte overhead), and four 24-byte
+	// arrays. The raw catalog is a slice of plain and owns no second backing.
+	const emptyCatalogObjectBytes = int64(64 + (5 + 16) + (10 + 16) + (18 + 16) + (7 + 16) + (8 + 16) + 4*24)
+	additionalCatalogBytes := 2*int64(len(emptyCatalog)) + emptyCatalogObjectBytes
+	liveBeforeCatalog := int64(cap(encoded)) + int64(len(plain)) + conservativeZlibWorkspaceBytes
+	exactAdditionalLive := maximumIndexPeakBytes - liveBeforeCatalog - additionalCatalogBytes
+	if exactAdditionalLive < 0 {
+		t.Fatal("empty integrated decode already exceeds the peak budget")
+	}
+	var catalog model.SourceCatalog
+	if _, _, _, err := decodeIndexContextWithCatalogLiveBytes(context.Background(), encoded, exactAdditionalLive, &catalog); err != nil {
+		t.Fatalf("integrated exact live budget decode error = %v", err)
+	}
+	if !reflect.DeepEqual(catalog, model.SourceCatalog{Paths: []model.SourcePath{}, Exclusions: []model.SourceExclusion{}, ExtractionWarnings: []model.SourceWarning{}, Warnings: []string{}}) {
+		t.Fatalf("integrated catalog = %#v", catalog)
+	}
+	if _, _, _, err := decodeIndexContextWithCatalogLiveBytes(context.Background(), encoded, exactAdditionalLive+1, nil); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("integrated live budget maximum+1 decode error = %v, want ErrInvalidIndex", err)
+	}
+	if _, _, err := validateIndexContextWithLiveBytes(context.Background(), encoded, exactAdditionalLive); err != nil {
+		t.Fatalf("integrated exact live budget raw validation error = %v", err)
+	}
+	if _, _, err := validateIndexContextWithLiveBytes(context.Background(), encoded, exactAdditionalLive+1); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("integrated live budget maximum+1 raw validation error = %v, want ErrInvalidIndex", err)
+	}
+}
+
+func TestSourceCatalogDecodeReservesRawDecodedAndCanonicalBuffers(t *testing.T) {
+	catalog := model.SourceCatalog{
+		Paths:              []model.SourcePath{{RelativePath: "a.go", Language: "go", Size: 3, SHA256: strings.Repeat("a", 64)}},
+		Exclusions:         []model.SourceExclusion{},
+		ExtractionWarnings: []model.SourceWarning{},
+		Warnings:           []string{"python-dynamic-lookup"},
+	}
+	encoded, err := encodeSourceCatalog(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preflight, err := preflightSourceCatalogJSON(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := decodeMemoryBudget{}
+	decoded, err := decodeSourceCatalogBudgeted(encoded, &budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minimum := int64(len(encoded))*2 + preflight.decodedBytes
+	if !reflect.DeepEqual(decoded, catalog) || budget.used < minimum {
+		t.Fatalf("decoded=%#v reservation=%d, want at least raw+canonical+decoded %d", decoded, budget.used, minimum)
+	}
+}
+
+func TestIndexCatalogAdvertisedNinetySixMiBIsRejectedAtEightMiBBoundary(t *testing.T) {
+	encoded, err := encodeIndex(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := mustDecompress(t, encoded)
+	emptyCatalog, err := encodeSourceCatalog(model.SourceCatalog{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lengthOffset := len(plain) - len(emptyCatalog) - 4
+	if lengthOffset < 0 || binary.BigEndian.Uint32(plain[lengthOffset:lengthOffset+4]) != uint32(len(emptyCatalog)) {
+		t.Fatal("could not locate authenticated catalog length")
+	}
+	binary.BigEndian.PutUint32(plain[lengthOffset:lengthOffset+4], uint32(maximumDecompressedIndexBytes))
+	encoded = mustCompress(plain[:lengthOffset+4])
+	if _, _, _, err := decodeIndexContext(context.Background(), encoded); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("96MiB advertised decode error = %v", err)
+	}
+	if _, _, err := validateIndex(encoded); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("96MiB advertised validation error = %v", err)
+	}
+}
+
+func TestIndexV3RejectsPreCatalogV2Payload(t *testing.T) {
+	encoded, err := encodeIndex([]model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := mutateHeader(encoded, func(header []byte) { binary.BigEndian.PutUint16(header[len(indexMagic):], 2) })
+	if _, _, _, err := decodeIndexContext(context.Background(), legacy); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("pre-catalog v2 decode error = %v, want ErrInvalidIndex", err)
+	}
+	if _, _, err := validateIndex(legacy); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("pre-catalog v2 validation error = %v, want ErrInvalidIndex", err)
 	}
 }
 
@@ -953,8 +1270,8 @@ func TestBuildReviewerShapePeakMemoryStaysBelowBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if preflight.plainSize != 85_800_318 {
-		t.Fatalf("reviewer-shape v2 preflight bytes = %d, want 85800318", preflight.plainSize)
+	if preflight.plainSize != 85_800_322 {
+		t.Fatalf("reviewer-shape v3 preflight bytes = %d, want 85800322", preflight.plainSize)
 	}
 
 	for _, test := range []struct {
@@ -1333,6 +1650,275 @@ func TestBuildFaultsPreservePreviousCurrentGeneration(t *testing.T) {
 	}
 }
 
+func TestBuildBarrierRunsAfterCurrentPointerTempIsPrepared(t *testing.T) {
+	roots, state := storeRoots(t)
+	first := mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	currentBefore := mustRead(t, filepath.Join(state, currentFilename))
+	injected := errors.New("barrier rejected publication")
+	sawPreparedPointer := false
+	_, err := BuildContextWithBarrier(context.Background(), roots, manifestVariant("b"), []model.Record{testRecord(testRecordB, "b.go", "B", []string{"b"})}, func() error {
+		entries, readErr := os.ReadDir(state)
+		if readErr != nil {
+			return readErr
+		}
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".CURRENT-") {
+				sawPreparedPointer = true
+			}
+		}
+		return injected
+	})
+	if !errors.Is(err, injected) || !sawPreparedPointer {
+		t.Fatalf("barrier error=%v prepared-pointer=%v", err, sawPreparedPointer)
+	}
+	if currentAfter := mustRead(t, filepath.Join(state, currentFilename)); !bytes.Equal(currentBefore, currentAfter) {
+		t.Fatalf("CURRENT changed after barrier failure: before=%q after=%q", currentBefore, currentAfter)
+	}
+	loaded, loadErr := Load(roots, first.IndexIdentity)
+	if loadErr != nil || loaded.IndexIdentity != first.IndexIdentity {
+		t.Fatalf("previous generation = %#v, %v", loaded, loadErr)
+	}
+}
+
+func TestBuildSameGenerationBarrierRunsOnceAtFinalSeam(t *testing.T) {
+	roots, state := storeRoots(t)
+	records := []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})}
+	first := mustBuild(t, roots, testManifest(), records)
+	currentBefore := mustRead(t, filepath.Join(state, currentFilename))
+	generationBefore := generationBytes(t, state, first.Manifest.GenerationIdentity)
+	injected := errors.New("same-generation barrier rejected")
+	materialized, barrierCalls := false, 0
+	_, err := buildWithFilesystemObservedContextBarrier(
+		context.Background(), boundaryFilesystem{}, roots, testManifest(), records,
+		buildHooks{materialized: func() { materialized = true }},
+		func() error {
+			barrierCalls++
+			if !materialized {
+				t.Fatal("same-generation barrier ran before final materialization")
+			}
+			return injected
+		},
+	)
+	if !errors.Is(err, injected) || barrierCalls != 1 {
+		t.Fatalf("same-generation error = %v, barrier calls = %d", err, barrierCalls)
+	}
+	if currentAfter := mustRead(t, filepath.Join(state, currentFilename)); !bytes.Equal(currentBefore, currentAfter) {
+		t.Fatalf("CURRENT changed after same-generation barrier failure: before=%q after=%q", currentBefore, currentAfter)
+	}
+	if generationAfter := generationBytes(t, state, first.Manifest.GenerationIdentity); !bytes.Equal(generationBefore, generationAfter) {
+		t.Fatal("immutable generation changed after same-generation barrier failure")
+	}
+}
+
+func TestBuildSameGenerationBarrierPreservesUnchangedSuccess(t *testing.T) {
+	roots, state := storeRoots(t)
+	records := []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})}
+	first := mustBuild(t, roots, testManifest(), records)
+	currentBefore := mustRead(t, filepath.Join(state, currentFilename))
+	barrierCalls := 0
+	repeated, err := BuildContextWithBarrier(context.Background(), roots, testManifest(), records, func() error {
+		barrierCalls++
+		return nil
+	})
+	if err != nil || barrierCalls != 1 || !reflect.DeepEqual(repeated, first) {
+		t.Fatalf("same-generation success = %#v, error = %v, barrier calls = %d", repeated, err, barrierCalls)
+	}
+	if currentAfter := mustRead(t, filepath.Join(state, currentFilename)); !bytes.Equal(currentBefore, currentAfter) {
+		t.Fatalf("CURRENT changed for same-generation success: before=%q after=%q", currentBefore, currentAfter)
+	}
+}
+
+func TestBuildSameGenerationBarrierCancellationReturnsError(t *testing.T) {
+	roots, state := storeRoots(t)
+	records := []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})}
+	first := mustBuild(t, roots, testManifest(), records)
+	currentBefore := mustRead(t, filepath.Join(state, currentFilename))
+	ctx, cancel := context.WithCancel(context.Background())
+	barrierCalls := 0
+	_, err := BuildContextWithBarrier(ctx, roots, testManifest(), records, func() error {
+		barrierCalls++
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || barrierCalls != 1 {
+		t.Fatalf("same-generation cancellation error = %v, barrier calls = %d", err, barrierCalls)
+	}
+	if currentAfter := mustRead(t, filepath.Join(state, currentFilename)); !bytes.Equal(currentBefore, currentAfter) {
+		t.Fatalf("CURRENT changed after same-generation cancellation: before=%q after=%q", currentBefore, currentAfter)
+	}
+	loaded, loadErr := Load(roots, first.IndexIdentity)
+	if loadErr != nil || loaded.IndexIdentity != first.IndexIdentity {
+		t.Fatalf("unchanged generation = %#v, %v", loaded, loadErr)
+	}
+}
+
+func TestBuildSameGenerationBarrierSerializesConcurrentValidation(t *testing.T) {
+	roots, _ := storeRoots(t)
+	records := []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})}
+	mustBuild(t, roots, testManifest(), records)
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	errorsSeen := make(chan error, 2)
+	go func() {
+		_, err := BuildContextWithBarrier(context.Background(), roots, testManifest(), records, func() error {
+			close(firstEntered)
+			<-releaseFirst
+			return nil
+		})
+		errorsSeen <- err
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first same-generation barrier was not invoked")
+	}
+	go func() {
+		_, err := BuildContextWithBarrier(context.Background(), roots, testManifest(), records, func() error {
+			close(secondEntered)
+			return nil
+		})
+		errorsSeen <- err
+	}()
+	select {
+	case <-secondEntered:
+		t.Fatal("second same-generation barrier entered while first held publication lock")
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(releaseFirst)
+	for range 2 {
+		if err := <-errorsSeen; err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-secondEntered:
+	default:
+		t.Fatal("second same-generation barrier never ran after lock release")
+	}
+}
+
+func TestBuildCurrentRenameFaultOccursBeforeAtomicBarrier(t *testing.T) {
+	roots, _ := storeRoots(t)
+	mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	injected := errors.New("rename seam")
+	barrierCalls := 0
+	_, err := buildWithFilesystemObservedContextBarrier(
+		context.Background(),
+		boundaryFilesystem{faults: Faults{BeforeCurrentRename: injected}},
+		roots,
+		manifestVariant("b"),
+		[]model.Record{testRecord(testRecordB, "b.go", "B", []string{"b"})},
+		buildHooks{},
+		func() error { barrierCalls++; return nil },
+	)
+	if !errors.Is(err, injected) || barrierCalls != 0 {
+		t.Fatalf("rename error=%v barrier calls=%d, want fault before barrier", err, barrierCalls)
+	}
+}
+
+func TestBuildAtomicBarrierSerializesConcurrentCurrentSelection(t *testing.T) {
+	roots, _ := storeRoots(t)
+	mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	errorsSeen := make(chan error, 2)
+	go func() {
+		_, err := BuildContextWithBarrier(context.Background(), roots, manifestVariant("b"), []model.Record{testRecord(testRecordB, "b.go", "B", []string{"b"})}, func() error {
+			close(firstEntered)
+			<-releaseFirst
+			return nil
+		})
+		errorsSeen <- err
+	}()
+	<-firstEntered
+	go func() {
+		_, err := BuildContextWithBarrier(context.Background(), roots, manifestVariant("c"), []model.Record{testRecord(testRecordA, "c.go", "C", []string{"c"})}, func() error {
+			close(secondEntered)
+			return nil
+		})
+		errorsSeen <- err
+	}()
+	enteredWhileLocked := false
+	select {
+	case <-secondEntered:
+		enteredWhileLocked = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(releaseFirst)
+	for range 2 {
+		if err := <-errorsSeen; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if enteredWhileLocked {
+		t.Fatal("second publication entered atomic barrier while first held it")
+	}
+	select {
+	case <-secondEntered:
+	default:
+		t.Fatal("second publication never reached barrier after lock release")
+	}
+}
+
+func TestConcurrentPublicationRollbackRestoresLatestSelectedCurrent(t *testing.T) {
+	roots, state := storeRoots(t)
+	mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan struct{})
+	var first Snapshot
+	var firstErr error
+	go func() {
+		defer close(firstDone)
+		first, firstErr = BuildContextWithBarrier(context.Background(), roots, manifestVariant("b"), []model.Record{testRecord(testRecordB, "b.go", "B", []string{"b"})}, func() error {
+			close(firstEntered)
+			<-releaseFirst
+			return nil
+		})
+	}()
+	<-firstEntered
+	injected := errors.New("second state sync failed")
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := BuildWithFaults(roots, manifestVariant("c"), []model.Record{testRecord(testRecordA, "c.go", "C", []string{"c"})}, Faults{BeforeStateSync: injected})
+		secondDone <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		entries, err := os.ReadDir(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prepared := 0
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".CURRENT-") {
+				prepared++
+			}
+		}
+		if prepared >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second publisher did not prepare CURRENT temp outside the publication lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(releaseFirst)
+	<-firstDone
+	if firstErr != nil {
+		t.Fatal(firstErr)
+	}
+	if err := <-secondDone; !errors.Is(err, injected) {
+		t.Fatalf("second publication error = %v, want injected", err)
+	}
+	current := mustRead(t, filepath.Join(state, currentFilename))
+	if string(current) != tokenFromIdentity(first.Manifest.GenerationIdentity)+"\n" {
+		t.Fatalf("rollback CURRENT = %q, want first concurrent selection", current)
+	}
+}
+
 func TestBuildRollsBackIndeterminateCurrentRenameFailure(t *testing.T) {
 	roots, state := storeRoots(t)
 	first := mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
@@ -1612,6 +2198,16 @@ func (filesystem errorAfterGenerationRenameFilesystem) syncDirectory(directory *
 
 func (filesystem errorAfterCurrentRenameFilesystem) replaceFile(directory *boundary.StateDirectory, source, destination string, point faultPoint) error {
 	if err := filesystem.storeFilesystem.replaceFile(directory, source, destination, point); err != nil {
+		return err
+	}
+	if point == faultBeforeCurrentRename {
+		return filesystem.cause
+	}
+	return nil
+}
+
+func (filesystem errorAfterCurrentRenameFilesystem) replaceFileAfterBarrier(directory *boundary.StateDirectory, source, destination string, point faultPoint, barrier func() error) error {
+	if err := filesystem.storeFilesystem.replaceFileAfterBarrier(directory, source, destination, point, barrier); err != nil {
 		return err
 	}
 	if point == faultBeforeCurrentRename {

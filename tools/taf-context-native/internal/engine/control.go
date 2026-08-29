@@ -44,6 +44,7 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 		coverage.ExclusionReasonCounts["incomplete-inventory"]++
 	}
 	warnings := append([]string(nil), inventoryResult.Warnings...)
+	extractionWarnings := make(map[string][]string)
 	records := make([]model.Record, 0)
 	aggregateBytes := 0
 	parserIDs := engine.dependencies.ParserIDs()
@@ -72,6 +73,9 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 			coverage.ExclusionReasonCounts["incomplete-extraction"]++
 		}
 		warnings = appendBoundedWarnings(warnings, report.WarningCodes...)
+		if codes := appendBoundedWarnings(nil, report.WarningCodes...); len(codes) != 0 {
+			extractionWarnings[item.RelativePath] = codes
+		}
 		for _, record := range fileRecords {
 			cost := recordFootprint(record)
 			if cost > maximumAggregateRecordBytes-aggregateBytes {
@@ -100,6 +104,7 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 		InclusionPolicyIdentity: currentInclusionPolicyIdentity(), ExclusionPolicyIdentity: currentExclusionPolicyIdentity(),
 		ParserIdentities: cloneStrings(parserIDs), Coverage: coverage,
 		SourceBindingDigest: sourceBinding(inventoryResult.Paths), SemanticDigest: semanticBinding(records),
+		SourceCatalog: sourceCatalog(inventoryResult, extractionWarnings),
 	}
 	snapshot, buildErr := engine.dependencies.Build(ctx, roots, manifest, records)
 	if buildErr != nil {
@@ -116,6 +121,23 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 	result.ParserVersions = cloneStrings(parserIDs)
 	result.Warnings = warnings
 	return result, nil
+}
+
+func sourceCatalog(result inventory.Result, extractionWarnings map[string][]string) model.SourceCatalog {
+	catalog := model.SourceCatalog{Partial: result.Partial, Warnings: append([]string(nil), result.Warnings...)}
+	for _, item := range result.Paths {
+		catalog.Paths = append(catalog.Paths, model.SourcePath{RelativePath: item.RelativePath, Language: item.Language, Size: item.Size, SHA256: item.SHA256})
+	}
+	for _, item := range result.Exclusions {
+		catalog.Exclusions = append(catalog.Exclusions, model.SourceExclusion{RelativePath: item.RelativePath, Reason: item.Reason})
+	}
+	for relative, codes := range extractionWarnings {
+		catalog.ExtractionWarnings = append(catalog.ExtractionWarnings, model.SourceWarning{RelativePath: relative, Codes: append([]string(nil), codes...)})
+	}
+	sort.Slice(catalog.ExtractionWarnings, func(i, j int) bool {
+		return catalog.ExtractionWarnings[i].RelativePath < catalog.ExtractionWarnings[j].RelativePath
+	})
+	return catalog
 }
 
 func (engine *Engine) state(ctx context.Context, roots *boundary.Roots, request wire.Request, metrics bool) (wire.Result, error) {

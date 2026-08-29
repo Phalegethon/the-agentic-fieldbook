@@ -18,15 +18,20 @@ import (
 var ErrDependencies = errors.New("incomplete native Level 1 dependencies")
 
 type Dependencies struct {
-	ValidateRoots func(wire.Envelope) (boundary.Roots, error)
-	Collect       func(boundary.Roots, inventory.Mode) (inventory.Result, error)
-	OpenFile      func(*boundary.Roots, string, int64) (boundary.StableFile, error)
-	Extract       func(context.Context, boundary.StableFile) ([]model.Record, extract.Report)
-	Build         func(context.Context, *boundary.Roots, model.Manifest, []model.Record) (store.Snapshot, error)
-	Load          func(context.Context, *boundary.Roots, string) (store.Snapshot, error)
-	Inspect       func(context.Context, *boundary.Roots) (store.Status, error)
-	ParserIDs     func() map[string]string
-	Fit           func(context.Context, wire.Request, wire.Result) (wire.Result, error)
+	ValidateRoots    func(wire.Envelope) (boundary.Roots, error)
+	Collect          func(boundary.Roots, inventory.Mode) (inventory.Result, error)
+	OpenFile         func(*boundary.Roots, string, int64) (boundary.StableFile, error)
+	OpenControl      func(*boundary.Roots, string, int64) (boundary.StableFile, error)
+	Extract          func(context.Context, boundary.StableFile) ([]model.Record, extract.Report)
+	Build            func(context.Context, *boundary.Roots, model.Manifest, []model.Record) (store.Snapshot, error)
+	BuildWithBarrier func(context.Context, *boundary.Roots, model.Manifest, []model.Record, func() error) (store.Snapshot, error)
+	Load             func(context.Context, *boundary.Roots, string) (store.Snapshot, error)
+	Inspect          func(context.Context, *boundary.Roots) (store.Status, error)
+	ParserIDs        func() map[string]string
+	Fit              func(context.Context, wire.Request, wire.Result) (wire.Result, error)
+	// ObserveUpdateCounters is intentionally an in-process-only test/evaluation
+	// seam. Production leaves it nil; no high-cardinality data crosses wire.
+	ObserveUpdateCounters func(model.WorkCounters)
 }
 
 type Engine struct{ dependencies Dependencies }
@@ -39,12 +44,16 @@ func ProductionDependencies() Dependencies {
 		OpenFile: func(roots *boundary.Roots, relative string, maximum int64) (boundary.StableFile, error) {
 			return roots.OpenRepositoryFile(relative, maximum)
 		},
-		Extract:   registry.ExtractContext,
-		Build:     store.BuildContext,
-		Load:      store.LoadContext,
-		Inspect:   store.InspectContext,
-		ParserIDs: registry.ParserIdentities,
-		Fit:       render.FitContext,
+		OpenControl: func(roots *boundary.Roots, relative string, maximum int64) (boundary.StableFile, error) {
+			return roots.OpenStateControlFile(relative, maximum)
+		},
+		Extract:          registry.ExtractContext,
+		Build:            store.BuildContext,
+		BuildWithBarrier: store.BuildContextWithBarrier,
+		Load:             store.LoadContext,
+		Inspect:          store.InspectContext,
+		ParserIDs:        registry.ParserIdentities,
+		Fit:              render.FitContext,
 	}
 }
 
@@ -68,6 +77,8 @@ func (engine *Engine) Execute(ctx context.Context, envelope wire.Envelope) (wire
 		result, err = engine.estimate(ctx, &roots, envelope.Request)
 	case wire.Build:
 		result, err = engine.build(ctx, &roots, envelope.Request)
+	case wire.Update:
+		result, err = engine.update(ctx, &roots, envelope.Request, envelope.ChangedPathsDocument)
 	case wire.StatusOperation:
 		result, err = engine.state(ctx, &roots, envelope.Request, false)
 	case wire.Metrics:
@@ -82,14 +93,34 @@ func (engine *Engine) Execute(ctx context.Context, envelope wire.Envelope) (wire
 	if err != nil {
 		return wire.Result{}, err
 	}
-	if contextErr := ctx.Err(); contextErr != nil {
-		return wire.Result{}, contextErr
+	publishedUpdate := envelope.Request.Operation == wire.Update && result.Status == wire.Ready
+	if !publishedUpdate {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return wire.Result{}, contextErr
+		}
 	}
-	fitted, err := engine.dependencies.Fit(ctx, envelope.Request, result)
-	if contextErr := ctx.Err(); contextErr != nil {
-		return wire.Result{}, contextErr
+	fitContext := ctx
+	if publishedUpdate {
+		fitContext = context.WithoutCancel(ctx)
+	}
+	fitted, err := engine.dependencies.Fit(fitContext, envelope.Request, result)
+	if !publishedUpdate {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return wire.Result{}, contextErr
+		}
 	}
 	if err != nil {
+		if publishedUpdate {
+			// CURRENT already names the new immutable generation. A renderer seam
+			// must therefore not turn that completed publication into an error (or
+			// emit an internally inconsistent ready result). Update responses have
+			// no optional findings; their bounded fallback only needs the frozen
+			// character accounting restored before the caller serializes it.
+			fallback := result
+			fallback.Warnings = append([]string{}, result.Warnings...)
+			fallback.OutputCharacters = wire.OutputCharacters(fallback)
+			return fallback, nil
+		}
 		return wire.Result{}, err
 	}
 	// A snippet response that the shared renderer had to shorten is partial
@@ -110,9 +141,15 @@ func (engine *Engine) Execute(ctx context.Context, envelope wire.Envelope) (wire
 	return fitted, nil
 }
 
+func (engine *Engine) observeUpdateCounters(counters model.WorkCounters) {
+	if engine.dependencies.ObserveUpdateCounters != nil {
+		engine.dependencies.ObserveUpdateCounters(counters)
+	}
+}
+
 func (engine *Engine) ready() bool {
 	d := engine.dependencies
-	return d.ValidateRoots != nil && d.Collect != nil && d.OpenFile != nil && d.Extract != nil && d.Build != nil && d.Load != nil && d.Inspect != nil && d.ParserIDs != nil && d.Fit != nil
+	return d.ValidateRoots != nil && d.Collect != nil && d.OpenFile != nil && d.OpenControl != nil && d.Extract != nil && d.Build != nil && d.BuildWithBarrier != nil && d.Load != nil && d.Inspect != nil && d.ParserIDs != nil && d.Fit != nil
 }
 
 func productionLimits() policy.Limits { return policy.ProductionLimits() }

@@ -471,6 +471,9 @@ func (r *Roots) ReadRepositoryPrefix(relative string, maximum int64) (StablePref
 	}
 	name := components[len(components)-1]
 	before, err := current.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return StablePrefix{}, ErrRepositoryPathNotFound
+	}
 	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || (r.gitMetadataInfo != nil && sameIdentity(before, r.gitMetadataInfo)) {
 		return StablePrefix{}, ErrUnsafePath
 	}
