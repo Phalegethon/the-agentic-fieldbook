@@ -276,8 +276,10 @@ func classifyMetadata(entry boundary.RepositoryEntry, ignores []ignoreRule, trac
 			return ExcludedIgnored, false, false
 		}
 	}
-	if strings.HasSuffix(strings.ToLower(entry.RelativePath), ".generated.go") || strings.HasSuffix(strings.ToLower(entry.RelativePath), ".gen.go") || strings.HasSuffix(strings.ToLower(entry.RelativePath), ".pb.go") {
-		return ExcludedGenerated, false, false
+	for _, suffix := range generatedSuffixPolicy {
+		if strings.HasSuffix(strings.ToLower(entry.RelativePath), suffix) {
+			return ExcludedGenerated, false, false
+		}
 	}
 	return "", false, false
 }

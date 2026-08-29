@@ -23,6 +23,19 @@ import (
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
 
+func TestPolicyIdentitiesAreStableAndDistinct(t *testing.T) {
+	// This catches an engine binding that derives from a mutable caller value
+	// instead of the immutable inventory policies Collect uses.
+	firstInclusion, firstExclusion := PolicyIdentities()
+	secondInclusion, secondExclusion := PolicyIdentities()
+	if firstInclusion == "" || firstExclusion == "" || firstInclusion == firstExclusion {
+		t.Fatalf("policy identities = %q, %q", firstInclusion, firstExclusion)
+	}
+	if firstInclusion != secondInclusion || firstExclusion != secondExclusion {
+		t.Fatalf("policy identities changed: %q/%q != %q/%q", firstInclusion, firstExclusion, secondInclusion, secondExclusion)
+	}
+}
+
 func TestCollectIsIndependentOfCreationOrder(t *testing.T) {
 	left := inventoryFixture(t, []string{"b.go", "docs/a.md", "a.py"})
 	right := inventoryFixture(t, []string{"a.py", "b.go", "docs/a.md"})

@@ -1,6 +1,9 @@
 package inventory
 
 import (
+	"crypto/sha256"
+	endian "encoding/binary"
+	"encoding/hex"
 	"path"
 	"regexp"
 	"strings"
@@ -81,12 +84,49 @@ var extensionRegistry = []LanguageMetadata{
 	{Language: "toml", Extensions: []string{".toml"}},
 }
 
+var excludedDirectoryPolicy = []struct{ component, reason string }{
+	{".git", ExcludedGit}, {"vendor", ExcludedVendored}, {"vendors", ExcludedVendored}, {"node_modules", ExcludedVendored}, {"third_party", ExcludedVendored},
+	{"generated", ExcludedGenerated}, {"dist", ExcludedGenerated}, {"build", ExcludedGenerated}, {"coverage", ExcludedGenerated}, {".next", ExcludedGenerated}, {"target", ExcludedGenerated},
+}
+
+var generatedSuffixPolicy = []string{".generated.go", ".gen.go", ".pb.go"}
+
 func ExtensionRegistry() []LanguageMetadata {
 	copyRegistry := make([]LanguageMetadata, len(extensionRegistry))
 	for index, metadata := range extensionRegistry {
 		copyRegistry[index] = LanguageMetadata{Language: metadata.Language, Markdown: metadata.Markdown, Extensions: append([]string(nil), metadata.Extensions...)}
 	}
 	return copyRegistry
+}
+
+// PolicyIdentities binds the installed immutable inclusion and exclusion
+// surfaces that Collect actually consults.
+func PolicyIdentities() (string, string) {
+	inclusion := []string{"taf-level1-inclusion-v1"}
+	for _, metadata := range extensionRegistry {
+		inclusion = append(inclusion, metadata.Language)
+		inclusion = append(inclusion, metadata.Extensions...)
+		if metadata.Markdown {
+			inclusion = append(inclusion, "markdown-size-ceiling")
+		}
+	}
+	exclusion := []string{"taf-level1-exclusion-v1", ExcludedGit, ExcludedGenerated, ExcludedVendored, ExcludedIgnored, ExcludedBinary, ExcludedOversized, ExcludedUnsupported, ExcludedUnsafe, ExcludedLimit}
+	for _, rule := range excludedDirectoryPolicy {
+		exclusion = append(exclusion, rule.component, rule.reason)
+	}
+	exclusion = append(exclusion, generatedSuffixPolicy...)
+	return policyDigest(inclusion), policyDigest(exclusion)
+}
+
+func policyDigest(parts []string) string {
+	hash := sha256.New()
+	var size [8]byte
+	for _, part := range parts {
+		endian.BigEndian.PutUint64(size[:], uint64(len(part)))
+		_, _ = hash.Write(size[:])
+		_, _ = hash.Write([]byte(part))
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
 }
 
 func parseIgnoreRules(base string, contents []byte, availableRules, availablePatternBytes int) ([]ignoreRule, int, bool) {
@@ -354,13 +394,11 @@ func markdownLanguage(language string) bool {
 
 func excludedDirectory(relative string) string {
 	for _, component := range strings.Split(relative, "/") {
-		switch strings.ToLower(component) {
-		case ".git":
-			return ExcludedGit
-		case "vendor", "vendors", "node_modules", "third_party":
-			return ExcludedVendored
-		case "generated", "dist", "build", "coverage", ".next", "target":
-			return ExcludedGenerated
+		component = strings.ToLower(component)
+		for _, rule := range excludedDirectoryPolicy {
+			if component == rule.component {
+				return rule.reason
+			}
 		}
 	}
 	return ""

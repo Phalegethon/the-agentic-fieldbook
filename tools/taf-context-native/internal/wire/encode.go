@@ -22,3 +22,8 @@ func EncodeResult(writer io.Writer, result Result) error {
 	_, err = writer.Write(append(encoded, '\n'))
 	return err
 }
+
+// OutputCharacters returns the frozen model-visible character calculation.
+// It deliberately shares validation's calculation rather than duplicating it
+// in callers that need to fit a result before encoding it.
+func OutputCharacters(result Result) int { return renderedOutputCharacters(result) }

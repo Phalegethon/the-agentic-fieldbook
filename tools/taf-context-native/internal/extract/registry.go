@@ -121,6 +121,16 @@ func (registry Registry) Extract(file boundary.StableFile) (records []model.Reco
 	return registry.ExtractContext(context.Background(), file)
 }
 
+// ParserIdentities returns a defensive copy of every installed production
+// parser identity, including languages not observed in a particular build.
+func (registry Registry) ParserIdentities() map[string]string {
+	identities := make(map[string]string, len(registry.byExtension))
+	for _, extractor := range registry.byExtension {
+		identities[extractor.Language()] = extractor.ParserVersion()
+	}
+	return identities
+}
+
 type contextExtractor interface {
 	ExtractContext(context.Context, boundary.StableFile) ([]model.Record, Report)
 }
