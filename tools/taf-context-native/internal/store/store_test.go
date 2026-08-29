@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -54,6 +55,227 @@ func TestBuildContextSameGenerationCancellationDuringMaterializationReturnsError
 	if loaded.IndexIdentity != first.IndexIdentity {
 		t.Fatalf("CURRENT changed: %s", loaded.IndexIdentity)
 	}
+}
+
+func TestBuildContextCancellationDuringPreparationStagesPreservesCurrent(t *testing.T) {
+	stages := []buildPhase{
+		buildPhasePreflight,
+		buildPhaseQueryKeys,
+		buildPhaseSort,
+		buildPhaseEncode,
+		buildPhaseCompression,
+		buildPhasePayloadDigest,
+		buildPhaseManifest,
+		buildPhaseGenerationDigest,
+	}
+	for index, stage := range stages {
+		t.Run(string(stage), func(t *testing.T) {
+			roots, state := storeRoots(t)
+			prior := mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+			priorCurrent := mustRead(t, filepath.Join(state, currentFilename))
+			records := buildCancellationRecords(8192)
+			ctx, cancel := context.WithCancel(context.Background())
+			calls := 0
+			hooks := buildHooks{building: func(current buildPhase) {
+				if current == stage {
+					calls++
+					if calls == 2 {
+						cancel()
+					}
+				}
+			}}
+			snapshot, err := buildWithFilesystemObservedContext(ctx, boundaryFilesystem{}, roots, manifestVariant(fmt.Sprintf("%x", index)), records, hooks)
+			if err != context.Canceled {
+				t.Fatalf("BuildContext error = %v, want context.Canceled", err)
+			}
+			if !reflect.DeepEqual(snapshot, Snapshot{}) {
+				t.Fatalf("canceled build exposed snapshot: %#v", snapshot)
+			}
+			if calls < 2 {
+				t.Fatalf("stage %q checkpoints = %d, want at least 2", stage, calls)
+			}
+			if current := mustRead(t, filepath.Join(state, currentFilename)); !bytes.Equal(current, priorCurrent) {
+				t.Fatalf("stage %q changed CURRENT: %q, want %q", stage, current, priorCurrent)
+			}
+			loaded, loadErr := Load(roots, prior.IndexIdentity)
+			if loadErr != nil || loaded.IndexIdentity != prior.IndexIdentity {
+				t.Fatalf("stage %q prior CURRENT load = %#v, %v", stage, loaded, loadErr)
+			}
+		})
+	}
+}
+
+func TestBuildContextCancellationDuringLongRecordValidationWinsOverValidity(t *testing.T) {
+	tests := []struct {
+		name    string
+		preview string
+		want    error
+	}{
+		{name: "valid", preview: strings.Repeat("v", maximumIndexStringBytes), want: context.Canceled},
+		{name: "invalid", preview: strings.Repeat("v", maximumIndexStringBytes-1) + "\x00", want: context.DeadlineExceeded},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			roots, state := storeRoots(t)
+			record := testRecord(testRecordA, "a.go", "A", []string{"a"})
+			record.Preview = test.preview
+			canceled := false
+			ctx := stagedBuildContext{Context: context.Background(), canceled: &canceled, err: test.want}
+			sawQueryKeys := false
+			observations := 0
+			hooks := buildHooks{building: func(phase buildPhase) {
+				if phase == buildPhaseQueryKeys {
+					sawQueryKeys = true
+				}
+				if sawQueryKeys && phase == buildPhaseValidation {
+					observations++
+					if observations == 2 {
+						canceled = true
+					}
+				}
+			}}
+			snapshot, err := buildWithFilesystemObservedContext(ctx, boundaryFilesystem{}, roots, testManifest(), []model.Record{record}, hooks)
+			if err != test.want {
+				t.Fatalf("BuildContext error = %v, want %v", err, test.want)
+			}
+			if !reflect.DeepEqual(snapshot, Snapshot{}) || observations != 2 {
+				t.Fatalf("snapshot/observations = %#v/%d", snapshot, observations)
+			}
+			if _, err := os.Stat(state); !os.IsNotExist(err) {
+				t.Fatalf("canceled validation created state: %v", err)
+			}
+		})
+	}
+
+	t.Run("invalid without cancellation", func(t *testing.T) {
+		roots, state := storeRoots(t)
+		record := testRecord(testRecordA, "a.go", "A", []string{"a"})
+		record.Preview = strings.Repeat("v", maximumIndexStringBytes-1) + "\x00"
+		if _, err := BuildContext(context.Background(), roots, testManifest(), []model.Record{record}); !errors.Is(err, ErrInvalidIndex) {
+			t.Fatalf("BuildContext error = %v, want ErrInvalidIndex", err)
+		}
+		if _, err := os.Stat(state); !os.IsNotExist(err) {
+			t.Fatalf("invalid build created state: %v", err)
+		}
+	})
+}
+
+func TestPostingRangeCountContextCancelsAcrossIsolatedRanges(t *testing.T) {
+	ordinals := make([]uint32, 8192)
+	for index := range ordinals {
+		ordinals[index] = uint32(index * 2)
+	}
+	canceled := false
+	ctx := stagedBuildContext{Context: context.Background(), canceled: &canceled, err: context.Canceled}
+	observations := 0
+	count, err := postingRangeCountContext(ctx, ordinals, func(phase buildPhase) {
+		if phase == buildPhaseRangeCount {
+			observations++
+			if observations == 4 {
+				canceled = true
+			}
+		}
+	})
+	if err != context.Canceled {
+		t.Fatalf("postingRangeCountContext error = %v, want context.Canceled", err)
+	}
+	if count != 0 || observations != 4 {
+		t.Fatalf("count/observations = %d/%d, want 0/4", count, observations)
+	}
+}
+
+func TestBuildContextCancellationDuringConsecutiveQueryRangeSerializationPreservesState(t *testing.T) {
+	tests := []struct {
+		name         string
+		prior        bool
+		contextError error
+	}{
+		{name: "initial", contextError: context.Canceled},
+		{name: "replacement", prior: true, contextError: context.DeadlineExceeded},
+	}
+	records := buildCancellationRecords(8192)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			roots, state := storeRoots(t)
+			var prior Snapshot
+			var priorCurrent []byte
+			if test.prior {
+				prior = mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+				priorCurrent = mustRead(t, filepath.Join(state, currentFilename))
+			}
+
+			canceled := false
+			ctx := stagedBuildContext{Context: context.Background(), canceled: &canceled, err: test.contextError}
+			sawRangeCount := false
+			rangeEncodeBeforeCount := false
+			rangeEncodeObservations := 0
+			hooks := buildHooks{building: func(phase buildPhase) {
+				if phase == buildPhaseRangeCount {
+					sawRangeCount = true
+				}
+				if phase == buildPhaseRangeEncode {
+					if !sawRangeCount {
+						rangeEncodeBeforeCount = true
+					}
+					rangeEncodeObservations++
+					if rangeEncodeObservations == 2 {
+						canceled = true
+					}
+				}
+			}}
+
+			snapshot, err := buildWithFilesystemObservedContext(ctx, boundaryFilesystem{}, roots, testManifest(), records, hooks)
+			if err != test.contextError {
+				t.Fatalf("BuildContext error = %v, want exact %v", err, test.contextError)
+			}
+			if !reflect.DeepEqual(snapshot, Snapshot{}) {
+				t.Fatalf("canceled build exposed snapshot: %#v", snapshot)
+			}
+			if !sawRangeCount || rangeEncodeBeforeCount || rangeEncodeObservations != 2 {
+				t.Fatalf("range count/encode-before-count/encode observations = %t/%t/%d, want true/false/2", sawRangeCount, rangeEncodeBeforeCount, rangeEncodeObservations)
+			}
+
+			if !test.prior {
+				if _, err := os.Stat(state); !os.IsNotExist(err) {
+					t.Fatalf("canceled initial serialization created state: %v", err)
+				}
+				return
+			}
+			if current := mustRead(t, filepath.Join(state, currentFilename)); !bytes.Equal(current, priorCurrent) {
+				t.Fatalf("canceled replacement changed CURRENT: %q, want %q", current, priorCurrent)
+			}
+			loaded, loadErr := Load(roots, prior.IndexIdentity)
+			if loadErr != nil || loaded.IndexIdentity != prior.IndexIdentity {
+				t.Fatalf("prior CURRENT load = %#v, %v", loaded, loadErr)
+			}
+		})
+	}
+}
+
+type stagedBuildContext struct {
+	context.Context
+	canceled *bool
+	err      error
+}
+
+func (ctx stagedBuildContext) Err() error {
+	if ctx.canceled != nil && *ctx.canceled {
+		return ctx.err
+	}
+	return ctx.Context.Err()
+}
+
+func buildCancellationRecords(count int) []model.Record {
+	records := make([]model.Record, count)
+	for index := range records {
+		records[index] = testRecord(
+			fmt.Sprintf("sha256:%064x", count-index),
+			fmt.Sprintf("pkg/%05d/service.go", index),
+			fmt.Sprintf("pkg.Service%05d", index),
+			[]string{"service", fmt.Sprintf("service%05d", index)},
+		)
+	}
+	return records
 }
 
 const (
@@ -107,6 +329,122 @@ func TestEncodeIndexIsDeterministicAndDoesNotMutateInputs(t *testing.T) {
 	}
 }
 
+func TestIndexV2PersistsCanonicalQueryStructures(t *testing.T) {
+	records := []model.Record{
+		testRecord(testRecordB, "docs/guide.md", "Guide Setup", []string{"guide", "setup"}),
+		testRecord(testRecordA, "pkg/service.go", "pkg.Service", []string{"alias", "service"}),
+	}
+	records[0].RecordKind, records[0].SourceType, records[0].Language = model.Heading, "document", "markdown"
+
+	encoded, err := encodeIndex(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := mustDecompress(t, encoded)
+	if version := binary.BigEndian.Uint16(plain[len(indexMagic):]); version != 2 {
+		t.Fatalf("index version = %d, want 2", version)
+	}
+	decoded, postings, queryIndex, err := decodeIndexContextWithQueryObserved(context.Background(), encoded, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) != 2 || !slices.Equal(postings["service"], []uint32{0}) {
+		t.Fatalf("decoded records/postings = %#v %#v", decoded, postings)
+	}
+	if got := queryIndex.QualifiedOrdinals("pkg.Service"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("qualified postings = %v", got)
+	}
+	if got := queryIndex.ShortOrdinals("Service"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("short postings = %v", got)
+	}
+	if got := queryIndex.TokenOrdinals("setup"); !slices.Equal(got, []uint32{1}) {
+		t.Fatalf("token postings = %v", got)
+	}
+	if got := queryIndex.FacetOrdinals(QueryFacetLanguage, "markdown"); !slices.Equal(got, []uint32{1}) {
+		t.Fatalf("language facet = %v", got)
+	}
+	if got := queryIndex.PathOrdinals(); !slices.Equal(got, []uint32{1, 0}) {
+		t.Fatalf("path ordinals = %v", got)
+	}
+	groups, partial := queryIndex.MapGroups()
+	if partial || len(groups) != 2 || groups[0].Path != "docs/guide.md" || groups[1].Path != "pkg/service.go" {
+		t.Fatalf("map groups = %#v partial=%v", groups, partial)
+	}
+}
+
+func TestIndexV2OmitsEmptyDerivedShortAliasButKeepsQualifiedPosting(t *testing.T) {
+	record := testRecord(testRecordA, "punctuation.go", "---", []string{"punctuation"})
+	encoded, err := encodeIndex([]model.Record{record})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, queryIndex, err := decodeIndexContext(context.Background(), encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := queryIndex.QualifiedOrdinals("---"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("qualified punctuation posting = %v", got)
+	}
+	if got := queryIndex.ShortOrdinals(""); len(got) != 0 {
+		t.Fatalf("empty short alias posting = %v", got)
+	}
+}
+
+func TestIndexV2RejectsOldShapeReservedTermsAndQuerySectionCorruption(t *testing.T) {
+	record := testRecord(testRecordA, "pkg/service.go", "pkg.Service", []string{"service"})
+	reserved := record
+	reserved.SearchTerms = []string{"~taf-query/t/service"}
+	if _, err := encodeIndex([]model.Record{reserved}); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("reserved term error = %v, want ErrInvalidIndex", err)
+	}
+
+	encoded, err := encodeIndex([]model.Record{record})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := mutateHeader(encoded, func(header []byte) { binary.BigEndian.PutUint16(header[len(indexMagic):], 1) })
+	if _, _, _, err := decodeIndexContextWithQueryObserved(context.Background(), old, nil); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("old shape decode error = %v, want ErrInvalidIndex", err)
+	}
+	if _, _, err := validateIndex(old); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("old shape validation error = %v, want ErrInvalidIndex", err)
+	}
+
+	corruptPayload := mutateFirstQueryOrdinal(t, encoded, 99)
+	if _, _, _, err := decodeIndexContextWithQueryObserved(context.Background(), corruptPayload, nil); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("corrupt query decode error = %v, want ErrInvalidIndex", err)
+	}
+	if _, _, err := validateIndex(corruptPayload); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("corrupt query validation error = %v, want ErrInvalidIndex", err)
+	}
+}
+
+func TestLoadContextCancelsDuringLargeMaterializationWithoutSnapshot(t *testing.T) {
+	records := make([]model.Record, 150_000)
+	for index := range records {
+		records[index] = testRecord(fmt.Sprintf("sha256:%064x", index), fmt.Sprintf("pkg/%06d.go", index), fmt.Sprintf("Service%06d", index), []string{"service"})
+	}
+	roots, _ := storeRoots(t)
+	identity := mustBuild(t, roots, testManifest(), records).IndexIdentity
+	ctx, cancel := context.WithCancel(context.Background())
+	checkpoints := 0
+	snapshot, err := loadContextObserved(ctx, roots, identity, func() {
+		checkpoints++
+		if checkpoints == 150 {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("LoadContext error = %v, want context.Canceled", err)
+	}
+	if snapshot.Records != nil || snapshot.Postings != nil || !snapshot.Query.Empty() || snapshot.IndexIdentity != "" {
+		t.Fatalf("canceled load exposed snapshot state: %#v", snapshot)
+	}
+	if checkpoints != 150 {
+		t.Fatalf("checkpoints = %d, want prompt cancellation during auxiliary construction at 150", checkpoints)
+	}
+}
+
 func TestEncodeIndexRejectsDuplicateAndInvalidRecords(t *testing.T) {
 	valid := testRecord(testRecordA, "a.go", "A", []string{"a"})
 	tests := []struct {
@@ -133,7 +471,7 @@ func TestEncodeIndexRejectsOversizedInputBeforePerRecordAllocation(t *testing.T)
 	sharedTerms := []string{"term"}
 	record := testRecord(testRecordA, "oversized.go", "Oversized", sharedTerms)
 	record.Preview = preview
-	records := make([]model.Record, 17_000)
+	records := make([]model.Record, 25_000)
 	for index := range records {
 		records[index] = record
 	}
@@ -150,7 +488,7 @@ func TestEncodeIndexRejectsOversizedInputBeforePerRecordAllocation(t *testing.T)
 	}
 }
 
-func TestEncodeIndexUsesBoundedRepresentationsWithoutPerRecordClones(t *testing.T) {
+func TestEncodeIndexUsesLinearBoundedV2Representations(t *testing.T) {
 	sharedTerms := []string{"term-b", "term-a"}
 	records := make([]model.Record, 20_000)
 	for index := range records {
@@ -164,11 +502,11 @@ func TestEncodeIndexUsesBoundedRepresentationsWithoutPerRecordClones(t *testing.
 	if encodeErr != nil {
 		t.Fatal(encodeErr)
 	}
-	// Race instrumentation accounts for roughly ten thousand bookkeeping
-	// allocations here. The former per-record cloning implementation exceeded
-	// sixty thousand allocations even without race instrumentation.
-	if allocations > 20_000 {
-		t.Fatalf("valid encode allocations = %.0f, want <= 20000", allocations)
+	// Format v2 derives canonical Unicode query keys twice (preflight and
+	// ordinal fill) and grows the persisted facet postings linearly. This locks
+	// the linear shape without pretending the auxiliary index is allocation-free.
+	if allocations > 1_000_000 {
+		t.Fatalf("valid v2 encode allocations = %.0f, want <= 1000000", allocations)
 	}
 }
 
@@ -328,8 +666,8 @@ func TestDecodeIndexUsesSingleLinearPostingRepresentation(t *testing.T) {
 	if decodeErr != nil {
 		t.Fatal(decodeErr)
 	}
-	if allocations > 410_000 {
-		t.Fatalf("decode allocations = %.0f, want <= 410000", allocations)
+	if allocations > 1_200_000 {
+		t.Fatalf("v2 decode allocations = %.0f, want <= 1200000", allocations)
 	}
 }
 
@@ -615,8 +953,8 @@ func TestBuildReviewerShapePeakMemoryStaysBelowBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if preflight.plainSize != 65_400_018 {
-		t.Fatalf("reviewer-shape plain bytes = %d, want 65400018", preflight.plainSize)
+	if preflight.plainSize != 85_800_318 {
+		t.Fatalf("reviewer-shape v2 preflight bytes = %d, want 85800318", preflight.plainSize)
 	}
 
 	for _, test := range []struct {
@@ -681,7 +1019,7 @@ func TestBuildRejectsUnknownManifestFormatAndControlCharacters(t *testing.T) {
 	t.Run("unknown manifest format", func(t *testing.T) {
 		roots, state := storeRoots(t)
 		manifest := testManifest()
-		manifest.FormatVersion = "2"
+		manifest.FormatVersion = "1"
 		if _, err := Build(roots, manifest, []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})}); !errors.Is(err, ErrInvalidManifest) {
 			t.Fatalf("error = %v, want ErrInvalidManifest", err)
 		}
@@ -1209,6 +1547,31 @@ func FuzzDecodeIndex(f *testing.F) {
 	})
 }
 
+func FuzzMalformedRawV2Bounded(f *testing.F) {
+	valid, err := encodeIndex([]model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(valid)
+	f.Add([]byte{})
+	f.Add(mutateHeader(valid, func(plain []byte) {
+		binary.BigEndian.PutUint16(plain[len(indexMagic):], indexFormatVersion-1)
+	}))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 1<<20 {
+			t.Skip()
+		}
+		records, postings, _, decodeErr := decodeIndexContext(context.Background(), data)
+		recordCount, postingCount, validateErr := validateIndexContext(context.Background(), data)
+		if (decodeErr == nil) != (validateErr == nil) {
+			t.Fatalf("decoder/validator disagree: decode=%v validate=%v", decodeErr, validateErr)
+		}
+		if decodeErr == nil && (recordCount != len(records) || postingCount != len(postings)) {
+			t.Fatalf("raw v2 counts = (%d,%d), materialized=(%d,%d)", recordCount, postingCount, len(records), len(postings))
+		}
+	})
+}
+
 type fataler interface {
 	Helper()
 	Fatal(...any)
@@ -1324,6 +1687,72 @@ func mutateHeader(encoded []byte, mutate func([]byte)) []byte {
 	return mustCompress(value)
 }
 
+func mustDecompress(t *testing.T, encoded []byte) []byte {
+	t.Helper()
+	reader, err := zlib.NewReader(bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := io.ReadAll(reader)
+	if closeErr := reader.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plain
+}
+
+func mutateFirstQueryOrdinal(t *testing.T, encoded []byte, ordinal uint32) []byte {
+	t.Helper()
+	plain := mustDecompress(t, encoded)
+	decoder := rawBinaryDecoder{value: plain}
+	_, _ = decoder.readBytes(len(indexMagic))
+	_, _ = decoder.readUint16()
+	recordCount, err := decoder.readCount(maximumIndexRecords)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range recordCount {
+		if err := skipRawRecord(&decoder); err != nil {
+			t.Fatal(err)
+		}
+	}
+	postingCount, err := decoder.readCount(maximumPostingTerms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range postingCount {
+		if _, err := decoder.readString(128); err != nil {
+			t.Fatal(err)
+		}
+		count, err := decoder.readCount(maximumPostingOrdinals)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decoder.readBytes(count * 4); err != nil {
+			t.Fatal(err)
+		}
+	}
+	queryPostingCount, err := decoder.readCount(maximumQueryPostingTerms)
+	if err != nil || queryPostingCount == 0 {
+		t.Fatalf("query posting count = %d, err=%v", queryPostingCount, err)
+	}
+	if _, err := decoder.readString(maximumQueryKeyBytes); err != nil {
+		t.Fatal(err)
+	}
+	ordinalCount, err := decoder.readCount(maximumQueryPostingOrdinals)
+	if err != nil || ordinalCount == 0 {
+		t.Fatalf("query ordinal count = %d, err=%v", ordinalCount, err)
+	}
+	rangeCount, err := decoder.readCount(ordinalCount)
+	if err != nil || rangeCount == 0 {
+		t.Fatalf("query range count = %d, err=%v", rangeCount, err)
+	}
+	binary.BigEndian.PutUint32(plain[decoder.offset:decoder.offset+4], ordinal)
+	return mustCompress(plain)
+}
+
 func mustCompress(plain []byte) []byte {
 	var output bytes.Buffer
 	writer, err := zlib.NewWriterLevel(&output, zlib.BestCompression)
@@ -1349,7 +1778,7 @@ func testRecord(identity, path, qualified string, terms []string) model.Record {
 
 func testManifest() model.Manifest {
 	return model.Manifest{
-		FormatVersion: "1", EngineVersion: "engine-v1",
+		FormatVersion: "2", EngineVersion: "engine-v1",
 		Binding: model.Binding{
 			RepositoryIdentity:      "sha256:1111111111111111111111111111111111111111111111111111111111111111",
 			WorktreeIdentity:        "sha256:2222222222222222222222222222222222222222222222222222222222222222",

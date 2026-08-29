@@ -1,0 +1,184 @@
+package query
+
+import (
+	"cmp"
+	"slices"
+	"strings"
+
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
+)
+
+// rankedCandidate carries every field used by the total ordering. Admission
+// computes these fields once; ranking comparisons never rescan or normalize a
+// record.
+type rankedCandidate struct {
+	record         model.Record
+	tier           int
+	evidence       int
+	normalizedPath string
+	startLine      int
+	kind           string
+	normalizedName string
+	identity       string
+	source         int
+	mapKind        int
+}
+
+func newRankedCandidate(record model.Record, tier int) rankedCandidate {
+	return rankedCandidate{
+		record:         record,
+		tier:           tier,
+		evidence:       evidenceTier(record),
+		normalizedPath: normalize(record.Path),
+		startLine:      record.StartLine,
+		kind:           string(record.RecordKind),
+		normalizedName: normalize(record.QualifiedName),
+		identity:       record.Identity,
+		source:         sourceTier(record.SourceType),
+		mapKind:        mapKindTier(record.RecordKind),
+	}
+}
+
+func compareRankedCandidate(left, right rankedCandidate) int {
+	comparisons := [...]int{
+		cmp.Compare(left.tier, right.tier),
+		cmp.Compare(left.evidence, right.evidence),
+		cmp.Compare(left.normalizedPath, right.normalizedPath),
+		cmp.Compare(left.startLine, right.startLine),
+		cmp.Compare(left.kind, right.kind),
+		cmp.Compare(left.normalizedName, right.normalizedName),
+		cmp.Compare(left.identity, right.identity),
+	}
+	for _, comparison := range comparisons {
+		if comparison != 0 {
+			return comparison
+		}
+	}
+	return 0
+}
+
+func compareRepresentativeCandidate(left, right rankedCandidate) int {
+	comparisons := [...]int{
+		cmp.Compare(left.evidence, right.evidence),
+		cmp.Compare(left.source, right.source),
+		cmp.Compare(left.mapKind, right.mapKind),
+		cmp.Compare(left.startLine, right.startLine),
+		cmp.Compare(left.normalizedName, right.normalizedName),
+		cmp.Compare(left.identity, right.identity),
+	}
+	for _, comparison := range comparisons {
+		if comparison != 0 {
+			return comparison
+		}
+	}
+	return 0
+}
+
+// boundedRanking maintains a sorted top-K incrementally. Every candidate
+// materialization and ordering comparison consumes the shared record budget;
+// there is no uncharged final global sort.
+type boundedRanking struct {
+	items   []rankedCandidate
+	total   int
+	maximum int
+	budget  *workBudget
+}
+
+func newBoundedRanking(maximum int, budget *workBudget) boundedRanking {
+	return boundedRanking{items: make([]rankedCandidate, 0, min(max(0, maximum), 64)), maximum: max(0, maximum), budget: budget}
+}
+
+func (ranking *boundedRanking) offer(record model.Record, tier int) bool {
+	if !ranking.budget.visitRecord() {
+		return false
+	}
+	return ranking.offerCandidate(newRankedCandidate(record, tier))
+}
+
+func (ranking *boundedRanking) offerCandidate(candidate rankedCandidate) bool {
+	low, high := 0, len(ranking.items)
+	for low < high {
+		if !ranking.budget.visitRecord() {
+			return false
+		}
+		middle := low + (high-low)/2
+		if compareRankedCandidate(ranking.items[middle], candidate) < 0 {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	ranking.total++
+	if ranking.maximum == 0 || low >= ranking.maximum {
+		return true
+	}
+	if len(ranking.items) < ranking.maximum {
+		ranking.items = append(ranking.items, rankedCandidate{})
+		copy(ranking.items[low+1:], ranking.items[low:])
+		ranking.items[low] = candidate
+		return true
+	}
+	copy(ranking.items[low+1:], ranking.items[low:len(ranking.items)-1])
+	ranking.items[low] = candidate
+	return true
+}
+
+func (ranking *boundedRanking) records() ([]model.Record, int) {
+	records := make([]model.Record, len(ranking.items))
+	for index := range ranking.items {
+		records[index] = ranking.items[index].record
+	}
+	return records, max(0, ranking.total-len(ranking.items))
+}
+
+func evidenceTier(record model.Record) int {
+	if record.EvidenceClass == model.Verified {
+		return 0
+	}
+	if record.EvidenceClass == model.Inferred {
+		return 1
+	}
+	return 2
+}
+
+func matchesOperation(record model.Record, operation wire.Operation) bool {
+	switch operation {
+	case wire.SearchSymbols:
+		return record.RecordKind != model.Heading && record.RecordKind != model.DocumentChunk && record.SourceType != "document"
+	case wire.SearchDocs:
+		return record.RecordKind == model.Heading || record.RecordKind == model.DocumentChunk || record.SourceType == "document"
+	default:
+		return true
+	}
+}
+
+func matchesFilters(record model.Record, filters wire.Filters) bool {
+	if len(filters.PathPrefixes) != 0 {
+		matched := false
+		for _, prefix := range filters.PathPrefixes {
+			if strings.HasPrefix(record.Path, prefix) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return matchesOne(filters.Languages, record.Language) && matchesOne(filters.SymbolKinds, string(record.RecordKind)) && matchesOne(filters.SourceTypes, record.SourceType)
+}
+
+func matchesOne(values []string, actual string) bool {
+	if len(values) == 0 {
+		return true
+	}
+	return slices.Contains(values, actual)
+}
+
+func deref(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}

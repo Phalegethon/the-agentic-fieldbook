@@ -23,7 +23,8 @@ type Dependencies struct {
 	OpenFile      func(*boundary.Roots, string, int64) (boundary.StableFile, error)
 	Extract       func(context.Context, boundary.StableFile) ([]model.Record, extract.Report)
 	Build         func(context.Context, *boundary.Roots, model.Manifest, []model.Record) (store.Snapshot, error)
-	Inspect       func(*boundary.Roots) (store.Status, error)
+	Load          func(context.Context, *boundary.Roots, string) (store.Snapshot, error)
+	Inspect       func(context.Context, *boundary.Roots) (store.Status, error)
 	ParserIDs     func() map[string]string
 }
 
@@ -39,7 +40,8 @@ func ProductionDependencies() Dependencies {
 		},
 		Extract:   registry.ExtractContext,
 		Build:     store.BuildContext,
-		Inspect:   store.Inspect,
+		Load:      store.LoadContext,
+		Inspect:   store.InspectContext,
 		ParserIDs: registry.ParserIdentities,
 	}
 }
@@ -68,6 +70,8 @@ func (engine *Engine) Execute(ctx context.Context, envelope wire.Envelope) (wire
 		result, err = engine.state(ctx, &roots, envelope.Request, false)
 	case wire.Metrics:
 		result, err = engine.state(ctx, &roots, envelope.Request, true)
+	case wire.RepositoryMap, wire.SearchSymbols, wire.SearchDocs:
+		result, err = engine.query(ctx, &roots, envelope.Request)
 	default:
 		result = engine.unsupported(envelope.Request)
 	}
@@ -79,7 +83,7 @@ func (engine *Engine) Execute(ctx context.Context, envelope wire.Envelope) (wire
 
 func (engine *Engine) ready() bool {
 	d := engine.dependencies
-	return d.ValidateRoots != nil && d.Collect != nil && d.OpenFile != nil && d.Extract != nil && d.Build != nil && d.Inspect != nil && d.ParserIDs != nil
+	return d.ValidateRoots != nil && d.Collect != nil && d.OpenFile != nil && d.Extract != nil && d.Build != nil && d.Load != nil && d.Inspect != nil && d.ParserIDs != nil
 }
 
 func productionLimits() policy.Limits { return policy.ProductionLimits() }

@@ -95,7 +95,7 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 		}
 	}
 	manifest := model.Manifest{
-		FormatVersion: "1", EngineVersion: engineVersion,
+		FormatVersion: "2", EngineVersion: engineVersion,
 		Binding:                 model.Binding{RepositoryIdentity: request.RepositoryIdentity, WorktreeIdentity: request.WorktreeIdentity, CommittedHead: request.CommittedHead, DirtyOverlayFingerprint: request.DirtyOverlayFingerprint},
 		InclusionPolicyIdentity: currentInclusionPolicyIdentity(), ExclusionPolicyIdentity: currentExclusionPolicyIdentity(),
 		ParserIdentities: cloneStrings(parserIDs), Coverage: coverage,
@@ -122,7 +122,7 @@ func (engine *Engine) state(ctx context.Context, roots *boundary.Roots, request 
 	if err := ctx.Err(); err != nil {
 		return wire.Result{}, err
 	}
-	status, err := engine.dependencies.Inspect(roots)
+	status, err := engine.dependencies.Inspect(ctx, roots)
 	if err != nil {
 		action := "rebuild-index"
 		if errors.Is(err, store.ErrNoCurrent) {

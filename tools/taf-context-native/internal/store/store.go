@@ -35,6 +35,7 @@ type Snapshot struct {
 	Manifest       model.Manifest
 	Records        []model.Record
 	Postings       map[string][]uint32
+	Query          QueryIndex
 	IndexIdentity  string
 	InstalledBytes int64
 }
@@ -56,13 +57,39 @@ type generationArtifacts struct {
 	installedBytes int64
 }
 
-type buildHooks struct{ materialized func() }
+type buildPhase string
 
-func (hooks buildHooks) decodeIndex(payload []byte) ([]model.Record, map[string][]uint32, error) {
+const (
+	buildPhasePreflight        buildPhase = "preflight"
+	buildPhaseQueryKeys        buildPhase = "query-keys"
+	buildPhaseSort             buildPhase = "sort"
+	buildPhaseEncode           buildPhase = "encode"
+	buildPhaseValidation       buildPhase = "validation"
+	buildPhaseRangeCount       buildPhase = "range-count"
+	buildPhaseRangeEncode      buildPhase = "range-encode"
+	buildPhaseCompression      buildPhase = "compression"
+	buildPhasePayloadDigest    buildPhase = "payload-digest"
+	buildPhaseManifest         buildPhase = "manifest"
+	buildPhaseGenerationDigest buildPhase = "generation-digest"
+)
+
+type buildHooks struct {
+	materialized func()
+	building     func(buildPhase)
+}
+
+func observeBuildContext(ctx context.Context, observed func(buildPhase), phase buildPhase) error {
+	if observed != nil {
+		observed(phase)
+	}
+	return ctx.Err()
+}
+
+func (hooks buildHooks) decodeIndex(ctx context.Context, payload []byte) ([]model.Record, map[string][]uint32, QueryIndex, error) {
 	if hooks.materialized != nil {
 		hooks.materialized()
 	}
-	return decodeIndex(payload)
+	return decodeIndexContext(ctx, payload)
 }
 
 // Build stages, verifies, installs, and atomically selects one immutable
@@ -71,9 +98,9 @@ func Build(roots *boundary.Roots, manifest model.Manifest, records []model.Recor
 	return BuildContext(context.Background(), roots, manifest, records)
 }
 
-// BuildContext observes cancellation before preparation, before state mutation,
-// and immediately before CURRENT publication. Build remains the compatibility
-// non-canceling entry point.
+// BuildContext observes cancellation throughout deterministic preparation,
+// before state mutation, and immediately before CURRENT publication. Build
+// remains the compatibility non-canceling entry point.
 func BuildContext(ctx context.Context, roots *boundary.Roots, manifest model.Manifest, records []model.Record) (Snapshot, error) {
 	return buildWithFilesystemObservedContext(ctx, boundaryFilesystem{}, roots, manifest, records, buildHooks{})
 }
@@ -100,7 +127,7 @@ func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFil
 	}
 	// Build and validate the complete deterministic byte image before the first
 	// state mutation. Invalid caller input must not create even an empty store.
-	artifacts, err := prepareGeneration(manifest, records)
+	artifacts, err := prepareGenerationContext(ctx, manifest, records, hooks.building)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -139,7 +166,7 @@ func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFil
 		if err := ctx.Err(); err != nil {
 			return Snapshot{}, err
 		}
-		selected, materializeErr := materializeArtifacts(artifacts, hooks)
+		selected, materializeErr := materializeArtifacts(ctx, artifacts, hooks)
 		if materializeErr != nil {
 			return Snapshot{}, materializeErr
 		}
@@ -149,7 +176,7 @@ func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFil
 		return selected, nil
 	}
 	if previousExists {
-		if err := validateGenerationMetadata(filesystem, generations, previousToken); err != nil {
+		if err := validateGenerationMetadataContext(ctx, filesystem, generations, previousToken); err != nil {
 			return Snapshot{}, err
 		}
 	}
@@ -236,7 +263,7 @@ func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFil
 		}
 		return Snapshot{}, original
 	}
-	selected, err := materializeArtifacts(artifacts, hooks)
+	selected, err := materializeArtifacts(ctx, artifacts, hooks)
 	if err != nil {
 		original := corrupt(err)
 		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, previousCurrent, original); rollbackErr != nil {
@@ -255,7 +282,21 @@ func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFil
 
 // Load validates CURRENT and its complete generation before exposing records.
 func Load(roots *boundary.Roots, expectedIndex string) (Snapshot, error) {
-	if roots == nil || !sha256Identity.MatchString(expectedIndex) {
+	return LoadContext(context.Background(), roots, expectedIndex)
+}
+
+// LoadContext keeps read-side callers from exposing a snapshot after their
+// operation has been cancelled. The underlying capability reads are bounded;
+// the post-load check closes the same-current cancellation window.
+func LoadContext(ctx context.Context, roots *boundary.Roots, expectedIndex string) (Snapshot, error) {
+	return loadContextObserved(ctx, roots, expectedIndex, nil)
+}
+
+func loadContextObserved(ctx context.Context, roots *boundary.Roots, expectedIndex string, observed func()) (Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
+	if roots == nil || !validSHA256IdentityString(expectedIndex) {
 		return Snapshot{}, ErrIndexMismatch
 	}
 	filesystem := boundaryFilesystem{}
@@ -275,7 +316,7 @@ func Load(roots *boundary.Roots, expectedIndex string) (Snapshot, error) {
 		return Snapshot{}, corrupt(err)
 	}
 	defer filesystem.closeDirectory(generations)
-	snapshot, _, exists, err := loadCurrentOptional(filesystem, state, generations)
+	snapshot, selectedCurrent, exists, err := loadCurrentOptionalContextObserved(ctx, filesystem, state, generations, observed)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -285,11 +326,29 @@ func Load(roots *boundary.Roots, expectedIndex string) (Snapshot, error) {
 	if snapshot.IndexIdentity != expectedIndex {
 		return Snapshot{}, ErrIndexMismatch
 	}
+	_, current, stillExists, err := readCurrentPointer(filesystem, state)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if !stillExists || !bytes.Equal(current, selectedCurrent) {
+		return Snapshot{}, ErrIndexMismatch
+	}
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
 	return snapshot, nil
 }
 
-// Inspect validates the same complete state as Load without an expected index.
+// Inspect validates the same complete state as Load without materializing a
+// snapshot. It remains the compatibility non-canceling entry point.
 func Inspect(roots *boundary.Roots) (Status, error) {
+	return InspectContext(context.Background(), roots)
+}
+
+func InspectContext(ctx context.Context, roots *boundary.Roots) (Status, error) {
+	if err := ctx.Err(); err != nil {
+		return Status{}, err
+	}
 	if roots == nil {
 		return Status{}, ErrStoreCorrupt
 	}
@@ -310,17 +369,14 @@ func Inspect(roots *boundary.Roots) (Status, error) {
 		return Status{}, corrupt(err)
 	}
 	defer filesystem.closeDirectory(generations)
-	snapshot, _, exists, err := loadCurrentOptional(filesystem, state, generations)
+	token, _, exists, err := readCurrentPointer(filesystem, state)
 	if err != nil {
 		return Status{}, err
 	}
 	if !exists {
 		return Status{}, ErrNoCurrent
 	}
-	return Status{
-		Ready: true, Manifest: snapshot.Manifest, IndexIdentity: snapshot.IndexIdentity,
-		GenerationIdentity: snapshot.Manifest.GenerationIdentity, InstalledBytes: snapshot.InstalledBytes,
-	}, nil
+	return inspectGenerationContext(ctx, filesystem, generations, token)
 }
 
 func openOrCreateGenerations(filesystem storeFilesystem, state *boundary.StateDirectory) (*boundary.StateDirectory, error) {
@@ -342,28 +398,48 @@ func openOrCreateGenerations(filesystem storeFilesystem, state *boundary.StateDi
 }
 
 func prepareGeneration(input model.Manifest, inputRecords []model.Record) (generationArtifacts, error) {
-	if input.FormatVersion != "1" {
+	return prepareGenerationContext(context.Background(), input, inputRecords, nil)
+}
+
+func prepareGenerationContext(ctx context.Context, input model.Manifest, inputRecords []model.Record, observed func(buildPhase)) (generationArtifacts, error) {
+	if err := ctx.Err(); err != nil {
+		return generationArtifacts{}, err
+	}
+	// Bound all caller-controlled manifest collections and strings before
+	// cloneManifest can traverse or allocate for them. Once bounded, manifest
+	// cloning and JSON map ordering are fixed-size operations.
+	if input.FormatVersion != "2" || !manifestVariableBounds(input) {
 		return generationArtifacts{}, ErrInvalidManifest
 	}
 	postingCount := 0
-	payload, err := encodeIndexObservedStats(inputRecords, nil, &postingCount)
+	payload, err := encodeIndexObservedStatsContext(ctx, inputRecords, nil, &postingCount, observed)
 	if err != nil {
 		return generationArtifacts{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return generationArtifacts{}, err
+	}
 	manifest := cloneManifest(input)
-	manifest.FormatVersion = "1"
+	manifest.FormatVersion = "2"
 	manifest.RecordCount = len(inputRecords)
 	manifest.PostingCount = postingCount
-	manifest.PayloadDigest = sha256ID(payload)
+	payloadDigest, err := sha256IDContext(ctx, payload, observed, buildPhasePayloadDigest)
+	if err != nil {
+		return generationArtifacts{}, err
+	}
+	manifest.PayloadDigest = payloadDigest
 	manifest.IndexIdentity = manifest.PayloadDigest
 	manifest.GenerationIdentity = zeroSHA256Identity
-	identity, err := computeGenerationIdentity(manifest)
+	identity, err := computeGenerationIdentityContext(ctx, manifest, observed)
 	if err != nil {
 		return generationArtifacts{}, err
 	}
 	manifest.GenerationIdentity = identity
-	manifestBytes, err := encodeManifest(manifest)
+	manifestBytes, err := encodeManifestContext(ctx, manifest, observed)
 	if err != nil {
+		return generationArtifacts{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return generationArtifacts{}, err
 	}
 	ready := []byte(identity + "\n")
@@ -378,13 +454,17 @@ func prepareGeneration(input model.Manifest, inputRecords []model.Record) (gener
 	}, nil
 }
 
-func materializeArtifacts(artifacts generationArtifacts, hooks buildHooks) (Snapshot, error) {
-	records, postings, err := hooks.decodeIndex(artifacts.payload)
+func materializeArtifacts(ctx context.Context, artifacts generationArtifacts, hooks buildHooks) (Snapshot, error) {
+	records, postings, queryIndex, err := hooks.decodeIndex(ctx, artifacts.payload)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return Snapshot{}, err
+	}
 	if err != nil || len(records) != artifacts.manifestValue.RecordCount || len(postings) != artifacts.manifestValue.PostingCount {
 		return Snapshot{}, ErrStoreCorrupt
 	}
 	return Snapshot{
 		Manifest: artifacts.manifestValue, Records: records, Postings: postings,
+		Query:         queryIndex,
 		IndexIdentity: artifacts.manifestValue.IndexIdentity, InstalledBytes: artifacts.installedBytes,
 	}, nil
 }
@@ -424,6 +504,13 @@ func verifyGenerationArtifacts(filesystem storeFilesystem, generations *boundary
 }
 
 func validateGenerationMetadata(filesystem storeFilesystem, generations *boundary.StateDirectory, token string) error {
+	return validateGenerationMetadataContext(context.Background(), filesystem, generations, token)
+}
+
+func validateGenerationMetadataContext(ctx context.Context, filesystem storeFilesystem, generations *boundary.StateDirectory, token string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !generationNamePattern.MatchString(token) {
 		return ErrStoreCorrupt
 	}
@@ -453,7 +540,10 @@ func validateGenerationMetadata(filesystem storeFilesystem, generations *boundar
 	if err != nil || sha256ID(payload) != manifest.PayloadDigest || manifest.IndexIdentity != manifest.PayloadDigest {
 		return ErrStoreCorrupt
 	}
-	recordCount, postingCount, err := validateIndex(payload)
+	recordCount, postingCount, err := validateIndexContext(ctx, payload)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
 	if err != nil || recordCount != manifest.RecordCount || postingCount != manifest.PostingCount {
 		return ErrStoreCorrupt
 	}
@@ -468,25 +558,98 @@ func validateGenerationMetadata(filesystem storeFilesystem, generations *boundar
 	return nil
 }
 
+func inspectGenerationContext(ctx context.Context, filesystem storeFilesystem, generations *boundary.StateDirectory, token string) (Status, error) {
+	if err := ctx.Err(); err != nil {
+		return Status{}, err
+	}
+	if !generationNamePattern.MatchString(token) {
+		return Status{}, ErrStoreCorrupt
+	}
+	directory, err := filesystem.openDirectory(generations, token)
+	if err != nil {
+		return Status{}, fmt.Errorf("open generation: %w", corrupt(err))
+	}
+	defer filesystem.closeDirectory(directory)
+	wantNames := []string{readyFilename, indexFilename, manifestFilename}
+	names, err := filesystem.names(directory, len(wantNames))
+	if err != nil || !slices.Equal(names, wantNames) {
+		return Status{}, ErrStoreCorrupt
+	}
+	manifestBytes, err := filesystem.readFile(directory, manifestFilename, maximumManifestBytes)
+	if err != nil {
+		return Status{}, ErrStoreCorrupt
+	}
+	manifest, err := decodeManifest(manifestBytes)
+	if err != nil || tokenFromIdentity(manifest.GenerationIdentity) != token {
+		return Status{}, ErrStoreCorrupt
+	}
+	ready, err := filesystem.readFile(directory, readyFilename, 72)
+	if err != nil || !bytes.Equal(ready, []byte(manifest.GenerationIdentity+"\n")) {
+		return Status{}, ErrStoreCorrupt
+	}
+	payload, err := filesystem.readFile(directory, indexFilename, maximumEncodedIndexBytes)
+	if err != nil || sha256ID(payload) != manifest.PayloadDigest || manifest.IndexIdentity != manifest.PayloadDigest {
+		return Status{}, ErrStoreCorrupt
+	}
+	recordCount, postingCount, err := validateIndexContext(ctx, payload)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return Status{}, err
+		}
+		return Status{}, ErrStoreCorrupt
+	}
+	if recordCount != manifest.RecordCount || postingCount != manifest.PostingCount {
+		return Status{}, ErrStoreCorrupt
+	}
+	identity, err := computeGenerationIdentity(manifest)
+	if err != nil || identity != manifest.GenerationIdentity {
+		return Status{}, ErrStoreCorrupt
+	}
+	names, err = filesystem.names(directory, len(wantNames))
+	if err != nil || !slices.Equal(names, wantNames) {
+		return Status{}, ErrStoreCorrupt
+	}
+	if err := ctx.Err(); err != nil {
+		return Status{}, err
+	}
+	installedBytes := int64(len(payload)) + int64(len(manifestBytes)) + int64(len(ready))
+	return Status{Ready: true, Manifest: manifest, IndexIdentity: manifest.IndexIdentity, GenerationIdentity: manifest.GenerationIdentity, InstalledBytes: installedBytes}, nil
+}
+
 func computeGenerationIdentity(manifest model.Manifest) (string, error) {
+	return computeGenerationIdentityContext(context.Background(), manifest, nil)
+}
+
+func computeGenerationIdentityContext(ctx context.Context, manifest model.Manifest, observed func(buildPhase)) (string, error) {
+	if !manifestVariableBounds(manifest) {
+		return "", ErrInvalidManifest
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	identityManifest := cloneManifest(manifest)
 	identityManifest.GenerationIdentity = zeroSHA256Identity
-	encoded, err := encodeManifest(identityManifest)
+	encoded, err := encodeManifestContext(ctx, identityManifest, observed)
 	if err != nil {
 		return "", err
 	}
-	material := make([]byte, 0, len(encoded)+18)
-	material = append(material, []byte("taf-generation-v1\x00")...)
-	material = append(material, encoded...)
-	return sha256ID(material), nil
+	return sha256MaterialIDContext(ctx, []byte("taf-generation-v2\x00"), encoded, observed, buildPhaseGenerationDigest)
 }
 
 func loadCurrentOptional(filesystem storeFilesystem, state, generations *boundary.StateDirectory) (Snapshot, []byte, bool, error) {
+	return loadCurrentOptionalContext(context.Background(), filesystem, state, generations)
+}
+
+func loadCurrentOptionalContext(ctx context.Context, filesystem storeFilesystem, state, generations *boundary.StateDirectory) (Snapshot, []byte, bool, error) {
+	return loadCurrentOptionalContextObserved(ctx, filesystem, state, generations, nil)
+}
+
+func loadCurrentOptionalContextObserved(ctx context.Context, filesystem storeFilesystem, state, generations *boundary.StateDirectory, observed func()) (Snapshot, []byte, bool, error) {
 	token, current, exists, err := readCurrentPointer(filesystem, state)
 	if err != nil || !exists {
 		return Snapshot{}, current, exists, err
 	}
-	snapshot, err := loadGeneration(filesystem, generations, token)
+	snapshot, err := loadGenerationContextObserved(ctx, filesystem, generations, token, observed)
 	if err != nil {
 		return Snapshot{}, nil, false, fmt.Errorf("validate selected generation: %w", err)
 	}
@@ -512,6 +675,17 @@ func readCurrentPointer(filesystem storeFilesystem, state *boundary.StateDirecto
 }
 
 func loadGeneration(filesystem storeFilesystem, generations *boundary.StateDirectory, token string) (Snapshot, error) {
+	return loadGenerationContext(context.Background(), filesystem, generations, token)
+}
+
+func loadGenerationContext(ctx context.Context, filesystem storeFilesystem, generations *boundary.StateDirectory, token string) (Snapshot, error) {
+	return loadGenerationContextObserved(ctx, filesystem, generations, token, nil)
+}
+
+func loadGenerationContextObserved(ctx context.Context, filesystem storeFilesystem, generations *boundary.StateDirectory, token string, observed func()) (Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
 	if !generationNamePattern.MatchString(token) {
 		return Snapshot{}, ErrStoreCorrupt
 	}
@@ -541,7 +715,10 @@ func loadGeneration(filesystem storeFilesystem, generations *boundary.StateDirec
 	if err != nil || sha256ID(payload) != manifest.PayloadDigest || manifest.IndexIdentity != manifest.PayloadDigest {
 		return Snapshot{}, fmt.Errorf("read index payload: %w", corrupt(err))
 	}
-	records, postings, err := decodeIndex(payload)
+	records, postings, queryIndex, err := decodeIndexContextWithQueryObserved(ctx, payload, observed)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return Snapshot{}, err
+	}
 	if err != nil || len(records) != manifest.RecordCount || len(postings) != manifest.PostingCount {
 		return Snapshot{}, ErrStoreCorrupt
 	}
@@ -554,7 +731,7 @@ func loadGeneration(filesystem storeFilesystem, generations *boundary.StateDirec
 		return Snapshot{}, ErrStoreCorrupt
 	}
 	installedBytes := int64(len(payload)) + int64(len(manifestBytes)) + int64(len(ready))
-	return Snapshot{Manifest: manifest, Records: records, Postings: postings, IndexIdentity: manifest.IndexIdentity, InstalledBytes: installedBytes}, nil
+	return Snapshot{Manifest: manifest, Records: records, Postings: postings, Query: queryIndex, IndexIdentity: manifest.IndexIdentity, InstalledBytes: installedBytes}, nil
 }
 
 func cloneManifest(manifest model.Manifest) model.Manifest {
