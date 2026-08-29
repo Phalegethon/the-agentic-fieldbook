@@ -1,0 +1,72 @@
+{
+  "schema_version": "1",
+  "modules": [
+    {
+      "module": "github.com/mattn/go-pointer",
+      "version": "v0.0.1",
+      "direct": false,
+      "upstream_license": "MIT",
+      "license_file": "vendor/github.com/mattn/go-pointer/LICENSE",
+      "license_sha256": "sha256:7228b277bcb9df4bdc7eb60852f4163fcf391add8ae5f60cfcc7232200176520",
+      "vendor_tree_sha256": "sha256:c42574eea9ab47a5790564b85b68cbabf22e26f2bded8fd48a39c393a7287f85"
+    },
+    {
+      "module": "github.com/tree-sitter/go-tree-sitter",
+      "version": "v0.25.0",
+      "direct": true,
+      "upstream_license": "MIT",
+      "license_file": "vendor/github.com/tree-sitter/go-tree-sitter/LICENSE",
+      "license_sha256": "sha256:0eea8dc45e89deeb03c7799bbbc7b4688f365fb274562f4540ecfebdea82e727",
+      "vendor_tree_sha256": "sha256:51596cd17c4eb630b074936fca6abdf6dfedcc5fa2d6d566b5a1b1535ce416c1",
+      "go_proxy_sum": "h1:sx6kcg8raRFCvc9BnXglke6axya12krCJF5xJ2sftRU=",
+      "go_mod_sum": "h1:r77ig7BikoZhHrrsjAnv8RqGti5rtSyvDHPzgTPsUuU=",
+      "origin_commit": "adc13ffd8b2c0b01b878fda9f7c422ce0df5fad3",
+      "origin_ref": "refs/tags/v0.25.0",
+      "upstream_tag_present_at_audit": false,
+      "immutable_resolution": "go-proxy-plus-sumdb",
+      "bundled_notices": [
+        {
+          "license": "Unicode-3.0",
+          "file": "vendor/github.com/tree-sitter/go-tree-sitter/src/unicode/LICENSE",
+          "sha256": "sha256:6a18c5fac70d7860b57f5b72b4e2c9a1ba6b3d2741eef7ff9767c5379364f10d"
+        }
+      ]
+    },
+    {
+      "module": "github.com/tree-sitter/tree-sitter-javascript",
+      "version": "v0.25.0",
+      "direct": true,
+      "upstream_license": "MIT",
+      "license_file": "vendor/github.com/tree-sitter/tree-sitter-javascript/LICENSE",
+      "license_sha256": "sha256:2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1",
+      "vendor_tree_sha256": "sha256:3ab45bbaa92ecc0a412dec416977bc35082f79d23a88e444839a16fbed5a9a21"
+    },
+    {
+      "module": "github.com/tree-sitter/tree-sitter-python",
+      "version": "v0.25.0",
+      "direct": true,
+      "upstream_license": "MIT",
+      "license_file": "vendor/github.com/tree-sitter/tree-sitter-python/LICENSE",
+      "license_sha256": "sha256:d724405ce238a22c0d35769c5a36b386ad5958192efe8bbb304fb2896254575f",
+      "vendor_tree_sha256": "sha256:239b0394ab6200df559ead231476964ec4e4279bba320f4aed33381be9012af3"
+    },
+    {
+      "module": "github.com/tree-sitter/tree-sitter-rust",
+      "version": "v0.24.2",
+      "direct": true,
+      "upstream_license": "MIT",
+      "license_file": "vendor/github.com/tree-sitter/tree-sitter-rust/LICENSE",
+      "license_sha256": "sha256:31d5b6f4243d5c7c6e1c4ebbbb9f6407bd1457a08bcc4f706521710341acba36",
+      "vendor_tree_sha256": "sha256:1c71127e9c1922125b5a56dd6908bf4761dbea74f836f1bd6dacb5facfd932fd"
+    },
+    {
+      "module": "github.com/tree-sitter/tree-sitter-typescript",
+      "version": "v0.23.2",
+      "direct": true,
+      "upstream_license": "MIT",
+      "license_file": "vendor/github.com/tree-sitter/tree-sitter-typescript/LICENSE",
+      "license_sha256": "sha256:49bf33cf78ef5897e4e161ce1517df7de1ae5042a65b6bcfd44401e0fc606559",
+      "vendor_tree_sha256": "sha256:9f84c0c046ef5af9d35e3f6e34c91177acbdfadeb6a3e6b0db9955c96018a8c0"
+    }
+  ]
+}

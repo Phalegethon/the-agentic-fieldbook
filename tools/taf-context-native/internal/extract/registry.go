@@ -4,6 +4,7 @@ package extract
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -58,6 +59,14 @@ func NewRegistry() Registry {
 		switch metadata.Language {
 		case "go":
 			extractor = goExtractor{extensions: metadata.Extensions}
+		case "python":
+			extractor = pythonExtractor{extensions: metadata.Extensions}
+		case "javascript":
+			extractor = javascriptExtractor{extensions: metadata.Extensions}
+		case "typescript":
+			extractor = typescriptExtractor{extensions: metadata.Extensions}
+		case "rust":
+			extractor = rustExtractor{extensions: metadata.Extensions}
 		case "markdown":
 			extractor = markdownExtractor{extensions: metadata.Extensions}
 		case "json":
@@ -109,6 +118,17 @@ func (registry *Registry) Register(extractor Extractor) error {
 }
 
 func (registry Registry) Extract(file boundary.StableFile) (records []model.Record, report Report) {
+	return registry.ExtractContext(context.Background(), file)
+}
+
+type contextExtractor interface {
+	ExtractContext(context.Context, boundary.StableFile) ([]model.Record, Report)
+}
+
+// ExtractContext preserves the Task 4 registry boundary while allowing native
+// parsers to be cancelled by later engine operations. Non-native extractors
+// retain their original bounded Extract implementation.
+func (registry Registry) ExtractContext(ctx context.Context, file boundary.StableFile) (records []model.Record, report Report) {
 	if !stableFileMatches(file) {
 		return nil, boundedReport(Report{ParseFailures: 1, WarningCodes: []string{"invalid-stable-file"}})
 	}
@@ -127,7 +147,11 @@ func (registry Registry) Extract(file boundary.StableFile) (records []model.Reco
 	if file.Size > extractor.MaximumBytes() {
 		return nil, boundedReport(Report{ParserVersion: extractor.ParserVersion(), ParseFailures: 1, WarningCodes: []string{"invalid-stable-file"}})
 	}
-	records, report = extractor.Extract(file)
+	if contextual, ok := extractor.(contextExtractor); ok {
+		records, report = contextual.ExtractContext(ctx, file)
+	} else {
+		records, report = extractor.Extract(file)
+	}
 	report.ParserVersion = extractor.ParserVersion()
 	report = boundedReport(report)
 	records, invalid := finalizeRecords(file, extractor, records)
