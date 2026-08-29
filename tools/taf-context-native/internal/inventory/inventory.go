@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -24,6 +25,10 @@ const (
 
 const binaryPrefixBytes int64 = 8192
 const ignorePrefixBytes int64 = 16384
+
+// inventoryEntryHook is a deterministic post-observation mutation seam for
+// tests. Production leaves it nil.
+var inventoryEntryHook func(boundary.RepositoryEntry)
 
 type Path struct {
 	RelativePath string
@@ -48,6 +53,7 @@ type Result struct {
 	DirectoryEntries    int
 	PrefixBytes         uint64
 	FullBodyOpens       int
+	FullBodyBytes       uint64
 }
 
 // Collect inventories source with the frozen production ceilings.
@@ -59,6 +65,7 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 	if mode != ModeBuild && mode != ModeEstimate {
 		return Result{}, errors.New("unsupported inventory mode")
 	}
+	ioBefore := roots.IOObservation()
 	result := Result{Coverage: model.Coverage{ExclusionReasonCounts: map[string]int{}}}
 	if mode == ModeEstimate {
 		result.Partial = true
@@ -66,29 +73,46 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 	}
 	tracked, indexWarning := trackedRepositoryPaths(roots)
 	if indexWarning != "" {
-		result.Partial = true
+		result.Partial, result.UnknownRemainder = true, true
 		addWarning(&result, indexWarning)
 	}
 	var ignores []ignoreRule
-	regularExclusions, languageSupported, languageUnsupported := 0, 0, 0
-	err := roots.WalkRepository(func(entry boundary.RepositoryEntry) error {
-		if result.DirectoryEntries >= policy.ProductionLimits().MaximumEligiblePaths {
+	ignorePatternBytes := 0
+	appendIgnorePolicy := func(base string, contents []byte) {
+		parsed, parsedBytes, limited := parseIgnoreRules(base, contents, maximumIgnoreRules-len(ignores), maximumIgnorePatternBytes-ignorePatternBytes)
+		ignores = append(ignores, parsed...)
+		ignorePatternBytes += parsedBytes
+		if limited {
 			result.Partial, result.UnknownRemainder = true, true
-			addWarning(&result, "inventory-entry-limit")
-			return boundary.ErrStopRepositoryWalk
+			addWarning(&result, "gitignore-rule-limit")
 		}
-		result.DirectoryEntries++
-		if strings.HasSuffix(entry.RelativePath, ".gitignore") && entry.Mode.IsRegular() {
+	}
+	commonExclude, commonExcludeErr := roots.OpenGitCommonMetadataFile("info/exclude", ignorePrefixBytes)
+	if commonExcludeErr == nil {
+		appendIgnorePolicy("", commonExclude.Bytes)
+		if commonExclude.Size > int64(len(commonExclude.Bytes)) {
+			result.Partial, result.UnknownRemainder = true, true
+			addWarning(&result, "git-info-exclude-prefix-truncated")
+		}
+	} else if !errors.Is(commonExcludeErr, boundary.ErrGitMetadataNotFound) {
+		result.Partial, result.UnknownRemainder = true, true
+		addWarning(&result, "git-info-exclude-unreadable")
+	}
+	regularExclusions, languageSupported, languageUnsupported := 0, 0, 0
+	err := roots.WalkRepository(policy.ProductionLimits().MaximumEligiblePaths, func(entry boundary.RepositoryEntry) error {
+		if inventoryEntryHook != nil {
+			inventoryEntryHook(entry)
+		}
+		if path.Base(entry.RelativePath) == ".gitignore" && entry.Mode.IsRegular() {
 			prefix, prefixErr := roots.ReadRepositoryPrefix(entry.RelativePath, ignorePrefixBytes)
 			if prefixErr != nil {
-				result.Partial = true
+				result.Partial, result.UnknownRemainder = true, true
 				addWarning(&result, "gitignore-unreadable")
 			} else {
 				base := strings.TrimSuffix(strings.TrimSuffix(entry.RelativePath, ".gitignore"), "/")
-				ignores = append(ignores, parseIgnoreRules(base, prefix.Bytes)...)
-				result.PrefixBytes += uint64(len(prefix.Bytes))
+				appendIgnorePolicy(base, prefix.Bytes)
 				if prefix.Size > int64(len(prefix.Bytes)) {
-					result.Partial = true
+					result.Partial, result.UnknownRemainder = true, true
 					addWarning(&result, "gitignore-prefix-truncated")
 				}
 			}
@@ -96,7 +120,7 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 		reason, prune := classifyMetadata(entry, ignores, tracked)
 		if reason != "" {
 			addExclusion(&result, entry.RelativePath, reason)
-			if entry.Mode.IsRegular() {
+			if entry.Mode.IsRegular() && reason != ExcludedGit {
 				regularExclusions++
 			}
 			if prune {
@@ -138,9 +162,6 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 			return boundary.ErrStopRepositoryWalk
 		}
 		prefix, prefixErr := roots.ReadRepositoryPrefix(entry.RelativePath, binaryPrefixBytes)
-		if prefixErr == nil {
-			result.PrefixBytes += uint64(len(prefix.Bytes))
-		}
 		if prefixErr != nil || prefix.Size != entry.Size {
 			addExclusion(&result, entry.RelativePath, ExcludedUnsafe)
 			regularExclusions++
@@ -153,7 +174,6 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 		}
 		candidate := Path{RelativePath: entry.RelativePath, Language: language, Size: entry.Size}
 		if mode == ModeBuild {
-			result.FullBodyOpens++
 			file, fileErr := roots.OpenRepositoryFile(entry.RelativePath, maximum)
 			if fileErr != nil || file.Size != entry.Size {
 				addExclusion(&result, entry.RelativePath, ExcludedUnsafe)
@@ -173,10 +193,18 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 	})
 	if errors.Is(err, boundary.ErrRepositoryEnumerationLimit) {
 		result.Partial, result.UnknownRemainder = true, true
-		addWarning(&result, "inventory-directory-batch-limit")
+		addWarning(&result, "inventory-entry-limit")
+	} else if errors.Is(err, boundary.ErrRepositoryChanged) {
+		result.Partial, result.UnknownRemainder = true, true
+		addWarning(&result, "repository-changed-during-inventory")
 	} else if err != nil && !errors.Is(err, boundary.ErrStopRepositoryWalk) {
 		return Result{}, err
 	}
+	ioAfter := roots.IOObservation()
+	result.DirectoryEntries = ioAfter.ReadDirectoryEntries - ioBefore.ReadDirectoryEntries
+	result.PrefixBytes = ioAfter.ReadPrefixBytes - ioBefore.ReadPrefixBytes
+	result.FullBodyOpens = ioAfter.FullBodyOpens - ioBefore.FullBodyOpens
+	result.FullBodyBytes = ioAfter.FullBodyBytes - ioBefore.FullBodyBytes
 	sort.Slice(result.Paths, func(i, j int) bool { return result.Paths[i].RelativePath < result.Paths[j].RelativePath })
 	sort.Slice(result.Exclusions, func(i, j int) bool {
 		if result.Exclusions[i].RelativePath == result.Exclusions[j].RelativePath {
@@ -200,23 +228,29 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 	return result, nil
 }
 
-func classifyMetadata(entry boundary.RepositoryEntry, ignores []ignoreRule, tracked map[string]struct{}) (reason string, prune bool) {
+func classifyMetadata(entry boundary.RepositoryEntry, ignores []ignoreRule, tracked gitIndex) (reason string, prune bool) {
 	if entry.GitMetadata {
 		return ExcludedGit, entry.Mode.IsDir()
 	}
 	if entry.Mode&os.ModeSymlink != 0 || (!entry.Mode.IsDir() && !entry.Mode.IsRegular()) {
 		return ExcludedUnsafe, false
 	}
+	if tracked.isGitlink(entry.RelativePath) {
+		return ExcludedGit, entry.Mode.IsDir()
+	}
 	if reason := excludedDirectory(entry.RelativePath); reason != "" {
 		return reason, entry.Mode.IsDir()
 	}
 	if entry.Mode.IsDir() {
+		if ignoredBy(ignores, entry.RelativePath, true) && !tracked.hasTrackedDescendant(entry.RelativePath) {
+			return ExcludedIgnored, true
+		}
 		return "", false
 	}
 	if !entry.Mode.IsRegular() {
 		return ExcludedUnsafe, false
 	}
-	if _, isTracked := tracked[entry.RelativePath]; !isTracked && ignoredBy(ignores, entry.RelativePath, false) {
+	if !tracked.isTracked(entry.RelativePath) && ignoredBy(ignores, entry.RelativePath, false) {
 		return ExcludedIgnored, false
 	}
 	if strings.HasSuffix(strings.ToLower(entry.RelativePath), ".generated.go") || strings.HasSuffix(strings.ToLower(entry.RelativePath), ".gen.go") || strings.HasSuffix(strings.ToLower(entry.RelativePath), ".pb.go") {

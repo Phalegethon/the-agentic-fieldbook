@@ -24,7 +24,14 @@ type ignoreRule struct {
 	negated   bool
 	directory bool
 	anchored  bool
+	matcher   *regexp.Regexp
 }
+
+const (
+	maximumIgnoreRules        = 256
+	maximumIgnorePatternBytes = 64 << 10
+	maximumIgnorePatternSize  = 1024
+)
 
 // LanguageMetadata is immutable extension metadata shared by inventory and
 // later extractor registration. ExtensionRegistry returns a defensive copy.
@@ -53,10 +60,12 @@ func ExtensionRegistry() []LanguageMetadata {
 	return copyRegistry
 }
 
-func parseIgnoreRules(base string, contents []byte) []ignoreRule {
+func parseIgnoreRules(base string, contents []byte, availableRules, availablePatternBytes int) ([]ignoreRule, int, bool) {
 	var rules []ignoreRule
+	patternBytes := 0
 	for _, line := range strings.Split(string(contents), "\n") {
-		line = strings.TrimSpace(line)
+		line = strings.TrimSuffix(line, "\r")
+		line = trimUnescapedTrailingSpaces(line)
 		if line == "" {
 			continue
 		}
@@ -70,23 +79,49 @@ func parseIgnoreRules(base string, contents []byte) []ignoreRule {
 		} else if rule.negated {
 			line = strings.TrimPrefix(line, "!")
 		}
-		rule.directory = strings.HasSuffix(line, "/")
+		rule.directory = strings.HasSuffix(line, "/") && !escapedByte(line, len(line)-1)
 		rule.anchored = strings.HasPrefix(line, "/")
-		line = strings.TrimPrefix(line, "/")
-		rule.pattern = strings.TrimSuffix(line, "/")
-		if rule.pattern != "" {
-			rules = append(rules, rule)
+		if rule.anchored {
+			line = line[1:]
 		}
+		if rule.directory {
+			line = line[:len(line)-1]
+		}
+		rule.pattern = line
+		if rule.pattern == "" {
+			continue
+		}
+		if len(rules) >= availableRules || len(rule.pattern) > maximumIgnorePatternSize || patternBytes+len(rule.pattern) > availablePatternBytes {
+			return rules, patternBytes, true
+		}
+		matcher, ok := compileGitGlob(rule.pattern)
+		if !ok {
+			continue
+		}
+		rule.matcher = matcher
+		rules = append(rules, rule)
+		patternBytes += len(rule.pattern)
 	}
-	return rules
+	return rules, patternBytes, false
 }
 
 func ignoredBy(rules []ignoreRule, relative string, directory bool) bool {
+	parent := path.Dir(relative)
+	if parent != "." {
+		components := strings.Split(parent, "/")
+		for index := range components {
+			ancestor := strings.Join(components[:index+1], "/")
+			if ignoredDirectlyBy(rules, ancestor, true) {
+				return true
+			}
+		}
+	}
+	return ignoredDirectlyBy(rules, relative, directory)
+}
+
+func ignoredDirectlyBy(rules []ignoreRule, relative string, directory bool) bool {
 	ignored := false
 	for _, rule := range rules {
-		if rule.directory && !directory && !strings.Contains(relative, "/") {
-			continue
-		}
 		if ignoreRuleMatches(rule, relative, directory) {
 			ignored = !rule.negated
 		}
@@ -113,7 +148,7 @@ func ignoreRuleMatches(rule ignoreRule, relative string, directory bool) bool {
 				candidate = path.Dir(relative)
 			}
 			for candidate != "." && candidate != "" {
-				if globMatches(pattern, candidate) {
+				if rule.matcher.MatchString(candidate) {
 					return true
 				}
 				candidate = path.Dir(candidate)
@@ -121,28 +156,35 @@ func ignoreRuleMatches(rule ignoreRule, relative string, directory bool) bool {
 			return false
 		}
 		for _, component := range strings.Split(relative, "/") {
-			if globMatches(pattern, component) {
+			if rule.matcher.MatchString(component) {
 				return true
 			}
 		}
 		return false
 	}
 	if strings.Contains(pattern, "/") || rule.anchored {
-		return globMatches(pattern, relative)
+		return rule.matcher.MatchString(relative)
 	}
 	for _, component := range strings.Split(relative, "/") {
-		if globMatches(pattern, component) {
+		if rule.matcher.MatchString(component) {
 			return true
 		}
 	}
 	return false
 }
 
-func globMatches(pattern, value string) bool {
+func compileGitGlob(pattern string) (*regexp.Regexp, bool) {
 	var expression strings.Builder
 	expression.WriteString("^")
 	for index := 0; index < len(pattern); index++ {
 		switch pattern[index] {
+		case '\\':
+			if index+1 < len(pattern) {
+				index++
+				expression.WriteString(regexp.QuoteMeta(string(pattern[index])))
+			} else {
+				expression.WriteString(`\\`)
+			}
 		case '*':
 			if index+1 < len(pattern) && pattern[index+1] == '*' {
 				index++
@@ -157,13 +199,83 @@ func globMatches(pattern, value string) bool {
 			}
 		case '?':
 			expression.WriteString("[^/]")
+		case '[':
+			class, end, ok := compileGitBracket(pattern, index)
+			if !ok {
+				return nil, false
+			}
+			expression.WriteString(class)
+			index = end
 		default:
 			expression.WriteString(regexp.QuoteMeta(string(pattern[index])))
 		}
 	}
 	expression.WriteString("$")
 	compiled, err := regexp.Compile(expression.String())
-	return err == nil && compiled.MatchString(value)
+	return compiled, err == nil
+}
+
+func compileGitBracket(pattern string, start int) (string, int, bool) {
+	end := start + 1
+	escaped := false
+	for ; end < len(pattern); end++ {
+		if !escaped && pattern[end] == ']' && end > start+1 {
+			break
+		}
+		if !escaped && pattern[end] == '\\' {
+			escaped = true
+		} else {
+			escaped = false
+		}
+	}
+	if end == len(pattern) {
+		return "", 0, false
+	}
+	contents := pattern[start+1 : end]
+	var expression strings.Builder
+	expression.WriteByte('[')
+	index := 0
+	if contents[0] == '!' || contents[0] == '^' {
+		expression.WriteByte('^')
+		index++
+	}
+	for ; index < len(contents); index++ {
+		character := contents[index]
+		if character == '\\' && index+1 < len(contents) {
+			index++
+			character = contents[index]
+		}
+		switch character {
+		case '\\', ']', '^':
+			expression.WriteByte('\\')
+			expression.WriteByte(character)
+		case '-':
+			if index == 0 || index == len(contents)-1 {
+				expression.WriteString(`\-`)
+			} else {
+				expression.WriteByte('-')
+			}
+		default:
+			expression.WriteByte(character)
+		}
+	}
+	expression.WriteByte(']')
+	return expression.String(), end, true
+}
+
+func trimUnescapedTrailingSpaces(line string) string {
+	for len(line) > 0 && line[len(line)-1] == ' ' && !escapedByte(line, len(line)-1) {
+		line = line[:len(line)-1]
+	}
+	return line
+}
+
+func escapedByte(value string, index int) bool {
+	backslashes := 0
+	for index--; index >= 0 && value[index] == '\\'; index-- {
+		backslashes++
+	}
+	return backslashes%2 == 1
 }
 
 func languageForPath(relative string) string {
@@ -185,55 +297,6 @@ func markdownLanguage(language string) bool {
 		}
 	}
 	return false
-}
-
-func doubleStarMatch(pattern, value string) bool {
-	for strings.Contains(pattern, "**/") {
-		prefix, suffix, _ := strings.Cut(pattern, "**/")
-		if prefix == "" {
-			if globMatches(suffix, value) {
-				return true
-			}
-			for index := range value {
-				if value[index] == '/' && globMatches(suffix, value[index+1:]) {
-					return true
-				}
-			}
-		}
-		break
-	}
-	// Git's ** here is an arbitrary sequence including slashes. A compact
-	// backtracking matcher keeps matching bounded by the already bounded path.
-	return globRecursive(pattern, value)
-}
-
-func globRecursive(pattern, value string) bool {
-	if pattern == "" {
-		return value == ""
-	}
-	if strings.HasPrefix(pattern, "**") {
-		for index := 0; index <= len(value); index++ {
-			if globRecursive(pattern[2:], value[index:]) {
-				return true
-			}
-		}
-		return false
-	}
-	if pattern[0] == '*' {
-		for index := 0; index <= len(value) && (index == 0 || value[index-1] != '/'); index++ {
-			if globRecursive(pattern[1:], value[index:]) {
-				return true
-			}
-		}
-		return false
-	}
-	if len(value) == 0 {
-		return false
-	}
-	if pattern[0] == '?' {
-		return value[0] != '/' && globRecursive(pattern[1:], value[1:])
-	}
-	return pattern[0] == value[0] && globRecursive(pattern[1:], value[1:])
 }
 
 func excludedDirectory(relative string) string {

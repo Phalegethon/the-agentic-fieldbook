@@ -21,6 +21,7 @@ var (
 	ErrFileTooLarge        = errors.New("repository file exceeds maximum size")
 	ErrStateUnavailable    = errors.New("state root has not been created")
 	ErrGitMetadataNotFound = errors.New("Git metadata file not found")
+	ErrRepositoryChanged   = errors.New("repository changed during enumeration")
 	// ErrSkipRepositoryDirectory lets a metadata consumer prune one safe
 	// directory without making the walker follow it.
 	ErrSkipRepositoryDirectory    = errors.New("skip repository directory")
@@ -50,6 +51,7 @@ type Roots struct {
 	gitCommonRoot    *os.Root
 	gitCommonInfo    os.FileInfo
 	gitMetadataInfo  os.FileInfo
+	ioObservation    *ioObservationState
 }
 
 // stateCreateHook is a deterministic test seam for an adversarial creation
@@ -114,6 +116,7 @@ func ValidateRoots(envelope wire.Envelope) (Roots, error) {
 		gitCommonRoot:    commonCapture.root,
 		gitCommonInfo:    commonCapture.lineage[len(commonCapture.lineage)-1],
 		gitMetadataInfo:  gitMetadataInfo,
+		ioObservation:    &ioObservationState{},
 	}, nil
 }
 

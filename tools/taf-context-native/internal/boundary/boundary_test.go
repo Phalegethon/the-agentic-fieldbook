@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -1132,7 +1133,7 @@ func TestWalkRepositoryUsesCapturedRootAndDoesNotFollowLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got []string
-	err = roots.WalkRepository(func(entry RepositoryEntry) error {
+	err = roots.WalkRepository(100, func(entry RepositoryEntry) error {
 		got = append(got, entry.RelativePath)
 		return nil
 	})
@@ -1172,9 +1173,182 @@ func TestWalkRepositoryRejectsDirectoryMutationDuringListing(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() { directoryReadHook = nil })
-	err := roots.WalkRepository(func(RepositoryEntry) error { return nil })
+	err := roots.WalkRepository(100, func(RepositoryEntry) error { return nil })
 	if !errors.Is(err, ErrUnsafePath) {
 		t.Fatalf("WalkRepository mutation error = %v, want ErrUnsafePath", err)
+	}
+}
+
+func TestWalkRepositorySurfacesExactGitIgnoreBeforeEverySibling(t *testing.T) {
+	roots := makeRoots(t)
+	defer roots.Close()
+	for _, relative := range []string{".a.go", ".gitignore", "foo.gitignore", "nested/.a.go", "nested/.gitignore"} {
+		path := filepath.Join(roots.Repository, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("fixture\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got []string
+	if err := roots.WalkRepository(100, func(entry RepositoryEntry) error {
+		got = append(got, entry.RelativePath)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 || got[0] != ".gitignore" {
+		t.Fatalf("root walk order = %#v, want exact .gitignore first", got)
+	}
+	nestedIgnore, nestedSibling := -1, -1
+	for index, relative := range got {
+		switch relative {
+		case "nested/.gitignore":
+			nestedIgnore = index
+		case "nested/.a.go":
+			nestedSibling = index
+		}
+	}
+	if nestedIgnore < 0 || nestedSibling < 0 || nestedIgnore > nestedSibling {
+		t.Fatalf("nested walk order = %#v, want exact .gitignore before sibling", got)
+	}
+}
+
+func TestWalkRepositoryBatchesMoreThan256FlatEntries(t *testing.T) {
+	roots := makeRoots(t)
+	defer roots.Close()
+	for index := 0; index < 257; index++ {
+		name := fmt.Sprintf("file-%03d.go", index)
+		if err := os.WriteFile(filepath.Join(roots.Repository, name), []byte("package fixture\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	visited := 0
+	if err := roots.WalkRepository(1024, func(RepositoryEntry) error {
+		visited++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if want := 259; visited != want { // 257 fixtures plus .git and README.md.
+		t.Fatalf("visited entries = %d, want %d", visited, want)
+	}
+}
+
+func TestWalkRepositoryStopsAtGlobalObservationLimit(t *testing.T) {
+	roots := makeRoots(t)
+	defer roots.Close()
+	for index := 0; index < 10; index++ {
+		if err := os.WriteFile(filepath.Join(roots.Repository, fmt.Sprintf("file-%02d.go", index)), []byte("package fixture\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := roots.IOObservation()
+	err := roots.WalkRepository(5, func(RepositoryEntry) error { return nil })
+	after := roots.IOObservation()
+	if !errors.Is(err, ErrRepositoryEnumerationLimit) {
+		t.Fatalf("WalkRepository limit error = %v, want ErrRepositoryEnumerationLimit", err)
+	}
+	if got := after.ReadDirectoryEntries - before.ReadDirectoryEntries; got > 5 {
+		t.Fatalf("observed directory entries = %d, want at most 5", got)
+	}
+}
+
+func TestWalkRepositoryRejectsMutationAfterChildCallbacks(t *testing.T) {
+	roots := makeRoots(t)
+	defer roots.Close()
+	if err := os.WriteFile(filepath.Join(roots.Repository, "a.go"), []byte("package a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(roots.Repository, "z.go"), []byte("package z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := roots.WalkRepository(100, func(entry RepositoryEntry) error {
+		if entry.RelativePath == "z.go" {
+			if err := os.WriteFile(filepath.Join(roots.Repository, "a.go"), []byte("package changed\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return nil
+	})
+	if !errors.Is(err, ErrRepositoryChanged) {
+		t.Fatalf("WalkRepository final mutation error = %v, want ErrRepositoryChanged", err)
+	}
+}
+
+func TestBoundaryIOHookReportsActualDirectoryPrefixAndBodyReads(t *testing.T) {
+	roots := makeRoots(t)
+	defer roots.Close()
+	contents := []byte("0123456789")
+	if err := os.WriteFile(filepath.Join(roots.Repository, "observed.go"), contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var hooked IOObservation
+	repositoryIOHook = func(delta IOObservation) {
+		hooked.ReadDirectoryEntries += delta.ReadDirectoryEntries
+		hooked.ReadPrefixBytes += delta.ReadPrefixBytes
+		hooked.FullBodyOpens += delta.FullBodyOpens
+		hooked.FullBodyBytes += delta.FullBodyBytes
+	}
+	t.Cleanup(func() { repositoryIOHook = nil })
+	before := roots.IOObservation()
+	if err := roots.WalkRepository(100, func(RepositoryEntry) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := roots.ReadRepositoryPrefix("observed.go", 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := roots.OpenRepositoryFile("observed.go", int64(len(contents))); err != nil {
+		t.Fatal(err)
+	}
+	after := roots.IOObservation()
+	want := IOObservation{
+		ReadDirectoryEntries: after.ReadDirectoryEntries - before.ReadDirectoryEntries,
+		ReadPrefixBytes:      after.ReadPrefixBytes - before.ReadPrefixBytes,
+		FullBodyOpens:        after.FullBodyOpens - before.FullBodyOpens,
+		FullBodyBytes:        after.FullBodyBytes - before.FullBodyBytes,
+	}
+	if hooked != want || hooked.ReadPrefixBytes != 4 || hooked.FullBodyOpens != 1 || hooked.FullBodyBytes != uint64(len(contents)) {
+		t.Fatalf("hooked I/O = %#v, want %#v", hooked, want)
+	}
+}
+
+func TestBoundaryIOHookCountsBytesReadBeforeOversizedFailure(t *testing.T) {
+	roots := makeRoots(t)
+	defer roots.Close()
+	path := filepath.Join(roots.Repository, "growing.go")
+	if err := os.WriteFile(path, []byte("1234"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var hooked IOObservation
+	repositoryIOHook = func(delta IOObservation) {
+		hooked.FullBodyOpens += delta.FullBodyOpens
+		hooked.FullBodyBytes += delta.FullBodyBytes
+	}
+	repositoryBeforeReadHook = func() {
+		repositoryBeforeReadHook = nil
+		file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.WriteString("5"); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		repositoryIOHook = nil
+		repositoryBeforeReadHook = nil
+	})
+	if _, err := roots.OpenRepositoryFile("growing.go", 4); !errors.Is(err, ErrFileTooLarge) {
+		t.Fatalf("growing file error = %v, want ErrFileTooLarge", err)
+	}
+	if hooked.FullBodyOpens != 1 || hooked.FullBodyBytes != 5 {
+		t.Fatalf("failed read I/O = %#v, want one open and five bytes", hooked)
 	}
 }
 

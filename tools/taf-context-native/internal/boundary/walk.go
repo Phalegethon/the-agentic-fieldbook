@@ -8,6 +8,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // RepositoryEntry is metadata observed through the retained repository
@@ -27,37 +28,96 @@ type StablePrefix struct {
 	Size         int64
 }
 
+// IOObservation reports repository I/O performed through this retained root.
+// Copies of Roots share the same monotonic observation state.
+type IOObservation struct {
+	ReadDirectoryEntries int
+	ReadPrefixBytes      uint64
+	FullBodyOpens        int
+	FullBodyBytes        uint64
+}
+
+type ioObservationState struct {
+	mu    sync.Mutex
+	value IOObservation
+}
+
+func (r *Roots) observeIO(delta IOObservation) {
+	if r.ioObservation == nil {
+		return
+	}
+	r.ioObservation.mu.Lock()
+	r.ioObservation.value.ReadDirectoryEntries += delta.ReadDirectoryEntries
+	r.ioObservation.value.ReadPrefixBytes += delta.ReadPrefixBytes
+	r.ioObservation.value.FullBodyOpens += delta.FullBodyOpens
+	r.ioObservation.value.FullBodyBytes += delta.FullBodyBytes
+	r.ioObservation.mu.Unlock()
+	if repositoryIOHook != nil {
+		repositoryIOHook(delta)
+	}
+}
+
+// IOObservation returns an atomic snapshot of repository I/O observations.
+func (r *Roots) IOObservation() IOObservation {
+	if r.ioObservation == nil {
+		return IOObservation{}
+	}
+	r.ioObservation.mu.Lock()
+	defer r.ioObservation.mu.Unlock()
+	return r.ioObservation.value
+}
+
 // directoryReadHook provides a deterministic mutation seam for boundary
 // tests. Production leaves it nil.
 var directoryReadHook func()
+var repositoryIOHook func(IOObservation)
 
 const maximumDirectoryBatch = 256
 
+type repositoryWalkBudget struct {
+	remaining int
+}
+
+type repositorySnapshotEntry struct {
+	name string
+	info os.FileInfo
+}
+
 // WalkRepository enumerates repository metadata through the captured root
 // capability. It never follows symlinks and never descends into Git metadata.
-func (r *Roots) WalkRepository(visit func(RepositoryEntry) error) error {
+func (r *Roots) WalkRepository(maximumObservations int, visit func(RepositoryEntry) error) error {
 	if r.repositoryRoot == nil || visit == nil {
 		return ErrUnsafePath
 	}
-	return r.walkRepositoryDirectory(r.repositoryRoot, "", nil, visit)
+	if maximumObservations <= 0 {
+		return ErrRepositoryEnumerationLimit
+	}
+	budget := &repositoryWalkBudget{remaining: maximumObservations}
+	return r.walkRepositoryDirectory(r.repositoryRoot, "", nil, budget, visit)
 }
 
-func (r *Roots) walkRepositoryDirectory(current *os.Root, parent string, ancestors []*os.Root, visit func(RepositoryEntry) error) error {
+func (r *Roots) walkRepositoryDirectory(current *os.Root, parent string, ancestors []*os.Root, budget *repositoryWalkBudget, visit func(RepositoryEntry) error) error {
 	if r.entersGitDirectory(append(ancestors, current)) {
 		return ErrUnsafePath
 	}
-	entries, err := readRootDirectory(current)
+	entries, err := r.readRootDirectory(current, budget, true)
 	if err != nil {
 		return err
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	sort.Slice(entries, func(i, j int) bool {
+		leftIgnore, rightIgnore := entries[i].name == ".gitignore", entries[j].name == ".gitignore"
+		if leftIgnore != rightIgnore {
+			return leftIgnore
+		}
+		return entries[i].name < entries[j].name
+	})
 	for _, entry := range entries {
-		name := entry.Name()
+		name := entry.name
 		if _, err := safeComponents(name, false); err != nil {
 			return ErrUnsafePath
 		}
 		info, err := current.Lstat(name)
-		if err != nil {
+		if err != nil || !sameSnapshot(entry.info, info) {
 			return fmt.Errorf("%w: %v", ErrUnsafePath, err)
 		}
 		relative := name
@@ -92,7 +152,7 @@ func (r *Roots) walkRepositoryDirectory(current *os.Root, parent string, ancesto
 			_ = next.Close()
 			continue
 		}
-		err = r.walkRepositoryDirectory(next, relative, append(ancestors, current), visit)
+		err = r.walkRepositoryDirectory(next, relative, append(ancestors, current), budget, visit)
 		closeErr := next.Close()
 		if err != nil {
 			return err
@@ -100,6 +160,13 @@ func (r *Roots) walkRepositoryDirectory(current *os.Root, parent string, ancesto
 		if closeErr != nil {
 			return fmt.Errorf("%w: %v", ErrUnsafePath, closeErr)
 		}
+	}
+	finalEntries, err := r.readRootDirectory(current, budget, false)
+	if err != nil {
+		return err
+	}
+	if !sameRepositorySnapshot(entries, finalEntries) {
+		return ErrRepositoryChanged
 	}
 	return nil
 }
@@ -110,7 +177,7 @@ func (r *Roots) isGitMetadata(info os.FileInfo) bool {
 		(r.gitMetadataInfo != nil && sameIdentity(info, r.gitMetadataInfo))
 }
 
-func readRootDirectory(root *os.Root) ([]os.DirEntry, error) {
+func (r *Roots) readRootDirectory(root *os.Root, budget *repositoryWalkBudget, invokeHook bool) ([]repositorySnapshotEntry, error) {
 	before, err := root.Stat(".")
 	if err != nil || !before.IsDir() {
 		return nil, ErrUnsafePath
@@ -125,21 +192,60 @@ func readRootDirectory(root *os.Root) ([]os.DirEntry, error) {
 	if err != nil || afterErr != nil || !opened.IsDir() || !sameIdentity(before, opened) || !sameIdentity(before, after) || !sameIdentity(opened, after) {
 		return nil, ErrUnsafePath
 	}
-	entries, err := directory.ReadDir(maximumDirectoryBatch + 1)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("%w: %v", ErrUnsafePath, err)
+	var entries []repositorySnapshotEntry
+	for {
+		if budget.remaining == 0 {
+			return nil, ErrRepositoryEnumerationLimit
+		}
+		batchMaximum := maximumDirectoryBatch
+		if budget.remaining < batchMaximum {
+			batchMaximum = budget.remaining
+		}
+		batch, readErr := directory.ReadDir(batchMaximum)
+		budget.remaining -= len(batch)
+		r.observeIO(IOObservation{ReadDirectoryEntries: len(batch)})
+		for _, entry := range batch {
+			info, statErr := root.Lstat(entry.Name())
+			if statErr != nil {
+				return nil, fmt.Errorf("%w: %v", ErrUnsafePath, statErr)
+			}
+			entries = append(entries, repositorySnapshotEntry{name: entry.Name(), info: info})
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("%w: %v", ErrUnsafePath, readErr)
+		}
+		if len(batch) == 0 {
+			return nil, ErrUnsafePath
+		}
 	}
-	if directoryReadHook != nil {
+	if invokeHook && directoryReadHook != nil {
 		directoryReadHook()
 	}
 	afterRead, afterReadErr := root.Stat(".")
 	if afterReadErr != nil || !sameSnapshot(before, afterRead) || !sameSnapshot(opened, afterRead) {
 		return nil, ErrUnsafePath
 	}
-	if len(entries) > maximumDirectoryBatch {
-		return nil, ErrRepositoryEnumerationLimit
-	}
 	return entries, nil
+}
+
+func sameRepositorySnapshot(first, second []repositorySnapshotEntry) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	firstByName := make(map[string]os.FileInfo, len(first))
+	for _, entry := range first {
+		firstByName[entry.name] = entry.info
+	}
+	for _, entry := range second {
+		previous, ok := firstByName[entry.name]
+		if !ok || !sameSnapshot(previous, entry.info) {
+			return false
+		}
+	}
+	return true
 }
 
 // ReadRepositoryPrefix reads no more than maximum bytes from a regular file
@@ -176,6 +282,7 @@ func (r *Roots) ReadRepositoryPrefix(relative string, maximum int64) (StablePref
 		return StablePrefix{}, ErrUnstableFile
 	}
 	contents, err := io.ReadAll(io.LimitReader(file, maximum))
+	r.observeIO(IOObservation{ReadPrefixBytes: uint64(len(contents))})
 	if err != nil {
 		return StablePrefix{}, fmt.Errorf("%w: %v", ErrUnsafePath, err)
 	}

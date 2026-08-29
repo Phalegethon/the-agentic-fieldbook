@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	endian "encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -78,7 +80,7 @@ func TestCollectClassifiesAndBoundsFilesDeterministically(t *testing.T) {
 	assertExclusion(t, result, "vendor", ExcludedVendored)
 	assertExclusion(t, result, "node_modules", ExcludedVendored)
 	assertExclusion(t, result, "target", ExcludedGenerated)
-	assertExclusion(t, result, "ignored/code.py", ExcludedIgnored)
+	assertExclusion(t, result, "ignored", ExcludedIgnored)
 	assertExclusion(t, result, "too-large.go", ExcludedOversized)
 	assertExclusion(t, result, "too-large.md", ExcludedOversized)
 	assertExclusion(t, result, "linked.go", ExcludedUnsafe)
@@ -155,6 +157,100 @@ func TestCollectAppliesNestedGitIgnoreRulesOnlyWithinTheirDirectory(t *testing.T
 	assertExclusion(t, result, "a/one.go", ExcludedIgnored)
 }
 
+func TestCollectLoadsOnlyExactGitIgnoreBasenameBeforeChildren(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, ".a.go", "package a\n")
+	writeFile(t, repository, "foo.gitignore", "*.go\n")
+	writeFile(t, repository, ".gitignore", "*.go\n!kept.go\n")
+	writeFile(t, repository, "kept.go", "package kept\n")
+	writeFile(t, repository, "ignored.go", "package ignored\n")
+	result := mustCollect(t, repository, ModeBuild)
+	if got, want := result.Paths, []Path{{RelativePath: "kept.go", Language: "go", Size: 13}}; !samePathsIgnoringDigest(got, want) {
+		t.Fatalf("exact .gitignore policy result = %#v", result)
+	}
+	assertExclusion(t, result, ".a.go", ExcludedIgnored)
+	assertExclusion(t, result, "ignored.go", ExcludedIgnored)
+}
+
+func TestCollectLoadsCommonGitInfoExcludeBeforeWalk(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, ".git/info/exclude", "excluded.go\n")
+	writeFile(t, repository, "excluded.go", "package excluded\n")
+	writeFile(t, repository, "kept.go", "package kept\n")
+	result := mustCollect(t, repository, ModeBuild)
+	if got, want := result.Paths, []Path{{RelativePath: "kept.go", Language: "go", Size: 13}}; !samePathsIgnoringDigest(got, want) {
+		t.Fatalf("info/exclude result = %#v", result)
+	}
+	assertExclusion(t, result, "excluded.go", ExcludedIgnored)
+}
+
+func TestCollectCannotReincludeFileBelowExcludedParent(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, ".gitignore", "parent/\n!parent/keep.go\n")
+	writeFile(t, repository, "parent/keep.go", "package keep\n")
+	result := mustCollect(t, repository, ModeBuild)
+	if len(result.Paths) != 0 {
+		t.Fatalf("excluded-parent negation paths = %#v, want none", result.Paths)
+	}
+	assertExclusion(t, result, "parent", ExcludedIgnored)
+}
+
+func TestCollectPreservesTrackedDescendantOfIgnoredDirectory(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, ".gitignore", "parent/\n")
+	writeFile(t, repository, "parent/tracked.go", "package tracked\n")
+	writeFile(t, repository, "parent/untracked.go", "package untracked\n")
+	writeGitIndex(t, repository, []string{"parent/tracked.go"})
+	result := mustCollect(t, repository, ModeBuild)
+	if got, want := result.Paths, []Path{{RelativePath: "parent/tracked.go", Language: "go", Size: 16}}; !samePathsIgnoringDigest(got, want) {
+		t.Fatalf("tracked descendant result = %#v", result)
+	}
+	assertExclusion(t, result, "parent/untracked.go", ExcludedIgnored)
+}
+
+func TestCollectParsesSignificantSpacesEscapesAndBracketRanges(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, ".gitignore", strings.Join([]string{
+		"plain.go   ",
+		`trailing.go\ `,
+		`literal\*.go`,
+		`literal\[.go`,
+		"[a-c].go",
+		"[!a-c]anged.go",
+		" leading.go",
+	}, "\n")+"\n")
+	for _, relative := range []string{"plain.go", "trailing.go ", "literal*.go", "literal[.go", "a.go", "b.go", "danged.go", " leading.go"} {
+		writeFile(t, repository, relative, "package ignored\n")
+	}
+	writeFile(t, repository, "kept.go", "package kept\n")
+	result := mustCollect(t, repository, ModeBuild)
+	if got, want := result.Paths, []Path{{RelativePath: "kept.go", Language: "go", Size: 13}}; !samePathsIgnoringDigest(got, want) {
+		t.Fatalf("spaces/escapes/brackets result = %#v", result)
+	}
+	for _, relative := range []string{"plain.go", "trailing.go ", "literal*.go", "literal[.go", "a.go", "b.go", "danged.go", " leading.go"} {
+		assertExclusion(t, result, relative, ExcludedIgnored)
+	}
+}
+
+func TestCollectHonorsAnchoredSlashDirectoryAndOrderedNegationRules(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, ".gitignore", "/root.go\nnested/*.go\ncache/\n*.py\n!keep.py\n")
+	writeFile(t, repository, "root.go", "package root\n")
+	writeFile(t, repository, "nested/root.go", "package nested\n")
+	writeFile(t, repository, "other/root.go", "package other\n")
+	writeFile(t, repository, "cache/hidden.go", "package cache\n")
+	writeFile(t, repository, "drop.py", "drop = 1\n")
+	writeFile(t, repository, "keep.py", "keep = 1\n")
+	result := mustCollect(t, repository, ModeBuild)
+	if got, want := result.Paths, []Path{{RelativePath: "keep.py", Language: "python", Size: 9}, {RelativePath: "other/root.go", Language: "go", Size: 14}}; !samePathsIgnoringDigest(got, want) {
+		t.Fatalf("anchored/directory/negation result = %#v", result)
+	}
+	assertExclusion(t, result, "root.go", ExcludedIgnored)
+	assertExclusion(t, result, "nested/root.go", ExcludedIgnored)
+	assertExclusion(t, result, "cache", ExcludedIgnored)
+	assertExclusion(t, result, "drop.py", ExcludedIgnored)
+}
+
 func TestCollectEstimateDoesNotCreateStateOrMutateRepository(t *testing.T) {
 	repository := newRepository(t)
 	writeFile(t, repository, "source.go", strings.Repeat("x", 32*1024))
@@ -215,6 +311,217 @@ func TestCollectMarksMalformedGitIndexPartial(t *testing.T) {
 	result := mustCollect(t, repository, ModeBuild)
 	if !result.Partial || !contains(result.Warnings, "git-index-invalid") {
 		t.Fatalf("malformed index result = %#v", result)
+	}
+}
+
+func TestParseGitIndexValidatesV2V3AndCompressedV4Entries(t *testing.T) {
+	tests := []struct {
+		name    string
+		version uint32
+		entries []gitIndexFixtureEntry
+		want    map[string]uint32
+	}{
+		{name: "v2", version: 2, entries: []gitIndexFixtureEntry{{name: "a.go", mode: 0o100644}}, want: map[string]uint32{"a.go": 0o100644}},
+		{name: "v3-extended", version: 3, entries: []gitIndexFixtureEntry{{name: "link.go", mode: 0o120000, extended: 0x2000}}, want: map[string]uint32{"link.go": 0o120000}},
+		{name: "v4-compressed", version: 4, entries: []gitIndexFixtureEntry{{name: "directory/a.go", mode: 0o100755}, {name: "directory/b.go", mode: 0o100644}}, want: map[string]uint32{"directory/a.go": 0o100755, "directory/b.go": 0o100644}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parsed, err := parseGitIndex(buildGitIndex(t, test.version, test.entries, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(parsed.modes, test.want) {
+				t.Fatalf("parsed modes = %#v, want %#v", parsed.modes, test.want)
+			}
+		})
+	}
+}
+
+func TestParseGitIndexAcceptsRealGitV4WithMultiByteCompression(t *testing.T) {
+	repository := t.TempDir()
+	runGit := func(arguments ...string) {
+		t.Helper()
+		command := exec.Command("git", append([]string{"-C", repository}, arguments...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", arguments, err, output)
+		}
+	}
+	runGit("init", "-q")
+	longName := strings.Repeat("a", 200) + ".go"
+	writeFile(t, repository, longName, "package long\n")
+	writeFile(t, repository, "b.go", "package b\n")
+	runGit("add", longName, "b.go")
+	runGit("update-index", "--index-version=4")
+	raw, err := os.ReadFile(filepath.Join(repository, ".git", "index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseGitIndex(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.modes[longName] != 0o100644 || parsed.modes["b.go"] != 0o100644 {
+		t.Fatalf("real v4 modes = %#v", parsed.modes)
+	}
+}
+
+func TestParseGitIndexRejectsInvalidFlagsModesNameLengthsPaddingAndOrder(t *testing.T) {
+	valid := buildGitIndex(t, 2, []gitIndexFixtureEntry{{name: "alpha.go", mode: 0o100644}}, nil)
+	tests := map[string][]byte{
+		"invalid-mode":         buildGitIndex(t, 2, []gitIndexFixtureEntry{{name: "alpha.go", mode: 0o100664}}, nil),
+		"v2-extended":          buildGitIndex(t, 2, []gitIndexFixtureEntry{{name: "alpha.go", mode: 0o100644, extended: 0x2000}}, nil),
+		"v3-reserved-extended": buildGitIndex(t, 3, []gitIndexFixtureEntry{{name: "alpha.go", mode: 0o100644, extended: 0x0001}}, nil),
+		"out-of-order":         buildGitIndex(t, 2, []gitIndexFixtureEntry{{name: "z.go", mode: 0o100644}, {name: "a.go", mode: 0o100644}}, nil),
+	}
+	badLength := append([]byte(nil), valid...)
+	endian.BigEndian.PutUint16(badLength[12+60:12+62], 1)
+	rewriteGitIndexChecksum(badLength)
+	tests["name-length"] = badLength
+	badPadding := append([]byte(nil), valid...)
+	badPadding[12+62+len("alpha.go")+1] = 1
+	rewriteGitIndexChecksum(badPadding)
+	tests["padding"] = badPadding
+	for name, raw := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseGitIndex(raw); err == nil {
+				t.Fatal("invalid index accepted")
+			}
+		})
+	}
+}
+
+func TestParseGitIndexValidatesExtensionsChecksumAndEntryCount(t *testing.T) {
+	entry := []gitIndexFixtureEntry{{name: "a.go", mode: 0o100644}}
+	optional := buildGitIndex(t, 2, entry, []gitIndexFixtureExtension{{signature: "TREE", contents: []byte("optional")}})
+	if _, err := parseGitIndex(optional); err != nil {
+		t.Fatalf("optional uppercase extension rejected: %v", err)
+	}
+	mandatory := buildGitIndex(t, 2, entry, []gitIndexFixtureExtension{{signature: "abcd", contents: []byte("mandatory")}})
+	if _, err := parseGitIndex(mandatory); err == nil {
+		t.Fatal("unknown mandatory lowercase extension accepted")
+	}
+	split := buildGitIndex(t, 2, entry, []gitIndexFixtureExtension{{signature: "link", contents: make([]byte, 20)}})
+	if _, err := parseGitIndex(split); !errors.Is(err, errSplitIndex) {
+		t.Fatalf("split extension error = %v, want errSplitIndex", err)
+	}
+	badChecksum := append([]byte(nil), optional...)
+	badChecksum[len(badChecksum)-1] ^= 0xff
+	if _, err := parseGitIndex(badChecksum); err == nil {
+		t.Fatal("invalid checksum accepted")
+	}
+	badCount := append([]byte(nil), optional...)
+	endian.BigEndian.PutUint32(badCount[8:12], 2)
+	rewriteGitIndexChecksum(badCount)
+	if _, err := parseGitIndex(badCount); err == nil {
+		t.Fatal("mismatched entry count accepted")
+	}
+}
+
+func TestCollectPrunesGitlinkSubmoduleAndNeverIndexesItsFiles(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, "module/source.go", "package module\n")
+	writeFile(t, repository, "kept.go", "package kept\n")
+	writeRawGitIndex(t, filepath.Join(repository, ".git"), buildGitIndex(t, 2, []gitIndexFixtureEntry{{name: "module", mode: 0o160000}}, nil))
+	result := mustCollect(t, repository, ModeBuild)
+	if got, want := result.Paths, []Path{{RelativePath: "kept.go", Language: "go", Size: 13}}; !samePathsIgnoringDigest(got, want) {
+		t.Fatalf("gitlink inventory result = %#v", result)
+	}
+	assertExclusion(t, result, "module", ExcludedGit)
+}
+
+func TestCollectMarksSplitAndInvalidIndexesUnknownWithZeroCoverage(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		index   []byte
+		warning string
+	}{
+		{name: "invalid", index: []byte("DIRCbroken"), warning: "git-index-invalid"},
+		{name: "split", index: buildGitIndex(t, 2, []gitIndexFixtureEntry{{name: "source.go", mode: 0o100644}}, []gitIndexFixtureExtension{{signature: "link", contents: make([]byte, 20)}}), warning: "git-index-split-unsupported"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := newRepository(t)
+			writeFile(t, repository, "source.go", "package source\n")
+			writeFile(t, repository, "unknown.xyz", "unknown\n")
+			writeRawGitIndex(t, filepath.Join(repository, ".git"), test.index)
+			result := mustCollect(t, repository, ModeBuild)
+			if !result.Partial || !result.UnknownRemainder || !contains(result.Warnings, test.warning) || result.Coverage.PathCoverage != 0 || result.Coverage.LanguageCoverage != 0 {
+				t.Fatalf("unknown index coverage result = %#v", result)
+			}
+		})
+	}
+}
+
+func TestCollectCoverageIsEquivalentForGitDirectoryAndPointerFile(t *testing.T) {
+	directoryRepository := newRepository(t)
+	writeFile(t, directoryRepository, "source.go", "package source\n")
+	pointerRepository := newRepository(t)
+	if err := os.Remove(filepath.Join(pointerRepository, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	gitDirectory := filepath.Join(t.TempDir(), "git-dir")
+	if err := os.Mkdir(gitDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, pointerRepository, ".git", "gitdir: "+gitDirectory+"\n")
+	writeFile(t, pointerRepository, "source.go", "package source\n")
+	directoryResult := mustCollect(t, directoryRepository, ModeBuild)
+	pointerResult := mustCollect(t, pointerRepository, ModeBuild)
+	if !reflect.DeepEqual(directoryResult.Coverage, pointerResult.Coverage) {
+		t.Fatalf("Git form coverage differs: directory=%#v pointer=%#v", directoryResult.Coverage, pointerResult.Coverage)
+	}
+}
+
+func TestCollectMarksPostChildMutationPartial(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, "a.go", "package a\n")
+	writeFile(t, repository, "z.go", "package z\n")
+	inventoryEntryHook = func(entry boundary.RepositoryEntry) {
+		if entry.RelativePath == "z.go" {
+			inventoryEntryHook = nil
+			if err := os.WriteFile(filepath.Join(repository, "a.go"), []byte("package changed\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Cleanup(func() { inventoryEntryHook = nil })
+	result := mustCollect(t, repository, ModeBuild)
+	if !result.Partial || !result.UnknownRemainder || !contains(result.Warnings, "repository-changed-during-inventory") || result.Coverage.PathCoverage != 0 {
+		t.Fatalf("post-child mutation result = %#v", result)
+	}
+}
+
+func TestCollectReportsActualBoundedRawIO(t *testing.T) {
+	repository := newRepository(t)
+	writeFile(t, repository, "source.go", strings.Repeat("x", 32*1024))
+	writeFile(t, repository, "binary.go", "\x00"+strings.Repeat("x", 32*1024))
+	roots := validatedRoots(t, repository)
+	defer roots.Close()
+	before := roots.IOObservation()
+	result, err := Collect(roots, ModeEstimate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := roots.IOObservation()
+	if result.DirectoryEntries != after.ReadDirectoryEntries-before.ReadDirectoryEntries || result.PrefixBytes != after.ReadPrefixBytes-before.ReadPrefixBytes || result.FullBodyOpens != after.FullBodyOpens-before.FullBodyOpens || result.FullBodyBytes != after.FullBodyBytes-before.FullBodyBytes {
+		t.Fatalf("inventory I/O counters are not boundary observations: result=%#v before=%#v after=%#v", result, before, after)
+	}
+	if result.DirectoryEntries != 6 || result.PrefixBytes != 2*uint64(binaryPrefixBytes) || result.FullBodyOpens != 0 || result.FullBodyBytes != 0 {
+		t.Fatalf("estimate I/O was not bounded: %#v", result)
+	}
+}
+
+func TestCollectBoundsIgnoreRulesAndPatternWork(t *testing.T) {
+	repository := newRepository(t)
+	var rules strings.Builder
+	for index := 0; index <= maximumIgnoreRules; index++ {
+		fmt.Fprintf(&rules, "ignored-%03d.go\n", index)
+	}
+	writeFile(t, repository, ".gitignore", rules.String())
+	writeFile(t, repository, "source.go", "package source\n")
+	result := mustCollect(t, repository, ModeBuild)
+	if !result.Partial || !result.UnknownRemainder || !contains(result.Warnings, "gitignore-rule-limit") || result.Coverage.PathCoverage != 0 {
+		t.Fatalf("bounded ignore policy result = %#v", result)
 	}
 }
 
@@ -284,7 +591,7 @@ func TestCollectStopsAtPathAndByteLimitsWithoutClaimingCompleteness(t *testing.T
 	if result.Coverage.ExclusionReasonCounts[ExcludedLimit] != 0 || !result.UnknownRemainder || result.Coverage.PathCoverage != 0 {
 		t.Fatalf("path-limit result must represent an unknown conservative remainder: %#v", result)
 	}
-	if result.DirectoryEntries != 4 || result.PrefixBytes != uint64(2*len("package a\n")) || result.FullBodyOpens != 2 || len(result.Paths) > limits.MaximumEligiblePaths {
+	if result.DirectoryEntries != 6 || result.PrefixBytes != uint64(2*len("package a\n")) || result.FullBodyOpens != 2 || result.FullBodyBytes != uint64(2*len("package a\n")) || len(result.Paths) > limits.MaximumEligiblePaths {
 		t.Fatalf("path ceiling performed unbounded work: %#v", result)
 	}
 
@@ -432,25 +739,91 @@ func writeGitIndex(t *testing.T, repository string, names []string) {
 
 func writeGitIndexIn(t *testing.T, gitDirectory string, names []string) {
 	t.Helper()
+	entries := make([]gitIndexFixtureEntry, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, gitIndexFixtureEntry{name: name, mode: 0o100644})
+	}
+	writeRawGitIndex(t, gitDirectory, buildGitIndex(t, 2, entries, nil))
+}
+
+type gitIndexFixtureEntry struct {
+	name     string
+	mode     uint32
+	stage    uint16
+	extended uint16
+}
+
+type gitIndexFixtureExtension struct {
+	signature string
+	contents  []byte
+}
+
+func buildGitIndex(t *testing.T, version uint32, entries []gitIndexFixtureEntry, extensions []gitIndexFixtureExtension) []byte {
+	t.Helper()
 	var raw bytes.Buffer
 	raw.WriteString("DIRC")
-	_ = endian.Write(&raw, endian.BigEndian, uint32(2))
-	_ = endian.Write(&raw, endian.BigEndian, uint32(len(names)))
-	for _, name := range names {
+	_ = endian.Write(&raw, endian.BigEndian, version)
+	_ = endian.Write(&raw, endian.BigEndian, uint32(len(entries)))
+	previous := ""
+	for _, entry := range entries {
 		start := raw.Len()
 		header := make([]byte, 60)
-		endian.BigEndian.PutUint32(header[24:28], 0o100644)
+		endian.BigEndian.PutUint32(header[24:28], entry.mode)
 		raw.Write(header)
-		_ = endian.Write(&raw, endian.BigEndian, uint16(len(name)))
-		raw.WriteString(name)
-		raw.WriteByte(0)
-		for (raw.Len()-start)%8 != 0 {
-			raw.WriteByte(0)
+		nameLength := len(entry.name)
+		if nameLength > 0x0fff {
+			nameLength = 0x0fff
 		}
+		flags := uint16(nameLength) | entry.stage<<12
+		if entry.extended != 0 {
+			flags |= 0x4000
+		}
+		_ = endian.Write(&raw, endian.BigEndian, flags)
+		if entry.extended != 0 {
+			_ = endian.Write(&raw, endian.BigEndian, entry.extended)
+		}
+		if version == 4 {
+			common := 0
+			for common < len(previous) && common < len(entry.name) && previous[common] == entry.name[common] {
+				common++
+			}
+			strip := len(previous) - common
+			if strip >= 0x80 {
+				t.Fatalf("fixture v4 strip is too large: %d", strip)
+			}
+			raw.WriteByte(byte(strip))
+			raw.WriteString(entry.name[common:])
+			raw.WriteByte(0)
+		} else {
+			raw.WriteString(entry.name)
+			raw.WriteByte(0)
+			for (raw.Len()-start)%8 != 0 {
+				raw.WriteByte(0)
+			}
+		}
+		previous = entry.name
+	}
+	for _, extension := range extensions {
+		if len(extension.signature) != 4 {
+			t.Fatalf("extension signature = %q, want four bytes", extension.signature)
+		}
+		raw.WriteString(extension.signature)
+		_ = endian.Write(&raw, endian.BigEndian, uint32(len(extension.contents)))
+		raw.Write(extension.contents)
 	}
 	digest := sha1.Sum(raw.Bytes())
 	raw.Write(digest[:])
-	if err := os.WriteFile(filepath.Join(gitDirectory, "index"), raw.Bytes(), 0o600); err != nil {
+	return raw.Bytes()
+}
+
+func rewriteGitIndexChecksum(raw []byte) {
+	digest := sha1.Sum(raw[:len(raw)-sha1.Size])
+	copy(raw[len(raw)-sha1.Size:], digest[:])
+}
+
+func writeRawGitIndex(t *testing.T, gitDirectory string, raw []byte) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(gitDirectory, "index"), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
