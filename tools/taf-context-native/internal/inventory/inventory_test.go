@@ -721,6 +721,63 @@ func TestCollectStopsDeterministicallyAtAggregateIgnoreMatchBudget(t *testing.T)
 	}
 }
 
+func TestIgnoreMatcherProductionBudgetsBoundActualRegexAttempts(t *testing.T) {
+	makeRules := func() []ignoreRule {
+		rules := make([]ignoreRule, maximumIgnoreRules)
+		for index := range rules {
+			pattern := fmt.Sprintf("never/%03d", index)
+			matcher, ok := compileGitGlob(pattern)
+			if !ok {
+				t.Fatalf("compileGitGlob(%q) failed", pattern)
+			}
+			rules[index] = ignoreRule{pattern: pattern, directory: true, slash: true, matcher: matcher}
+		}
+		return rules
+	}
+	type observation struct {
+		attempts int
+		work     int
+	}
+	run := func(relative string, repeat bool) observation {
+		budget := newIgnoreMatchBudget(maximumIgnoreRuleEvaluations, maximumIgnoreMatchWork)
+		rules := makeRules()
+		observed := observation{}
+		ignoreRegexMatchHook = func(pattern, candidate string) {
+			observed.attempts++
+			observed.work += (len(pattern) + 1) * (len(candidate) + 1)
+		}
+		t.Cleanup(func() { ignoreRegexMatchHook = nil })
+		for {
+			_, limited := ignoredBy(rules, relative, true, budget)
+			if limited {
+				break
+			}
+			if !repeat {
+				t.Fatal("depth-256 matcher did not exhaust its work budget")
+			}
+		}
+		if observed.attempts > maximumIgnoreRuleEvaluations {
+			t.Fatalf("actual regex attempts = %d, ceiling = %d", observed.attempts, maximumIgnoreRuleEvaluations)
+		}
+		if observed.work > maximumIgnoreMatchWork {
+			t.Fatalf("actual regex work = %d, ceiling = %d", observed.work, maximumIgnoreMatchWork)
+		}
+		return observed
+	}
+
+	depth256 := strings.Repeat("d/", 255) + "d"
+	first := run(depth256, false)
+	second := run(depth256, false)
+	if first != second || first.attempts == 0 || first.work == 0 {
+		t.Fatalf("depth-256 slash-directory work is not deterministic: first=%#v second=%#v", first, second)
+	}
+
+	evaluationBound := run("a/b", true)
+	if evaluationBound.attempts != maximumIgnoreRuleEvaluations {
+		t.Fatalf("actual regex attempts = %d, want exact evaluation ceiling %d", evaluationBound.attempts, maximumIgnoreRuleEvaluations)
+	}
+}
+
 func TestCollectDeepTraversalReturnsStablePartial(t *testing.T) {
 	repository := newRepository(t)
 	current := repository

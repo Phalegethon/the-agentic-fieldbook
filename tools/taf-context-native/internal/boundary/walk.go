@@ -30,10 +30,11 @@ type StablePrefix struct {
 // IOObservation reports repository I/O performed through this retained root.
 // Copies of Roots share the same monotonic observation state.
 type IOObservation struct {
-	ReadDirectoryEntries int
-	ReadPrefixBytes      uint64
-	FullBodyOpens        int
-	FullBodyBytes        uint64
+	ReadDirectoryEntries      int
+	MaterializedSnapshotBytes uint64
+	ReadPrefixBytes           uint64
+	FullBodyOpens             int
+	FullBodyBytes             uint64
 }
 
 type ioObservationState struct {
@@ -47,6 +48,7 @@ func (r *Roots) observeIO(delta IOObservation) {
 	}
 	r.ioObservation.mu.Lock()
 	r.ioObservation.value.ReadDirectoryEntries += delta.ReadDirectoryEntries
+	r.ioObservation.value.MaterializedSnapshotBytes += delta.MaterializedSnapshotBytes
 	r.ioObservation.value.ReadPrefixBytes += delta.ReadPrefixBytes
 	r.ioObservation.value.FullBodyOpens += delta.FullBodyOpens
 	r.ioObservation.value.FullBodyBytes += delta.FullBodyBytes
@@ -88,6 +90,18 @@ type repositoryObservationBudget struct {
 	remaining int
 }
 
+type repositorySnapshotByteBudget struct {
+	remaining uint64
+}
+
+func (budget *repositorySnapshotByteBudget) consume(amount uint64) bool {
+	if budget == nil || amount > budget.remaining {
+		return false
+	}
+	budget.remaining -= amount
+	return true
+}
+
 type repositorySnapshotEntry struct {
 	name string
 	info os.FileInfo
@@ -100,24 +114,34 @@ type repositoryDirectorySnapshot struct {
 }
 
 type repositoryWalkState struct {
-	discovery             *repositoryObservationBudget
-	path                  []byte
-	depth                 int
-	emittedPathBytes      uint64
-	retainedSnapshotBytes uint64
-	snapshots             []repositoryDirectorySnapshot
+	discovery        *repositoryObservationBudget
+	snapshotBytes    *repositorySnapshotByteBudget
+	path             []byte
+	depth            int
+	emittedPathBytes uint64
+	snapshots        []repositoryDirectorySnapshot
 }
 
 // WalkRepository enumerates repository metadata through the captured root
 // capability. It never follows symlinks and never descends into Git metadata.
 func (r *Roots) WalkRepository(maximumObservations int, visit func(RepositoryEntry) error) error {
+	return r.walkRepository(maximumObservations, maximumRepositorySnapshotBytes, visit)
+}
+
+func (r *Roots) walkRepository(maximumObservations int, maximumSnapshotBytes uint64, visit func(RepositoryEntry) error) error {
 	if r.repositoryRoot == nil || visit == nil {
 		return ErrUnsafePath
 	}
 	if maximumObservations <= 0 {
 		return ErrRepositoryEnumerationLimit
 	}
-	state := &repositoryWalkState{discovery: &repositoryObservationBudget{remaining: maximumObservations}}
+	if maximumSnapshotBytes == 0 {
+		return ErrRepositoryTraversalLimit
+	}
+	state := &repositoryWalkState{
+		discovery:     &repositoryObservationBudget{remaining: maximumObservations},
+		snapshotBytes: &repositorySnapshotByteBudget{remaining: maximumSnapshotBytes},
+	}
 	if err := r.walkRepositoryDirectory(r.repositoryRoot, state, visit); err != nil {
 		return err
 	}
@@ -125,21 +149,23 @@ func (r *Roots) WalkRepository(maximumObservations int, visit func(RepositoryEnt
 	if !ok {
 		return ErrRepositoryEnumerationLimit
 	}
-	return r.validateRepositorySnapshots(state.snapshots, &repositoryObservationBudget{remaining: verificationMaximum})
+	return r.validateRepositorySnapshots(
+		state.snapshots,
+		&repositoryObservationBudget{remaining: verificationMaximum},
+		state.snapshotBytes,
+	)
 }
 
 func (r *Roots) walkRepositoryDirectory(current *os.Root, state *repositoryWalkState, visit func(RepositoryEntry) error) error {
 	if r.entersGitDirectory([]*os.Root{current}) {
 		return ErrUnsafePath
 	}
-	entries, identity, err := r.readRootDirectory(current, state.discovery, true)
+	entries, identity, err := r.readRootDirectory(current, state.discovery, state.snapshotBytes, len(state.path), true)
 	if err != nil {
 		return err
 	}
 	sort.Slice(entries, func(i, j int) bool { return repositoryEntryLess(entries[i], entries[j]) })
-	if !state.retainSnapshot(identity, entries) {
-		return ErrRepositoryTraversalLimit
-	}
+	state.retainSnapshot(identity, entries)
 	for _, entry := range entries {
 		name := entry.name
 		if _, err := safeComponents(name, false); err != nil {
@@ -222,21 +248,12 @@ func (state *repositoryWalkState) pushPath(name string) bool {
 	return true
 }
 
-func (state *repositoryWalkState) retainSnapshot(identity os.FileInfo, entries []repositorySnapshotEntry) bool {
-	required := uint64(len(state.path) + repositorySnapshotEntryOverheadBytes)
-	for _, entry := range entries {
-		required += uint64(len(entry.name) + repositorySnapshotEntryOverheadBytes)
-	}
-	if required > maximumRepositorySnapshotBytes-state.retainedSnapshotBytes {
-		return false
-	}
-	state.retainedSnapshotBytes += required
+func (state *repositoryWalkState) retainSnapshot(identity os.FileInfo, entries []repositorySnapshotEntry) {
 	state.snapshots = append(state.snapshots, repositoryDirectorySnapshot{
 		relative: string(state.path),
 		identity: identity,
 		entries:  entries,
 	})
-	return true
 }
 
 func boundedMultiply(value, factor int) (int, bool) {
@@ -246,7 +263,7 @@ func boundedMultiply(value, factor int) (int, bool) {
 	return value * factor, true
 }
 
-func (r *Roots) validateRepositorySnapshots(snapshots []repositoryDirectorySnapshot, budget *repositoryObservationBudget) error {
+func (r *Roots) validateRepositorySnapshots(snapshots []repositoryDirectorySnapshot, budget *repositoryObservationBudget, snapshotBytes *repositorySnapshotByteBudget) error {
 	for _, snapshot := range snapshots {
 		current := r.repositoryRoot
 		var closers []*os.Root
@@ -269,11 +286,10 @@ func (r *Roots) validateRepositorySnapshots(snapshots []repositoryDirectorySnaps
 			closeRoots(closers)
 			return ErrRepositoryChanged
 		}
-		identity, identityErr := current.Stat(".")
-		entries, _, readErr := r.readRootDirectory(current, budget, false)
+		entries, identity, readErr := r.readRootDirectory(current, budget, snapshotBytes, len(snapshot.relative), false)
 		closeRoots(closers)
-		if identityErr != nil || readErr != nil || !sameSnapshot(snapshot.identity, identity) {
-			if errors.Is(readErr, ErrRepositoryEnumerationLimit) {
+		if readErr != nil || !sameSnapshot(snapshot.identity, identity) {
+			if errors.Is(readErr, ErrRepositoryEnumerationLimit) || errors.Is(readErr, ErrRepositoryTraversalLimit) {
 				return readErr
 			}
 			return ErrRepositoryChanged
@@ -300,7 +316,12 @@ func (r *Roots) isGitMetadata(info os.FileInfo) bool {
 		(r.gitMetadataInfo != nil && sameIdentity(info, r.gitMetadataInfo))
 }
 
-func (r *Roots) readRootDirectory(root *os.Root, budget *repositoryObservationBudget, invokeHook bool) ([]repositorySnapshotEntry, os.FileInfo, error) {
+func (r *Roots) readRootDirectory(root *os.Root, budget *repositoryObservationBudget, snapshotBytes *repositorySnapshotByteBudget, relativeBytes int, invokeHook bool) ([]repositorySnapshotEntry, os.FileInfo, error) {
+	directoryBytes := uint64(relativeBytes + repositorySnapshotEntryOverheadBytes)
+	if !snapshotBytes.consume(directoryBytes) {
+		return nil, nil, ErrRepositoryTraversalLimit
+	}
+	r.observeIO(IOObservation{MaterializedSnapshotBytes: directoryBytes})
 	before, err := root.Stat(".")
 	if err != nil || !before.IsDir() {
 		return nil, nil, ErrUnsafePath
@@ -324,10 +345,26 @@ func (r *Roots) readRootDirectory(root *os.Root, budget *repositoryObservationBu
 		if budget.remaining < batchMaximum {
 			batchMaximum = budget.remaining
 		}
+		maximumEntryBytes := uint64(maximumRepositoryPathBytes + repositorySnapshotEntryOverheadBytes)
+		snapshotBatchMaximum := int(snapshotBytes.remaining / maximumEntryBytes)
+		if snapshotBatchMaximum == 0 {
+			return nil, nil, ErrRepositoryTraversalLimit
+		}
+		if snapshotBatchMaximum < batchMaximum {
+			batchMaximum = snapshotBatchMaximum
+		}
 		batch, readErr := directory.ReadDir(batchMaximum)
 		budget.remaining -= len(batch)
 		r.observeIO(IOObservation{ReadDirectoryEntries: len(batch)})
 		for _, entry := range batch {
+			if len(entry.Name()) > maximumRepositoryPathBytes {
+				return nil, nil, ErrRepositoryTraversalLimit
+			}
+			entryBytes := uint64(len(entry.Name()) + repositorySnapshotEntryOverheadBytes)
+			if !snapshotBytes.consume(entryBytes) {
+				return nil, nil, ErrRepositoryTraversalLimit
+			}
+			r.observeIO(IOObservation{MaterializedSnapshotBytes: entryBytes})
 			info, statErr := root.Lstat(entry.Name())
 			if statErr != nil {
 				return nil, nil, fmt.Errorf("%w: %v", ErrUnsafePath, statErr)

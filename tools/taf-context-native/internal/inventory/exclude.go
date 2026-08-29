@@ -42,6 +42,10 @@ type ignoreMatchBudget struct {
 	remainingWork        int
 }
 
+// ignoreRegexMatchHook observes actual regular-expression invocations in
+// boundary-work tests. Production leaves it nil.
+var ignoreRegexMatchHook func(pattern, candidate string)
+
 func newIgnoreMatchBudget(evaluations, work int) *ignoreMatchBudget {
 	return &ignoreMatchBudget{remainingEvaluations: evaluations, remainingWork: work}
 }
@@ -154,67 +158,67 @@ func ignoredBy(rules []ignoreRule, relative string, directory bool, budget *igno
 func ignoredDirectlyBy(rules []ignoreRule, relative string, directory bool, budget *ignoreMatchBudget) (bool, bool) {
 	ignored := false
 	for _, rule := range rules {
-		if !budget.consume(rule, relative) {
+		matched, limited := ignoreRuleMatches(rule, relative, directory, budget)
+		if limited {
 			return false, true
 		}
-		if ignoreRuleMatches(rule, relative, directory) {
+		if matched {
 			ignored = !rule.negated
 		}
 	}
 	return ignored, false
 }
 
-func ignoreRuleMatches(rule ignoreRule, relative string, directory bool) bool {
+func ignoreRuleMatches(rule ignoreRule, relative string, directory bool, budget *ignoreMatchBudget) (bool, bool) {
 	if rule.base != "" {
 		if len(relative) <= len(rule.base) || relative[:len(rule.base)] != rule.base || relative[len(rule.base)] != '/' {
-			return false
+			return false, false
 		}
 		relative = relative[len(rule.base)+1:]
 	}
 	if rule.directory {
-		if rule.slash {
-			if !directory {
-				return false
-			}
-			candidate := relative
-			for candidate != "." && candidate != "" {
-				if rule.matcher.MatchString(candidate) {
-					return true
-				}
-				slash := strings.LastIndexByte(candidate, '/')
-				if slash < 0 {
-					break
-				}
-				candidate = candidate[:slash]
-			}
-			return false
-		}
 		if !directory {
-			return false
+			return false, false
+		}
+		if rule.slash {
+			// ignoredBy already supplies every ancestor as a directory candidate.
+			// Rescanning those ancestors here duplicates regex work by depth.
+			return matchIgnoreCandidate(rule, relative, budget)
 		}
 		if rule.anchored {
-			return rule.matcher.MatchString(relative)
+			return matchIgnoreCandidate(rule, relative, budget)
 		}
-		return matcherMatchesComponent(rule.matcher, relative)
+		return matcherMatchesComponent(rule, relative, budget)
 	}
 	if rule.slash || rule.anchored {
-		return rule.matcher.MatchString(relative)
+		return matchIgnoreCandidate(rule, relative, budget)
 	}
-	return matcherMatchesComponent(rule.matcher, relative)
+	return matcherMatchesComponent(rule, relative, budget)
 }
 
-func matcherMatchesComponent(matcher *regexp.Regexp, relative string) bool {
+func matcherMatchesComponent(rule ignoreRule, relative string, budget *ignoreMatchBudget) (bool, bool) {
 	start := 0
 	for index := 0; index <= len(relative); index++ {
 		if index != len(relative) && relative[index] != '/' {
 			continue
 		}
-		if matcher.MatchString(relative[start:index]) {
-			return true
+		matched, limited := matchIgnoreCandidate(rule, relative[start:index], budget)
+		if limited || matched {
+			return matched, limited
 		}
 		start = index + 1
 	}
-	return false
+	return false, false
+}
+
+func matchIgnoreCandidate(rule ignoreRule, candidate string, budget *ignoreMatchBudget) (bool, bool) {
+	if !budget.consume(rule, candidate) {
+		return false, true
+	}
+	if ignoreRegexMatchHook != nil {
+		ignoreRegexMatchHook(rule.pattern, candidate)
+	}
+	return rule.matcher.MatchString(candidate), false
 }
 
 func compileGitGlob(pattern string) (*regexp.Regexp, bool) {

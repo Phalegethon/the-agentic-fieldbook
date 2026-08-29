@@ -1358,6 +1358,55 @@ func TestWalkRepositoryBoundsGlobalVerificationWorkAndObservations(t *testing.T)
 	}
 }
 
+func TestWalkRepositoryBoundsFlatLongNameSnapshotBeforeMaterialization(t *testing.T) {
+	roots := makeRoots(t)
+	const (
+		fileCount       = 200
+		snapshotMaximum = 32 << 10
+	)
+	for index := 0; index < fileCount; index++ {
+		name := fmt.Sprintf("%03d-%s.go", index, strings.Repeat("x", 230))
+		if err := os.WriteFile(filepath.Join(roots.Repository, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := roots.IOObservation()
+	err := roots.walkRepository(10_000, snapshotMaximum, func(RepositoryEntry) error { return nil })
+	after := roots.IOObservation()
+	if !errors.Is(err, ErrRepositoryTraversalLimit) {
+		t.Fatalf("long-name snapshot error = %v, want ErrRepositoryTraversalLimit", err)
+	}
+	observedEntries := after.ReadDirectoryEntries - before.ReadDirectoryEntries
+	observedBytes := after.MaterializedSnapshotBytes - before.MaterializedSnapshotBytes
+	if observedEntries <= 0 || observedEntries >= fileCount {
+		t.Fatalf("boundary observed %d entries, want a bounded nonzero prefix below %d", observedEntries, fileCount)
+	}
+	if observedBytes == 0 || observedBytes > snapshotMaximum {
+		t.Fatalf("boundary materialized %d snapshot bytes, ceiling = %d", observedBytes, snapshotMaximum)
+	}
+}
+
+func TestWalkRepositorySharesSnapshotByteCeilingWithVerification(t *testing.T) {
+	roots := makeRoots(t)
+	const snapshotMaximum = 12 << 10
+	for index := 0; index < 20; index++ {
+		name := fmt.Sprintf("%03d-%s.go", index, strings.Repeat("v", 230))
+		if err := os.WriteFile(filepath.Join(roots.Repository, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := roots.IOObservation()
+	err := roots.walkRepository(10_000, snapshotMaximum, func(RepositoryEntry) error { return nil })
+	after := roots.IOObservation()
+	if !errors.Is(err, ErrRepositoryTraversalLimit) {
+		t.Fatalf("verification snapshot error = %v, want ErrRepositoryTraversalLimit", err)
+	}
+	observedBytes := after.MaterializedSnapshotBytes - before.MaterializedSnapshotBytes
+	if observedBytes == 0 || observedBytes > snapshotMaximum {
+		t.Fatalf("discovery and verification materialized %d bytes, shared ceiling = %d", observedBytes, snapshotMaximum)
+	}
+}
+
 func openDescriptorCount(t *testing.T) int {
 	t.Helper()
 	if runtime.GOOS != "linux" {
@@ -1380,6 +1429,7 @@ func TestBoundaryIOHookReportsActualDirectoryPrefixAndBodyReads(t *testing.T) {
 	var hooked IOObservation
 	repositoryIOHook = func(delta IOObservation) {
 		hooked.ReadDirectoryEntries += delta.ReadDirectoryEntries
+		hooked.MaterializedSnapshotBytes += delta.MaterializedSnapshotBytes
 		hooked.ReadPrefixBytes += delta.ReadPrefixBytes
 		hooked.FullBodyOpens += delta.FullBodyOpens
 		hooked.FullBodyBytes += delta.FullBodyBytes
@@ -1397,10 +1447,11 @@ func TestBoundaryIOHookReportsActualDirectoryPrefixAndBodyReads(t *testing.T) {
 	}
 	after := roots.IOObservation()
 	want := IOObservation{
-		ReadDirectoryEntries: after.ReadDirectoryEntries - before.ReadDirectoryEntries,
-		ReadPrefixBytes:      after.ReadPrefixBytes - before.ReadPrefixBytes,
-		FullBodyOpens:        after.FullBodyOpens - before.FullBodyOpens,
-		FullBodyBytes:        after.FullBodyBytes - before.FullBodyBytes,
+		ReadDirectoryEntries:      after.ReadDirectoryEntries - before.ReadDirectoryEntries,
+		MaterializedSnapshotBytes: after.MaterializedSnapshotBytes - before.MaterializedSnapshotBytes,
+		ReadPrefixBytes:           after.ReadPrefixBytes - before.ReadPrefixBytes,
+		FullBodyOpens:             after.FullBodyOpens - before.FullBodyOpens,
+		FullBodyBytes:             after.FullBodyBytes - before.FullBodyBytes,
 	}
 	if hooked != want || hooked.ReadPrefixBytes != 4 || hooked.FullBodyOpens != 1 || hooked.FullBodyBytes != uint64(len(contents)) {
 		t.Fatalf("hooked I/O = %#v, want %#v", hooked, want)
