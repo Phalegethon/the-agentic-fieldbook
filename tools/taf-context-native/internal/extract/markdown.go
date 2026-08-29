@@ -1,6 +1,7 @@
 package extract
 
 import (
+	"bytes"
 	"path"
 	"strings"
 	"unicode"
@@ -30,132 +31,213 @@ func (extractor markdownExtractor) MaximumBytes() int64 {
 }
 
 type markdownLine struct {
-	text  string
-	bytes int
+	text   string
+	bytes  int
+	number int
+	next   int
 }
 
-type markdownHeading struct {
-	qualified string
-	start     int
-	end       int
+type markdownParser struct {
+	source       []byte
+	records      []model.Record
+	warnings     []string
+	hierarchy    [6]string
+	documentName string
+	section      string
+	chunk        int
+	chunkStart   int
+	chunkEnd     int
+	chunkLines   int
+	chunkBytes   int
+	chunkTerms   []string
+	limited      bool
+	failed       bool
 }
 
 func (extractor markdownExtractor) Extract(file boundary.StableFile) ([]model.Record, Report) {
 	if !utf8.Valid(file.Bytes) {
 		return nil, Report{ParserVersion: markdownParserVersion, ParseFailures: 1, WarningCodes: []string{"markdown-invalid-utf8"}}
 	}
-	lines := markdownLines(string(file.Bytes))
-	fenced := markdownFencedLines(lines)
-	headings := findMarkdownHeadings(lines, fenced)
-	records := make([]model.Record, 0, len(headings)*2+1)
-	warnings := []string{}
-	appendRecord := func(record model.Record) bool {
-		if len(records) >= maximumMarkdownRecords {
-			warnings = append(warnings, "markdown-record-limit")
-			return false
-		}
-		records = append(records, record)
-		return true
+	parser := markdownParser{
+		source:       file.Bytes,
+		records:      make([]model.Record, 0, 256),
+		documentName: markdownDocumentName(file.RelativePath),
 	}
-	for _, heading := range headings {
-		if !appendRecord(structuralRecord(heading.qualified, model.Heading, "document", heading.start, heading.end)) {
-			break
-		}
+	parser.section = parser.documentName
+	parser.chunk = 1
+	parser.parse()
+	report := Report{ParserVersion: markdownParserVersion, WarningCodes: parser.warnings}
+	if parser.failed || parser.limited {
+		report.ParseFailures = 1
 	}
-	sections := markdownSections(file.RelativePath, lines, headings)
-	for _, section := range sections {
-		chunk := 1
-		for _, prose := range markdownProseRanges(section, fenced) {
-			for start := prose.start; start <= prose.end; {
-				if lines[start-1].bytes > maximumMarkdownChunkBytes {
-					warnings = append(warnings, "markdown-line-too-long")
-					start++
-					continue
-				}
-				end := markdownChunkEnd(lines, start, prose.end)
-				qualified := section.qualified + "#chunk-" + decimal(chunk)
-				record := structuralRecord(qualified, model.DocumentChunk, "document", start, end)
-				record.SearchTerms = markdownChunkTerms(lines, start, end)
-				if !appendRecord(record) {
-					return records, Report{ParserVersion: markdownParserVersion, WarningCodes: warnings}
-				}
-				start = end + 1
-				chunk++
-			}
-		}
-	}
-	return records, Report{ParserVersion: markdownParserVersion, WarningCodes: warnings}
+	return parser.records, report
 }
 
-func markdownLines(source string) []markdownLine {
-	raw := strings.Split(source, "\n")
-	if len(raw) != 0 && raw[len(raw)-1] == "" {
-		raw = raw[:len(raw)-1]
-	}
-	lines := make([]markdownLine, len(raw))
-	for index, line := range raw {
-		lineBytes := len(line) + 1
-		line = strings.TrimSuffix(line, "\r")
-		lines[index] = markdownLine{text: line, bytes: lineBytes}
-	}
-	return lines
-}
-
-func markdownFencedLines(lines []markdownLine) []bool {
-	fenced := make([]bool, len(lines))
+func (parser *markdownParser) parse() {
+	offset, lineNumber := 0, 1
 	fenceCharacter := byte(0)
 	fenceLength := 0
-	for index, line := range lines {
+	for offset < len(parser.source) && !parser.limited {
+		line, ok := nextMarkdownLine(parser.source, offset, lineNumber)
+		if !ok {
+			break
+		}
 		if fenceCharacter != 0 {
-			fenced[index] = true
 			if markdownFenceClose(line.text, fenceCharacter, fenceLength) {
 				fenceCharacter, fenceLength = 0, 0
 			}
+			offset, lineNumber = line.next, line.number+1
 			continue
 		}
-		if character, length, ok := markdownFenceOpen(line.text); ok {
-			fenced[index] = true
+		if character, length, open := markdownFenceOpen(line.text); open {
+			parser.flushChunk()
 			fenceCharacter, fenceLength = character, length
+			offset, lineNumber = line.next, line.number+1
+			continue
 		}
+		if text, level, heading := markdownATXHeading(line.text); heading {
+			parser.startHeading(text, level, line.number, line.number)
+			parser.addChunkLine(line)
+			offset, lineNumber = line.next, line.number+1
+			continue
+		}
+		next, hasNext := nextMarkdownLine(parser.source, line.next, line.number+1)
+		if hasNext {
+			level := markdownSetextLevel(next.text)
+			if text, supported := markdownSetextText(line.text); level != 0 && supported {
+				parser.startHeading(text, level, line.number, next.number)
+				parser.addChunkLine(line)
+				parser.addChunkLine(next)
+				offset, lineNumber = next.next, next.number+1
+				continue
+			}
+		}
+		parser.addChunkLine(line)
+		offset, lineNumber = line.next, line.number+1
 	}
-	return fenced
+	if fenceCharacter != 0 && !parser.limited {
+		parser.warnings = append(parser.warnings, "markdown-unterminated-fence")
+		parser.failed = true
+	}
+	parser.flushChunk()
 }
 
-func findMarkdownHeadings(lines []markdownLine, fenced []bool) []markdownHeading {
-	var headings []markdownHeading
-	var hierarchy [6]string
-	for index := 0; index < len(lines); index++ {
-		line := lines[index].text
-		start := index + 1
-		if fenced[index] {
-			continue
-		}
-		text, level, ok := markdownATXHeading(line)
-		end := index + 1
-		if !ok && index+1 < len(lines) && !fenced[index+1] {
-			if setextLevel := markdownSetextLevel(lines[index+1].text); setextLevel != 0 {
-				if setextText, textOK := markdownSetextText(line); textOK {
-					text, level, ok, end = setextText, setextLevel, true, index+2
-					index++
-				}
-			}
-		}
-		if !ok || text == "" {
-			continue
-		}
-		for depth := level - 1; depth < len(hierarchy); depth++ {
-			hierarchy[depth] = ""
-		}
-		hierarchy[level-1] = text
-		parts := make([]string, 0, level)
-		for depth := 0; depth < level; depth++ {
-			if hierarchy[depth] != "" {
-				parts = append(parts, hierarchy[depth])
-			}
-		}
-		headings = append(headings, markdownHeading{qualified: strings.Join(parts, "."), start: start, end: end})
+func nextMarkdownLine(source []byte, offset, number int) (markdownLine, bool) {
+	if offset < 0 || offset >= len(source) {
+		return markdownLine{}, false
 	}
-	return headings
+	relativeEnd := bytes.IndexByte(source[offset:], '\n')
+	end, next := len(source), len(source)
+	if relativeEnd >= 0 {
+		end = offset + relativeEnd
+		next = end + 1
+	}
+	raw := source[offset:end]
+	if len(raw) != 0 && raw[len(raw)-1] == '\r' {
+		raw = raw[:len(raw)-1]
+	}
+	return markdownLine{text: string(raw), bytes: next - offset, number: number, next: next}, true
+}
+
+func (parser *markdownParser) startHeading(text string, level, start, end int) {
+	parser.flushChunk()
+	for depth := level - 1; depth < len(parser.hierarchy); depth++ {
+		parser.hierarchy[depth] = ""
+	}
+	if len(text) > 512 {
+		parser.warnings = append(parser.warnings, "markdown-heading-limit")
+		parser.limited = true
+		return
+	}
+	parser.hierarchy[level-1] = text
+	parts := make([]string, 0, level)
+	for depth := 0; depth < level; depth++ {
+		if parser.hierarchy[depth] != "" {
+			parts = append(parts, parser.hierarchy[depth])
+		}
+	}
+	qualified := strings.Join(parts, ".")
+	if len(qualified) > 512 {
+		parser.warnings = append(parser.warnings, "markdown-heading-limit")
+		parser.limited = true
+		return
+	}
+	if qualified == "" {
+		qualified = parser.documentName
+	}
+	parser.section = qualified
+	parser.chunk = 1
+	if text != "" {
+		parser.appendRecord(structuralRecord(qualified, model.Heading, "document", start, end))
+	}
+}
+
+func (parser *markdownParser) addChunkLine(line markdownLine) {
+	if parser.limited {
+		return
+	}
+	if line.bytes > maximumMarkdownChunkBytes {
+		parser.flushChunk()
+		parser.warnings = append(parser.warnings, "markdown-line-too-long")
+		return
+	}
+	if parser.chunkLines != 0 && (parser.chunkLines == maximumMarkdownChunkLines || parser.chunkBytes+line.bytes > maximumMarkdownChunkBytes) {
+		parser.flushChunk()
+	}
+	if parser.chunkLines == 0 {
+		parser.chunkStart = line.number
+	}
+	parser.chunkEnd = line.number
+	parser.chunkLines++
+	parser.chunkBytes += line.bytes
+	parser.appendChunkTerms(line.text)
+}
+
+func (parser *markdownParser) appendChunkTerms(line string) {
+	if len(parser.chunkTerms) >= 64 {
+		return
+	}
+	for _, term := range strings.FieldsFunc(line, func(character rune) bool {
+		return !unicodeLetterOrDigit(character)
+	}) {
+		if len(term) <= 128 {
+			parser.chunkTerms = append(parser.chunkTerms, term)
+			if len(parser.chunkTerms) == 64 {
+				return
+			}
+		}
+	}
+}
+
+func (parser *markdownParser) flushChunk() {
+	if parser.chunkLines == 0 || parser.limited {
+		parser.resetChunk()
+		return
+	}
+	record := structuralRecord(parser.section+"#chunk-"+decimal(parser.chunk), model.DocumentChunk, "document", parser.chunkStart, parser.chunkEnd)
+	record.SearchTerms = append([]string(nil), parser.chunkTerms...)
+	if parser.appendRecord(record) {
+		parser.chunk++
+	}
+	parser.resetChunk()
+}
+
+func (parser *markdownParser) resetChunk() {
+	parser.chunkStart = 0
+	parser.chunkEnd = 0
+	parser.chunkLines = 0
+	parser.chunkBytes = 0
+	parser.chunkTerms = parser.chunkTerms[:0]
+}
+
+func (parser *markdownParser) appendRecord(record model.Record) bool {
+	if len(parser.records) >= maximumMarkdownRecords {
+		parser.warnings = append(parser.warnings, "markdown-record-limit")
+		parser.limited = true
+		return false
+	}
+	parser.records = append(parser.records, record)
+	return true
 }
 
 func markdownFenceOpen(line string) (byte, int, bool) {
@@ -212,7 +294,7 @@ func markdownATXHeading(line string) (string, int, bool) {
 	for closing > 0 && text[closing-1] == '#' {
 		closing--
 	}
-	if closing < len(text) && closing > 0 && (text[closing-1] == ' ' || text[closing-1] == '\t') {
+	if closing < len(text) && (closing == 0 || text[closing-1] == ' ' || text[closing-1] == '\t') {
 		text = strings.TrimSpace(text[:closing])
 	}
 	return text, level, true
@@ -248,92 +330,57 @@ func markdownSetextText(line string) (string, bool) {
 		return "", false
 	}
 	rest = strings.TrimSpace(rest)
-	return rest, rest != ""
+	if rest == "" || markdownBlockStart(rest) {
+		return "", false
+	}
+	first, _ := utf8.DecodeRuneInString(rest)
+	if !unicode.IsLetter(first) && !unicode.IsDigit(first) {
+		return "", false
+	}
+	return rest, true
 }
 
-type markdownSection struct {
-	qualified string
-	start     int
-	end       int
+func markdownBlockStart(line string) bool {
+	if line[0] == '>' || markdownThematicBreak(line) {
+		return true
+	}
+	if len(line) >= 2 && (line[0] == '-' || line[0] == '+' || line[0] == '*') && (line[1] == ' ' || line[1] == '\t') {
+		return true
+	}
+	digits := 0
+	for digits < len(line) && digits < 10 && line[digits] >= '0' && line[digits] <= '9' {
+		digits++
+	}
+	return digits > 0 && digits <= 9 && digits+1 < len(line) && (line[digits] == '.' || line[digits] == ')') && (line[digits+1] == ' ' || line[digits+1] == '\t')
 }
 
-func markdownProseRanges(section markdownSection, fenced []bool) []markdownSection {
-	var ranges []markdownSection
-	for line := section.start; line <= section.end; {
-		for line <= section.end && fenced[line-1] {
-			line++
+func markdownThematicBreak(line string) bool {
+	marker := byte(0)
+	count := 0
+	for index := 0; index < len(line); index++ {
+		if line[index] == ' ' || line[index] == '\t' {
+			continue
 		}
-		if line > section.end {
-			break
+		if marker == 0 {
+			if line[index] != '*' && line[index] != '-' && line[index] != '_' {
+				return false
+			}
+			marker = line[index]
 		}
-		start := line
-		for line <= section.end && !fenced[line-1] {
-			line++
+		if line[index] != marker {
+			return false
 		}
-		ranges = append(ranges, markdownSection{qualified: section.qualified, start: start, end: line - 1})
+		count++
 	}
-	return ranges
-}
-
-func markdownSections(relative string, lines []markdownLine, headings []markdownHeading) []markdownSection {
-	if len(lines) == 0 {
-		return nil
-	}
-	var sections []markdownSection
-	if len(headings) == 0 || headings[0].start > 1 {
-		end := len(lines)
-		if len(headings) != 0 {
-			end = headings[0].start - 1
-		}
-		sections = append(sections, markdownSection{qualified: markdownDocumentName(relative), start: 1, end: end})
-	}
-	for index, heading := range headings {
-		end := len(lines)
-		if index+1 < len(headings) {
-			end = headings[index+1].start - 1
-		}
-		sections = append(sections, markdownSection{qualified: heading.qualified, start: heading.start, end: end})
-	}
-	return sections
+	return count >= 3
 }
 
 func markdownDocumentName(relative string) string {
 	withoutExtension := strings.TrimSuffix(relative, path.Ext(relative))
+	if withoutExtension == "" {
+		withoutExtension = relative
+	}
 	return strings.ReplaceAll(withoutExtension, "/", ".")
-}
-
-func markdownChunkEnd(lines []markdownLine, start, maximum int) int {
-	end := start - 1
-	bytes := 0
-	for end < maximum && end-start+1 < maximumMarkdownChunkLines {
-		next := lines[end].bytes
-		if end >= start && bytes+next > maximumMarkdownChunkBytes {
-			break
-		}
-		bytes += next
-		end++
-	}
-	if end < start {
-		return start
-	}
-	return end
-}
-
-func markdownChunkTerms(lines []markdownLine, start, end int) []string {
-	var terms []string
-	for line := start; line <= end && len(terms) < 64; line++ {
-		for _, term := range strings.FieldsFunc(lines[line-1].text, func(character rune) bool {
-			return !unicodeLetterOrDigit(character)
-		}) {
-			if len(term) <= 128 {
-				terms = append(terms, term)
-				if len(terms) == 64 {
-					break
-				}
-			}
-		}
-	}
-	return terms
 }
 
 func unicodeLetterOrDigit(character rune) bool {

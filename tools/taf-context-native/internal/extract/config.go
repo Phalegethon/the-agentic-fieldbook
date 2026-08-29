@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
-	"unicode"
+	"unicode/utf8"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
@@ -36,17 +37,9 @@ func (extractor tomlExtractor) Extract(file boundary.StableFile) ([]model.Record
 	if len(lines) != 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
-	var records []model.Record
-	var table []string
-	continuation := tomlValueState{}
+	state := newTOMLDocumentState()
 	for index, raw := range lines {
 		lineNumber := index + 1
-		if continuation.active() {
-			if !continuation.scan(raw) {
-				return nil, tomlFailure()
-			}
-			continue
-		}
 		line, ok := stripTOMLComment(raw)
 		if !ok {
 			return nil, tomlFailure()
@@ -63,9 +56,8 @@ func (extractor tomlExtractor) Extract(file boundary.StableFile) ([]model.Record
 			if !ok {
 				return nil, tomlFailure()
 			}
-			table = parsed
-			if !appendConfigurationRecord(&records, strings.Join(table, "."), lineNumber) {
-				return records, configurationLimitReport(tomlParserVersion, "toml-record-limit")
+			if !state.defineTable(parsed, true) || !state.appendRecord(strings.Join(parsed, "."), lineNumber) {
+				return nil, tomlFailureOrLimit(state)
 			}
 			continue
 		}
@@ -77,9 +69,8 @@ func (extractor tomlExtractor) Extract(file boundary.StableFile) ([]model.Record
 			if !ok {
 				return nil, tomlFailure()
 			}
-			table = parsed
-			if !appendConfigurationRecord(&records, strings.Join(table, "."), lineNumber) {
-				return records, configurationLimitReport(tomlParserVersion, "toml-record-limit")
+			if !state.defineTable(parsed, false) || !state.appendRecord(strings.Join(parsed, "."), lineNumber) {
+				return nil, tomlFailureOrLimit(state)
 			}
 			continue
 		}
@@ -92,23 +83,134 @@ func (extractor tomlExtractor) Extract(file boundary.StableFile) ([]model.Record
 		if !ok || value == "" {
 			return nil, tomlFailure()
 		}
-		qualifiedParts := append(append([]string(nil), table...), key...)
-		qualified := strings.Join(qualifiedParts, ".")
-		if len(qualified) > 512 || !appendConfigurationRecord(&records, qualified, lineNumber) {
-			return records, configurationLimitReport(tomlParserVersion, "toml-record-limit")
-		}
-		if !continuation.scan(value) {
+		if _, supported := tomlValueKind(value); !supported {
 			return nil, tomlFailure()
 		}
+		qualifiedParts := append(append([]string(nil), state.table...), key...)
+		qualified := strings.Join(qualifiedParts, ".")
+		if len(qualified) > 512 || !state.defineValue(key) || !state.appendRecord(qualified, lineNumber) {
+			return nil, tomlFailureOrLimit(state)
+		}
 	}
-	if continuation.active() {
-		return nil, tomlFailure()
-	}
-	return records, Report{ParserVersion: tomlParserVersion}
+	return state.records, Report{ParserVersion: tomlParserVersion}
 }
 
 func tomlFailure() Report {
 	return Report{ParserVersion: tomlParserVersion, ParseFailures: 1, WarningCodes: []string{"toml-parse-failure"}}
+}
+
+func tomlFailureOrLimit(state *tomlDocumentState) Report {
+	if state.recordLimited {
+		return configurationLimitReport(tomlParserVersion, "toml-record-limit")
+	}
+	return tomlFailure()
+}
+
+type tomlNodeKind uint8
+
+const (
+	tomlImplicitTable tomlNodeKind = iota + 1
+	tomlImplicitKeyTable
+	tomlRegularTable
+	tomlArrayTable
+	tomlValue
+)
+
+type tomlDocumentState struct {
+	records       []model.Record
+	nodes         map[string]tomlNodeKind
+	arrayCounts   map[string]int
+	arrayValues   map[string]tomlNodeKind
+	table         []string
+	arrayScope    string
+	recordLimited bool
+}
+
+func newTOMLDocumentState() *tomlDocumentState {
+	return &tomlDocumentState{
+		nodes:       make(map[string]tomlNodeKind),
+		arrayCounts: make(map[string]int),
+		arrayValues: make(map[string]tomlNodeKind),
+	}
+}
+
+func (state *tomlDocumentState) appendRecord(qualified string, line int) bool {
+	if qualified == "" || len(state.records) >= maximumConfigurationRecords {
+		state.recordLimited = true
+		return false
+	}
+	state.records = append(state.records, structuralRecord(qualified, model.Configuration, "configuration", line, line))
+	return true
+}
+
+func (state *tomlDocumentState) defineTable(parts []string, array bool) bool {
+	for length := 1; length < len(parts); length++ {
+		prefix := tomlPathIdentity(parts[:length])
+		switch state.nodes[prefix] {
+		case 0:
+			state.nodes[prefix] = tomlImplicitTable
+		case tomlValue, tomlArrayTable:
+			return false
+		}
+	}
+	identity := tomlPathIdentity(parts)
+	existing := state.nodes[identity]
+	if array {
+		if existing != 0 && existing != tomlArrayTable {
+			return false
+		}
+		state.nodes[identity] = tomlArrayTable
+		state.arrayCounts[identity]++
+		state.arrayScope = identity + "#" + strconv.Itoa(state.arrayCounts[identity])
+	} else {
+		if existing != 0 && existing != tomlImplicitTable {
+			return false
+		}
+		state.nodes[identity] = tomlRegularTable
+		state.arrayScope = ""
+	}
+	state.table = append(state.table[:0], parts...)
+	return true
+}
+
+func (state *tomlDocumentState) defineValue(key []string) bool {
+	if state.arrayScope != "" {
+		for length := 1; length < len(key); length++ {
+			identity := state.arrayScope + "\x00" + tomlPathIdentity(key[:length])
+			switch state.arrayValues[identity] {
+			case 0:
+				state.arrayValues[identity] = tomlImplicitKeyTable
+			case tomlValue:
+				return false
+			}
+		}
+		identity := state.arrayScope + "\x00" + tomlPathIdentity(key)
+		if state.arrayValues[identity] != 0 {
+			return false
+		}
+		state.arrayValues[identity] = tomlValue
+		return true
+	}
+	parts := append(append([]string(nil), state.table...), key...)
+	for length := 1; length < len(parts); length++ {
+		prefix := tomlPathIdentity(parts[:length])
+		switch state.nodes[prefix] {
+		case 0:
+			state.nodes[prefix] = tomlImplicitKeyTable
+		case tomlValue:
+			return false
+		}
+	}
+	identity := tomlPathIdentity(parts)
+	if state.nodes[identity] != 0 {
+		return false
+	}
+	state.nodes[identity] = tomlValue
+	return true
+}
+
+func tomlPathIdentity(parts []string) string {
+	return strings.Join(parts, "\x00")
 }
 
 func appendConfigurationRecord(records *[]model.Record, qualified string, line int) bool {
@@ -224,7 +326,7 @@ func parseTOMLKeyPath(value string) ([]string, bool) {
 			index++
 		default:
 			start := index
-			for index < len(value) && (unicode.IsLetter(rune(value[index])) || unicode.IsDigit(rune(value[index])) || value[index] == '_' || value[index] == '-') {
+			for index < len(value) && isTOMLBareKeyByte(value[index]) {
 				index++
 			}
 			if start == index {
@@ -232,7 +334,7 @@ func parseTOMLKeyPath(value string) ([]string, bool) {
 			}
 			component = value[start:index]
 		}
-		if component == "" || len(component) > 128 {
+		if component == "" || len(component) > 128 || !validTOMLKeyComponent(component) {
 			return nil, false
 		}
 		components = append(components, component)
@@ -249,46 +351,77 @@ func parseTOMLKeyPath(value string) ([]string, bool) {
 	}
 }
 
-type tomlValueState struct {
-	multiline string
-	square    int
-	curly     int
+func isTOMLBareKeyByte(character byte) bool {
+	return (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') || character == '_' || character == '-'
 }
 
-func (state tomlValueState) active() bool {
-	return state.multiline != "" || state.square != 0 || state.curly != 0
-}
-
-func (state *tomlValueState) scan(value string) bool {
-	if state.multiline != "" {
-		if strings.Contains(value, state.multiline) {
-			state.multiline = ""
-		}
-		return true
+func validTOMLKeyComponent(component string) bool {
+	if !utf8.ValidString(component) {
+		return false
 	}
-	quote := byte(0)
-	escaped := false
-	for index := 0; index < len(value); index++ {
-		if quote == 0 && index+3 <= len(value) && (value[index:index+3] == `"""` || value[index:index+3] == `'''`) {
-			delimiter := value[index : index+3]
-			remainder := value[index+3:]
-			if !strings.Contains(remainder, delimiter) {
-				state.multiline = delimiter
-				return true
-			}
-			index += 2 + strings.Index(remainder, delimiter) + 3
-			continue
+	for _, character := range component {
+		if character < 0x20 || character == 0x7f {
+			return false
 		}
+	}
+	return true
+}
+
+func tomlValueKind(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	if value[0] == '[' {
+		return tomlArrayKind(value)
+	}
+	return tomlPrimitiveKind(value)
+}
+
+func tomlPrimitiveKind(value string) (string, bool) {
+	if value == "true" || value == "false" {
+		return "boolean", true
+	}
+	if validTOMLSimpleString(value) {
+		return "string", true
+	}
+	if kind, ok := validTOMLNumber(value); ok {
+		return kind, true
+	}
+	return "", false
+}
+
+func validTOMLSimpleString(value string) bool {
+	if len(value) < 2 || (value[0] != '"' && value[0] != '\'') || value[len(value)-1] != value[0] || strings.HasPrefix(value, `"""`) || strings.HasPrefix(value, `'''`) {
+		return false
+	}
+	quote := value[0]
+	for index := 1; index < len(value)-1; index++ {
 		character := value[index]
-		if quote == '"' && escaped {
-			escaped = false
-			continue
+		if character == quote || character == '\\' || character < 0x20 || character == 0x7f {
+			return false
 		}
-		if quote == '"' && character == '\\' {
-			escaped = true
-			continue
-		}
+	}
+	return true
+}
+
+func tomlArrayKind(value string) (string, bool) {
+	if len(value) < 2 || value[len(value)-1] != ']' {
+		return "", false
+	}
+	contents := strings.TrimSpace(value[1 : len(value)-1])
+	if contents == "" {
+		return "array", true
+	}
+	var elements []string
+	start := 0
+	quote := byte(0)
+	for index := 0; index < len(contents); index++ {
+		character := contents[index]
 		if quote != 0 {
+			if character == '\\' || character < 0x20 || character == 0x7f {
+				return "", false
+			}
 			if character == quote {
 				quote = 0
 			}
@@ -297,20 +430,104 @@ func (state *tomlValueState) scan(value string) bool {
 		switch character {
 		case '\'', '"':
 			quote = character
-		case '[':
-			state.square++
-		case ']':
-			state.square--
-		case '{':
-			state.curly++
-		case '}':
-			state.curly--
-		}
-		if state.square < 0 || state.curly < 0 {
-			return false
+		case ',', ']':
+			if character == ']' {
+				return "", false
+			}
+			elements = append(elements, strings.TrimSpace(contents[start:index]))
+			start = index + 1
+		case '[', '{', '}':
+			return "", false
 		}
 	}
-	return quote == 0 && !escaped
+	if quote != 0 {
+		return "", false
+	}
+	elements = append(elements, strings.TrimSpace(contents[start:]))
+	wantedKind := ""
+	for index, element := range elements {
+		if element == "" {
+			if index == len(elements)-1 {
+				continue
+			}
+			return "", false
+		}
+		kind, ok := tomlPrimitiveKind(element)
+		if !ok || (wantedKind != "" && kind != wantedKind) {
+			return "", false
+		}
+		wantedKind = kind
+	}
+	if wantedKind == "" {
+		return "", false
+	}
+	return "array-" + wantedKind, true
+}
+
+func validTOMLNumber(value string) (string, bool) {
+	index := 0
+	if value[index] == '+' || value[index] == '-' {
+		index++
+		if index == len(value) {
+			return "", false
+		}
+	}
+	integerStart := index
+	if !consumeTOMLDigits(value, &index) {
+		return "", false
+	}
+	integerDigits := strings.ReplaceAll(value[integerStart:index], "_", "")
+	if len(integerDigits) > 1 && integerDigits[0] == '0' {
+		return "", false
+	}
+	kind := "integer"
+	if index < len(value) && value[index] == '.' {
+		kind = "float"
+		index++
+		if !consumeTOMLDigits(value, &index) {
+			return "", false
+		}
+	}
+	if index < len(value) && (value[index] == 'e' || value[index] == 'E') {
+		kind = "float"
+		index++
+		if index < len(value) && (value[index] == '+' || value[index] == '-') {
+			index++
+		}
+		if !consumeTOMLDigits(value, &index) {
+			return "", false
+		}
+	}
+	if index != len(value) {
+		return "", false
+	}
+	clean := strings.ReplaceAll(value, "_", "")
+	if kind == "integer" {
+		_, err := strconv.ParseInt(clean, 10, 64)
+		return kind, err == nil
+	}
+	_, err := strconv.ParseFloat(clean, 64)
+	return kind, err == nil
+}
+
+func consumeTOMLDigits(value string, index *int) bool {
+	start := *index
+	previousDigit := false
+	for *index < len(value) {
+		character := value[*index]
+		if character >= '0' && character <= '9' {
+			previousDigit = true
+			*index++
+			continue
+		}
+		if character == '_' && previousDigit && *index+1 < len(value) && value[*index+1] >= '0' && value[*index+1] <= '9' {
+			previousDigit = false
+			*index++
+			continue
+		}
+		break
+	}
+	return *index > start && previousDigit
 }
 
 type jsonExtractor struct{ extensions []string }

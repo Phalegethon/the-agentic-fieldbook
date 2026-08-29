@@ -30,11 +30,23 @@ type StablePrefix struct {
 // IOObservation reports repository I/O performed through this retained root.
 // Copies of Roots share the same monotonic observation state.
 type IOObservation struct {
-	ReadDirectoryEntries      int
-	MaterializedSnapshotBytes uint64
-	ReadPrefixBytes           uint64
-	FullBodyOpens             int
-	FullBodyBytes             uint64
+	ReadDirectoryEntries         int
+	MaterializedSnapshotBytes    uint64
+	PeakSnapshotReservationBytes uint64
+	ReadPrefixBytes              uint64
+	FullBodyOpens                int
+	FullBodyBytes                uint64
+}
+
+func (r *Roots) observeSnapshotReservation(amount uint64) {
+	if r.ioObservation == nil {
+		return
+	}
+	r.ioObservation.mu.Lock()
+	if amount > r.ioObservation.value.PeakSnapshotReservationBytes {
+		r.ioObservation.value.PeakSnapshotReservationBytes = amount
+	}
+	r.ioObservation.mu.Unlock()
 }
 
 type ioObservationState struct {
@@ -91,14 +103,34 @@ type repositoryObservationBudget struct {
 }
 
 type repositorySnapshotByteBudget struct {
+	maximum   uint64
 	remaining uint64
+	roots     *Roots
 }
 
 func (budget *repositorySnapshotByteBudget) consume(amount uint64) bool {
-	if budget == nil || amount > budget.remaining {
+	reserved, ok := budget.reserve(amount)
+	if !ok {
 		return false
 	}
+	return budget.commit(reserved, amount)
+}
+
+func (budget *repositorySnapshotByteBudget) reserve(amount uint64) (uint64, bool) {
+	if budget == nil || amount > budget.remaining {
+		return 0, false
+	}
 	budget.remaining -= amount
+	budget.roots.observeSnapshotReservation(budget.maximum - budget.remaining)
+	return amount, true
+}
+
+func (budget *repositorySnapshotByteBudget) commit(reserved, materialized uint64) bool {
+	if budget == nil || materialized > reserved {
+		return false
+	}
+	budget.remaining += reserved - materialized
+	budget.roots.observeIO(IOObservation{MaterializedSnapshotBytes: materialized})
 	return true
 }
 
@@ -140,7 +172,7 @@ func (r *Roots) walkRepository(maximumObservations int, maximumSnapshotBytes uin
 	}
 	state := &repositoryWalkState{
 		discovery:     &repositoryObservationBudget{remaining: maximumObservations},
-		snapshotBytes: &repositorySnapshotByteBudget{remaining: maximumSnapshotBytes},
+		snapshotBytes: &repositorySnapshotByteBudget{maximum: maximumSnapshotBytes, remaining: maximumSnapshotBytes, roots: r},
 	}
 	if err := r.walkRepositoryDirectory(r.repositoryRoot, state, visit); err != nil {
 		return err
@@ -321,7 +353,6 @@ func (r *Roots) readRootDirectory(root *os.Root, budget *repositoryObservationBu
 	if !snapshotBytes.consume(directoryBytes) {
 		return nil, nil, ErrRepositoryTraversalLimit
 	}
-	r.observeIO(IOObservation{MaterializedSnapshotBytes: directoryBytes})
 	before, err := root.Stat(".")
 	if err != nil || !before.IsDir() {
 		return nil, nil, ErrUnsafePath
@@ -353,18 +384,31 @@ func (r *Roots) readRootDirectory(root *os.Root, budget *repositoryObservationBu
 		if snapshotBatchMaximum < batchMaximum {
 			batchMaximum = snapshotBatchMaximum
 		}
+		reservedBytes := uint64(batchMaximum) * maximumEntryBytes
+		reservation, ok := snapshotBytes.reserve(reservedBytes)
+		if !ok {
+			return nil, nil, ErrRepositoryTraversalLimit
+		}
 		batch, readErr := directory.ReadDir(batchMaximum)
 		budget.remaining -= len(batch)
 		r.observeIO(IOObservation{ReadDirectoryEntries: len(batch)})
+		materializedBytes := uint64(0)
 		for _, entry := range batch {
 			if len(entry.Name()) > maximumRepositoryPathBytes {
+				_ = snapshotBytes.commit(reservation, reservation)
 				return nil, nil, ErrRepositoryTraversalLimit
 			}
 			entryBytes := uint64(len(entry.Name()) + repositorySnapshotEntryOverheadBytes)
-			if !snapshotBytes.consume(entryBytes) {
+			if entryBytes > reservation-materializedBytes {
+				_ = snapshotBytes.commit(reservation, reservation)
 				return nil, nil, ErrRepositoryTraversalLimit
 			}
-			r.observeIO(IOObservation{MaterializedSnapshotBytes: entryBytes})
+			materializedBytes += entryBytes
+		}
+		if !snapshotBytes.commit(reservation, materializedBytes) {
+			return nil, nil, ErrRepositoryTraversalLimit
+		}
+		for _, entry := range batch {
 			info, statErr := root.Lstat(entry.Name())
 			if statErr != nil {
 				return nil, nil, fmt.Errorf("%w: %v", ErrUnsafePath, statErr)
@@ -395,13 +439,8 @@ func sameRepositorySnapshot(first, second []repositorySnapshotEntry) bool {
 	if len(first) != len(second) {
 		return false
 	}
-	firstByName := make(map[string]os.FileInfo, len(first))
-	for _, entry := range first {
-		firstByName[entry.name] = entry.info
-	}
-	for _, entry := range second {
-		previous, ok := firstByName[entry.name]
-		if !ok || !sameSnapshot(previous, entry.info) {
+	for index := range first {
+		if first[index].name != second[index].name || !sameSnapshot(first[index].info, second[index].info) {
 			return false
 		}
 	}

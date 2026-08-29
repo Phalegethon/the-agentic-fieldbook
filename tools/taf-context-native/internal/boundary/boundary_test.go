@@ -1407,6 +1407,61 @@ func TestWalkRepositorySharesSnapshotByteCeilingWithVerification(t *testing.T) {
 	}
 }
 
+func TestWalkRepositoryReservesReadDirBatchesInsideSharedSnapshotCeiling(t *testing.T) {
+	roots := makeRoots(t)
+	const snapshotMaximum = 64 << 10
+	for index := 0; index < 20; index++ {
+		name := fmt.Sprintf("short-%03d.go", index)
+		if err := os.WriteFile(filepath.Join(roots.Repository, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := roots.walkRepository(10_000, snapshotMaximum, func(RepositoryEntry) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	observed := roots.IOObservation()
+	if observed.PeakSnapshotReservationBytes == 0 || observed.PeakSnapshotReservationBytes > snapshotMaximum {
+		t.Fatalf("peak reservation = %d, ceiling = %d", observed.PeakSnapshotReservationBytes, snapshotMaximum)
+	}
+	wantMaterialized := uint64(2 * (repositorySnapshotEntryOverheadBytes +
+		20*(len("short-000.go")+repositorySnapshotEntryOverheadBytes) +
+		len(".git") + repositorySnapshotEntryOverheadBytes +
+		len("README.md") + repositorySnapshotEntryOverheadBytes))
+	if observed.MaterializedSnapshotBytes != wantMaterialized || observed.MaterializedSnapshotBytes > snapshotMaximum {
+		t.Fatalf("discovery+verification materialized bytes = %d, want exact %d within ceiling %d", observed.MaterializedSnapshotBytes, wantMaterialized, snapshotMaximum)
+	}
+	if observed.PeakSnapshotReservationBytes <= observed.MaterializedSnapshotBytes {
+		t.Fatalf("batch was not conservatively reserved before ReadDir: %#v", observed)
+	}
+}
+
+func TestSameRepositorySnapshotComparesSortedEntriesWithoutAllocation(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "identity")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := make([]repositorySnapshotEntry, 1024)
+	second := make([]repositorySnapshotEntry, len(first))
+	for index := range first {
+		name := fmt.Sprintf("entry-%04d", index)
+		first[index] = repositorySnapshotEntry{name: name, info: info}
+		second[index] = repositorySnapshotEntry{name: name, info: info}
+	}
+	allocations := testing.AllocsPerRun(20, func() {
+		if !sameRepositorySnapshot(first, second) {
+			t.Fatal("identical sorted snapshots differ")
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("snapshot comparison allocations = %f, want 0", allocations)
+	}
+}
+
 func openDescriptorCount(t *testing.T) int {
 	t.Helper()
 	if runtime.GOOS != "linux" {

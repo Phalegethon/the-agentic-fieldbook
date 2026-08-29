@@ -23,6 +23,11 @@ import (
 
 const maximumExtractorWarnings = 64
 
+const (
+	maximumStableRelativePathBytes      = 4096
+	maximumStableRelativePathComponents = 256
+)
+
 var ErrInvalidExtractor = errors.New("extractor metadata does not match the inventory registry")
 
 type Extractor interface {
@@ -104,6 +109,9 @@ func (registry *Registry) Register(extractor Extractor) error {
 }
 
 func (registry Registry) Extract(file boundary.StableFile) (records []model.Record, report Report) {
+	if !stableFileMatches(file) {
+		return nil, boundedReport(Report{ParseFailures: 1, WarningCodes: []string{"invalid-stable-file"}})
+	}
 	extension := strings.ToLower(path.Ext(file.RelativePath))
 	extractor := registry.byExtension[extension]
 	if extractor == nil {
@@ -116,7 +124,7 @@ func (registry Registry) Extract(file boundary.StableFile) (records []model.Reco
 			report = boundedReport(Report{ParserVersion: extractor.ParserVersion(), ParseFailures: 1, WarningCodes: []string{"extractor-panic"}})
 		}
 	}()
-	if !stableFileMatches(file) || file.Size > extractor.MaximumBytes() {
+	if file.Size > extractor.MaximumBytes() {
 		return nil, boundedReport(Report{ParserVersion: extractor.ParserVersion(), ParseFailures: 1, WarningCodes: []string{"invalid-stable-file"}})
 	}
 	records, report = extractor.Extract(file)
@@ -131,12 +139,31 @@ func (registry Registry) Extract(file boundary.StableFile) (records []model.Reco
 }
 
 func stableFileMatches(file boundary.StableFile) bool {
-	if file.RelativePath == "" || file.Size < 0 || file.Size != int64(len(file.Bytes)) || !utf8.Valid(file.Bytes) {
+	if !canonicalStableRelativePath(file.RelativePath) || file.Size < 0 || file.Size != int64(len(file.Bytes)) || !utf8.Valid(file.Bytes) {
 		return false
 	}
 	digest := sha256.Sum256(file.Bytes)
 	want := hex.EncodeToString(digest[:])
 	return file.SHA256 == want || file.SHA256 == "sha256:"+want
+}
+
+func canonicalStableRelativePath(relative string) bool {
+	if relative == "" || len(relative) > maximumStableRelativePathBytes || !utf8.ValidString(relative) || strings.ContainsAny(relative, "\x00\\") || strings.HasPrefix(relative, "/") || path.Clean(relative) != relative {
+		return false
+	}
+	if len(relative) >= 2 && ((relative[0] >= 'A' && relative[0] <= 'Z') || (relative[0] >= 'a' && relative[0] <= 'z')) && relative[1] == ':' {
+		return false
+	}
+	components := strings.Split(relative, "/")
+	if len(components) > maximumStableRelativePathComponents {
+		return false
+	}
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 func finalizeRecords(file boundary.StableFile, extractor Extractor, input []model.Record) ([]model.Record, bool) {

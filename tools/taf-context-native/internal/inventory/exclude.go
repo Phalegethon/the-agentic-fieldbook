@@ -40,11 +40,8 @@ const (
 type ignoreMatchBudget struct {
 	remainingEvaluations int
 	remainingWork        int
+	observe              func(pattern, candidate string)
 }
-
-// ignoreRegexMatchHook observes actual regular-expression invocations in
-// boundary-work tests. Production leaves it nil.
-var ignoreRegexMatchHook func(pattern, candidate string)
 
 func newIgnoreMatchBudget(evaluations, work int) *ignoreMatchBudget {
 	return &ignoreMatchBudget{remainingEvaluations: evaluations, remainingWork: work}
@@ -188,35 +185,27 @@ func ignoreRuleMatches(rule ignoreRule, relative string, directory bool, budget 
 		if rule.anchored {
 			return matchIgnoreCandidate(rule, relative, budget)
 		}
-		return matcherMatchesComponent(rule, relative, budget)
+		return matchIgnoreCandidate(rule, ignoreCandidateBase(relative), budget)
 	}
 	if rule.slash || rule.anchored {
 		return matchIgnoreCandidate(rule, relative, budget)
 	}
-	return matcherMatchesComponent(rule, relative, budget)
+	return matchIgnoreCandidate(rule, ignoreCandidateBase(relative), budget)
 }
 
-func matcherMatchesComponent(rule ignoreRule, relative string, budget *ignoreMatchBudget) (bool, bool) {
-	start := 0
-	for index := 0; index <= len(relative); index++ {
-		if index != len(relative) && relative[index] != '/' {
-			continue
-		}
-		matched, limited := matchIgnoreCandidate(rule, relative[start:index], budget)
-		if limited || matched {
-			return matched, limited
-		}
-		start = index + 1
+func ignoreCandidateBase(relative string) string {
+	if slash := strings.LastIndexByte(relative, '/'); slash >= 0 {
+		return relative[slash+1:]
 	}
-	return false, false
+	return relative
 }
 
 func matchIgnoreCandidate(rule ignoreRule, candidate string, budget *ignoreMatchBudget) (bool, bool) {
 	if !budget.consume(rule, candidate) {
 		return false, true
 	}
-	if ignoreRegexMatchHook != nil {
-		ignoreRegexMatchHook(rule.pattern, candidate)
+	if budget != nil && budget.observe != nil {
+		budget.observe(rule.pattern, candidate)
 	}
 	return rule.matcher.MatchString(candidate), false
 }

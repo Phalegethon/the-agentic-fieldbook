@@ -1,10 +1,12 @@
 package extract
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -55,6 +57,24 @@ func TestGoExtractorClassifiesMainAndBoundsSyntaxErrors(t *testing.T) {
 	records, report = NewRegistry().Extract(stableFile("broken.go", "package broken\nfunc (\n"))
 	if len(records) != 0 || report.ParserVersion != "go/parser@go1.27" || report.ParseFailures != 1 || !contains(report.WarningCodes, "go-parse-failure") || len(report.WarningCodes) > 64 {
 		t.Fatalf("syntax-error extraction = records %#v report %#v", records, report)
+	}
+}
+
+func TestGoExtractorRequiresExactMainEntryPointSignature(t *testing.T) {
+	fixtures := []string{
+		"package main\nfunc main(value int) {}\n",
+		"package main\nfunc main() int { return 0 }\n",
+		"package main\nfunc main[T any]() {}\n",
+	}
+	for index, source := range fixtures {
+		records, report := NewRegistry().Extract(stableFile(fmt.Sprintf("cmd/invalid-%d.go", index), source))
+		if report.ParseFailures != 0 {
+			t.Fatalf("fixture %d report = %#v", index, report)
+		}
+		assertRecord(t, records, recordExpectation{"main.main", model.Definition, "source", 2, 2, "go", "go/parser@go1.27", model.Verified})
+		if entries := recordsOfKind(records, model.EntryPoint); len(entries) != 0 {
+			t.Fatalf("fixture %d promoted invalid main signature: %#v", index, entries)
+		}
 	}
 }
 
@@ -109,6 +129,44 @@ func TestMarkdownExtractorDoesNotPromoteIndentedCodeToSetextHeading(t *testing.T
 	}
 	if headings := recordsOfKind(records, model.Heading); len(headings) != 0 {
 		t.Fatalf("indented code became a setext heading: %#v", headings)
+	}
+}
+
+func TestMarkdownExtractorRejectsBlockSetextCandidatesAndParsesEmptyATX(t *testing.T) {
+	source := "- list item\n---\n***\n---\n# ###\n# named ###\n# literal###\n"
+	records, report := NewRegistry().Extract(stableFile("docs/commonmark.md", source))
+	if report.ParseFailures != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	for _, forbidden := range []string{"- list item", "***", "###"} {
+		for _, record := range recordsOfKind(records, model.Heading) {
+			if record.QualifiedName == forbidden {
+				t.Fatalf("block/closing marker became heading %q: %#v", forbidden, records)
+			}
+		}
+	}
+	assertRecord(t, records, recordExpectation{"named", model.Heading, "document", 6, 6, "markdown", "taf-markdown@1", model.Verified})
+	assertRecord(t, records, recordExpectation{"literal###", model.Heading, "document", 7, 7, "markdown", "taf-markdown@1", model.Verified})
+}
+
+func TestMarkdownExtractorBoundsLegalRepeatedHeadingMemory(t *testing.T) {
+	const maximumMeasuredAllocations = 96 << 20
+	maximum := int(NewRegistry().byExtension[".md"].MaximumBytes())
+	line := []byte("# heading\n")
+	source := bytes.Repeat(line, maximum/len(line))
+	file := stableFileBytes("docs/repeated.md", source)
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	records, report := NewRegistry().Extract(file)
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	if allocated > maximumMeasuredAllocations {
+		t.Fatalf("repeated-heading extraction allocated %d bytes, ceiling = %d", allocated, maximumMeasuredAllocations)
+	}
+	if len(records) > maximumMarkdownRecords || report.ParseFailures != 1 || !contains(report.WarningCodes, "markdown-record-limit") {
+		t.Fatalf("repeated-heading result = %d records, report %#v", len(records), report)
 	}
 }
 
@@ -218,6 +276,26 @@ func TestConfigurationExtractorsBoundDepthCollectionsAndMalformedInput(t *testin
 	}
 }
 
+func TestTOMLExtractorFailsClosedOnMalformedDuplicateAndConflictingInput(t *testing.T) {
+	fixtures := map[string]string{
+		"invalid-value":         "valid = 1\ninvalid = ?\n",
+		"duplicate-key":         "key = 1\nkey = 2\n",
+		"duplicate-table":       "[table]\nkey = 1\n[table]\nother = 2\n",
+		"value-table-conflict":  "conflict = 1\n[conflict]\n",
+		"table-value-conflict":  "[conflict]\nchild = 1\n[conflict.child]\n",
+		"unsupported-multiline": "value = \"\"\"unsupported\"\"\"\n",
+		"invalid-bare-key":      "bad?key = 1\n",
+	}
+	for name, source := range fixtures {
+		t.Run(name, func(t *testing.T) {
+			records, report := NewRegistry().Extract(stableFile("config/invalid.toml", source))
+			if len(records) != 0 || report.ParseFailures != 1 || !contains(report.WarningCodes, "toml-parse-failure") {
+				t.Fatalf("records = %#v, report = %#v", records, report)
+			}
+		})
+	}
+}
+
 func TestConfigurationExtractorOmitsUnrepresentableQualifiedName(t *testing.T) {
 	records, report := NewRegistry().Extract(stableFile("config/control.json", `{"line\nbreak": 1}`))
 	if len(records) != 0 || report.ParseFailures != 0 || !contains(report.WarningCodes, "invalid-extractor-record") {
@@ -258,6 +336,34 @@ func TestRegistryUsesStableExactMetadataAndRecordIdentities(t *testing.T) {
 	}
 }
 
+func TestRegistryRejectsNonCanonicalRepositoryRelativePaths(t *testing.T) {
+	tooDeep := strings.Repeat("d/", 256) + "value.go"
+	tooLong := strings.Repeat("a", 4094) + ".go"
+	invalid := []string{
+		"/absolute.go",
+		"//server/share.go",
+		"C:/windows.go",
+		`C:\windows.go`,
+		"relative\\windows.go",
+		"./value.go",
+		"a/../value.go",
+		"a//value.go",
+		"a/value.go/",
+		".",
+		"..",
+		"nul\x00value.go",
+		"bad-\xff.go",
+		tooDeep,
+		tooLong,
+	}
+	for _, relative := range invalid {
+		records, report := NewRegistry().Extract(stableFile(relative, "package invalid\n"))
+		if len(records) != 0 || report.ParseFailures != 1 || !contains(report.WarningCodes, "invalid-stable-file") {
+			t.Fatalf("path %q accepted: records %#v report %#v", relative, records, report)
+		}
+	}
+}
+
 func TestRecordIdentitiesAreIndependentOfExtractorRecordOrder(t *testing.T) {
 	file := stableFile("pkg/permutation.go", "package pkg\n")
 	extractor := goExtractor{extensions: []string{".go"}}
@@ -293,8 +399,12 @@ type recordExpectation struct {
 }
 
 func stableFile(relative, contents string) boundary.StableFile {
-	digest := sha256.Sum256([]byte(contents))
-	return boundary.StableFile{RelativePath: relative, Bytes: []byte(contents), SHA256: fmt.Sprintf("%x", digest), Size: int64(len(contents))}
+	return stableFileBytes(relative, []byte(contents))
+}
+
+func stableFileBytes(relative string, contents []byte) boundary.StableFile {
+	digest := sha256.Sum256(contents)
+	return boundary.StableFile{RelativePath: relative, Bytes: contents, SHA256: fmt.Sprintf("%x", digest), Size: int64(len(contents))}
 }
 
 func assertRecord(t *testing.T, records []model.Record, want recordExpectation) {

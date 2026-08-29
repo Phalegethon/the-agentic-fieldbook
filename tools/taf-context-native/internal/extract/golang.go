@@ -87,7 +87,7 @@ declarations:
 					continue
 				}
 				qualified = packageName + "." + receiver + "." + node.Name.Name
-			} else if packageName == "main" && node.Name.Name == "main" {
+			} else if packageName == "main" && node.Name.Name == "main" && goMainEntryPointSignature(node.Type) {
 				kind = model.EntryPoint
 			}
 			start, end = astLines(fileSet, node.Pos(), node.End())
@@ -97,6 +97,17 @@ declarations:
 		}
 	}
 	return records, Report{ParserVersion: goParserVersion, WarningCodes: warnings}
+}
+
+func goMainEntryPointSignature(function *ast.FuncType) bool {
+	if function == nil {
+		return false
+	}
+	return goFieldListEmpty(function.TypeParams) && goFieldListEmpty(function.Params) && goFieldListEmpty(function.Results)
+}
+
+func goFieldListEmpty(fields *ast.FieldList) bool {
+	return fields == nil || len(fields.List) == 0
 }
 
 func structuralRecord(qualified string, kind model.RecordKind, sourceType string, start, end int) model.Record {

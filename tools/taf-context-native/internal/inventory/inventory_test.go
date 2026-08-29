@@ -742,11 +742,10 @@ func TestIgnoreMatcherProductionBudgetsBoundActualRegexAttempts(t *testing.T) {
 		budget := newIgnoreMatchBudget(maximumIgnoreRuleEvaluations, maximumIgnoreMatchWork)
 		rules := makeRules()
 		observed := observation{}
-		ignoreRegexMatchHook = func(pattern, candidate string) {
+		budget.observe = func(pattern, candidate string) {
 			observed.attempts++
 			observed.work += (len(pattern) + 1) * (len(candidate) + 1)
 		}
-		t.Cleanup(func() { ignoreRegexMatchHook = nil })
 		for {
 			_, limited := ignoredBy(rules, relative, true, budget)
 			if limited {
@@ -775,6 +774,37 @@ func TestIgnoreMatcherProductionBudgetsBoundActualRegexAttempts(t *testing.T) {
 	evaluationBound := run("a/b", true)
 	if evaluationBound.attempts != maximumIgnoreRuleEvaluations {
 		t.Fatalf("actual regex attempts = %d, want exact evaluation ceiling %d", evaluationBound.attempts, maximumIgnoreRuleEvaluations)
+	}
+}
+
+func TestIgnoreMatcherChecksEachScopedNonSlashComponentOnce(t *testing.T) {
+	rules := make([]ignoreRule, maximumIgnoreRules)
+	for index := range rules {
+		pattern := fmt.Sprintf("never-%03d", index)
+		matcher, ok := compileGitGlob(pattern)
+		if !ok {
+			t.Fatalf("compileGitGlob(%q) failed", pattern)
+		}
+		rules[index] = ignoreRule{pattern: pattern, matcher: matcher}
+	}
+	relative := strings.Repeat("d/", 255) + "file.go"
+	run := func() (attempts, work int, limited bool) {
+		budget := newIgnoreMatchBudget(maximumIgnoreRuleEvaluations, maximumIgnoreMatchWork)
+		budget.observe = func(pattern, candidate string) {
+			attempts++
+			work += (len(pattern) + 1) * (len(candidate) + 1)
+		}
+		_, limited = ignoredBy(rules, relative, false, budget)
+		return attempts, work, limited
+	}
+	firstAttempts, firstWork, firstLimited := run()
+	secondAttempts, secondWork, secondLimited := run()
+	wantAttempts := maximumIgnoreRules * 256
+	if firstLimited || secondLimited {
+		t.Fatalf("depth-256 non-slash rules exhausted a production budget: first=%v second=%v", firstLimited, secondLimited)
+	}
+	if firstAttempts != wantAttempts || secondAttempts != wantAttempts || firstWork != secondWork {
+		t.Fatalf("non-slash scoped work is not linear/deterministic: first=%d/%d second=%d/%d want attempts=%d", firstAttempts, firstWork, secondAttempts, secondWork, wantAttempts)
 	}
 }
 
