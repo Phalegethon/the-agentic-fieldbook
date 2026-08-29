@@ -72,6 +72,11 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 	var ignores []ignoreRule
 	regularExclusions, languageSupported, languageUnsupported := 0, 0, 0
 	err := roots.WalkRepository(func(entry boundary.RepositoryEntry) error {
+		if result.DirectoryEntries >= policy.ProductionLimits().MaximumEligiblePaths {
+			result.Partial, result.UnknownRemainder = true, true
+			addWarning(&result, "inventory-entry-limit")
+			return boundary.ErrStopRepositoryWalk
+		}
 		result.DirectoryEntries++
 		if strings.HasSuffix(entry.RelativePath, ".gitignore") && entry.Mode.IsRegular() {
 			prefix, prefixErr := roots.ReadRepositoryPrefix(entry.RelativePath, ignorePrefixBytes)
@@ -166,7 +171,10 @@ func collect(roots boundary.Roots, mode Mode, limits policy.Limits) (Result, err
 		result.EligibleSourceBytes += uint64(entry.Size)
 		return nil
 	})
-	if err != nil && !errors.Is(err, boundary.ErrStopRepositoryWalk) {
+	if errors.Is(err, boundary.ErrRepositoryEnumerationLimit) {
+		result.Partial, result.UnknownRemainder = true, true
+		addWarning(&result, "inventory-directory-batch-limit")
+	} else if err != nil && !errors.Is(err, boundary.ErrStopRepositoryWalk) {
 		return Result{}, err
 	}
 	sort.Slice(result.Paths, func(i, j int) bool { return result.Paths[i].RelativePath < result.Paths[j].RelativePath })

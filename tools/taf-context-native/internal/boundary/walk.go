@@ -31,6 +31,8 @@ type StablePrefix struct {
 // tests. Production leaves it nil.
 var directoryReadHook func()
 
+const maximumDirectoryBatch = 256
+
 // WalkRepository enumerates repository metadata through the captured root
 // capability. It never follows symlinks and never descends into Git metadata.
 func (r *Roots) WalkRepository(visit func(RepositoryEntry) error) error {
@@ -123,8 +125,8 @@ func readRootDirectory(root *os.Root) ([]os.DirEntry, error) {
 	if err != nil || afterErr != nil || !opened.IsDir() || !sameIdentity(before, opened) || !sameIdentity(before, after) || !sameIdentity(opened, after) {
 		return nil, ErrUnsafePath
 	}
-	entries, err := directory.ReadDir(-1)
-	if err != nil {
+	entries, err := directory.ReadDir(maximumDirectoryBatch + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%w: %v", ErrUnsafePath, err)
 	}
 	if directoryReadHook != nil {
@@ -133,6 +135,9 @@ func readRootDirectory(root *os.Root) ([]os.DirEntry, error) {
 	afterRead, afterReadErr := root.Stat(".")
 	if afterReadErr != nil || !sameSnapshot(before, afterRead) || !sameSnapshot(opened, afterRead) {
 		return nil, ErrUnsafePath
+	}
+	if len(entries) > maximumDirectoryBatch {
+		return nil, ErrRepositoryEnumerationLimit
 	}
 	return entries, nil
 }

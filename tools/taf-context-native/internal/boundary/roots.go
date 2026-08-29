@@ -23,8 +23,9 @@ var (
 	ErrGitMetadataNotFound = errors.New("Git metadata file not found")
 	// ErrSkipRepositoryDirectory lets a metadata consumer prune one safe
 	// directory without making the walker follow it.
-	ErrSkipRepositoryDirectory = errors.New("skip repository directory")
-	ErrStopRepositoryWalk      = errors.New("stop repository walk")
+	ErrSkipRepositoryDirectory    = errors.New("skip repository directory")
+	ErrStopRepositoryWalk         = errors.New("stop repository walk")
+	ErrRepositoryEnumerationLimit = errors.New("repository directory enumeration limit")
 )
 
 const maximumGitMetadataBytes = 4096

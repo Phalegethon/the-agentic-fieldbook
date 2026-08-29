@@ -11,6 +11,9 @@ import (
 )
 
 const maximumGitIndexBytes int64 = 32 << 20
+const maximumGitIndexEntries = 250000
+
+var errSplitIndex = errors.New("split Git index is unsupported")
 
 func trackedRepositoryPaths(roots boundary.Roots) (map[string]struct{}, string) {
 	index, err := roots.OpenGitMetadataFile("index", maximumGitIndexBytes)
@@ -21,6 +24,9 @@ func trackedRepositoryPaths(roots boundary.Roots) (map[string]struct{}, string) 
 		return nil, "git-index-unreadable"
 	}
 	tracked, err := parseGitIndex(index.Bytes)
+	if errors.Is(err, errSplitIndex) {
+		return nil, "git-index-split-unsupported"
+	}
 	if err != nil {
 		return nil, "git-index-invalid"
 	}
@@ -38,7 +44,10 @@ func parseGitIndex(contents []byte) (map[string]struct{}, error) {
 	if version < 2 || version > 4 {
 		return nil, errors.New("unsupported index version")
 	}
-	tracked := make(map[string]struct{}, count)
+	if count > maximumGitIndexEntries || uint64(count) > uint64((len(contents)-32)/62) {
+		return nil, errors.New("unbounded index entry count")
+	}
+	tracked := make(map[string]struct{}, int(count))
 	offset := 12
 	previous := ""
 	for entry := uint32(0); entry < count; entry++ {
@@ -47,6 +56,14 @@ func parseGitIndex(contents []byte) (map[string]struct{}, error) {
 			return nil, errors.New("truncated index entry")
 		}
 		flags := endian.BigEndian.Uint16(contents[offset+60 : offset+62])
+		mode := endian.BigEndian.Uint32(contents[offset+24 : offset+28])
+		fileType := mode & 0o170000
+		if fileType != 0o100000 && fileType != 0o120000 && fileType != 0o160000 {
+			return nil, errors.New("unsupported index mode")
+		}
+		if version == 2 && flags&0x4000 != 0 {
+			return nil, errors.New("v2 extended flags")
+		}
 		offset += 62
 		if flags&0x4000 != 0 {
 			if offset+2 > len(contents)-20 {
@@ -83,6 +100,21 @@ func parseGitIndex(contents []byte) (map[string]struct{}, error) {
 		}
 		tracked[name] = struct{}{}
 		previous = name
+	}
+	for offset < len(contents)-20 {
+		if offset+8 > len(contents)-20 {
+			return nil, errors.New("truncated index extension")
+		}
+		signature := string(contents[offset : offset+4])
+		size := endian.BigEndian.Uint32(contents[offset+4 : offset+8])
+		offset += 8
+		if uint64(size) > uint64(len(contents)-20-offset) {
+			return nil, errors.New("invalid index extension")
+		}
+		if signature == "link" {
+			return nil, errSplitIndex
+		}
+		offset += int(size)
 	}
 	return tracked, nil
 }

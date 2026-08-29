@@ -2,6 +2,7 @@ package inventory
 
 import (
 	"path"
+	"regexp"
 	"strings"
 )
 
@@ -22,6 +23,7 @@ type ignoreRule struct {
 	pattern   string
 	negated   bool
 	directory bool
+	anchored  bool
 }
 
 // LanguageMetadata is immutable extension metadata shared by inventory and
@@ -41,8 +43,6 @@ var extensionRegistry = []LanguageMetadata{
 	{Language: "markdown", Extensions: []string{".md", ".mdx"}, Markdown: true},
 	{Language: "json", Extensions: []string{".json"}},
 	{Language: "toml", Extensions: []string{".toml"}},
-	{Language: "yaml", Extensions: []string{".yaml", ".yml"}},
-	{Language: "ini", Extensions: []string{".ini", ".cfg", ".conf"}},
 }
 
 func ExtensionRegistry() []LanguageMetadata {
@@ -71,7 +71,9 @@ func parseIgnoreRules(base string, contents []byte) []ignoreRule {
 			line = strings.TrimPrefix(line, "!")
 		}
 		rule.directory = strings.HasSuffix(line, "/")
-		rule.pattern = strings.Trim(strings.TrimSuffix(line, "/"), "/")
+		rule.anchored = strings.HasPrefix(line, "/")
+		line = strings.TrimPrefix(line, "/")
+		rule.pattern = strings.TrimSuffix(line, "/")
 		if rule.pattern != "" {
 			rules = append(rules, rule)
 		}
@@ -105,6 +107,19 @@ func ignoreRuleMatches(rule ignoreRule, relative string, directory bool) bool {
 	}
 	pattern := rule.pattern
 	if rule.directory {
+		if strings.Contains(pattern, "/") {
+			candidate := relative
+			if !directory {
+				candidate = path.Dir(relative)
+			}
+			for candidate != "." && candidate != "" {
+				if globMatches(pattern, candidate) {
+					return true
+				}
+				candidate = path.Dir(candidate)
+			}
+			return false
+		}
 		for _, component := range strings.Split(relative, "/") {
 			if globMatches(pattern, component) {
 				return true
@@ -112,18 +127,43 @@ func ignoreRuleMatches(rule ignoreRule, relative string, directory bool) bool {
 		}
 		return false
 	}
-	if strings.Contains(pattern, "/") {
+	if strings.Contains(pattern, "/") || rule.anchored {
 		return globMatches(pattern, relative)
 	}
-	return globMatches(pattern, path.Base(relative))
+	for _, component := range strings.Split(relative, "/") {
+		if globMatches(pattern, component) {
+			return true
+		}
+	}
+	return false
 }
 
 func globMatches(pattern, value string) bool {
-	if strings.Contains(pattern, "**") {
-		return doubleStarMatch(pattern, value)
+	var expression strings.Builder
+	expression.WriteString("^")
+	for index := 0; index < len(pattern); index++ {
+		switch pattern[index] {
+		case '*':
+			if index+1 < len(pattern) && pattern[index+1] == '*' {
+				index++
+				if index+1 < len(pattern) && pattern[index+1] == '/' {
+					index++
+					expression.WriteString("(?:.*/)?")
+				} else {
+					expression.WriteString(".*")
+				}
+			} else {
+				expression.WriteString("[^/]*")
+			}
+		case '?':
+			expression.WriteString("[^/]")
+		default:
+			expression.WriteString(regexp.QuoteMeta(string(pattern[index])))
+		}
 	}
-	matched, err := path.Match(pattern, value)
-	return err == nil && matched
+	expression.WriteString("$")
+	compiled, err := regexp.Compile(expression.String())
+	return err == nil && compiled.MatchString(value)
 }
 
 func languageForPath(relative string) string {

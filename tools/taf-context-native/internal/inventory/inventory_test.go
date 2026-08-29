@@ -229,20 +229,25 @@ func TestBinaryPrefixAllowsOnlyTrailingPartialRune(t *testing.T) {
 	}
 }
 
-func TestExtensionRegistryIncludesBoundedConfigFormats(t *testing.T) {
+func TestExtensionRegistryMatchesExtractorBackedFormats(t *testing.T) {
 	registry := ExtensionRegistry()
 	seen := map[string]bool{}
 	for _, metadata := range registry {
 		seen[metadata.Language] = true
 	}
-	for _, language := range []string{"json", "toml", "yaml", "ini"} {
+	for _, language := range []string{"go", "python", "javascript", "typescript", "rust", "markdown", "json", "toml"} {
 		if !seen[language] {
 			t.Fatalf("registry missing %s: %#v", language, registry)
 		}
 	}
-	for _, relative := range []string{"config.json", "config.toml", "config.yaml", "config.ini"} {
+	for _, relative := range []string{"config.json", "config.toml"} {
 		if languageForPath(relative) == "" {
 			t.Fatalf("registry/inventory mismatch for %s", relative)
+		}
+	}
+	for _, relative := range []string{"config.yaml", "config.ini", "config.conf"} {
+		if languageForPath(relative) != "" {
+			t.Fatalf("registry unexpectedly accepts unbacked format %s", relative)
 		}
 	}
 }
@@ -433,7 +438,9 @@ func writeGitIndexIn(t *testing.T, gitDirectory string, names []string) {
 	_ = endian.Write(&raw, endian.BigEndian, uint32(len(names)))
 	for _, name := range names {
 		start := raw.Len()
-		raw.Write(make([]byte, 60))
+		header := make([]byte, 60)
+		endian.BigEndian.PutUint32(header[24:28], 0o100644)
+		raw.Write(header)
 		_ = endian.Write(&raw, endian.BigEndian, uint16(len(name)))
 		raw.WriteString(name)
 		raw.WriteByte(0)
