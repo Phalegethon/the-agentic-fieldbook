@@ -20,6 +20,8 @@ var (
 	ErrUnstableFile        = errors.New("repository file changed while being read")
 	ErrFileTooLarge        = errors.New("repository file exceeds maximum size")
 	ErrStateUnavailable    = errors.New("state root has not been created")
+	ErrStateEntryNotFound  = errors.New("state entry not found")
+	ErrStateEntryChanged   = errors.New("state entry changed during access")
 	ErrGitMetadataNotFound = errors.New("Git metadata file not found")
 	ErrRepositoryChanged   = errors.New("repository changed during enumeration")
 	// ErrSkipRepositoryDirectory lets a metadata consumer prune one safe

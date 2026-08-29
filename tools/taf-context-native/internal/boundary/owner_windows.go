@@ -145,4 +145,48 @@ func privilegedSystemSID(sid uintptr) bool {
 
 func ownerOnlyFile(info os.FileInfo) error { return ErrUnsafeRoot }
 
-func safeStateFile(file *os.File) error { return ownerOnlyOpenFile(file) }
+func safeStateFile(file *os.File) error {
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || ownerOnlyOpenFile(file) != nil {
+		return ErrUnsafeRoot
+	}
+	links, err := windowsStateFileLinkCount(file)
+	if err != nil || links != 1 {
+		return ErrUnsafeRoot
+	}
+	return nil
+}
+
+func safeAtomicStateFile(file *os.File) error {
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || ownerOnlyOpenFile(file) != nil {
+		return ErrUnsafeRoot
+	}
+	links, err := windowsStateFileLinkCount(file)
+	if err != nil || links > 1 {
+		return ErrUnsafeRoot
+	}
+	return nil
+}
+
+func windowsStateFileLinkCount(file *os.File) (uint32, error) {
+	connection, err := file.SyscallConn()
+	if err != nil {
+		return 0, ErrUnsafeRoot
+	}
+	var details syscall.ByHandleFileInformation
+	var callErr error
+	if err := connection.Control(func(value uintptr) {
+		callErr = syscall.GetFileInformationByHandle(syscall.Handle(value), &details)
+	}); err != nil || callErr != nil {
+		return 0, ErrUnsafeRoot
+	}
+	return details.NumberOfLinks, nil
+}
+
+func safeLiveStateEntry(info os.FileInfo) error {
+	if info == nil || !info.Mode().IsRegular() {
+		return ErrUnsafeRoot
+	}
+	return nil
+}
