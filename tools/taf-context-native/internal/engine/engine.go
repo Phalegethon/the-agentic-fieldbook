@@ -26,6 +26,7 @@ type Dependencies struct {
 	Load          func(context.Context, *boundary.Roots, string) (store.Snapshot, error)
 	Inspect       func(context.Context, *boundary.Roots) (store.Status, error)
 	ParserIDs     func() map[string]string
+	Fit           func(context.Context, wire.Request, wire.Result) (wire.Result, error)
 }
 
 type Engine struct{ dependencies Dependencies }
@@ -43,6 +44,7 @@ func ProductionDependencies() Dependencies {
 		Load:      store.LoadContext,
 		Inspect:   store.InspectContext,
 		ParserIDs: registry.ParserIdentities,
+		Fit:       render.FitContext,
 	}
 }
 
@@ -72,18 +74,45 @@ func (engine *Engine) Execute(ctx context.Context, envelope wire.Envelope) (wire
 		result, err = engine.state(ctx, &roots, envelope.Request, true)
 	case wire.RepositoryMap, wire.SearchSymbols, wire.SearchDocs:
 		result, err = engine.query(ctx, &roots, envelope.Request)
+	case wire.SourceSnippets:
+		result, err = engine.sourceSnippets(ctx, &roots, envelope.Request)
 	default:
 		result = engine.unsupported(envelope.Request)
 	}
 	if err != nil {
 		return wire.Result{}, err
 	}
-	return render.Fit(envelope.Request, result)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return wire.Result{}, contextErr
+	}
+	fitted, err := engine.dependencies.Fit(ctx, envelope.Request, result)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return wire.Result{}, contextErr
+	}
+	if err != nil {
+		return wire.Result{}, err
+	}
+	// A snippet response that the shared renderer had to shorten is partial
+	// evidence, even when every source reread itself verified. Refit after the
+	// status/action change so counters and final transport accounting agree.
+	if envelope.Request.Operation == wire.SourceSnippets && result.Status == wire.Ready && fitted.OmittedCount > result.OmittedCount {
+		result.Status = wire.Partial
+		result.NextSafeAction = "refine-query"
+		if contextErr := ctx.Err(); contextErr != nil {
+			return wire.Result{}, contextErr
+		}
+		refitted, refitErr := engine.dependencies.Fit(ctx, envelope.Request, result)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return wire.Result{}, contextErr
+		}
+		return refitted, refitErr
+	}
+	return fitted, nil
 }
 
 func (engine *Engine) ready() bool {
 	d := engine.dependencies
-	return d.ValidateRoots != nil && d.Collect != nil && d.OpenFile != nil && d.Extract != nil && d.Build != nil && d.Load != nil && d.Inspect != nil && d.ParserIDs != nil
+	return d.ValidateRoots != nil && d.Collect != nil && d.OpenFile != nil && d.Extract != nil && d.Build != nil && d.Load != nil && d.Inspect != nil && d.ParserIDs != nil && d.Fit != nil
 }
 
 func productionLimits() policy.Limits { return policy.ProductionLimits() }

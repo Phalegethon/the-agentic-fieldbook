@@ -287,8 +287,10 @@ func renderedOutputCharacters(result Result) int {
 	fmt.Fprintf(&text, "COVERAGE paths=%.3f languages=%.3f unsupported=%d parse_failures=%d\n", result.Coverage.PathCoverage, result.Coverage.LanguageCoverage, result.Coverage.UnsupportedLanguageCount, result.Coverage.ParseFailureCount)
 	for _, finding := range result.Findings {
 		fmt.Fprintf(&text, "FINDING %s %s %s:%d-%d %s %s method=%s\n", finding.EvidenceClass, finding.RecordKind, finding.Path, finding.StartLine, finding.EndLine, finding.Language, finding.QualifiedName, finding.ExtractionMethod)
-		if finding.Preview != "" {
-			fmt.Fprintf(&text, "PREVIEW %s\n", finding.Preview)
+		if finding.Preview != "" || result.Operation == SourceSnippets {
+			for _, line := range strings.Split(finding.Preview, "\n") {
+				fmt.Fprintf(&text, "PREVIEW %s\n", line)
+			}
 		}
 	}
 	fmt.Fprintf(&text, "NEXT %s\n", result.NextSafeAction)
@@ -296,13 +298,21 @@ func renderedOutputCharacters(result Result) int {
 }
 
 func validateFinding(finding Finding, rank int, freshness string) error {
-	if finding.Rank != rank || !validSHA(finding.ResultIdentity) || !validPath(finding.Path) || finding.StartLine < 1 || finding.EndLine < finding.StartLine || !validCounter(finding.StartLine) || !validCounter(finding.EndLine) || !validText(finding.Language, false) || !oneOf(finding.RecordKind, "module", "definition", "import", "entry-point", "configuration", "heading", "document-chunk") || !oneOf(finding.SourceType, "source", "document", "configuration") || !validText(finding.QualifiedName, true) || !validText(finding.ExtractionMethod, false) || !validText(finding.Preview, true) || !oneOf(finding.EvidenceClass, "verified", "inferred", "uncertain") {
+	if finding.Rank != rank || !validSHA(finding.ResultIdentity) || !validPath(finding.Path) || finding.StartLine < 1 || finding.EndLine < finding.StartLine || !validCounter(finding.StartLine) || !validCounter(finding.EndLine) || !validText(finding.Language, false) || !oneOf(finding.RecordKind, "module", "definition", "import", "entry-point", "configuration", "heading", "document-chunk") || !oneOf(finding.SourceType, "source", "document", "configuration") || !validText(finding.QualifiedName, true) || !validText(finding.ExtractionMethod, false) || !validPreview(finding.Preview) || !oneOf(finding.EvidenceClass, "verified", "inferred", "uncertain") {
 		return ErrInvalidWire
 	}
 	if freshness != "exact" && finding.EvidenceClass == "verified" {
 		return ErrInvalidWire
 	}
 	return nil
+}
+
+// Previews are bounded evidence fields, unlike metadata text: source snippets
+// may span several lines and need the full 2k–12k model-output range. The
+// result/output validators still enforce the global rendered character and
+// serialized-byte ceilings before a frame is emitted.
+func validPreview(value string) bool {
+	return utf8.ValidString(value) && utf8.RuneCountInString(value) <= 12000 && !strings.ContainsAny(value, "\x00\r")
 }
 
 func validID(value string) bool     { return canonicalID.MatchString(value) }

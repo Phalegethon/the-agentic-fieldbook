@@ -3,6 +3,7 @@ package render
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"sort"
 
@@ -11,6 +12,19 @@ import (
 )
 
 var ErrUnrenderable = errors.New("mandatory Level 1 result exceeds output budget")
+
+// FitContext adds cancellation dominance around the deterministic renderer;
+// Fit remains the compatibility entry point for context-free callers.
+func FitContext(ctx context.Context, request wire.Request, result wire.Result) (wire.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return wire.Result{}, err
+	}
+	fitted, err := Fit(request, result)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return wire.Result{}, contextErr
+	}
+	return fitted, err
+}
 
 // Fit copies and normalizes result, retaining only a deterministic prefix of
 // optional findings that can be encoded within both frozen output limits.

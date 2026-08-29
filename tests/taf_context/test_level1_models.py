@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+import re
 import unittest
 
 from taf_context.level1_models import (
@@ -21,6 +22,7 @@ from taf_context.level1_models import (
     parse_level1_request,
     parse_level1_result,
 )
+from taf_context.level1_render import render_level1_result
 
 
 REPOSITORY_IDENTITY = "sha256:" + "1" * 64
@@ -85,6 +87,97 @@ def finding_wire() -> dict[str, object]:
         "evidence_class": "verified",
         "preview": "class RecoveryDossier:",
     }
+
+
+class PreviewContractTests(unittest.TestCase):
+    def test_preview_accepts_bounded_multiline_unicode_but_rejects_unsafe_or_over_limit(self) -> None:
+        wire = finding_wire()
+        wire["preview"] = "x" * 12000
+        self.assertEqual(Level1Finding.from_dict(wire).preview, wire["preview"])
+        wire["preview"] = "é" * 6000 + "\nNEXT not-structural"
+        self.assertEqual(Level1Finding.from_dict(wire).preview, wire["preview"])
+        for value in ("x" * 12001, "safe\runsafe", "safe\x00unsafe", "\ud800"):
+            wire["preview"] = value
+            with self.assertRaises(ValueError):
+                Level1Finding.from_dict(wire)
+
+    def test_preview_schema_pattern_rejects_surrogates_and_preserves_astral_lf_bounds(self) -> None:
+        schema = json.loads((
+            Path(__file__).resolve().parents[2]
+            / "tools/taf-context/contracts/level1/result.schema.json"
+        ).read_text(encoding="utf-8"))
+        preview = schema["$defs"]["finding"]["properties"]["preview"]
+        pattern = re.compile(preview["pattern"])
+
+        def schema_accepts(value: str) -> bool:
+            return len(value) <= preview["maxLength"] and pattern.fullmatch(value) is not None
+
+        for value in ("\ud800", "\udfff", "\ud800\udfff", "safe\runsafe", "safe\x00unsafe", "x" * 12001):
+            self.assertFalse(schema_accepts(value), repr(value))
+        for value in ("🙂", "first\nsecond", "x" * 12000):
+            self.assertTrue(schema_accepts(value), repr(value))
+
+    def test_go_encoded_multiline_preview_fixture_parses_and_prefixes_every_physical_line(self) -> None:
+        fixture = (
+            Path(__file__).resolve().parents[2]
+            / "tools/taf-context-native/internal/wire/testdata"
+            / "go-multiline-preview-result.json"
+        )
+        result = parse_level1_result(fixture.read_bytes())
+        self.assertEqual(
+            result.findings[0].preview,
+            "α\nLEVEL1 fake\nCOVERAGE fake\nFINDING fake\nPREVIEW fake\nNEXT fake\nwarning fake\n\nlast",
+        )
+        rendered = render_level1_result(
+            Level1Request.from_dict(request_wire("source-snippets")),
+            status=result.status,
+            provider_version=result.provider_version,
+            index_identity=result.index_identity,
+            freshness=result.freshness,
+            parser_versions=result.parser_versions,
+            coverage=result.coverage,
+            ranked_findings=result.findings,
+            warnings=result.warnings,
+            next_safe_action=result.next_safe_action,
+            provider_omitted_count=result.omitted_count,
+        )
+        self.assertEqual(rendered.model_text, "".join((
+            "LEVEL1 status=ready operation=source-snippets freshness=exact returned=1 omitted=0 warnings=0\n",
+            "COVERAGE paths=1.000 languages=1.000 unsupported=0 parse_failures=0\n",
+            "FINDING verified definition tools/taf-context/taf_context/recovery.py:10-14 Python taf_context.recovery.RecoveryDossier method=tree-sitter-python@0.25.0\n",
+            "PREVIEW α\nPREVIEW LEVEL1 fake\nPREVIEW COVERAGE fake\nPREVIEW FINDING fake\nPREVIEW PREVIEW fake\nPREVIEW NEXT fake\nPREVIEW warning fake\nPREVIEW \nPREVIEW last\n",
+            "NEXT use-cited-evidence\n",
+        )))
+        self.assertEqual(result.output_characters, len(rendered.model_text))
+        fixture_wire = json.loads(fixture.read_text(encoding="utf-8"))
+        for preview in ("x" * 12001, "safe\runsafe", "safe\x00unsafe"):
+            fixture_wire["findings"][0]["preview"] = preview
+            with self.assertRaises(ValueError):
+                Level1Result.from_dict(fixture_wire)
+
+    def test_go_encoded_empty_source_preview_fixture_has_a_physical_preview_line(self) -> None:
+        fixture = (
+            Path(__file__).resolve().parents[2]
+            / "tools/taf-context-native/internal/wire/testdata"
+            / "go-empty-source-preview-result.json"
+        )
+        result = parse_level1_result(fixture.read_bytes())
+        rendered = render_level1_result(
+            Level1Request.from_dict(request_wire("source-snippets")),
+            status=result.status,
+            provider_version=result.provider_version,
+            index_identity=result.index_identity,
+            freshness=result.freshness,
+            parser_versions=result.parser_versions,
+            coverage=result.coverage,
+            ranked_findings=result.findings,
+            warnings=result.warnings,
+            next_safe_action=result.next_safe_action,
+            provider_omitted_count=result.omitted_count,
+        )
+        self.assertEqual(result.findings[0].preview, "")
+        self.assertIn("PREVIEW \n", rendered.model_text)
+        self.assertEqual(result.output_characters, len(rendered.model_text))
 
 
 def result_wire() -> dict[str, object]:

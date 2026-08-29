@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from .level1_models import (
     Level1Coverage,
     Level1Finding,
+    Level1Operation,
     Level1Request,
     Level1Result,
     Level1ResultStatus,
@@ -62,11 +63,18 @@ def render_level1_result(
     _validate_sorted_values(warnings, "warnings")
 
     maximum = min(request.maximum_results, len(ranked_findings))
+    mandatory_previews = request.operation is Level1Operation.SOURCE_SNIPPETS
+    redacted_previews = tuple(
+        redact_preview(item.preview) for item in ranked_findings[:maximum]
+    ) if mandatory_previews else ()
     selected_count = 0
     for count in range(0, maximum + 1):
         candidate = tuple(
-            _finding_with_preview(item, "")
-            for item in ranked_findings[:count]
+            _finding_with_preview(
+                item,
+                redacted_previews[index] if mandatory_previews else "",
+            )
+            for index, item in enumerate(ranked_findings[:count])
         )
         text = _render_text(
             request,
@@ -83,8 +91,11 @@ def render_level1_result(
         selected_count = count
 
     selected = tuple(
-        _finding_with_preview(item, "")
-        for item in ranked_findings[:selected_count]
+        _finding_with_preview(
+            item,
+            redacted_previews[index] if mandatory_previews else "",
+        )
+        for index, item in enumerate(ranked_findings[:selected_count])
     )
     omitted_count = (
         provider_omitted_count + len(ranked_findings) - selected_count
@@ -103,24 +114,25 @@ def render_level1_result(
         raise ValueError("mandatory Level 1 metadata exceeds request budget")
 
     mutable = list(selected)
-    for index, original in enumerate(ranked_findings[:selected_count]):
-        preview = redact_preview(original.preview)
-        if not preview:
-            continue
-        proposed = list(mutable)
-        proposed[index] = _finding_with_preview(original, preview)
-        proposed_text = _render_text(
-            request,
-            status,
-            freshness,
-            coverage,
-            tuple(proposed),
-            omitted_count,
-            len(warnings),
-            next_safe_action,
-        )
-        if len(proposed_text) <= request.maximum_model_output_characters:
-            mutable = proposed
+    if not mandatory_previews:
+        for index, original in enumerate(ranked_findings[:selected_count]):
+            preview = redact_preview(original.preview)
+            if not preview:
+                continue
+            proposed = list(mutable)
+            proposed[index] = _finding_with_preview(original, preview)
+            proposed_text = _render_text(
+                request,
+                status,
+                freshness,
+                coverage,
+                tuple(proposed),
+                omitted_count,
+                len(warnings),
+                next_safe_action,
+            )
+            if len(proposed_text) <= request.maximum_model_output_characters:
+                mutable = proposed
 
     final_findings = tuple(mutable)
     model_text = _render_text(
@@ -189,8 +201,8 @@ def _render_text(
             f"{finding.start_line}-{finding.end_line} {finding.language} "
             f"{finding.qualified_name} method={finding.extraction_method}"
         )
-        if finding.preview:
-            lines.append(f"PREVIEW {finding.preview}")
+        if finding.preview or request.operation is Level1Operation.SOURCE_SNIPPETS:
+            lines.extend(f"PREVIEW {line}" for line in finding.preview.split("\n"))
     lines.append(f"NEXT {next_safe_action}")
     return "\n".join(lines) + "\n"
 

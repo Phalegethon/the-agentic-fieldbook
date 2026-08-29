@@ -69,6 +69,7 @@ _SHA256_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _MAX_WIRE_BYTES = 256 * 1024
 _MAX_STRING = 512
+_MAX_PREVIEW = 12000
 _MAX_COLLECTION = 64
 _MAX_COUNTER = 2**31 - 1
 _READ_OPERATIONS = {
@@ -262,7 +263,7 @@ class Level1Finding:
             _text(value, "qualified_name", empty=True),
             _text(value, "extraction_method"),
             _enum(value, "evidence_class", Confidence),
-            _text(value, "preview", empty=True),
+            _preview(value, "preview"),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -602,6 +603,19 @@ def _text(
         or not _valid_unicode(item)
         or "\x00" in item
         or "\n" in item
+        or "\r" in item
+    ):
+        raise Level1ModelError(field)
+    return item
+
+
+def _preview(value: dict[str, object], field: str) -> str:
+    item = value[field]
+    if (
+        not isinstance(item, str)
+        or len(item) > _MAX_PREVIEW
+        or not _valid_unicode(item)
+        or "\x00" in item
         or "\r" in item
     ):
         raise Level1ModelError(field)

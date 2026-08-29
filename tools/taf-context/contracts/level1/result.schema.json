@@ -140,7 +140,7 @@
         "qualified_name": {"type": "string", "maxLength": 512},
         "extraction_method": {"type": "string", "minLength": 1, "maxLength": 512},
         "evidence_class": {"enum": ["verified", "inferred", "uncertain"]},
-        "preview": {"type": "string", "maxLength": 512}
+        "preview": {"type": "string", "maxLength": 12000, "pattern": "^[^\\u0000\\r\\uD800-\\uDFFF]*$"}
       }
     },
     "coverage": {

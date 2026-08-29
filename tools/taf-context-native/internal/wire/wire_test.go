@@ -246,6 +246,74 @@ func TestEncodeResultCanonicalizesOneLineAndVerifiesOutputCharacters(t *testing.
 	}
 }
 
+func TestEncodeResultMatchesMultilinePreviewFixture(t *testing.T) {
+	result := validResult()
+	result.Operation = SourceSnippets
+	result.Findings[0].Preview = "α\nLEVEL1 fake\nCOVERAGE fake\nFINDING fake\nPREVIEW fake\nNEXT fake\nwarning fake\n\nlast"
+	result.OutputCharacters = renderedOutputCharacters(result)
+	var encoded bytes.Buffer
+	if err := EncodeResult(&encoded, result); err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(filepath.Join("testdata", "go-multiline-preview-result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(encoded.Bytes(), want) {
+		t.Fatalf("Go canonical fixture differs\n got: %q\nwant: %q", encoded.String(), string(want))
+	}
+}
+
+func TestPreviewValidatorAllowsBoundedMultilineSourceOnly(t *testing.T) {
+	if !validPreview(strings.Repeat("x", 12000)) || !validPreview(strings.Repeat("é", 6000)) {
+		t.Fatal("rejected a 12,000-code-point or multibyte preview")
+	}
+	for _, value := range []string{strings.Repeat("x", 12001), "safe\runsafe", "safe\x00unsafe", string([]byte{0xff})} {
+		if validPreview(value) {
+			t.Fatalf("accepted invalid preview %q", value)
+		}
+	}
+	if !validText(strings.Repeat("x", 512), false) {
+		t.Fatal("rejected 512-byte metadata")
+	}
+	for _, value := range []string{strings.Repeat("x", 513), "metadata\nline"} {
+		if validText(value, false) {
+			t.Fatalf("relaxed generic metadata validation for %q", value)
+		}
+	}
+}
+
+func TestSourceSnippetsCountsAnEmptyExactPreviewPhysicalLine(t *testing.T) {
+	empty := validResult()
+	empty.Operation = SourceSnippets
+	empty.Findings[0].Preview = ""
+	empty.OutputCharacters = renderedOutputCharacters(empty)
+	nonempty := empty
+	nonempty.Findings[0].Preview = "x"
+	nonempty.OutputCharacters = renderedOutputCharacters(nonempty)
+	if got, want := empty.OutputCharacters, nonempty.OutputCharacters-1; got != want {
+		t.Fatalf("source-snippets empty-preview characters = %d, want %d", got, want)
+	}
+}
+
+func TestEncodeResultMatchesEmptySourcePreviewFixture(t *testing.T) {
+	result := validResult()
+	result.Operation = SourceSnippets
+	result.Findings[0].Preview = ""
+	result.OutputCharacters = renderedOutputCharacters(result)
+	var encoded bytes.Buffer
+	if err := EncodeResult(&encoded, result); err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(filepath.Join("testdata", "go-empty-source-preview-result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(encoded.Bytes(), want) {
+		t.Fatalf("Go canonical empty-preview fixture differs\n got: %q\nwant: %q", encoded.String(), string(want))
+	}
+}
+
 func TestEncodeResultRejectsSerializedLengthInsteadOfRenderedTextLength(t *testing.T) {
 	result := validResult()
 	result.OutputCharacters = 1434

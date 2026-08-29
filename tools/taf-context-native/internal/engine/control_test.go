@@ -122,13 +122,12 @@ func TestStatusAndMetricsRefuseMismatchedWorktreeAndAbsentState(t *testing.T) {
 	}
 }
 
-func TestLaterOperationsReturnBoundedUnsupportedResult(t *testing.T) {
-	// This catches a later operation that starts fallback query/snippet work
-	// instead of returning the frozen representable unsupported response.
+func TestUpdateRemainsBoundedUnsupportedResult(t *testing.T) {
+	// This catches an unimplemented lifecycle operation that starts fallback
+	// work instead of returning the frozen representable unsupported response.
 	repository, state := controlRoots(t)
 	engine := New(ProductionDependencies())
-	envelope := controlEnvelope(wire.SourceSnippets, repository, state, testPtr(engineSHA))
-	envelope.Request.ResultIdentities = []string{engineSHA}
+	envelope := controlEnvelope(wire.Update, repository, state, testPtr(engineSHA))
 	result, err := engine.Execute(context.Background(), envelope)
 	if err != nil {
 		t.Fatal(err)

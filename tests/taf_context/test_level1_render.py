@@ -17,8 +17,11 @@ from taf_context.models import Freshness
 from .test_level1_models import INDEX_IDENTITY, finding_wire, request_wire
 
 
-def request(*, budget: int = 4000, maximum_results: int = 10) -> Level1Request:
-    wire = request_wire()
+def request(
+    *, budget: int = 4000, maximum_results: int = 10,
+    operation: str = "search-symbols",
+) -> Level1Request:
+    wire = request_wire(operation)
     wire["maximum_model_output_characters"] = budget
     wire["maximum_results"] = maximum_results
     return Level1Request.from_dict(wire)
@@ -99,6 +102,15 @@ class ExactRenderingTests(unittest.TestCase):
         self.assertFalse(rendered.result.truncated)
         self.assertEqual(rendered.result.findings[0].preview, "class RecoveryDossier:")
 
+    def test_source_snippets_empty_exact_line_has_a_physical_preview_line(self) -> None:
+        rendered = render(
+            request(operation="source-snippets"),
+            (finding(1, preview=""),),
+        )
+
+        self.assertIn("PREVIEW \n", rendered.model_text)
+        self.assertEqual(rendered.result.output_characters, len(rendered.model_text))
+
     def test_warnings_are_counted_without_copying_warning_payload_to_model_text(self) -> None:
         rendered = render(
             request(),
@@ -170,6 +182,18 @@ class BudgetRenderingTests(unittest.TestCase):
                 line.startswith(("LEVEL1 ", "COVERAGE ", "FINDING ", "PREVIEW ", "NEXT ")),
                 line,
             )
+
+    def test_source_snippet_preview_that_does_not_fit_drops_its_whole_finding(self) -> None:
+        rendered = render(
+            request(budget=2000, operation="source-snippets"),
+            (finding(1, preview="x" * 1800),),
+        )
+
+        self.assertEqual(rendered.result.returned_count, 0)
+        self.assertEqual(rendered.result.omitted_count, 1)
+        self.assertEqual(rendered.result.findings, ())
+        self.assertNotIn("FINDING ", rendered.model_text)
+        self.assertNotIn("PREVIEW ", rendered.model_text)
 
     def test_a_record_that_cannot_fit_is_omitted_without_a_partial_line(self) -> None:
         huge_name_wire = finding_wire()
