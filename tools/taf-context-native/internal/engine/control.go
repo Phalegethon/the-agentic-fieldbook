@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
@@ -17,6 +18,8 @@ import (
 )
 
 const engineVersion = "0.1.0"
+
+const maximumAggregateRecordBytes = 64 << 20
 
 func (engine *Engine) estimate(ctx context.Context, roots *boundary.Roots, request wire.Request) (wire.Result, error) {
 	if err := ctx.Err(); err != nil {
@@ -39,6 +42,7 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 	coverage := cloneCoverage(inventoryResult.Coverage)
 	warnings := append([]string(nil), inventoryResult.Warnings...)
 	records := make([]model.Record, 0)
+	aggregateBytes := 0
 	parserIDs := engine.dependencies.ParserIDs()
 	for _, item := range inventoryResult.Paths {
 		if err := ctx.Err(); err != nil {
@@ -60,10 +64,25 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 			return engine.result(request, wire.Error, "unknown", nil, coverage, "rebuild-index"), nil
 		}
 		coverage.ParseFailureCount += report.ParseFailures
-		warnings = append(warnings, report.WarningCodes...)
+		warnings = appendBoundedWarnings(warnings, report.WarningCodes...)
+		for _, record := range fileRecords {
+			cost := recordFootprint(record)
+			if cost > maximumAggregateRecordBytes-aggregateBytes {
+				coverage.ParseFailureCount++
+				result := engine.result(request, wire.Partial, "partial", nil, coverage, "rebuild-index")
+				result.Warnings = appendBoundedWarnings(warnings, "engine-aggregate-limit")
+				return result, nil
+			}
+			aggregateBytes += cost
+		}
 		records = append(records, fileRecords...)
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Identity < records[j].Identity })
+	for index := 1; index < len(records); index++ {
+		if records[index-1].Identity == records[index].Identity {
+			return engine.result(request, wire.Error, "unknown", nil, coverage, "rebuild-index"), nil
+		}
+	}
 	manifest := model.Manifest{
 		FormatVersion: "1", EngineVersion: engineVersion,
 		Binding:                 model.Binding{RepositoryIdentity: request.RepositoryIdentity, WorktreeIdentity: request.WorktreeIdentity, CommittedHead: request.CommittedHead, DirtyOverlayFingerprint: request.DirtyOverlayFingerprint},
@@ -71,12 +90,12 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 		ParserIdentities: cloneStrings(parserIDs), Coverage: coverage,
 		SourceBindingDigest: sourceBinding(inventoryResult.Paths), SemanticDigest: semanticBinding(records),
 	}
-	snapshot, buildErr := engine.dependencies.Build(roots, manifest, records)
+	snapshot, buildErr := engine.dependencies.Build(ctx, roots, manifest, records)
 	if buildErr != nil {
 		return engine.result(request, wire.Error, "unknown", nil, coverage, "rebuild-index"), nil
 	}
 	status, freshness, action := wire.Ready, "exact", "use-index"
-	if inventoryResult.Partial || coverage.ParseFailureCount != 0 {
+	if !completeCoverage(coverage, inventoryResult.Partial) {
 		status, freshness, action = wire.Partial, "partial", "rebuild-index"
 	}
 	result := engine.result(request, status, freshness, ptr(snapshot.IndexIdentity), coverage, action)
@@ -101,6 +120,9 @@ func (engine *Engine) state(ctx context.Context, roots *boundary.Roots, request 
 	resultStatus := wire.Ready
 	if freshness != "exact" {
 		resultStatus = wire.Stale
+	}
+	if freshness == "partial" {
+		resultStatus = wire.Partial
 	}
 	result := engine.result(request, resultStatus, freshness, request.IndexIdentity, status.Manifest.Coverage, action)
 	result.ParserVersions = cloneStrings(status.Manifest.ParserIdentities)
@@ -138,7 +160,7 @@ func freshnessFor(request wire.Request, manifest model.Manifest, index string, p
 	if manifest.Binding.DirtyOverlayFingerprint != request.DirtyOverlayFingerprint {
 		return "commit-fresh-worktree-stale", "rebuild-index"
 	}
-	if manifest.Coverage.ParseFailureCount != 0 || manifest.Coverage.PathCoverage < 1 || manifest.Coverage.LanguageCoverage < 1 {
+	if !completeCoverage(manifest.Coverage, false) {
 		return "partial", "rebuild-index"
 	}
 	return "exact", "use-index"
@@ -153,11 +175,45 @@ func sourceBinding(paths []inventory.Path) string {
 }
 
 func semanticBinding(records []model.Record) string {
-	parts := []string{"taf-level1-semantic-binding-v1"}
+	parts := []string{"taf-level1-semantic-binding-v2"}
 	for _, record := range records {
-		parts = append(parts, record.Identity, record.Path, string(record.RecordKind), record.QualifiedName, record.SourceDigest, record.ExtractionMethod, string(record.EvidenceClass))
+		parts = append(parts, record.Identity, record.Path, fmt.Sprintf("%d", record.StartLine), fmt.Sprintf("%d", record.EndLine), record.Language, string(record.RecordKind), record.SourceType, record.QualifiedName, record.ExtractionMethod, string(record.EvidenceClass), fmt.Sprintf("%d", len(record.SearchTerms)))
+		parts = append(parts, record.SearchTerms...)
+		parts = append(parts, record.SourceDigest, record.Preview)
 	}
 	return hashParts(parts)
+}
+
+func completeCoverage(coverage model.Coverage, inventoryPartial bool) bool {
+	return !inventoryPartial && coverage.IndexedPathCount > 0 && coverage.ParseFailureCount == 0 && coverage.PathCoverage == 1 && coverage.LanguageCoverage == 1
+}
+
+func recordFootprint(record model.Record) int {
+	// Conservative retained Go headers plus every payload held across the
+	// engine/store handoff; this leaves Task 6's store headroom intact.
+	size := 256 + len(record.Identity) + len(record.Path) + len(record.Language) + len(record.SourceType) + len(record.QualifiedName) + len(record.ExtractionMethod) + len(record.SourceDigest) + len(record.Preview)
+	for _, term := range record.SearchTerms {
+		size += 32 + len(term)
+	}
+	return size
+}
+
+func appendBoundedWarnings(current []string, added ...string) []string {
+	seen := make(map[string]struct{}, len(current)+len(added))
+	for _, warning := range current {
+		seen[warning] = struct{}{}
+	}
+	for _, warning := range added {
+		if len(seen) < 64 {
+			seen[warning] = struct{}{}
+		}
+	}
+	output := make([]string, 0, len(seen))
+	for warning := range seen {
+		output = append(output, warning)
+	}
+	sort.Strings(output)
+	return output
 }
 
 func currentInclusionPolicyIdentity() string {

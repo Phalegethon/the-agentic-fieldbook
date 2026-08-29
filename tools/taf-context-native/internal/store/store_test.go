@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -25,6 +26,18 @@ import (
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
+
+func TestBuildContextCancelledBeforePreparationCreatesNoState(t *testing.T) {
+	root, state := storeRoots(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := BuildContext(ctx, root, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("BuildContext error = %v", err)
+	}
+	if _, err := os.Stat(state); !os.IsNotExist(err) {
+		t.Fatalf("canceled build created state: %v", err)
+	}
+}
 
 const (
 	testRecordA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

@@ -19,11 +19,15 @@ func Fit(request wire.Request, result wire.Result) (wire.Result, error) {
 	normalize(&output, request.MaximumResults)
 	for {
 		output.OutputCharacters = wire.OutputCharacters(output)
-		var encoded bytes.Buffer
-		if err := wire.EncodeResult(&encoded, output); err != nil {
+		encoded, err := wire.MarshalResult(output)
+		if err != nil {
 			return wire.Result{}, err
 		}
-		if output.OutputCharacters <= request.MaximumModelOutputCharacters && encoded.Len() <= policy.ProductionLimits().MaximumStdoutBytes {
+		if output.OutputCharacters <= request.MaximumModelOutputCharacters && len(encoded)+1 <= policy.ProductionLimits().MaximumStdoutBytes {
+			var final bytes.Buffer
+			if err := wire.EncodeResult(&final, output); err != nil {
+				return wire.Result{}, err
+			}
 			return output, nil
 		}
 		if len(output.Findings) == 0 {

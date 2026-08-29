@@ -93,6 +93,25 @@ func TestFitRejectsMandatoryResultBeyondBudget(t *testing.T) {
 	}
 }
 
+func TestFitReducesInitiallyOversizedJSONAndCharacterResults(t *testing.T) {
+	// A final-only encoder used to reject this before the renderer could trim.
+	findings := make([]wire.Finding, 0, 64)
+	for index := 0; index < 64; index++ {
+		findings = append(findings, renderFinding(index+1, string(rune('a'+index)), strings.Repeat("é", 256)))
+	}
+	result, err := Fit(renderRequest(12000, 64), renderResult(findings))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.OutputCharacters > 12000 || len(result.Findings) >= 64 || !result.Truncated {
+		t.Fatalf("unfitted result: %#v", result)
+	}
+	var encoded strings.Builder
+	if err := wire.EncodeResult(&encoded, result); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func renderRequest(budget, maximumResults int) wire.Request {
 	return wire.Request{MaximumModelOutputCharacters: budget, MaximumResults: maximumResults}
 }

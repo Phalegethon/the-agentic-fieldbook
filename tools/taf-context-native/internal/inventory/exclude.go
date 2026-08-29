@@ -4,10 +4,13 @@ import (
 	"crypto/sha256"
 	endian "encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"path"
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/policy"
 )
 
 const (
@@ -91,6 +94,8 @@ var excludedDirectoryPolicy = []struct{ component, reason string }{
 
 var generatedSuffixPolicy = []string{".generated.go", ".gen.go", ".pb.go"}
 
+var policyAlgorithmTokens = []string{"git-index-v4-bounded-v1", "descriptor-walk-snapshot-v2", "gitignore-glob-v2", "binary-prefix-utf8-v2", "unsafe-symlink-classification-v1"}
+
 func ExtensionRegistry() []LanguageMetadata {
 	copyRegistry := make([]LanguageMetadata, len(extensionRegistry))
 	for index, metadata := range extensionRegistry {
@@ -102,6 +107,11 @@ func ExtensionRegistry() []LanguageMetadata {
 // PolicyIdentities binds the installed immutable inclusion and exclusion
 // surfaces that Collect actually consults.
 func PolicyIdentities() (string, string) {
+	return policyIdentities(policy.ProductionLimits())
+}
+
+func policyIdentities(limits policy.Limits) (string, string) {
+	limitBytes, _ := json.Marshal(limits)
 	inclusion := []string{"taf-level1-inclusion-v1"}
 	for _, metadata := range extensionRegistry {
 		inclusion = append(inclusion, metadata.Language)
@@ -110,11 +120,13 @@ func PolicyIdentities() (string, string) {
 			inclusion = append(inclusion, "markdown-size-ceiling")
 		}
 	}
-	exclusion := []string{"taf-level1-exclusion-v1", ExcludedGit, ExcludedGenerated, ExcludedVendored, ExcludedIgnored, ExcludedBinary, ExcludedOversized, ExcludedUnsupported, ExcludedUnsafe, ExcludedLimit}
+	inclusion = append(inclusion, string(limitBytes))
+	exclusion := []string{"taf-level1-exclusion-v1", string(limitBytes), ExcludedGit, ExcludedGenerated, ExcludedVendored, ExcludedIgnored, ExcludedBinary, ExcludedOversized, ExcludedUnsupported, ExcludedUnsafe, ExcludedLimit}
 	for _, rule := range excludedDirectoryPolicy {
 		exclusion = append(exclusion, rule.component, rule.reason)
 	}
 	exclusion = append(exclusion, generatedSuffixPolicy...)
+	exclusion = append(exclusion, policyAlgorithmTokens...)
 	return policyDigest(inclusion), policyDigest(exclusion)
 }
 

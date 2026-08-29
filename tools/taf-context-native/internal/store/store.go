@@ -3,6 +3,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -67,7 +68,14 @@ func (hooks buildHooks) decodeIndex(payload []byte) ([]model.Record, map[string]
 // Build stages, verifies, installs, and atomically selects one immutable
 // generation through the caller's retained state-root capability.
 func Build(roots *boundary.Roots, manifest model.Manifest, records []model.Record) (Snapshot, error) {
-	return buildWithFilesystem(boundaryFilesystem{}, roots, manifest, records)
+	return BuildContext(context.Background(), roots, manifest, records)
+}
+
+// BuildContext observes cancellation before preparation, before state mutation,
+// and immediately before CURRENT publication. Build remains the compatibility
+// non-canceling entry point.
+func BuildContext(ctx context.Context, roots *boundary.Roots, manifest model.Manifest, records []model.Record) (Snapshot, error) {
+	return buildWithFilesystemObservedContext(ctx, boundaryFilesystem{}, roots, manifest, records, buildHooks{})
 }
 
 // BuildWithFaults is the deterministic durability-test entry point.
@@ -80,6 +88,13 @@ func buildWithFilesystem(filesystem storeFilesystem, roots *boundary.Roots, mani
 }
 
 func buildWithFilesystemObserved(filesystem storeFilesystem, roots *boundary.Roots, manifest model.Manifest, records []model.Record, hooks buildHooks) (Snapshot, error) {
+	return buildWithFilesystemObservedContext(context.Background(), filesystem, roots, manifest, records, hooks)
+}
+
+func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFilesystem, roots *boundary.Roots, manifest model.Manifest, records []model.Record, hooks buildHooks) (Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
 	if roots == nil {
 		return Snapshot{}, ErrStoreCorrupt
 	}
@@ -87,6 +102,9 @@ func buildWithFilesystemObserved(filesystem storeFilesystem, roots *boundary.Roo
 	// state mutation. Invalid caller input must not create even an empty store.
 	artifacts, err := prepareGeneration(manifest, records)
 	if err != nil {
+		return Snapshot{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
 	if err := filesystem.ensureState(roots); err != nil {
@@ -187,6 +205,9 @@ func buildWithFilesystemObserved(filesystem storeFilesystem, roots *boundary.Roo
 	if err := verifyGenerationArtifacts(filesystem, generations, artifacts); err != nil {
 		return Snapshot{}, corrupt(err)
 	}
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
 	if err := publishCurrent(filesystem, state, artifacts.token, previousCurrent); err != nil {
 		return Snapshot{}, err
 	}
@@ -212,6 +233,12 @@ func buildWithFilesystemObserved(filesystem storeFilesystem, roots *boundary.Roo
 			return Snapshot{}, rollbackErr
 		}
 		return Snapshot{}, original
+	}
+	if err := ctx.Err(); err != nil {
+		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, previousCurrent, err); rollbackErr != nil {
+			return Snapshot{}, rollbackErr
+		}
+		return Snapshot{}, err
 	}
 	return selected, nil
 }

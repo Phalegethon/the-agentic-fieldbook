@@ -222,6 +222,16 @@ func ValidateRequest(request Request) error {
 }
 
 func validateResult(result Result) error {
+	if err := validateResultWithoutBudgets(result); err != nil {
+		return err
+	}
+	if result.OutputCharacters > 12000 {
+		return ErrInvalidWire
+	}
+	return nil
+}
+
+func validateResultWithoutBudgets(result Result) error {
 	if result.SchemaVersion != "1" || !validID(result.RequestIdentity) || !validOperation(result.Operation) || !validStatus(result.Status) || result.ProviderIdentity != "taf.native.level1" || !validText(result.ProviderVersion, false) || !validSHA(result.RepositoryIdentity) || !validSHA(result.WorktreeIdentity) || !validObject(result.CommittedHead) || !validSHA(result.DirtyOverlayFingerprint) || !validFreshness(result.Freshness) || !validID(result.NextSafeAction) {
 		return ErrInvalidWire
 	}
@@ -234,7 +244,7 @@ func validateResult(result Result) error {
 	if result.ParserVersions == nil || result.Coverage.ExclusionReasonCounts == nil || result.Findings == nil || result.Warnings == nil || len(result.ParserVersions) > policy.ProductionLimits().MaximumCollectionItems || len(result.Findings) > policy.ProductionLimits().MaximumCollectionItems || len(result.Warnings) > policy.ProductionLimits().MaximumCollectionItems || result.ReturnedCount != len(result.Findings) || !validCounter(result.ReturnedCount) || !validCounter(result.OmittedCount) || result.Truncated != (result.OmittedCount > 0) {
 		return ErrInvalidWire
 	}
-	if !validCounter(result.Coverage.IndexedPathCount) || !validCounter(result.Coverage.ExcludedPathCount) || !validCounter(result.Coverage.UnsupportedLanguageCount) || !validCounter(result.Coverage.ParseFailureCount) || len(result.Coverage.ExclusionReasonCounts) > policy.ProductionLimits().MaximumCollectionItems || !validCounter(result.OutputCharacters) || result.OutputCharacters != renderedOutputCharacters(result) || result.OutputCharacters > 12000 {
+	if !validCounter(result.Coverage.IndexedPathCount) || !validCounter(result.Coverage.ExcludedPathCount) || !validCounter(result.Coverage.UnsupportedLanguageCount) || !validCounter(result.Coverage.ParseFailureCount) || len(result.Coverage.ExclusionReasonCounts) > policy.ProductionLimits().MaximumCollectionItems || !validCounter(result.OutputCharacters) || result.OutputCharacters != renderedOutputCharacters(result) {
 		return ErrInvalidWire
 	}
 	if result.Coverage.PathCoverage < 0 || result.Coverage.PathCoverage > 1 || result.Coverage.LanguageCoverage < 0 || result.Coverage.LanguageCoverage > 1 || math.IsNaN(result.Coverage.PathCoverage) || math.IsInf(result.Coverage.PathCoverage, 0) || math.IsNaN(result.Coverage.LanguageCoverage) || math.IsInf(result.Coverage.LanguageCoverage, 0) {

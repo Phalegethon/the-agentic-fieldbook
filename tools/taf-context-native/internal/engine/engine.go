@@ -22,7 +22,7 @@ type Dependencies struct {
 	Collect       func(boundary.Roots, inventory.Mode) (inventory.Result, error)
 	OpenFile      func(*boundary.Roots, string, int64) (boundary.StableFile, error)
 	Extract       func(context.Context, boundary.StableFile) ([]model.Record, extract.Report)
-	Build         func(*boundary.Roots, model.Manifest, []model.Record) (store.Snapshot, error)
+	Build         func(context.Context, *boundary.Roots, model.Manifest, []model.Record) (store.Snapshot, error)
 	Inspect       func(*boundary.Roots) (store.Status, error)
 	ParserIDs     func() map[string]string
 }
@@ -38,7 +38,7 @@ func ProductionDependencies() Dependencies {
 			return roots.OpenRepositoryFile(relative, maximum)
 		},
 		Extract:   registry.ExtractContext,
-		Build:     store.Build,
+		Build:     store.BuildContext,
 		Inspect:   store.Inspect,
 		ParserIDs: registry.ParserIdentities,
 	}

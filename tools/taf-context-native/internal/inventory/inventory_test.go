@@ -36,6 +36,22 @@ func TestPolicyIdentitiesAreStableAndDistinct(t *testing.T) {
 	}
 }
 
+func TestPolicyIdentitiesBindEveryProductionLimit(t *testing.T) {
+	limits := policy.ProductionLimits()
+	baseInclusion, baseExclusion := policyIdentities(limits)
+	mutations := []func(*policy.Limits){
+		func(v *policy.Limits) { v.MaximumEligiblePaths++ }, func(v *policy.Limits) { v.MaximumEligibleSourceBytes++ }, func(v *policy.Limits) { v.MaximumSourceFileBytes++ }, func(v *policy.Limits) { v.MaximumMarkdownFileBytes++ }, func(v *policy.Limits) { v.MaximumWireBytes++ }, func(v *policy.Limits) { v.MaximumCollectionItems++ },
+	}
+	for _, mutate := range mutations {
+		changed := limits
+		mutate(&changed)
+		gotInclusion, gotExclusion := policyIdentities(changed)
+		if gotInclusion == baseInclusion || gotExclusion == baseExclusion {
+			t.Fatal("limit mutation did not change both policy identities")
+		}
+	}
+}
+
 func TestCollectIsIndependentOfCreationOrder(t *testing.T) {
 	left := inventoryFixture(t, []string{"b.go", "docs/a.md", "a.py"})
 	right := inventoryFixture(t, []string{"a.py", "b.go", "docs/a.md"})
