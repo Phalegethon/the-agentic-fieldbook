@@ -7,6 +7,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
@@ -33,9 +34,9 @@ func (extractor tomlExtractor) MaximumBytes() int64 {
 }
 
 func (extractor tomlExtractor) Extract(file boundary.StableFile) ([]model.Record, Report) {
-	lines := strings.Split(string(file.Bytes), "\n")
-	if len(lines) != 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
+	lines, ok := splitTOMLLines(file.Bytes)
+	if !ok {
+		return nil, tomlFailure()
 	}
 	state := newTOMLDocumentState()
 	for index, raw := range lines {
@@ -44,7 +45,7 @@ func (extractor tomlExtractor) Extract(file boundary.StableFile) ([]model.Record
 		if !ok {
 			return nil, tomlFailure()
 		}
-		line = strings.TrimSpace(line)
+		line = trimTOMLSpace(line)
 		if line == "" {
 			continue
 		}
@@ -52,7 +53,7 @@ func (extractor tomlExtractor) Extract(file boundary.StableFile) ([]model.Record
 			if !strings.HasSuffix(line, "]]") || len(line) < 5 {
 				return nil, tomlFailure()
 			}
-			parsed, ok := parseTOMLKeyPath(strings.TrimSpace(line[2 : len(line)-2]))
+			parsed, ok := parseTOMLKeyPath(trimTOMLSpace(line[2 : len(line)-2]))
 			if !ok {
 				return nil, tomlFailure()
 			}
@@ -65,7 +66,7 @@ func (extractor tomlExtractor) Extract(file boundary.StableFile) ([]model.Record
 			if !strings.HasSuffix(line, "]") || strings.HasPrefix(line, "[[") || len(line) < 3 {
 				return nil, tomlFailure()
 			}
-			parsed, ok := parseTOMLKeyPath(strings.TrimSpace(line[1 : len(line)-1]))
+			parsed, ok := parseTOMLKeyPath(trimTOMLSpace(line[1 : len(line)-1]))
 			if !ok {
 				return nil, tomlFailure()
 			}
@@ -78,8 +79,8 @@ func (extractor tomlExtractor) Extract(file boundary.StableFile) ([]model.Record
 		if equals < 0 {
 			return nil, tomlFailure()
 		}
-		key, ok := parseTOMLKeyPath(strings.TrimSpace(line[:equals]))
-		value := strings.TrimSpace(line[equals+1:])
+		key, ok := parseTOMLKeyPath(trimTOMLSpace(line[:equals]))
+		value := trimTOMLSpace(line[equals+1:])
 		if !ok || value == "" {
 			return nil, tomlFailure()
 		}
@@ -93,6 +94,53 @@ func (extractor tomlExtractor) Extract(file boundary.StableFile) ([]model.Record
 		}
 	}
 	return state.records, Report{ParserVersion: tomlParserVersion}
+}
+
+func splitTOMLLines(source []byte) ([]string, bool) {
+	if !utf8.Valid(source) {
+		return nil, false
+	}
+	text := string(source)
+	lines := make([]string, 0, bytes.Count(source, []byte{'\n'})+1)
+	lineStart := 0
+	for index := 0; index < len(text); {
+		character, size := utf8.DecodeRuneInString(text[index:])
+		switch {
+		case character == '\r':
+			if index+1 >= len(text) || text[index+1] != '\n' {
+				return nil, false
+			}
+			lines = append(lines, text[lineStart:index])
+			index += 2
+			lineStart = index
+		case character == '\n':
+			lines = append(lines, text[lineStart:index])
+			index++
+			lineStart = index
+		case character == '\t':
+			index += size
+		case unicode.IsControl(character):
+			return nil, false
+		default:
+			index += size
+		}
+	}
+	if lineStart < len(text) {
+		lines = append(lines, text[lineStart:])
+	}
+	return lines, true
+}
+
+func trimTOMLSpace(value string) string {
+	start := 0
+	for start < len(value) && (value[start] == ' ' || value[start] == '\t') {
+		start++
+	}
+	end := len(value)
+	for end > start && (value[end-1] == ' ' || value[end-1] == '\t') {
+		end--
+	}
+	return value[start:end]
 }
 
 func tomlFailure() Report {
@@ -368,7 +416,7 @@ func validTOMLKeyComponent(component string) bool {
 }
 
 func tomlValueKind(value string) (string, bool) {
-	value = strings.TrimSpace(value)
+	value = trimTOMLSpace(value)
 	if value == "" {
 		return "", false
 	}
@@ -409,7 +457,7 @@ func tomlArrayKind(value string) (string, bool) {
 	if len(value) < 2 || value[len(value)-1] != ']' {
 		return "", false
 	}
-	contents := strings.TrimSpace(value[1 : len(value)-1])
+	contents := trimTOMLSpace(value[1 : len(value)-1])
 	if contents == "" {
 		return "array", true
 	}
@@ -434,7 +482,7 @@ func tomlArrayKind(value string) (string, bool) {
 			if character == ']' {
 				return "", false
 			}
-			elements = append(elements, strings.TrimSpace(contents[start:index]))
+			elements = append(elements, trimTOMLSpace(contents[start:index]))
 			start = index + 1
 		case '[', '{', '}':
 			return "", false
@@ -443,7 +491,7 @@ func tomlArrayKind(value string) (string, bool) {
 	if quote != 0 {
 		return "", false
 	}
-	elements = append(elements, strings.TrimSpace(contents[start:]))
+	elements = append(elements, trimTOMLSpace(contents[start:]))
 	wantedKind := ""
 	for index, element := range elements {
 		if element == "" {

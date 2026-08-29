@@ -296,6 +296,50 @@ func TestTOMLExtractorFailsClosedOnMalformedDuplicateAndConflictingInput(t *test
 	}
 }
 
+func TestTOMLExtractorValidatesWholeDocumentLexicalBytes(t *testing.T) {
+	invalid := []struct {
+		name   string
+		source string
+	}{
+		{"non-breaking-space", "key = 1\u00a0"},
+		{"lone-carriage-return", "key = 1\r"},
+		{"control-in-comment", "key = 1 # bad\x01"},
+		{"embedded-carriage-return", "key = 1\rnext = 2\n"},
+		{"control-in-trailing-comment-line", "valid = 1\n# trailing bad\x01\n"},
+	}
+	for _, fixture := range invalid {
+		t.Run("reject-"+fixture.name, func(t *testing.T) {
+			records, report := NewRegistry().Extract(stableFile("config/invalid.toml", fixture.source))
+			if len(records) != 0 || report.ParseFailures != 1 || !reflect.DeepEqual(report.WarningCodes, []string{"toml-parse-failure"}) {
+				t.Fatalf("records = %#v, report = %#v", records, report)
+			}
+		})
+	}
+
+	valid := []struct {
+		name      string
+		source    string
+		qualified []string
+	}{
+		{"space-tab-and-lf", "first \t= \t1\nsecond = 2\n", []string{"first", "second"}},
+		{"crlf", "first = 1\r\nsecond = 2\r\n", []string{"first", "second"}},
+		{"utf8-comment", "key = 1 # olağan UTF-8 açıklama ✓\n", []string{"key"}},
+	}
+	for _, fixture := range valid {
+		t.Run("accept-"+fixture.name, func(t *testing.T) {
+			records, report := NewRegistry().Extract(stableFile("config/valid.toml", fixture.source))
+			if report.ParseFailures != 0 || len(report.WarningCodes) != 0 || len(records) != len(fixture.qualified) {
+				t.Fatalf("records = %#v, report = %#v", records, report)
+			}
+			for index, qualified := range fixture.qualified {
+				if records[index].QualifiedName != qualified {
+					t.Fatalf("record %d = %#v, want qualified name %q", index, records[index], qualified)
+				}
+			}
+		})
+	}
+}
+
 func TestConfigurationExtractorOmitsUnrepresentableQualifiedName(t *testing.T) {
 	records, report := NewRegistry().Extract(stableFile("config/control.json", `{"line\nbreak": 1}`))
 	if len(records) != 0 || report.ParseFailures != 0 || !contains(report.WarningCodes, "invalid-extractor-record") {
