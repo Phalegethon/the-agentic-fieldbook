@@ -344,10 +344,12 @@ func (p *Parser) ParseWithOptions(callback func(int, Point) []byte, oldTree *Tre
 	}
 
 	var cOptions C.TSParseOptions
-	if options != nil {
+	if options != nil && options.ProgressCallback != nil {
+		progressPayload := pointer.Save(options)
+		defer pointer.Unref(progressPayload)
 		cOptions = C.TSParseOptions{
 			progress_callback: (*[0]byte)(C.parserProgressCallback),
-			payload:           pointer.Save(options),
+			payload:           progressPayload,
 		}
 	}
 

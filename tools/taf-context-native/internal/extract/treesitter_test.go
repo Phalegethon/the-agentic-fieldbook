@@ -7,18 +7,23 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
+	sitter "github.com/tree-sitter/go-tree-sitter"
+	python "github.com/tree-sitter/tree-sitter-python/bindings/go"
 )
 
 func TestPythonExtractorUsesDecoratedAsyncAndLexicalRanges(t *testing.T) {
@@ -252,6 +257,286 @@ func TestTreeSitterCancellationAndDeterministicWorkLimits(t *testing.T) {
 	}
 }
 
+func TestTreeSitterParseCancellationOccursInsideNativeProgress(t *testing.T) {
+	ctx := newNthErrCancellationContext(3)
+	source := []byte(strings.Repeat("def parsed():\n    pass\n", 10_000))
+	tree, err := parseTree(ctx, sitter.NewLanguage(python.Language()), source)
+	if tree != nil {
+		tree.Close()
+	}
+	if tree != nil || !errors.Is(err, errTreeSitterCancelled) || ctx.checks.Load() < 3 {
+		t.Fatalf("parse cancellation = tree %v err %v checks %d", tree, err, ctx.checks.Load())
+	}
+}
+
+func TestTreeSitterCancellationAfterFinalQueryNextReturnsNoPartials(t *testing.T) {
+	ctx := newArmedEndCancellationContext()
+	file := stableFile("pkg/final.py", "class Final:\n    pass\n")
+	records, report := extractTreeSitter(ctx, file, treeSitterGrammar{
+		language:      sitter.NewLanguage(python.Language()),
+		query:         "(class_definition) @item",
+		parserVersion: pythonParserVersion,
+		warningPrefix: "python",
+		handle: func(analysis *treeSitterAnalysis, node *sitter.Node) {
+			analysis.appendNodeRecord(node, analysis.qualified("Final"), model.Definition, model.Verified)
+			ctx.arm()
+		},
+	})
+	if len(records) != 0 || report.ParseFailures != 1 || !contains(report.WarningCodes, "tree-sitter-cancelled") {
+		t.Fatalf("end cancellation = records %#v report %#v checks %d", records, report, ctx.checks.Load())
+	}
+}
+
+func TestTreeSitterProgressPayloadsAreReleasedByBinding(t *testing.T) {
+	t.Run("parse", func(t *testing.T) {
+		marker, collected := newCallbackMarker()
+		exerciseParseProgressPayload(t, marker)
+		waitForCallbackMarker(t, collected)
+	})
+	t.Run("query replacements and close", func(t *testing.T) {
+		markers := make([]*callbackMarker, 3)
+		collected := make([]<-chan struct{}, len(markers))
+		for index := range markers {
+			markers[index], collected[index] = newCallbackMarker()
+		}
+		exerciseQueryProgressPayloads(t, markers)
+		markers = nil
+		for index, markerCollected := range collected {
+			if !callbackMarkerCollected(markerCollected) {
+				for attempts := 0; attempts < 50 && !callbackMarkerCollected(markerCollected); attempts++ {
+					runtime.GC()
+					runtime.Gosched()
+				}
+			}
+			if !callbackMarkerCollected(markerCollected) {
+				t.Fatalf("query callback payload %d remains retained after replacement/close", index)
+			}
+		}
+	})
+}
+
+func TestTreeSitterQueryCursorCloseIsIdempotent(t *testing.T) {
+	if os.Getenv("TAF_TEST_QUERY_CURSOR_DOUBLE_CLOSE") == "1" {
+		exerciseQueryCursorDoubleClose()
+		return
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestTreeSitterQueryCursorCloseIsIdempotent$")
+	command.Env = append(os.Environ(), "TAF_TEST_QUERY_CURSOR_DOUBLE_CLOSE=1")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("double close failed: %v\n%s", err, output)
+	}
+}
+
+func TestTreeSitterConcurrentCancellationHasNoWatcherLeak(t *testing.T) {
+	source := []byte(strings.Repeat("def cancelled():\n    pass\n", 2_000))
+	before := runtime.NumGoroutine()
+	var wait sync.WaitGroup
+	failures := make(chan error, 16)
+	for worker := 0; worker < 16; worker++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for iteration := 0; iteration < 10; iteration++ {
+				ctx := newNthErrCancellationContext(3)
+				tree, err := parseTree(ctx, sitter.NewLanguage(python.Language()), source)
+				if tree != nil {
+					tree.Close()
+				}
+				if tree != nil || !errors.Is(err, errTreeSitterCancelled) {
+					failures <- fmt.Errorf("tree %v err %v checks %d", tree, err, ctx.checks.Load())
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	close(failures)
+	for err := range failures {
+		t.Error(err)
+	}
+	runtime.GC()
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before+2 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if after := runtime.NumGoroutine(); after > before+2 {
+		t.Fatalf("goroutines after concurrent cancellation = %d, before = %d", after, before)
+	}
+}
+
+type nthErrCancellationContext struct {
+	threshold int32
+	checks    atomic.Int32
+	closed    atomic.Bool
+	done      chan struct{}
+}
+
+func newNthErrCancellationContext(threshold int32) *nthErrCancellationContext {
+	return &nthErrCancellationContext{threshold: threshold, done: make(chan struct{})}
+}
+
+func (ctx *nthErrCancellationContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (ctx *nthErrCancellationContext) Done() <-chan struct{}       { return ctx.done }
+func (ctx *nthErrCancellationContext) Value(any) any               { return nil }
+func (ctx *nthErrCancellationContext) Err() error {
+	if ctx.checks.Add(1) < ctx.threshold {
+		return nil
+	}
+	if ctx.closed.CompareAndSwap(false, true) {
+		close(ctx.done)
+	}
+	return context.Canceled
+}
+
+type armedEndCancellationContext struct {
+	armed  atomic.Bool
+	checks atomic.Int32
+	closed atomic.Bool
+	done   chan struct{}
+}
+
+func newArmedEndCancellationContext() *armedEndCancellationContext {
+	return &armedEndCancellationContext{done: make(chan struct{})}
+}
+
+func (ctx *armedEndCancellationContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (ctx *armedEndCancellationContext) Done() <-chan struct{}       { return ctx.done }
+func (ctx *armedEndCancellationContext) Value(any) any               { return nil }
+func (ctx *armedEndCancellationContext) arm()                        { ctx.armed.Store(true) }
+func (ctx *armedEndCancellationContext) Err() error {
+	if !ctx.armed.Load() || ctx.checks.Add(1) < 2 {
+		return nil
+	}
+	if ctx.closed.CompareAndSwap(false, true) {
+		close(ctx.done)
+	}
+	return context.Canceled
+}
+
+type callbackMarker struct {
+	collected chan struct{}
+}
+
+func newCallbackMarker() (*callbackMarker, <-chan struct{}) {
+	marker := &callbackMarker{collected: make(chan struct{})}
+	runtime.SetFinalizer(marker, func(marker *callbackMarker) {
+		close(marker.collected)
+	})
+	return marker, marker.collected
+}
+
+func callbackMarkerCollected(collected <-chan struct{}) bool {
+	select {
+	case <-collected:
+		return true
+	default:
+		return false
+	}
+}
+
+func waitForCallbackMarker(t *testing.T, collected <-chan struct{}) {
+	t.Helper()
+	for attempts := 0; attempts < 50 && !callbackMarkerCollected(collected); attempts++ {
+		runtime.GC()
+		runtime.Gosched()
+	}
+	if !callbackMarkerCollected(collected) {
+		t.Fatal("callback payload remains retained after native lifecycle ended")
+	}
+}
+
+func exerciseParseProgressPayload(t *testing.T, marker *callbackMarker) {
+	t.Helper()
+	parser := sitter.NewParser()
+	if err := parser.SetLanguage(sitter.NewLanguage(python.Language())); err != nil {
+		t.Fatal(err)
+	}
+	source := []byte(strings.Repeat("class Payload:\n    pass\n", 200))
+	options := &sitter.ParseOptions{ProgressCallback: func(sitter.ParseState) bool {
+		runtime.KeepAlive(marker)
+		return false
+	}}
+	tree := parser.ParseWithOptions(func(offset int, _ sitter.Point) []byte {
+		if offset < len(source) {
+			return source[offset:]
+		}
+		return nil
+	}, nil, options)
+	if tree == nil {
+		parser.Close()
+		t.Fatal("parse with progress options returned nil")
+	}
+	tree.Close()
+	parser.Close()
+	runtime.KeepAlive(marker)
+}
+
+func exerciseQueryProgressPayloads(t *testing.T, markers []*callbackMarker) {
+	t.Helper()
+	parser := sitter.NewParser()
+	if err := parser.SetLanguage(sitter.NewLanguage(python.Language())); err != nil {
+		t.Fatal(err)
+	}
+	source := []byte("class Payload:\n    pass\n")
+	tree := parser.Parse(source, nil)
+	if tree == nil {
+		parser.Close()
+		t.Fatal("query payload fixture parse returned nil")
+	}
+	query, queryError := sitter.NewQuery(sitter.NewLanguage(python.Language()), "(class_definition) @item")
+	if queryError != nil || query == nil {
+		tree.Close()
+		parser.Close()
+		t.Fatalf("query payload fixture compilation: %v", queryError)
+	}
+	cursor := sitter.NewQueryCursor()
+
+	_ = cursor.MatchesWithOptions(query, tree.RootNode(), source, queryOptionsForMarker(markers[0]))
+	plainMatches := cursor.Matches(query, tree.RootNode(), source)
+	for plainMatches.Next() != nil {
+	}
+
+	optionMatches := cursor.MatchesWithOptions(query, tree.RootNode(), source, queryOptionsForMarker(markers[1]))
+	for optionMatches.Next() != nil {
+	}
+	plainCaptures := cursor.Captures(query, tree.RootNode(), source)
+	for match, _ := plainCaptures.Next(); match != nil; match, _ = plainCaptures.Next() {
+	}
+
+	_ = cursor.MatchesWithOptions(query, tree.RootNode(), source, queryOptionsForMarker(markers[2]))
+	cursor.Close()
+	query.Close()
+	tree.Close()
+	parser.Close()
+	for _, marker := range markers {
+		runtime.KeepAlive(marker)
+	}
+}
+
+func queryOptionsForMarker(marker *callbackMarker) sitter.QueryCursorOptions {
+	return sitter.QueryCursorOptions{ProgressCallback: func(sitter.QueryCursorState) bool {
+		runtime.KeepAlive(marker)
+		return false
+	}}
+}
+
+func exerciseQueryCursorDoubleClose() {
+	parser := sitter.NewParser()
+	_ = parser.SetLanguage(sitter.NewLanguage(python.Language()))
+	source := []byte("class Close:\n    pass\n")
+	tree := parser.Parse(source, nil)
+	query, _ := sitter.NewQuery(sitter.NewLanguage(python.Language()), "(class_definition) @item")
+	cursor := sitter.NewQueryCursor()
+	_ = cursor.MatchesWithOptions(query, tree.RootNode(), source, sitter.QueryCursorOptions{
+		ProgressCallback: func(sitter.QueryCursorState) bool { return false },
+	})
+	cursor.Close()
+	cursor.Close()
+	query.Close()
+	tree.Close()
+	parser.Close()
+}
+
 func TestTreeSitterLifecycle1000ParseSmoke(t *testing.T) {
 	fixtures := []struct {
 		path   string
@@ -331,6 +616,10 @@ type licenseModule struct {
 	LicenseFile               string          `json:"license_file"`
 	LicenseSHA256             string          `json:"license_sha256"`
 	VendorTreeSHA256          string          `json:"vendor_tree_sha256"`
+	UpstreamVendorTreeSHA256  string          `json:"upstream_vendor_tree_sha256"`
+	VendorPatchFile           string          `json:"vendor_patch_file"`
+	VendorPatchSHA256         string          `json:"vendor_patch_sha256"`
+	PatchedFiles              []patchedFile   `json:"patched_files"`
 	GoProxySum                string          `json:"go_proxy_sum"`
 	GoModSum                  string          `json:"go_mod_sum"`
 	OriginCommit              string          `json:"origin_commit"`
@@ -344,6 +633,12 @@ type licenseNotice struct {
 	License string `json:"license"`
 	File    string `json:"file"`
 	SHA256  string `json:"sha256"`
+}
+
+type patchedFile struct {
+	File           string `json:"file"`
+	UpstreamSHA256 string `json:"upstream_sha256"`
+	PatchedSHA256  string `json:"patched_sha256"`
 }
 
 func TestLicenseInventoryMatchesModuleAndVendorGraph(t *testing.T) {
@@ -400,6 +695,36 @@ func TestLicenseInventoryMatchesModuleAndVendorGraph(t *testing.T) {
 				module.ImmutableResolution != "go-proxy-plus-sumdb" {
 				t.Fatalf("runtime provenance controls = %#v", module)
 			}
+			if module.UpstreamVendorTreeSHA256 != "sha256:51596cd17c4eb630b074936fca6abdf6dfedcc5fa2d6d566b5a1b1535ce416c1" ||
+				module.VendorPatchFile != "vendor/patches/go-tree-sitter-v0.25.0-callback-lifecycle.patch" ||
+				module.VendorPatchSHA256 != "sha256:eda875a3f0c4e638ef1832fcdbab42576573a23fb86c21583aff9e83130e76a9" {
+				t.Fatalf("runtime vendor patch controls = %#v", module)
+			}
+			wantPatchedFiles := []patchedFile{
+				{
+					File:           "vendor/github.com/tree-sitter/go-tree-sitter/parser.go",
+					UpstreamSHA256: "sha256:489695115f7532c9e2a7b68cbbd335c9fea922ef77c9c664dc868ee381c65119",
+					PatchedSHA256:  "sha256:19aeec45c0d7ad672524b8a943acca1befcc35b51a7362f4b11efa94c80ad48b",
+				},
+				{
+					File:           "vendor/github.com/tree-sitter/go-tree-sitter/query.go",
+					UpstreamSHA256: "sha256:8c0e950716d51344c3d02468a0b4067c0b0341ee4f0af28efe69682a7ebd3dcd",
+					PatchedSHA256:  "sha256:0cf865430478f34b7c9baca7ad586bcfb3a5da928c2beab3391f6c558c3c22d4",
+				},
+			}
+			if !reflect.DeepEqual(module.PatchedFiles, wantPatchedFiles) {
+				t.Fatalf("runtime patched files = %#v", module.PatchedFiles)
+			}
+			patchBytes, err := os.ReadFile(filepath.Join(moduleRoot, filepath.FromSlash(module.VendorPatchFile)))
+			if err != nil || digestBytes(patchBytes) != module.VendorPatchSHA256 {
+				t.Fatalf("runtime vendor patch was not audited: %v", err)
+			}
+			for _, patched := range module.PatchedFiles {
+				patchedBytes, err := os.ReadFile(filepath.Join(moduleRoot, filepath.FromSlash(patched.File)))
+				if err != nil || digestBytes(patchedBytes) != patched.PatchedSHA256 {
+					t.Fatalf("runtime patched file %s drifted: %v", patched.File, err)
+				}
+			}
 			if len(module.BundledNotices) != 1 || module.BundledNotices[0] != (licenseNotice{
 				License: "Unicode-3.0",
 				File:    "vendor/github.com/tree-sitter/go-tree-sitter/src/unicode/LICENSE",
@@ -411,8 +736,9 @@ func TestLicenseInventoryMatchesModuleAndVendorGraph(t *testing.T) {
 			if err != nil || digestBytes(noticeBytes) != module.BundledNotices[0].SHA256 || !strings.Contains(string(noticeBytes), "Unicode, Inc.") {
 				t.Fatalf("runtime bundled Unicode notice was not audited: %v", err)
 			}
-		} else if len(module.BundledNotices) != 0 {
-			t.Fatalf("module %s has unexpected bundled notices: %#v", key, module.BundledNotices)
+		} else if len(module.BundledNotices) != 0 || module.UpstreamVendorTreeSHA256 != "" || module.VendorPatchFile != "" ||
+			module.VendorPatchSHA256 != "" || len(module.PatchedFiles) != 0 {
+			t.Fatalf("module %s has unexpected runtime patch metadata: %#v", key, module)
 		}
 		licensePath := filepath.Join(moduleRoot, filepath.FromSlash(module.LicenseFile))
 		licenseBytes, err := os.ReadFile(licensePath)

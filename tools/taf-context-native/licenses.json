@@ -17,7 +17,22 @@
       "upstream_license": "MIT",
       "license_file": "vendor/github.com/tree-sitter/go-tree-sitter/LICENSE",
       "license_sha256": "sha256:0eea8dc45e89deeb03c7799bbbc7b4688f365fb274562f4540ecfebdea82e727",
-      "vendor_tree_sha256": "sha256:51596cd17c4eb630b074936fca6abdf6dfedcc5fa2d6d566b5a1b1535ce416c1",
+      "vendor_tree_sha256": "sha256:9e425138abc987a0514732393d7c7d539d047478e4b1407ece668a1f8aa46189",
+      "upstream_vendor_tree_sha256": "sha256:51596cd17c4eb630b074936fca6abdf6dfedcc5fa2d6d566b5a1b1535ce416c1",
+      "vendor_patch_file": "vendor/patches/go-tree-sitter-v0.25.0-callback-lifecycle.patch",
+      "vendor_patch_sha256": "sha256:eda875a3f0c4e638ef1832fcdbab42576573a23fb86c21583aff9e83130e76a9",
+      "patched_files": [
+        {
+          "file": "vendor/github.com/tree-sitter/go-tree-sitter/parser.go",
+          "upstream_sha256": "sha256:489695115f7532c9e2a7b68cbbd335c9fea922ef77c9c664dc868ee381c65119",
+          "patched_sha256": "sha256:19aeec45c0d7ad672524b8a943acca1befcc35b51a7362f4b11efa94c80ad48b"
+        },
+        {
+          "file": "vendor/github.com/tree-sitter/go-tree-sitter/query.go",
+          "upstream_sha256": "sha256:8c0e950716d51344c3d02468a0b4067c0b0341ee4f0af28efe69682a7ebd3dcd",
+          "patched_sha256": "sha256:0cf865430478f34b7c9baca7ad586bcfb3a5da928c2beab3391f6c558c3c22d4"
+        }
+      ],
       "go_proxy_sum": "h1:sx6kcg8raRFCvc9BnXglke6axya12krCJF5xJ2sftRU=",
       "go_mod_sum": "h1:r77ig7BikoZhHrrsjAnv8RqGti5rtSyvDHPzgTPsUuU=",
       "origin_commit": "adc13ffd8b2c0b01b878fda9f7c422ce0df5fad3",

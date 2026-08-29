@@ -1,0 +1,96 @@
+diff --git a/tools/taf-context-native/vendor/github.com/tree-sitter/go-tree-sitter/parser.go b/tools/taf-context-native/vendor/github.com/tree-sitter/go-tree-sitter/parser.go
+index 7c4e3cd..ed8da0a 100644
+--- a/tools/taf-context-native/vendor/github.com/tree-sitter/go-tree-sitter/parser.go
++++ b/tools/taf-context-native/vendor/github.com/tree-sitter/go-tree-sitter/parser.go
+@@ -347 +347,3 @@ func (p *Parser) ParseWithOptions(callback func(int, Point) []byte, oldTree *Tre
+-	if options != nil {
++	if options != nil && options.ProgressCallback != nil {
++		progressPayload := pointer.Save(options)
++		defer pointer.Unref(progressPayload)
+@@ -350 +352 @@ func (p *Parser) ParseWithOptions(callback func(int, Point) []byte, oldTree *Tre
+-			payload:           pointer.Save(options),
++			payload:           progressPayload,
+diff --git a/tools/taf-context-native/vendor/github.com/tree-sitter/go-tree-sitter/query.go b/tools/taf-context-native/vendor/github.com/tree-sitter/go-tree-sitter/query.go
+index 8e41ccf..c25ee67 100644
+--- a/tools/taf-context-native/vendor/github.com/tree-sitter/go-tree-sitter/query.go
++++ b/tools/taf-context-native/vendor/github.com/tree-sitter/go-tree-sitter/query.go
+@@ -61 +61,3 @@ type QueryCursor struct {
+-	_inner *C.TSQueryCursor
++	_inner         *C.TSQueryCursor
++	options        *C.TSQueryCursorOptions
++	optionsPayload unsafe.Pointer
+@@ -710 +712,8 @@ func (qc *QueryCursor) Close() {
+-	C.ts_query_cursor_delete(qc._inner)
++	if qc == nil {
++		return
++	}
++	if qc._inner != nil {
++		C.ts_query_cursor_delete(qc._inner)
++		qc._inner = nil
++	}
++	qc.releaseOptions()
+@@ -752,0 +762 @@ func (qc *QueryCursor) Matches(query *Query, node *Node, text []byte) QueryMatch
++	qc.releaseOptions()
+@@ -787,3 +797,2 @@ func (qc *QueryCursor) MatchesWithOptions(query *Query, node *Node, text []byte,
+-	cOptions := &C.TSQueryCursorOptions{
+-		payload:           pointer.Save(&options),
+-		progress_callback: (*[0]byte)(C.queryProgressCallback),
++	if qc == nil || qc._inner == nil {
++		panic("query cursor is closed")
+@@ -790,0 +800,11 @@ func (qc *QueryCursor) MatchesWithOptions(query *Query, node *Node, text []byte,
++	if options.ProgressCallback == nil {
++		return qc.Matches(query, node, text)
++	}
++	cOptions, optionsPayload := newQueryCursorOptions(options)
++	installed := false
++	defer func() {
++		if !installed {
++			freeQueryCursorOptions(cOptions, optionsPayload)
++		}
++	}()
++	previousOptions, previousPayload := qc.options, qc.optionsPayload
+@@ -792,0 +813,3 @@ func (qc *QueryCursor) MatchesWithOptions(query *Query, node *Node, text []byte,
++	qc.options, qc.optionsPayload = cOptions, optionsPayload
++	installed = true
++	freeQueryCursorOptions(previousOptions, previousPayload)
+@@ -817,0 +841 @@ func (qc *QueryCursor) Captures(query *Query, node *Node, text []byte) QueryCapt
++	qc.releaseOptions()
+@@ -826,0 +851,38 @@ func (qc *QueryCursor) Captures(query *Query, node *Node, text []byte) QueryCapt
++func newQueryCursorOptions(options QueryCursorOptions) (cOptions *C.TSQueryCursorOptions, payload unsafe.Pointer) {
++	cOptions = (*C.TSQueryCursorOptions)(C.malloc(C.size_t(C.sizeof_TSQueryCursorOptions)))
++	if cOptions == nil {
++		panic("failed to allocate query cursor options")
++	}
++	complete := false
++	defer func() {
++		if !complete {
++			freeQueryCursorOptions(cOptions, payload)
++		}
++	}()
++	payload = pointer.Save(&options)
++	*cOptions = C.TSQueryCursorOptions{
++		payload:           payload,
++		progress_callback: (*[0]byte)(C.queryProgressCallback),
++	}
++	complete = true
++	return cOptions, payload
++}
++
++func (qc *QueryCursor) releaseOptions() {
++	if qc == nil {
++		return
++	}
++	options, payload := qc.options, qc.optionsPayload
++	qc.options, qc.optionsPayload = nil, nil
++	freeQueryCursorOptions(options, payload)
++}
++
++func freeQueryCursorOptions(options *C.TSQueryCursorOptions, payload unsafe.Pointer) {
++	if payload != nil {
++		pointer.Unref(payload)
++	}
++	if options != nil {
++		C.free(unsafe.Pointer(options))
++	}
++}
++

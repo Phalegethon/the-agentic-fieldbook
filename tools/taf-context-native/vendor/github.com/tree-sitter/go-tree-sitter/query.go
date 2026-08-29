@@ -58,7 +58,9 @@ func newCaptureQuantifier(raw C.TSQuantifier) CaptureQuantifier {
 
 // A stateful object for executing a [Query] on a syntax [Tree].
 type QueryCursor struct {
-	_inner *C.TSQueryCursor
+	_inner         *C.TSQueryCursor
+	options        *C.TSQueryCursorOptions
+	optionsPayload unsafe.Pointer
 }
 
 // A stateful object that is passed into the progress callback [QueryOptions.ProgressCallback].
@@ -707,7 +709,14 @@ func NewQueryCursor() *QueryCursor {
 
 // Delete the underlying memory for a query cursor.
 func (qc *QueryCursor) Close() {
-	C.ts_query_cursor_delete(qc._inner)
+	if qc == nil {
+		return
+	}
+	if qc._inner != nil {
+		C.ts_query_cursor_delete(qc._inner)
+		qc._inner = nil
+	}
+	qc.releaseOptions()
 }
 
 // Return the maximum number of in-progress matches for this cursor.
@@ -750,6 +759,7 @@ func (qc *QueryCursor) DidExceedMatchLimit() bool {
 // captures from a previous match.
 func (qc *QueryCursor) Matches(query *Query, node *Node, text []byte) QueryMatches {
 	C.ts_query_cursor_exec(qc._inner, query._inner, node._inner)
+	qc.releaseOptions()
 	qm := QueryMatches{
 		_inner:  qc._inner,
 		query:   query,
@@ -784,12 +794,25 @@ func queryProgressCallback(state *C.TSQueryCursorState) C.bool {
 // one match may contain captures that appear *before* some of the
 // captures from a previous match.
 func (qc *QueryCursor) MatchesWithOptions(query *Query, node *Node, text []byte, options QueryCursorOptions) QueryMatches {
-	cOptions := &C.TSQueryCursorOptions{
-		payload:           pointer.Save(&options),
-		progress_callback: (*[0]byte)(C.queryProgressCallback),
+	if qc == nil || qc._inner == nil {
+		panic("query cursor is closed")
 	}
+	if options.ProgressCallback == nil {
+		return qc.Matches(query, node, text)
+	}
+	cOptions, optionsPayload := newQueryCursorOptions(options)
+	installed := false
+	defer func() {
+		if !installed {
+			freeQueryCursorOptions(cOptions, optionsPayload)
+		}
+	}()
+	previousOptions, previousPayload := qc.options, qc.optionsPayload
 
 	C.ts_query_cursor_exec_with_options(qc._inner, query._inner, node._inner, cOptions)
+	qc.options, qc.optionsPayload = cOptions, optionsPayload
+	installed = true
+	freeQueryCursorOptions(previousOptions, previousPayload)
 
 	qm := QueryMatches{
 		_inner:  qc._inner,
@@ -815,12 +838,51 @@ func (qc *QueryCursor) MatchesWithOptions(query *Query, node *Node, text []byte,
 // want a single, ordered sequence of captures.
 func (qc *QueryCursor) Captures(query *Query, node *Node, text []byte) QueryCaptures {
 	C.ts_query_cursor_exec(qc._inner, query._inner, node._inner)
+	qc.releaseOptions()
 	return QueryCaptures{
 		_inner:  qc._inner,
 		query:   query,
 		text:    text,
 		buffer1: []byte{},
 		buffer2: []byte{},
+	}
+}
+
+func newQueryCursorOptions(options QueryCursorOptions) (cOptions *C.TSQueryCursorOptions, payload unsafe.Pointer) {
+	cOptions = (*C.TSQueryCursorOptions)(C.malloc(C.size_t(C.sizeof_TSQueryCursorOptions)))
+	if cOptions == nil {
+		panic("failed to allocate query cursor options")
+	}
+	complete := false
+	defer func() {
+		if !complete {
+			freeQueryCursorOptions(cOptions, payload)
+		}
+	}()
+	payload = pointer.Save(&options)
+	*cOptions = C.TSQueryCursorOptions{
+		payload:           payload,
+		progress_callback: (*[0]byte)(C.queryProgressCallback),
+	}
+	complete = true
+	return cOptions, payload
+}
+
+func (qc *QueryCursor) releaseOptions() {
+	if qc == nil {
+		return
+	}
+	options, payload := qc.options, qc.optionsPayload
+	qc.options, qc.optionsPayload = nil, nil
+	freeQueryCursorOptions(options, payload)
+}
+
+func freeQueryCursorOptions(options *C.TSQueryCursorOptions, payload unsafe.Pointer) {
+	if payload != nil {
+		pointer.Unref(payload)
+	}
+	if options != nil {
+		C.free(unsafe.Pointer(options))
 	}
 }
 

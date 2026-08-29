@@ -6,8 +6,6 @@ import (
 	"path"
 	"sort"
 	"strings"
-	"sync"
-	"sync/atomic"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
@@ -69,6 +67,9 @@ func extractTreeSitter(ctx context.Context, file boundary.StableFile, grammar tr
 		return nil, treeSitterFailure(grammar.parserVersion, grammar.warningPrefix+"-query-failure")
 	}
 	defer query.Close()
+	if ctx.Err() != nil {
+		return nil, treeSitterFailure(grammar.parserVersion, "tree-sitter-cancelled")
+	}
 
 	cursor := sitter.NewQueryCursor()
 	if cursor == nil {
@@ -93,13 +94,23 @@ func extractTreeSitter(ctx context.Context, file boundary.StableFile, grammar tr
 		analysis.addWarning(grammar.warningPrefix + "-syntax-error")
 	}
 
-	matches := cursor.Matches(query, root, file.Bytes)
+	matches := cursor.MatchesWithOptions(query, root, file.Bytes, sitter.QueryCursorOptions{
+		ProgressCallback: func(sitter.QueryCursorState) bool {
+			return ctx.Err() != nil
+		},
+	})
+	if ctx.Err() != nil {
+		return nil, treeSitterFailure(grammar.parserVersion, "tree-sitter-cancelled")
+	}
 	captures := 0
 	for !analysis.stopped {
 		if ctx.Err() != nil {
 			return nil, treeSitterFailure(grammar.parserVersion, "tree-sitter-cancelled")
 		}
 		match := matches.Next()
+		if ctx.Err() != nil {
+			return nil, treeSitterFailure(grammar.parserVersion, "tree-sitter-cancelled")
+		}
 		if match == nil {
 			break
 		}
@@ -127,6 +138,9 @@ func extractTreeSitter(ctx context.Context, file boundary.StableFile, grammar tr
 	if cursor.DidExceedMatchLimit() {
 		analysis.limit("tree-sitter-match-limit")
 	}
+	if ctx.Err() != nil {
+		return nil, treeSitterFailure(grammar.parserVersion, "tree-sitter-cancelled")
+	}
 	if analysis.ambiguous {
 		for index := range analysis.records {
 			if analysis.records[index].EvidenceClass == model.Verified {
@@ -135,6 +149,9 @@ func extractTreeSitter(ctx context.Context, file boundary.StableFile, grammar tr
 		}
 	}
 	sort.Strings(analysis.warnings)
+	if ctx.Err() != nil {
+		return nil, treeSitterFailure(grammar.parserVersion, "tree-sitter-cancelled")
+	}
 	return analysis.records, Report{
 		ParserVersion: grammar.parserVersion,
 		ParseFailures: analysis.parseFailures,
@@ -143,8 +160,8 @@ func extractTreeSitter(ctx context.Context, file boundary.StableFile, grammar tr
 }
 
 // parseTree owns and closes a fresh parser for every call. The returned tree
-// belongs to the caller. A caller-owned atomic flag keeps cancellation memory
-// valid until the watcher has stopped and prevents parser reuse races.
+// belongs to the caller. Cancellation is checked by the binding-owned native
+// progress callback; C never retains a pointer into Go memory between calls.
 func parseTree(ctx context.Context, language *sitter.Language, source []byte) (*sitter.Tree, error) {
 	if language == nil {
 		return nil, errTreeSitterParse
@@ -160,25 +177,19 @@ func parseTree(ctx context.Context, language *sitter.Language, source []byte) (*
 	if err := parser.SetLanguage(language); err != nil {
 		return nil, errTreeSitterParse
 	}
-	var cancellation uintptr
-	parser.SetCancellationFlag(&cancellation)
-	done := make(chan struct{})
-	var watcher sync.WaitGroup
-	watcher.Add(1)
-	go func() {
-		defer watcher.Done()
-		select {
-		case <-ctx.Done():
-			atomic.StoreUintptr(&cancellation, 1)
-		case <-done:
+	length := len(source)
+	tree := parser.ParseWithOptions(func(offset int, _ sitter.Point) []byte {
+		if offset >= 0 && offset < length {
+			return source[offset:]
 		}
-	}()
-	tree := parser.Parse(source, nil)
-	close(done)
-	watcher.Wait()
-	parser.SetCancellationFlag(nil)
+		return nil
+	}, nil, &sitter.ParseOptions{
+		ProgressCallback: func(sitter.ParseState) bool {
+			return ctx.Err() != nil
+		},
+	})
 	if tree == nil {
-		if ctx.Err() != nil || atomic.LoadUintptr(&cancellation) != 0 {
+		if ctx.Err() != nil {
 			return nil, errTreeSitterCancelled
 		}
 		return nil, errTreeSitterParse
