@@ -276,7 +276,7 @@ func cleanupFile(filesystem storeFilesystem, directory *boundary.StateDirectory,
 	_ = filesystem.removeFile(directory, name)
 }
 
-func publishCurrent(filesystem storeFilesystem, state *boundary.StateDirectory, generationToken string, barrier func() error) ([]byte, func(), error) {
+func publishCurrent(filesystem storeFilesystem, state *boundary.StateDirectory, generationToken, expectedPreviousToken string, barrier func() error) ([]byte, func(), error) {
 	contents := []byte(generationToken + "\n")
 	temporary, err := randomEntryName(".CURRENT-")
 	if err != nil {
@@ -291,10 +291,14 @@ func publishCurrent(filesystem storeFilesystem, state *boundary.StateDirectory, 
 	}
 	currentPublicationLock.Lock()
 	unlock := currentPublicationLock.Unlock
-	_, previous, _, err := readCurrentPointer(filesystem, state)
+	previousToken, previous, previousExists, err := readCurrentPointer(filesystem, state)
 	if err != nil {
 		unlock()
 		return nil, nil, err
+	}
+	if expectedPreviousToken != "" && (!previousExists || previousToken != expectedPreviousToken) {
+		unlock()
+		return nil, nil, ErrIndexMismatch
 	}
 	if err := filesystem.replaceFileAfterBarrier(state, temporary, currentFilename, faultBeforeCurrentRename, barrier); err != nil {
 		if isInjectedFilesystemFault(err) {

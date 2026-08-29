@@ -333,7 +333,10 @@ func encodeIndexCatalogObservedStatsContext(ctx context.Context, input []model.R
 		return nil, err
 	}
 	var encoded bytes.Buffer
-	writer, err := zlib.NewWriterLevel(&encoded, zlib.BestCompression)
+	// Level 1 is rebuilt and locally updated on an interactive path. BestSpeed
+	// keeps the deterministic zlib format and bounded decode contract while
+	// avoiding the disproportionate CPU cost of exhaustive compression.
+	writer, err := zlib.NewWriterLevel(&encoded, zlib.BestSpeed)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidIndex, err)
 	}

@@ -123,6 +123,45 @@ func TestSearchSupportsQualifiedShortAliasPrefixFuzzyAndDocumentSeparation(t *te
 	}
 }
 
+func TestSearchUsesPersistedFuzzyTermsBeforeSubstringFrontierExhaustion(t *testing.T) {
+	records := make([]model.Record, policy.ProductionLimits().MaximumLexicalCandidates+1)
+	for index := range records {
+		records[index] = testRecord(index, "noise", model.Definition, model.Verified)
+		records[index].SearchTerms = []string{"noise"}
+	}
+	document := testRecord(len(records)-1, "Level One Markdown", model.Heading, model.Verified)
+	document.Path = "markdown/record-00027.md"
+	document.Language = "markdown"
+	document.SourceType = "document"
+	document.SearchTerms = []string{"markdown"}
+	records[len(records)-1] = document
+	request := searchRequest("markdwn")
+	request.Operation = wire.SearchDocs
+	response := Search(indexedSnapshot(records), request, policy.ProductionLimits())
+	if got := identities(response.Records); !reflect.DeepEqual(got, []string{document.Identity}) {
+		t.Fatalf("fuzzy document records = %#v, want %s", got, document.Identity)
+	}
+}
+
+func TestSearchUsesFullPhraseFuzzyFallbackBeforeBroadIndividualTokens(t *testing.T) {
+	records := make([]model.Record, policy.ProductionLimits().MaximumLexicalCandidates+1)
+	for index := range records {
+		records[index] = testRecord(index, fmt.Sprintf("Level One Markdown %d#chunk-1", index+1000), model.DocumentChunk, model.Verified)
+		records[index].Language = "markdown"
+		records[index].SourceType = "document"
+	}
+	target := testRecord(len(records)-1, "Level One Markdown 27#chunk-1", model.DocumentChunk, model.Verified)
+	target.Language = "markdown"
+	target.SourceType = "document"
+	records[len(records)-1] = target
+	request := searchRequest("level one markdown 27#chunk-2")
+	request.Operation = wire.SearchDocs
+	response := Search(indexedSnapshot(records), request, policy.ProductionLimits())
+	if got := identities(response.Records); !reflect.DeepEqual(got, []string{target.Identity}) {
+		t.Fatalf("full-phrase fuzzy records = %#v, want %s", got, target.Identity)
+	}
+}
+
 func TestSearchAdmitsSubstringFromBoundedPersistedFrontier(t *testing.T) {
 	record := testRecord(0, "pkg.ServiceWorker", model.Definition, model.Verified)
 	record.SearchTerms = []string{"serviceworker"}

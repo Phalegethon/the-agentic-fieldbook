@@ -136,7 +136,7 @@ func renderRequest(budget, maximumResults int) wire.Request {
 func renderResult(findings []wire.Finding) wire.Result {
 	return wire.Result{
 		SchemaVersion: "1", RequestIdentity: "request", Operation: wire.Estimate,
-		Status: wire.Partial, ProviderIdentity: "taf.native.level1", ProviderVersion: "0.1.0",
+		Status: wire.Partial, ProviderIdentity: "taf-context", ProviderVersion: "0.1.0",
 		RepositoryIdentity: testSHA, WorktreeIdentity: testSHA,
 		CommittedHead: "0123456789abcdef0123456789abcdef01234567", DirtyOverlayFingerprint: testSHA,
 		Freshness: "partial", ParserVersions: map[string]string{},

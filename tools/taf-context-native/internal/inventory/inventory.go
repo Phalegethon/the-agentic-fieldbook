@@ -4,6 +4,8 @@ package inventory
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path"
@@ -35,6 +37,8 @@ type Path struct {
 	Language     string
 	Size         int64
 	SHA256       string
+	Bytes        []byte
+	BodyRetained bool
 }
 
 type Exclusion struct {
@@ -180,18 +184,27 @@ func collectWithIgnoreLimits(roots boundary.Roots, mode Mode, limits policy.Limi
 		}
 		candidate := Path{RelativePath: entry.RelativePath, Language: language, Size: entry.Size}
 		if mode == ModeBuild {
-			file, fileErr := roots.OpenRepositoryFile(entry.RelativePath, maximum)
-			if fileErr != nil || file.Size != entry.Size {
-				addExclusion(&result, entry.RelativePath, ExcludedUnsafe)
-				regularExclusions++
-				return nil
+			if int64(len(prefix.Bytes)) == prefix.Size {
+				digest := sha256.Sum256(prefix.Bytes)
+				candidate.SHA256 = hex.EncodeToString(digest[:])
+				candidate.Bytes = append([]byte(nil), prefix.Bytes...)
+				candidate.BodyRetained = true
+			} else {
+				file, fileErr := roots.OpenRepositoryFile(entry.RelativePath, maximum)
+				if fileErr != nil || file.Size != entry.Size {
+					addExclusion(&result, entry.RelativePath, ExcludedUnsafe)
+					regularExclusions++
+					return nil
+				}
+				if binary(file.Bytes, false) {
+					addExclusion(&result, entry.RelativePath, ExcludedBinary)
+					regularExclusions++
+					return nil
+				}
+				candidate.SHA256 = file.SHA256
+				candidate.Bytes = file.Bytes
+				candidate.BodyRetained = true
 			}
-			if binary(file.Bytes, false) {
-				addExclusion(&result, entry.RelativePath, ExcludedBinary)
-				regularExclusions++
-				return nil
-			}
-			candidate.SHA256 = file.SHA256
 		}
 		result.Paths = append(result.Paths, candidate)
 		result.EligibleSourceBytes += uint64(entry.Size)

@@ -1532,6 +1532,18 @@ func TestLoadRejectsWrongExpectedIdentityAndMissingCurrent(t *testing.T) {
 	}
 }
 
+func TestCurrentGenerationReadsOnlyTheSelectedPointerIdentity(t *testing.T) {
+	roots, _ := storeRoots(t)
+	if _, err := CurrentGenerationContext(context.Background(), roots); !errors.Is(err, ErrNoCurrent) {
+		t.Fatalf("missing current = %v, want ErrNoCurrent", err)
+	}
+	snapshot := mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	identity, err := CurrentGenerationContext(context.Background(), roots)
+	if err != nil || identity != snapshot.Manifest.GenerationIdentity {
+		t.Fatalf("current generation = %q, %v; want %q", identity, err, snapshot.Manifest.GenerationIdentity)
+	}
+}
+
 func TestIncompleteStagingIsIgnoredWhenCurrentIsValid(t *testing.T) {
 	roots, _ := storeRoots(t)
 	snapshot := mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})

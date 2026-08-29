@@ -46,6 +46,34 @@ func TestUpdateRejectsInvalidControlBeforeChangedSourceOpen(t *testing.T) {
 	}
 }
 
+func TestCachedUpdateReusesTheValidatedPriorGeneration(t *testing.T) {
+	repository, state := controlRoots(t)
+	dependencies := ProductionDependencies()
+	inspect, load := dependencies.Inspect, dependencies.Load
+	inspectCalls, loadCalls := 0, 0
+	dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+		inspectCalls++
+		return inspect(ctx, roots)
+	}
+	dependencies.Load = func(ctx context.Context, roots *boundary.Roots, identity string) (store.Snapshot, error) {
+		loadCalls++
+		return load(ctx, roots, identity)
+	}
+	cached := NewCached(dependencies)
+	built := mustBuildForUpdate(t, cached, repository, state)
+	if err := os.WriteFile(filepath.Join(repository, "main.go"), []byte("package main\nfunc Main() { println(\"updated\") }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeUpdateDocument(t, state, updateDocument(t, built.IndexIdentity, "main.go"))
+	result, err := cached.Execute(context.Background(), validUpdateEnvelope(repository, state, built.IndexIdentity))
+	if err != nil || result.Status != wire.Ready || result.Freshness != "exact" {
+		t.Fatalf("cached update = %#v, %v", result, err)
+	}
+	if inspectCalls != 0 || loadCalls != 0 {
+		t.Fatalf("inspect=%d load=%d, want pointer validation without generation reload", inspectCalls, loadCalls)
+	}
+}
+
 func TestUpdateControlDocumentIsStateRootOwned(t *testing.T) {
 	repository, state := controlRoots(t)
 	engine := New(ProductionDependencies())

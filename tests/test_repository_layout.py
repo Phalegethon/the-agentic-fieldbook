@@ -228,6 +228,11 @@ class RepositoryLayoutTest(unittest.TestCase):
             )
         )
 
+    def test_native_level1_adapter_template_stays_inside_the_native_root(self) -> None:
+        template = ROOT / PUBLIC_NATIVE_LEVEL1_ROOT / "adapter" / "manifest.template.json"
+        self.assertTrue(template.is_file())
+        self.assertTrue(_is_public_native_level1_path(template.relative_to(ROOT)))
+
     def test_private_bakeoff_artifacts_are_rejected_from_public_layout(self) -> None:
         forbidden = (
             Path("experiments/level1-bakeoff/python/candidate.json"),

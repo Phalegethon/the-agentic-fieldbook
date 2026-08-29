@@ -4,6 +4,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/extract"
@@ -18,23 +19,34 @@ import (
 var ErrDependencies = errors.New("incomplete native Level 1 dependencies")
 
 type Dependencies struct {
-	ValidateRoots    func(wire.Envelope) (boundary.Roots, error)
-	Collect          func(boundary.Roots, inventory.Mode) (inventory.Result, error)
-	OpenFile         func(*boundary.Roots, string, int64) (boundary.StableFile, error)
-	OpenControl      func(*boundary.Roots, string, int64) (boundary.StableFile, error)
-	Extract          func(context.Context, boundary.StableFile) ([]model.Record, extract.Report)
-	Build            func(context.Context, *boundary.Roots, model.Manifest, []model.Record) (store.Snapshot, error)
-	BuildWithBarrier func(context.Context, *boundary.Roots, model.Manifest, []model.Record, func() error) (store.Snapshot, error)
-	Load             func(context.Context, *boundary.Roots, string) (store.Snapshot, error)
-	Inspect          func(context.Context, *boundary.Roots) (store.Status, error)
-	ParserIDs        func() map[string]string
-	Fit              func(context.Context, wire.Request, wire.Result) (wire.Result, error)
+	ValidateRoots          func(wire.Envelope) (boundary.Roots, error)
+	Collect                func(boundary.Roots, inventory.Mode) (inventory.Result, error)
+	OpenFile               func(*boundary.Roots, string, int64) (boundary.StableFile, error)
+	OpenControl            func(*boundary.Roots, string, int64) (boundary.StableFile, error)
+	Extract                func(context.Context, boundary.StableFile) ([]model.Record, extract.Report)
+	Build                  func(context.Context, *boundary.Roots, model.Manifest, []model.Record) (store.Snapshot, error)
+	BuildWithBarrier       func(context.Context, *boundary.Roots, model.Manifest, []model.Record, func() error) (store.Snapshot, error)
+	BuildCachedWithBarrier func(context.Context, *boundary.Roots, store.Snapshot, model.Manifest, []model.Record, func() error) (store.Snapshot, error)
+	Load                   func(context.Context, *boundary.Roots, string) (store.Snapshot, error)
+	Inspect                func(context.Context, *boundary.Roots) (store.Status, error)
+	CurrentGeneration      func(context.Context, *boundary.Roots) (string, error)
+	ParserIDs              func() map[string]string
+	Fit                    func(context.Context, wire.Request, wire.Result) (wire.Result, error)
 	// ObserveUpdateCounters is intentionally an in-process-only test/evaluation
 	// seam. Production leaves it nil; no high-cardinality data crosses wire.
 	ObserveUpdateCounters func(model.WorkCounters)
 }
 
-type Engine struct{ dependencies Dependencies }
+type snapshotCache struct {
+	mu       sync.RWMutex
+	snapshot store.Snapshot
+	ready    bool
+}
+
+type Engine struct {
+	dependencies Dependencies
+	cache        *snapshotCache
+}
 
 func ProductionDependencies() Dependencies {
 	registry := extract.NewRegistry()
@@ -47,17 +59,65 @@ func ProductionDependencies() Dependencies {
 		OpenControl: func(roots *boundary.Roots, relative string, maximum int64) (boundary.StableFile, error) {
 			return roots.OpenStateControlFile(relative, maximum)
 		},
-		Extract:          registry.ExtractContext,
-		Build:            store.BuildContext,
-		BuildWithBarrier: store.BuildContextWithBarrier,
-		Load:             store.LoadContext,
-		Inspect:          store.InspectContext,
-		ParserIDs:        registry.ParserIdentities,
-		Fit:              render.FitContext,
+		Extract:                registry.ExtractContext,
+		Build:                  store.BuildContext,
+		BuildWithBarrier:       store.BuildContextWithBarrier,
+		BuildCachedWithBarrier: store.BuildCachedContextWithBarrier,
+		Load:                   store.LoadContext,
+		Inspect:                store.InspectContext,
+		CurrentGeneration:      store.CurrentGenerationContext,
+		ParserIDs:              registry.ParserIdentities,
+		Fit:                    render.FitContext,
 	}
 }
 
 func New(dependencies Dependencies) *Engine { return &Engine{dependencies: dependencies} }
+
+// NewCached retains one already-validated immutable generation for a bounded
+// multi-request process. New remains uncached so one-shot callers and fault
+// tests preserve their per-request state validation semantics.
+func NewCached(dependencies Dependencies) *Engine {
+	return &Engine{dependencies: dependencies, cache: &snapshotCache{}}
+}
+
+func (engine *Engine) cachedSnapshot(request wire.Request) (store.Snapshot, bool) {
+	if engine == nil || engine.cache == nil || request.IndexIdentity == nil {
+		return store.Snapshot{}, false
+	}
+	engine.cache.mu.RLock()
+	defer engine.cache.mu.RUnlock()
+	snapshot := engine.cache.snapshot
+	if !engine.cache.ready || snapshot.IndexIdentity != *request.IndexIdentity {
+		return store.Snapshot{}, false
+	}
+	freshness, _ := freshnessFor(request, snapshot.Manifest, snapshot.IndexIdentity, engine.dependencies.ParserIDs())
+	if freshness != "exact" {
+		return store.Snapshot{}, false
+	}
+	return snapshot, true
+}
+
+func (engine *Engine) cachedIndex(identity string) (store.Snapshot, bool) {
+	if engine == nil || engine.cache == nil || identity == "" {
+		return store.Snapshot{}, false
+	}
+	engine.cache.mu.RLock()
+	defer engine.cache.mu.RUnlock()
+	if !engine.cache.ready || engine.cache.snapshot.IndexIdentity != identity {
+		return store.Snapshot{}, false
+	}
+	return engine.cache.snapshot, true
+}
+
+func (engine *Engine) rememberSnapshot(snapshot store.Snapshot) {
+	if engine == nil || engine.cache == nil || snapshot.IndexIdentity == "" {
+		return
+	}
+	engine.cache.mu.Lock()
+	engine.cache.snapshot = snapshot
+	engine.cache.ready = true
+	engine.cache.mu.Unlock()
+}
 
 func (engine *Engine) Execute(ctx context.Context, envelope wire.Envelope) (wire.Result, error) {
 	if engine == nil || !engine.ready() {
@@ -149,7 +209,7 @@ func (engine *Engine) observeUpdateCounters(counters model.WorkCounters) {
 
 func (engine *Engine) ready() bool {
 	d := engine.dependencies
-	return d.ValidateRoots != nil && d.Collect != nil && d.OpenFile != nil && d.OpenControl != nil && d.Extract != nil && d.Build != nil && d.BuildWithBarrier != nil && d.Load != nil && d.Inspect != nil && d.ParserIDs != nil && d.Fit != nil
+	return d.ValidateRoots != nil && d.Collect != nil && d.OpenFile != nil && d.OpenControl != nil && d.Extract != nil && d.Build != nil && d.BuildWithBarrier != nil && d.BuildCachedWithBarrier != nil && d.Load != nil && d.Inspect != nil && d.CurrentGeneration != nil && d.ParserIDs != nil && d.Fit != nil
 }
 
 func productionLimits() policy.Limits { return policy.ProductionLimits() }

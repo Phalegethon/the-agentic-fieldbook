@@ -112,6 +112,13 @@ func BuildContextWithBarrier(ctx context.Context, roots *boundary.Roots, manifes
 	return buildWithFilesystemObservedContextBarrier(ctx, boundaryFilesystem{}, roots, manifest, records, buildHooks{}, barrier)
 }
 
+// BuildCachedContextWithBarrier publishes a replacement from an already
+// validated in-memory current snapshot. It still verifies the selected CURRENT
+// token under the publication lock and verifies every newly installed byte.
+func BuildCachedContextWithBarrier(ctx context.Context, roots *boundary.Roots, previous Snapshot, manifest model.Manifest, records []model.Record, barrier func() error) (Snapshot, error) {
+	return buildWithFilesystemObservedContextBarrierTrusted(ctx, boundaryFilesystem{}, roots, manifest, records, buildHooks{}, barrier, &previous)
+}
+
 // BuildWithFaults is the deterministic durability-test entry point.
 func BuildWithFaults(roots *boundary.Roots, manifest model.Manifest, records []model.Record, faults Faults) (Snapshot, error) {
 	return buildWithFilesystem(boundaryFilesystem{faults: faults}, roots, manifest, records)
@@ -130,6 +137,10 @@ func buildWithFilesystemObservedContext(ctx context.Context, filesystem storeFil
 }
 
 func buildWithFilesystemObservedContextBarrier(ctx context.Context, filesystem storeFilesystem, roots *boundary.Roots, manifest model.Manifest, records []model.Record, hooks buildHooks, barrier func() error) (Snapshot, error) {
+	return buildWithFilesystemObservedContextBarrierTrusted(ctx, filesystem, roots, manifest, records, hooks, barrier, nil)
+}
+
+func buildWithFilesystemObservedContextBarrierTrusted(ctx context.Context, filesystem storeFilesystem, roots *boundary.Roots, manifest model.Manifest, records []model.Record, hooks buildHooks, barrier func() error, trustedPrevious *Snapshot) (Snapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
@@ -144,6 +155,19 @@ func buildWithFilesystemObservedContextBarrier(ctx context.Context, filesystem s
 	}
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
+	}
+	var prepared *Snapshot
+	expectedPreviousToken := ""
+	if trustedPrevious != nil {
+		if trustedPrevious.IndexIdentity == "" || trustedPrevious.IndexIdentity != trustedPrevious.Manifest.IndexIdentity || !validSHA256IdentityString(trustedPrevious.Manifest.GenerationIdentity) {
+			return Snapshot{}, ErrIndexMismatch
+		}
+		expectedPreviousToken = tokenFromIdentity(trustedPrevious.Manifest.GenerationIdentity)
+		value, materializeErr := materializeInputSnapshot(ctx, artifacts, records)
+		if materializeErr != nil {
+			return Snapshot{}, materializeErr
+		}
+		prepared = &value
 	}
 	if err := filesystem.ensureState(roots); err != nil {
 		return Snapshot{}, corrupt(err)
@@ -177,7 +201,7 @@ func buildWithFilesystemObservedContextBarrier(ctx context.Context, filesystem s
 		if err := ctx.Err(); err != nil {
 			return Snapshot{}, err
 		}
-		selected, materializeErr := materializeArtifacts(ctx, artifacts, hooks)
+		selected, materializeErr := materializePreparedSnapshot(ctx, artifacts, hooks, prepared)
 		if materializeErr != nil {
 			return Snapshot{}, materializeErr
 		}
@@ -199,7 +223,10 @@ func buildWithFilesystemObservedContextBarrier(ctx context.Context, filesystem s
 		}
 		return selected, nil
 	}
-	if previousExists {
+	if expectedPreviousToken != "" && (!previousExists || previousToken != expectedPreviousToken) {
+		return Snapshot{}, ErrIndexMismatch
+	}
+	if previousExists && expectedPreviousToken == "" {
 		if err := validateGenerationMetadataContext(ctx, filesystem, generations, previousToken); err != nil {
 			return Snapshot{}, err
 		}
@@ -269,7 +296,7 @@ func buildWithFilesystemObservedContextBarrier(ctx context.Context, filesystem s
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
-	publicationPrevious, unlockPublication, err := publishCurrent(filesystem, state, artifacts.token, barrier)
+	publicationPrevious, unlockPublication, err := publishCurrent(filesystem, state, artifacts.token, expectedPreviousToken, barrier)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -289,7 +316,7 @@ func buildWithFilesystemObservedContextBarrier(ctx context.Context, filesystem s
 		}
 		return Snapshot{}, original
 	}
-	selected, err := materializeArtifacts(ctx, artifacts, hooks)
+	selected, err := materializePreparedSnapshot(ctx, artifacts, hooks, prepared)
 	if err != nil {
 		original := corrupt(err)
 		if rollbackErr := rollbackCurrentWithFilesystem(filesystem, state, publicationPrevious, original); rollbackErr != nil {
@@ -405,6 +432,35 @@ func InspectContext(ctx context.Context, roots *boundary.Roots) (Status, error) 
 	return inspectGenerationContext(ctx, filesystem, generations, token)
 }
 
+// CurrentGenerationContext reads only the atomically selected immutable
+// generation identity. Callers may use it to revalidate an in-memory snapshot;
+// it deliberately does not replace Load or Inspect for uncached state.
+func CurrentGenerationContext(ctx context.Context, roots *boundary.Roots) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if roots == nil {
+		return "", ErrStoreCorrupt
+	}
+	filesystem := boundaryFilesystem{}
+	state, err := filesystem.openStateDirectory(roots, "")
+	if errors.Is(err, boundary.ErrStateUnavailable) {
+		return "", ErrNoCurrent
+	}
+	if err != nil {
+		return "", corrupt(err)
+	}
+	defer filesystem.closeDirectory(state)
+	token, _, exists, err := readCurrentPointer(filesystem, state)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", ErrNoCurrent
+	}
+	return "sha256:" + token, nil
+}
+
 func openOrCreateGenerations(filesystem storeFilesystem, state *boundary.StateDirectory) (*boundary.StateDirectory, error) {
 	directory, err := filesystem.openDirectory(state, generationsDirectory)
 	if err == nil {
@@ -497,6 +553,33 @@ func materializeArtifacts(ctx context.Context, artifacts generationArtifacts, ho
 		Manifest: artifacts.manifestValue, Records: records, Postings: postings,
 		Query:         queryIndex,
 		IndexIdentity: artifacts.manifestValue.IndexIdentity, InstalledBytes: artifacts.installedBytes,
+	}, nil
+}
+
+func materializePreparedSnapshot(ctx context.Context, artifacts generationArtifacts, hooks buildHooks, prepared *Snapshot) (Snapshot, error) {
+	if prepared != nil {
+		if err := ctx.Err(); err != nil {
+			return Snapshot{}, err
+		}
+		return *prepared, nil
+	}
+	return materializeArtifacts(ctx, artifacts, hooks)
+}
+
+func materializeInputSnapshot(ctx context.Context, artifacts generationArtifacts, records []model.Record) (Snapshot, error) {
+	queryIndex, err := buildQueryIndexContext(ctx, records, nil)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	postings := make(map[string][]uint32, artifacts.manifestValue.PostingCount)
+	for ordinal, record := range records {
+		for _, term := range record.SearchTerms {
+			postings[term] = append(postings[term], uint32(ordinal))
+		}
+	}
+	return Snapshot{
+		Manifest: artifacts.manifestValue, Records: slices.Clone(records), Postings: postings,
+		Query: queryIndex, IndexIdentity: artifacts.manifestValue.IndexIdentity, InstalledBytes: artifacts.installedBytes,
 	}, nil
 }
 

@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +13,7 @@ func EncodeResult(writer io.Writer, result Result) error {
 	if err := validateResult(result); err != nil {
 		return err
 	}
-	encoded, err := json.Marshal(result)
+	encoded, err := marshalCanonical(result)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidWire, err)
 	}
@@ -29,7 +30,7 @@ func MeasureResult(result Result) (int, int, error) {
 	if err := validateResultWithoutBudgets(result); err != nil {
 		return 0, 0, err
 	}
-	encoded, err := json.Marshal(result)
+	encoded, err := marshalCanonical(result)
 	if err != nil {
 		return 0, 0, fmt.Errorf("%w: %v", ErrInvalidWire, err)
 	}
@@ -40,3 +41,17 @@ func MeasureResult(result Result) (int, int, error) {
 // It deliberately shares validation's calculation rather than duplicating it
 // in callers that need to fit a result before encoding it.
 func OutputCharacters(result Result) int { return renderedOutputCharacters(result) }
+
+func marshalCanonical(value any) ([]byte, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		return nil, err
+	}
+	return json.Marshal(decoded)
+}

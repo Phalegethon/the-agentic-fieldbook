@@ -15,6 +15,7 @@ import (
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/inventory"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/store"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
 
@@ -44,18 +45,39 @@ func (engine *Engine) update(ctx context.Context, roots *boundary.Roots, request
 		return wire.Result{}, err
 	}
 
-	status, inspectErr := engine.dependencies.Inspect(ctx, roots)
-	if err := ctx.Err(); err != nil {
-		return wire.Result{}, err
-	}
-	if inspectErr != nil || request.IndexIdentity == nil {
+	if request.IndexIdentity == nil {
 		return engine.staleUpdate(request, emptyCoverage()), nil
 	}
-	snapshot, loadErr := engine.dependencies.Load(ctx, roots, *request.IndexIdentity)
-	if err := ctx.Err(); err != nil {
-		return wire.Result{}, err
+	snapshot, cached := engine.cachedIndex(*request.IndexIdentity)
+	status := store.Status{}
+	if cached {
+		current, currentErr := engine.dependencies.CurrentGeneration(ctx, roots)
+		if err := ctx.Err(); err != nil {
+			return wire.Result{}, err
+		}
+		if currentErr != nil || current != snapshot.Manifest.GenerationIdentity {
+			return engine.staleUpdate(request, snapshot.Manifest.Coverage), nil
+		}
+		status = store.Status{Ready: true, Manifest: snapshot.Manifest, IndexIdentity: snapshot.IndexIdentity, GenerationIdentity: snapshot.Manifest.GenerationIdentity, InstalledBytes: snapshot.InstalledBytes}
+	} else {
+		var inspectErr error
+		status, inspectErr = engine.dependencies.Inspect(ctx, roots)
+		if err := ctx.Err(); err != nil {
+			return wire.Result{}, err
+		}
+		if inspectErr != nil {
+			return engine.staleUpdate(request, emptyCoverage()), nil
+		}
+		var loadErr error
+		snapshot, loadErr = engine.dependencies.Load(ctx, roots, *request.IndexIdentity)
+		if err := ctx.Err(); err != nil {
+			return wire.Result{}, err
+		}
+		if loadErr != nil {
+			return engine.staleUpdate(request, status.Manifest.Coverage), nil
+		}
 	}
-	if loadErr != nil || snapshot.IndexIdentity != status.IndexIdentity || snapshot.Manifest.GenerationIdentity != status.GenerationIdentity {
+	if snapshot.IndexIdentity != status.IndexIdentity || snapshot.Manifest.GenerationIdentity != status.GenerationIdentity {
 		return engine.staleUpdate(request, status.Manifest.Coverage), nil
 	}
 	if !validUpdateBindings(document, snapshot.Manifest, snapshot.IndexIdentity, request) {
@@ -196,7 +218,13 @@ func (engine *Engine) update(ctx context.Context, roots *boundary.Roots, request
 	manifest.SourceBindingDigest = sourceBinding(sourceCatalogPaths(catalog))
 	manifest.SemanticDigest = semanticBinding(records)
 	manifest.SourceCatalog = catalog
-	published, buildErr := engine.dependencies.BuildWithBarrier(ctx, roots, manifest, records, func() error {
+	publicationBarrier := func() error {
+		if cached {
+			current, currentErr := engine.dependencies.CurrentGeneration(ctx, roots)
+			if currentErr != nil || current != snapshot.Manifest.GenerationIdentity {
+				return errors.New("selected generation changed before publication")
+			}
+		}
 		for _, changedPath := range document.ChangedPaths {
 			previous := witnesses[changedPath]
 			classification, classifyErr := inventory.ClassifyDeclared(roots, changedPath)
@@ -209,10 +237,18 @@ func (engine *Engine) update(ctx context.Context, roots *boundary.Roots, request
 			}
 		}
 		return nil
-	})
+	}
+	var published store.Snapshot
+	var buildErr error
+	if cached {
+		published, buildErr = engine.dependencies.BuildCachedWithBarrier(ctx, roots, snapshot, manifest, records, publicationBarrier)
+	} else {
+		published, buildErr = engine.dependencies.BuildWithBarrier(ctx, roots, manifest, records, publicationBarrier)
+	}
 	if buildErr != nil {
 		return engine.updateFailure(request, coverage), nil
 	}
+	engine.rememberSnapshot(published)
 	result := engine.result(request, wire.Ready, "exact", ptr(published.IndexIdentity), coverage, "use-index")
 	result.ParserVersions = cloneStrings(parserIDs)
 	result.Warnings = warnings

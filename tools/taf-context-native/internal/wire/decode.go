@@ -93,13 +93,32 @@ func requireKeys(value map[string]json.RawMessage, required []string, nullable m
 func isNull(raw json.RawMessage) bool { return len(raw) == 0 || bytes.Equal(raw, []byte("null")) }
 
 func validateEnvelope(envelope Envelope) error {
-	if envelope.Phase != "query" || !validText(envelope.RepositoryRoot, false) || !filepath.IsAbs(envelope.RepositoryRoot) || !validText(envelope.StateRoot, false) || !filepath.IsAbs(envelope.StateRoot) {
+	if !validPhaseOperation(envelope.Phase, envelope.Request.Operation) || !validText(envelope.RepositoryRoot, false) || !filepath.IsAbs(envelope.RepositoryRoot) || !validText(envelope.StateRoot, false) || !filepath.IsAbs(envelope.StateRoot) {
 		return ErrInvalidWire
 	}
 	if envelope.ChangedPathsDocument != nil && !validText(*envelope.ChangedPathsDocument, false) {
 		return ErrInvalidWire
 	}
 	return nil
+}
+
+func validPhaseOperation(phase string, operation Operation) bool {
+	switch phase {
+	case "build":
+		return operation == Build
+	case "estimate":
+		return operation == Estimate
+	case "inspect":
+		return operation == StatusOperation
+	case "metrics":
+		return operation == Metrics
+	case "update":
+		return operation == Update
+	case "query":
+		return operation == RepositoryMap || operation == SearchDocs || operation == SearchSymbols || operation == SourceSnippets
+	default:
+		return false
+	}
 }
 
 func readFramed(reader io.Reader) ([]byte, error) {
@@ -178,7 +197,7 @@ func requireEOF(decoder *json.Decoder) error {
 }
 
 func ValidateRequest(request Request) error {
-	if request.SchemaVersion != "1" || !validID(request.RequestIdentity) || !validID(request.ConsumerIdentity) || !validOperation(request.Operation) || !validSHA(request.RepositoryIdentity) || !validSHA(request.WorktreeIdentity) || !validObject(request.CommittedHead) || !validSHA(request.DirtyOverlayFingerprint) || request.ProviderIdentity != "taf.native.level1" || !validID(request.RequiredCapability) || !validFreshness(request.MinimumFreshness) {
+	if request.SchemaVersion != "1" || !validID(request.RequestIdentity) || !validID(request.ConsumerIdentity) || !validOperation(request.Operation) || !validSHA(request.RepositoryIdentity) || !validSHA(request.WorktreeIdentity) || !validObject(request.CommittedHead) || !validSHA(request.DirtyOverlayFingerprint) || request.ProviderIdentity != "taf-context" || !validID(request.RequiredCapability) || !validFreshness(request.MinimumFreshness) {
 		return ErrInvalidWire
 	}
 	if request.RequiredCapability != string(request.Operation) {
@@ -232,7 +251,7 @@ func validateResult(result Result) error {
 }
 
 func validateResultWithoutBudgets(result Result) error {
-	if result.SchemaVersion != "1" || !validID(result.RequestIdentity) || !validOperation(result.Operation) || !validStatus(result.Status) || result.ProviderIdentity != "taf.native.level1" || !validText(result.ProviderVersion, false) || !validSHA(result.RepositoryIdentity) || !validSHA(result.WorktreeIdentity) || !validObject(result.CommittedHead) || !validSHA(result.DirtyOverlayFingerprint) || !validFreshness(result.Freshness) || !validID(result.NextSafeAction) {
+	if result.SchemaVersion != "1" || !validID(result.RequestIdentity) || !validOperation(result.Operation) || !validStatus(result.Status) || result.ProviderIdentity != "taf-context" || !validText(result.ProviderVersion, false) || !validSHA(result.RepositoryIdentity) || !validSHA(result.WorktreeIdentity) || !validObject(result.CommittedHead) || !validSHA(result.DirtyOverlayFingerprint) || !validFreshness(result.Freshness) || !validID(result.NextSafeAction) {
 		return ErrInvalidWire
 	}
 	if result.IndexIdentity != nil && !validSHA(*result.IndexIdentity) {

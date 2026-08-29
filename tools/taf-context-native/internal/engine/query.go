@@ -21,6 +21,9 @@ func (engine *Engine) query(ctx context.Context, roots *boundary.Roots, request 
 	if request.IndexIdentity == nil {
 		return engine.result(request, wire.Error, "unusable", nil, emptyCoverage(), "build-index"), nil
 	}
+	if snapshot, cached := engine.cachedSnapshot(request); cached {
+		return engine.querySnapshot(ctx, request, snapshot)
+	}
 	status, err := engine.dependencies.Inspect(ctx, roots)
 	if err != nil {
 		action := "rebuild-index"
@@ -65,6 +68,11 @@ func (engine *Engine) query(ctx context.Context, roots *boundary.Roots, request 
 		}
 		return engine.result(request, resultStatus, loadedFreshness, request.IndexIdentity, snapshot.Manifest.Coverage, loadedAction), nil
 	}
+	engine.rememberSnapshot(snapshot)
+	return engine.querySnapshot(ctx, request, snapshot)
+}
+
+func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, snapshot store.Snapshot) (wire.Result, error) {
 	var response query.Response
 	switch request.Operation {
 	case wire.RepositoryMap:

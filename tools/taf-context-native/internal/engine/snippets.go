@@ -45,46 +45,54 @@ func (engine *Engine) sourceSnippets(ctx context.Context, roots *boundary.Roots,
 	if request.IndexIdentity == nil {
 		return engine.result(request, wire.Error, "unusable", nil, emptyCoverage(), "build-index"), nil
 	}
-	status, err := engine.dependencies.Inspect(ctx, roots)
-	if contextErr := ctx.Err(); contextErr != nil {
-		return wire.Result{}, contextErr
-	}
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return wire.Result{}, err
+	snapshot, cached := engine.cachedSnapshot(request)
+	status := store.Status{}
+	if cached {
+		current, currentErr := engine.dependencies.CurrentGeneration(ctx, roots)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return wire.Result{}, contextErr
 		}
-		return engine.snippetUnavailable(request, err), nil
-	}
-	if err := ctx.Err(); err != nil {
-		return wire.Result{}, err
-	}
-	if freshness, _ := freshnessFor(request, status.Manifest, status.IndexIdentity, engine.dependencies.ParserIDs()); freshness != "exact" {
-		return engine.snippetStale(request, status.Manifest.Coverage), nil
-	}
-	if !validSnippetIdentity(status.GenerationIdentity) || status.GenerationIdentity != status.Manifest.GenerationIdentity {
-		return engine.snippetStale(request, status.Manifest.Coverage), nil
-	}
-	snapshot, err := engine.dependencies.Load(ctx, roots, status.IndexIdentity)
-	if contextErr := ctx.Err(); contextErr != nil {
-		return wire.Result{}, contextErr
-	}
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return wire.Result{}, err
+		if currentErr != nil || current != snapshot.Manifest.GenerationIdentity || !validSnippetIdentity(current) {
+			return engine.snippetStale(request, snapshot.Manifest.Coverage), nil
 		}
-		if errors.Is(err, store.ErrIndexMismatch) {
+	} else {
+		var err error
+		status, err = engine.dependencies.Inspect(ctx, roots)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return wire.Result{}, contextErr
+		}
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return wire.Result{}, err
+			}
+			return engine.snippetUnavailable(request, err), nil
+		}
+		if freshness, _ := freshnessFor(request, status.Manifest, status.IndexIdentity, engine.dependencies.ParserIDs()); freshness != "exact" {
 			return engine.snippetStale(request, status.Manifest.Coverage), nil
 		}
-		return engine.snippetUnavailable(request, err), nil
-	}
-	if err := ctx.Err(); err != nil {
-		return wire.Result{}, err
-	}
-	if snapshot.IndexIdentity != status.IndexIdentity || !validSnippetIdentity(snapshot.Manifest.GenerationIdentity) || snapshot.Manifest.GenerationIdentity != status.GenerationIdentity {
-		return engine.snippetStale(request, snapshot.Manifest.Coverage), nil
-	}
-	if freshness, _ := freshnessFor(request, snapshot.Manifest, snapshot.IndexIdentity, engine.dependencies.ParserIDs()); freshness != "exact" {
-		return engine.snippetStale(request, snapshot.Manifest.Coverage), nil
+		if !validSnippetIdentity(status.GenerationIdentity) || status.GenerationIdentity != status.Manifest.GenerationIdentity {
+			return engine.snippetStale(request, status.Manifest.Coverage), nil
+		}
+		snapshot, err = engine.dependencies.Load(ctx, roots, status.IndexIdentity)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return wire.Result{}, contextErr
+		}
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return wire.Result{}, err
+			}
+			if errors.Is(err, store.ErrIndexMismatch) {
+				return engine.snippetStale(request, status.Manifest.Coverage), nil
+			}
+			return engine.snippetUnavailable(request, err), nil
+		}
+		if snapshot.IndexIdentity != status.IndexIdentity || !validSnippetIdentity(snapshot.Manifest.GenerationIdentity) || snapshot.Manifest.GenerationIdentity != status.GenerationIdentity {
+			return engine.snippetStale(request, snapshot.Manifest.Coverage), nil
+		}
+		if freshness, _ := freshnessFor(request, snapshot.Manifest, snapshot.IndexIdentity, engine.dependencies.ParserIDs()); freshness != "exact" {
+			return engine.snippetStale(request, snapshot.Manifest.Coverage), nil
+		}
+		engine.rememberSnapshot(snapshot)
 	}
 
 	groups, err := resolveSnippetGroups(snapshot.Records, request.ResultIdentities)
@@ -107,26 +115,36 @@ func (engine *Engine) sourceSnippets(ctx context.Context, roots *boundary.Roots,
 	if err := ctx.Err(); err != nil {
 		return wire.Result{}, err
 	}
-	// The second inspection closes CURRENT/manifest/binding races across all
-	// repository reads. Any changed state invalidates every assembled preview.
-	after, err := engine.dependencies.Inspect(ctx, roots)
-	if contextErr := ctx.Err(); contextErr != nil {
-		return wire.Result{}, contextErr
-	}
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// A second current check closes state-selection races across all repository
+	// reads. Cached immutable bytes were already validated before retention.
+	if cached {
+		current, currentErr := engine.dependencies.CurrentGeneration(ctx, roots)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return wire.Result{}, contextErr
+		}
+		if currentErr != nil || current != snapshot.Manifest.GenerationIdentity {
+			return engine.snippetStale(request, snapshot.Manifest.Coverage), nil
+		}
+	} else {
+		after, err := engine.dependencies.Inspect(ctx, roots)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return wire.Result{}, contextErr
+		}
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return wire.Result{}, err
+			}
+			return engine.snippetStale(request, snapshot.Manifest.Coverage), nil
+		}
+		if err := ctx.Err(); err != nil {
 			return wire.Result{}, err
 		}
-		return engine.snippetStale(request, snapshot.Manifest.Coverage), nil
-	}
-	if err := ctx.Err(); err != nil {
-		return wire.Result{}, err
-	}
-	if after.IndexIdentity != status.IndexIdentity || !validSnippetIdentity(after.GenerationIdentity) || after.GenerationIdentity != status.GenerationIdentity || after.Manifest.GenerationIdentity != status.GenerationIdentity {
-		return engine.snippetStale(request, after.Manifest.Coverage), nil
-	}
-	if freshness, _ := freshnessFor(request, after.Manifest, after.IndexIdentity, engine.dependencies.ParserIDs()); freshness != "exact" {
-		return engine.snippetStale(request, after.Manifest.Coverage), nil
+		if after.IndexIdentity != status.IndexIdentity || !validSnippetIdentity(after.GenerationIdentity) || after.GenerationIdentity != status.GenerationIdentity || after.Manifest.GenerationIdentity != status.GenerationIdentity {
+			return engine.snippetStale(request, after.Manifest.Coverage), nil
+		}
+		if freshness, _ := freshnessFor(request, after.Manifest, after.IndexIdentity, engine.dependencies.ParserIDs()); freshness != "exact" {
+			return engine.snippetStale(request, after.Manifest.Coverage), nil
+		}
 	}
 
 	result := engine.result(request, wire.Ready, "exact", request.IndexIdentity, snapshot.Manifest.Coverage, "use-index")

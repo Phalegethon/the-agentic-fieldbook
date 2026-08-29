@@ -6,8 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/extract"
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
 
@@ -94,6 +100,55 @@ func TestBuildThenStatusAndMetricsAreExactAndDoNotLeakFindings(t *testing.T) {
 	}
 }
 
+func TestBuildExtractsIndependentFilesConcurrently(t *testing.T) {
+	repository, state := controlRoots(t)
+	for index := 0; index < 24; index++ {
+		path := filepath.Join(repository, fmt.Sprintf("parallel-%02d.go", index))
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("package sample\nfunc Parallel%d() {}\n", index)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	previous := runtime.GOMAXPROCS(4)
+	defer runtime.GOMAXPROCS(previous)
+	dependencies := ProductionDependencies()
+	extractFile := dependencies.Extract
+	var active, maximum int32
+	dependencies.Extract = func(ctx context.Context, file boundary.StableFile) ([]model.Record, extract.Report) {
+		current := atomic.AddInt32(&active, 1)
+		for observed := atomic.LoadInt32(&maximum); current > observed && !atomic.CompareAndSwapInt32(&maximum, observed, current); observed = atomic.LoadInt32(&maximum) {
+		}
+		time.Sleep(5 * time.Millisecond)
+		records, report := extractFile(ctx, file)
+		atomic.AddInt32(&active, -1)
+		return records, report
+	}
+	result, err := New(dependencies).Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil || result.Status != wire.Ready {
+		t.Fatalf("build = %#v, %v", result, err)
+	}
+	if maximum < 2 {
+		t.Fatalf("maximum concurrent extractions = %d, want at least 2", maximum)
+	}
+}
+
+func TestBuildReusesStableBodiesAlreadyReadByBuildInventory(t *testing.T) {
+	repository, state := controlRoots(t)
+	dependencies := ProductionDependencies()
+	open := dependencies.OpenFile
+	var extractionOpens int32
+	dependencies.OpenFile = func(roots *boundary.Roots, relative string, maximum int64) (boundary.StableFile, error) {
+		atomic.AddInt32(&extractionOpens, 1)
+		return open(roots, relative, maximum)
+	}
+	result, err := New(dependencies).Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil || result.Status != wire.Ready {
+		t.Fatalf("build = %#v, %v", result, err)
+	}
+	if extractionOpens != 0 {
+		t.Fatalf("extraction reopened %d inventory-stable bodies", extractionOpens)
+	}
+}
+
 func TestStatusAndMetricsRefuseMismatchedWorktreeAndAbsentState(t *testing.T) {
 	// This catches control reads that create/repair missing state or report an
 	// exact index after the request's worktree binding changes.
@@ -158,7 +213,7 @@ func controlEnvelope(operation wire.Operation, repository, state string, index *
 		SchemaVersion: "1", RequestIdentity: "request", ConsumerIdentity: "consumer", Operation: operation,
 		RepositoryIdentity: engineSHA, WorktreeIdentity: engineSHA,
 		CommittedHead: "0123456789abcdef0123456789abcdef01234567", DirtyOverlayFingerprint: engineSHA,
-		ProviderIdentity: "taf.native.level1", IndexIdentity: index, RequiredCapability: string(operation),
+		ProviderIdentity: "taf-context", IndexIdentity: index, RequiredCapability: string(operation),
 		MinimumFreshness: "exact", Filters: wire.Filters{}, MaximumResults: 64, MaximumModelOutputCharacters: 12000,
 	}}
 }

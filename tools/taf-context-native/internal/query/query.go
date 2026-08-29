@@ -92,17 +92,21 @@ func Search(snapshot store.Snapshot, request wire.Request, limits policy.Limits)
 			collector.intersect(ordinals, tier)
 		}
 	}
+	queryTokens := tokens(queryText)
 	probe("qualified/"+queryText, snapshot.Query.QualifiedOrdinals(queryText), 0)
-	if short := shortName(queryText); short != "" {
+	if short := shortName(queryText); short != "" && len(queryTokens) == 1 {
 		probe("short/"+short, snapshot.Query.ShortOrdinals(short), 1)
 	}
 	probe("token/"+queryText, snapshot.Query.TokenOrdinals(queryText), 2)
-	for _, token := range tokens(queryText) {
-		probe("token/"+token, snapshot.Query.TokenOrdinals(token), 2)
+	incompleteTerms := probeFallbackTerms(&collector, queryText, seenExactTerms)
+	// Treat a multi-token phrase as one intent. Unioning broad component words
+	// (for example "level" and "one") can exhaust the record budget and outrank
+	// the exact or fuzzy phrase the caller actually supplied.
+	if len(queryTokens) == 1 {
+		probe("token/"+queryTokens[0], snapshot.Query.TokenOrdinals(queryTokens[0]), 2)
 	}
 
 	incompleteSubstring := probeSubstringFrontier(&collector, queryText)
-	incompleteTerms := probeFallbackTerms(&collector, queryText, seenExactTerms)
 	selected, omitted := collector.ranking.records()
 	return budget.response(selected, omitted, plan.partial || collector.partial || incompleteSubstring || incompleteTerms || omitted > 0)
 }

@@ -24,7 +24,7 @@ func validRequest() Request {
 	return Request{
 		SchemaVersion: "1", RequestIdentity: "request-0001", ConsumerIdentity: "taf.work-recovery",
 		Operation: SearchSymbols, RepositoryIdentity: repositoryIdentity, WorktreeIdentity: worktreeIdentity,
-		CommittedHead: head, DirtyOverlayFingerprint: dirtyIdentity, ProviderIdentity: "taf.native.level1",
+		CommittedHead: head, DirtyOverlayFingerprint: dirtyIdentity, ProviderIdentity: "taf-context",
 		IndexIdentity: ptr(indexIdentity), RequiredCapability: "search-symbols", MinimumFreshness: "exact",
 		Query: ptr("RecoveryDossier"), ResultIdentities: []string{},
 		Filters:        Filters{PathPrefixes: []string{"tools/taf-context"}, Languages: []string{"Python"}, SymbolKinds: []string{"class"}, SourceTypes: []string{"source"}},
@@ -121,13 +121,13 @@ func TestDecodeEnvelopeRequiresPresentNonNullContractFields(t *testing.T) {
 	}
 }
 
-func TestDecodeEnvelopeEnforcesQueryRootsAndChangedPathDocument(t *testing.T) {
+func TestDecodeEnvelopeEnforcesRootsAndChangedPathDocument(t *testing.T) {
 	raw, _ := json.Marshal(validEnvelope())
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		t.Fatal(err)
 	}
-	for field, value := range map[string]json.RawMessage{"phase": json.RawMessage(`"inspect"`), "repository_root": json.RawMessage(`"relative"`), "state_root": json.RawMessage(`"relative"`), "changed_paths_document": json.RawMessage(`"bad\nvalue"`)} {
+	for field, value := range map[string]json.RawMessage{"repository_root": json.RawMessage(`"relative"`), "state_root": json.RawMessage(`"relative"`), "changed_paths_document": json.RawMessage(`"bad\nvalue"`)} {
 		copy := cloneRawMap(envelope)
 		copy[field] = value
 		encoded, _ := json.Marshal(copy)
@@ -135,6 +135,75 @@ func TestDecodeEnvelopeEnforcesQueryRootsAndChangedPathDocument(t *testing.T) {
 			t.Fatalf("accepted invalid %s", field)
 		}
 	}
+}
+
+func TestDecodeEnvelopeEnforcesAdvertisedPhaseOperationMapping(t *testing.T) {
+	cases := []struct {
+		phase     string
+		operation Operation
+	}{
+		{"build", Build},
+		{"estimate", Estimate},
+		{"inspect", StatusOperation},
+		{"metrics", Metrics},
+		{"update", Update},
+		{"query", RepositoryMap},
+		{"query", SearchDocs},
+		{"query", SearchSymbols},
+		{"query", SourceSnippets},
+	}
+	for _, item := range cases {
+		t.Run(item.phase+"-"+string(item.operation), func(t *testing.T) {
+			envelope := envelopeForOperation(item.phase, item.operation)
+			raw, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeEnvelope(bytes.NewReader(append(raw, '\n'))); err != nil {
+				t.Fatalf("rejected advertised phase/operation pair: %v", err)
+			}
+			envelope.Phase = mismatchedPhase(item.phase)
+			raw, err = json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeEnvelope(bytes.NewReader(append(raw, '\n'))); err == nil {
+				t.Fatal("accepted mismatched phase/operation pair")
+			}
+		})
+	}
+}
+
+func envelopeForOperation(phase string, operation Operation) Envelope {
+	envelope := validEnvelope()
+	envelope.Phase = phase
+	envelope.Request.Operation = operation
+	envelope.Request.RequiredCapability = string(operation)
+	envelope.Request.Query = nil
+	envelope.Request.ResultIdentities = []string{}
+	envelope.Request.Filters = Filters{PathPrefixes: []string{}, Languages: []string{}, SymbolKinds: []string{}, SourceTypes: []string{}}
+	if operation == Estimate || operation == Build {
+		envelope.Request.IndexIdentity = nil
+	}
+	if operation == SearchSymbols || operation == SearchDocs {
+		envelope.Request.Query = ptr("query")
+		envelope.Request.Filters = validRequest().Filters
+	}
+	if operation == RepositoryMap {
+		envelope.Request.Filters = validRequest().Filters
+	}
+	if operation == SourceSnippets {
+		envelope.Request.ResultIdentities = []string{resultIdentity}
+		envelope.Request.Filters = validRequest().Filters
+	}
+	return envelope
+}
+
+func mismatchedPhase(phase string) string {
+	if phase == "query" {
+		return "build"
+	}
+	return "query"
 }
 
 func TestRequestRequiresOperationCapabilityParity(t *testing.T) {
@@ -202,6 +271,9 @@ func TestRequestRejectsBadIdentitiesQueryResultRulesFiltersAndBudgets(t *testing
 	badBudget := validRequest()
 	badBudget.MaximumModelOutputCharacters = 2001
 	cases = append(cases, badBudget)
+	legacyProvider := validRequest()
+	legacyProvider.ProviderIdentity = "taf.native.level1"
+	cases = append(cases, legacyProvider)
 	for _, request := range cases {
 		if err := ValidateRequest(request); err == nil {
 			t.Fatalf("accepted invalid request: %+v", request)
@@ -212,7 +284,7 @@ func TestRequestRejectsBadIdentitiesQueryResultRulesFiltersAndBudgets(t *testing
 func validResult() Result {
 	return Result{
 		SchemaVersion: "1", RequestIdentity: "request-0001", Operation: SearchSymbols, Status: Ready,
-		ProviderIdentity: "taf.native.level1", ProviderVersion: "0.1.0", IndexIdentity: ptr(indexIdentity),
+		ProviderIdentity: "taf-context", ProviderVersion: "0.1.0", IndexIdentity: ptr(indexIdentity),
 		RepositoryIdentity: repositoryIdentity, WorktreeIdentity: worktreeIdentity, CommittedHead: head,
 		DirtyOverlayFingerprint: dirtyIdentity, Freshness: "exact", ParserVersions: map[string]string{"tree-sitter-python": "0.25.0"},
 		Coverage:      Coverage{PathCoverage: 1, LanguageCoverage: 1, IndexedPathCount: 1, ExclusionReasonCounts: map[string]int{}},
@@ -243,6 +315,28 @@ func TestEncodeResultCanonicalizesOneLineAndVerifiesOutputCharacters(t *testing.
 	}
 	if string(wire["output_characters"]) != "369" {
 		t.Fatalf("output characters = %s", wire["output_characters"])
+	}
+}
+
+func TestEncodeResultSortsObjectKeysRecursively(t *testing.T) {
+	result := validResult()
+	var encoded bytes.Buffer
+	if err := EncodeResult(&encoded, result); err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded.Bytes()))
+	decoder.UseNumber()
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		t.Fatal(err)
+	}
+	want, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append(want, '\n')
+	if !bytes.Equal(encoded.Bytes(), want) {
+		t.Fatalf("result is not canonical key order\n got: %.96s\nwant: %.96s", encoded.Bytes(), want)
 	}
 }
 

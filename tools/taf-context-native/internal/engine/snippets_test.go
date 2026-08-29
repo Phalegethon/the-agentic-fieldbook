@@ -58,6 +58,39 @@ func TestSourceSnippetsPropagatesCancellationFromInitialInspection(t *testing.T)
 	}
 }
 
+func TestCachedSourceSnippetsRevalidateThePointerWithoutReloadingTheGeneration(t *testing.T) {
+	repository, state := controlRoots(t)
+	dependencies := ProductionDependencies()
+	inspect, load := dependencies.Inspect, dependencies.Load
+	inspectCalls, loadCalls := 0, 0
+	dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+		inspectCalls++
+		return inspect(ctx, roots)
+	}
+	dependencies.Load = func(ctx context.Context, roots *boundary.Roots, identity string) (store.Snapshot, error) {
+		loadCalls++
+		return load(ctx, roots, identity)
+	}
+	cached := NewCached(dependencies)
+	built, err := cached.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := controlEnvelope(wire.SearchSymbols, repository, state, built.IndexIdentity)
+	query.Request.Query = testPtr("main")
+	searched, err := cached.Execute(context.Background(), query)
+	if err != nil || len(searched.Findings) == 0 {
+		t.Fatalf("search = %#v, %v", searched, err)
+	}
+	result, err := cached.Execute(context.Background(), snippetEnvelope(repository, state, built.IndexIdentity, searched.Findings[0].ResultIdentity))
+	if err != nil || result.Freshness != "exact" || len(result.Findings) != 1 {
+		t.Fatalf("cached snippets = %#v, %v", result, err)
+	}
+	if inspectCalls != 0 || loadCalls != 0 {
+		t.Fatalf("inspect=%d load=%d, want pointer-only cache revalidation", inspectCalls, loadCalls)
+	}
+}
+
 // This catches an output reduction that drops an oversized earlier requested
 // preview but exposes a later one. Snippet output must be a request-order
 // prefix, never a hole that changes which source evidence is presented.

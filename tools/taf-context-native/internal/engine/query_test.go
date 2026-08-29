@@ -37,6 +37,36 @@ func TestBuiltGenerationServesAllReadOnlyQueryOperations(t *testing.T) {
 	}
 }
 
+func TestCachedEngineValidatesAndLoadsAnUnchangedGenerationOnce(t *testing.T) {
+	repository, state := controlRoots(t)
+	base := New(ProductionDependencies())
+	built, err := base.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencies := ProductionDependencies()
+	inspect, load := dependencies.Inspect, dependencies.Load
+	inspectCalls, loadCalls := 0, 0
+	dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+		inspectCalls++
+		return inspect(ctx, roots)
+	}
+	dependencies.Load = func(ctx context.Context, roots *boundary.Roots, identity string) (store.Snapshot, error) {
+		loadCalls++
+		return load(ctx, roots, identity)
+	}
+	cached := NewCached(dependencies)
+	for index := 0; index < 2; index++ {
+		result, executeErr := cached.Execute(context.Background(), controlEnvelope(wire.RepositoryMap, repository, state, built.IndexIdentity))
+		if executeErr != nil || result.Freshness != "exact" || len(result.Findings) == 0 {
+			t.Fatalf("query %d = %#v, %v", index, result, executeErr)
+		}
+	}
+	if inspectCalls != 1 || loadCalls != 1 {
+		t.Fatalf("inspect=%d load=%d, want one validated materialization", inspectCalls, loadCalls)
+	}
+}
+
 func TestQueryRefusesStaleBindingWithoutFindings(t *testing.T) {
 	repository, state := controlRoots(t)
 	engine := New(ProductionDependencies())

@@ -1,0 +1,24 @@
+{
+  "schema_version": "1",
+  "adapter_identity": "taf.level1-native",
+  "adapter_version": "0.1.0",
+  "provider_identity": "taf-context",
+  "provider_version": "0.1.0",
+  "executable": "bin/taf-level1",
+  "arguments": [],
+  "capabilities": [
+    "build",
+    "estimate",
+    "metrics",
+    "repository-map",
+    "search-docs",
+    "search-symbols",
+    "source-snippets",
+    "status",
+    "update"
+  ],
+  "supported_phases": ["build", "estimate", "inspect", "metrics", "query", "update"],
+  "environment_allowlist": [],
+  "locality": "local",
+  "network_required": false
+}

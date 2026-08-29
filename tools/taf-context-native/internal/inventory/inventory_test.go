@@ -896,6 +896,9 @@ func TestCollectBuildSHA256MatchesBytes(t *testing.T) {
 	if got, want := result.Paths[0].SHA256, fmt.Sprintf("%x", digest); got != want {
 		t.Fatalf("SHA256 = %s, want %s", got, want)
 	}
+	if !result.Paths[0].BodyRetained || !bytes.Equal(result.Paths[0].Bytes, []byte(contents)) || result.FullBodyOpens != 0 {
+		t.Fatalf("small build body was not retained from the stable prefix read: %#v", result)
+	}
 }
 
 func TestCollectStopsAtPathAndByteLimitsWithoutClaimingCompleteness(t *testing.T) {
@@ -919,7 +922,7 @@ func TestCollectStopsAtPathAndByteLimitsWithoutClaimingCompleteness(t *testing.T
 	if result.Coverage.ExclusionReasonCounts[ExcludedLimit] != 0 || !result.UnknownRemainder || result.Coverage.PathCoverage != 0 {
 		t.Fatalf("path-limit result must represent an unknown conservative remainder: %#v", result)
 	}
-	if result.DirectoryEntries != 6 || result.PrefixBytes != uint64(2*len("package a\n")) || result.FullBodyOpens != 2 || result.FullBodyBytes != uint64(2*len("package a\n")) || len(result.Paths) > limits.MaximumEligiblePaths {
+	if result.DirectoryEntries != 6 || result.PrefixBytes != uint64(2*len("package a\n")) || result.FullBodyOpens != 0 || result.FullBodyBytes != 0 || len(result.Paths) > limits.MaximumEligiblePaths {
 		t.Fatalf("path ceiling performed unbounded work: %#v", result)
 	}
 

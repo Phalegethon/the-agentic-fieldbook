@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"runtime"
 	"sort"
+	"sync"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/extract"
@@ -20,6 +22,14 @@ import (
 const engineVersion = "0.1.0"
 
 const maximumAggregateRecordBytes = 64 << 20
+
+const maximumExtractionWorkers = 8
+
+type extractedPath struct {
+	records []model.Record
+	report  extract.Report
+	invalid bool
+}
 
 func (engine *Engine) estimate(ctx context.Context, roots *boundary.Roots, request wire.Request) (wire.Result, error) {
 	if err := ctx.Err(); err != nil {
@@ -48,19 +58,15 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 	records := make([]model.Record, 0)
 	aggregateBytes := 0
 	parserIDs := engine.dependencies.ParserIDs()
-	for _, item := range inventoryResult.Paths {
-		if err := ctx.Err(); err != nil {
-			return wire.Result{}, err
-		}
-		maximum := int64(productionLimits().MaximumSourceFileBytes)
-		if item.Language == "markdown" {
-			maximum = int64(productionLimits().MaximumMarkdownFileBytes)
-		}
-		file, openErr := engine.dependencies.OpenFile(roots, item.RelativePath, maximum)
-		if openErr != nil || file.RelativePath != item.RelativePath || file.Size != item.Size || file.SHA256 != item.SHA256 {
+	extracted, extractErr := engine.extractPaths(ctx, roots, inventoryResult.Paths)
+	if extractErr != nil {
+		return wire.Result{}, extractErr
+	}
+	for index, item := range inventoryResult.Paths {
+		fileRecords, report := extracted[index].records, extracted[index].report
+		if extracted[index].invalid {
 			return engine.result(request, wire.Error, "unknown", nil, coverage, "rebuild-index"), nil
 		}
-		fileRecords, report := engine.dependencies.Extract(ctx, file)
 		if err := ctx.Err(); err != nil {
 			return wire.Result{}, err
 		}
@@ -113,6 +119,7 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 		}
 		return engine.result(request, wire.Error, "unknown", nil, coverage, "rebuild-index"), nil
 	}
+	engine.rememberSnapshot(snapshot)
 	status, freshness, action := wire.Ready, "exact", "use-index"
 	if !completeCoverage(coverage, false) {
 		status, freshness, action = wire.Partial, "partial", "rebuild-index"
@@ -121,6 +128,51 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 	result.ParserVersions = cloneStrings(parserIDs)
 	result.Warnings = warnings
 	return result, nil
+}
+
+func (engine *Engine) extractPaths(ctx context.Context, roots *boundary.Roots, paths []inventory.Path) ([]extractedPath, error) {
+	results := make([]extractedPath, len(paths))
+	if len(paths) == 0 {
+		return results, ctx.Err()
+	}
+	workers := min(len(paths), maximumExtractionWorkers, max(1, runtime.GOMAXPROCS(0)))
+	jobs := make(chan int, len(paths))
+	for index := range paths {
+		jobs <- index
+	}
+	close(jobs)
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for range workers {
+		go func() {
+			defer wait.Done()
+			for index := range jobs {
+				if ctx.Err() != nil {
+					continue
+				}
+				item := paths[index]
+				maximum := int64(productionLimits().MaximumSourceFileBytes)
+				if item.Language == "markdown" {
+					maximum = int64(productionLimits().MaximumMarkdownFileBytes)
+				}
+				file := boundary.StableFile{RelativePath: item.RelativePath, Bytes: item.Bytes, SHA256: item.SHA256, Size: item.Size}
+				var err error
+				if !item.BodyRetained {
+					file, err = engine.dependencies.OpenFile(roots, item.RelativePath, maximum)
+				}
+				if err != nil || file.RelativePath != item.RelativePath || file.Size != item.Size || file.SHA256 != item.SHA256 || int64(len(file.Bytes)) != item.Size {
+					results[index].invalid = true
+					continue
+				}
+				results[index].records, results[index].report = engine.dependencies.Extract(ctx, file)
+			}
+		}()
+	}
+	wait.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 func sourceCatalog(result inventory.Result, extractionWarnings map[string][]string) model.SourceCatalog {
@@ -178,7 +230,7 @@ func (engine *Engine) result(request wire.Request, status wire.Status, freshness
 	}
 	return wire.Result{
 		SchemaVersion: "1", RequestIdentity: request.RequestIdentity, Operation: request.Operation,
-		Status: status, ProviderIdentity: "taf.native.level1", ProviderVersion: engineVersion, IndexIdentity: index,
+		Status: status, ProviderIdentity: "taf-context", ProviderVersion: engineVersion, IndexIdentity: index,
 		RepositoryIdentity: request.RepositoryIdentity, WorktreeIdentity: request.WorktreeIdentity, CommittedHead: request.CommittedHead,
 		DirtyOverlayFingerprint: request.DirtyOverlayFingerprint, Freshness: freshness,
 		ParserVersions: cloneStrings(engine.dependencies.ParserIDs()), Coverage: wireCoverage(coverage), Findings: []wire.Finding{},
