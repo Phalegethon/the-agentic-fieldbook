@@ -479,14 +479,19 @@ class RepositoryLayoutTest(unittest.TestCase):
             sorted(
                 path.relative_to(ROOT).as_posix()
                 for path in ROOT.rglob("*")
-                if ".git" not in path.relative_to(ROOT).parts
+                if not {".git", ".worktrees"}.intersection(
+                    path.relative_to(ROOT).parts
+                )
             )
         )
         public_files = tuple(
             sorted(
                 path.relative_to(ROOT)
                 for path in ROOT.rglob("*")
-                if path.is_file() and ".git" not in path.relative_to(ROOT).parts
+                if path.is_file()
+                and not {".git", ".worktrees"}.intersection(
+                    path.relative_to(ROOT).parts
+                )
             )
         )
         self.assertFalse(
