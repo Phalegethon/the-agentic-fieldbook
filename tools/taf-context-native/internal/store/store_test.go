@@ -1387,9 +1387,7 @@ func TestLoadAndInspectFailClosedOnCorruptionAndUnsafeState(t *testing.T) {
 			writeExisting(t, filepath.Join(state, currentFilename), []byte(strings.Repeat("f", 64)+"\n"))
 		}},
 		{name: "insecure current mode", mutate: func(t *testing.T, state string, _ Snapshot) {
-			if err := os.Chmod(filepath.Join(state, currentFilename), 0o644); err != nil {
-				t.Fatal(err)
-			}
+			makeInsecurePermissions(t, filepath.Join(state, currentFilename), 0o644)
 		}},
 		{name: "current symlink", mutate: func(t *testing.T, state string, _ Snapshot) {
 			path := filepath.Join(state, currentFilename)
@@ -1423,14 +1421,10 @@ func TestLoadAndInspectFailClosedOnCorruptionAndUnsafeState(t *testing.T) {
 			writeExisting(t, path, data[:len(data)-1])
 		}},
 		{name: "insecure generation mode", mutate: func(t *testing.T, state string, snapshot Snapshot) {
-			if err := os.Chmod(generationPath(state, snapshot.Manifest.GenerationIdentity), 0o755); err != nil {
-				t.Fatal(err)
-			}
+			makeInsecurePermissions(t, generationPath(state, snapshot.Manifest.GenerationIdentity), 0o755)
 		}},
 		{name: "insecure manifest mode", mutate: func(t *testing.T, state string, snapshot Snapshot) {
-			if err := os.Chmod(installedPath(state, snapshot.Manifest.GenerationIdentity, manifestFilename), 0o644); err != nil {
-				t.Fatal(err)
-			}
+			makeInsecurePermissions(t, installedPath(state, snapshot.Manifest.GenerationIdentity, manifestFilename), 0o644)
 		}},
 		{name: "generation symlink", mutate: func(t *testing.T, state string, snapshot Snapshot) {
 			path := generationPath(state, snapshot.Manifest.GenerationIdentity)
@@ -2069,6 +2063,9 @@ func TestConcurrentBuilderAndInspectorsExposeOnlyReadyGenerations(t *testing.T) 
 }
 
 func TestAtomicCurrentExtremeChurnNeverFalseCorrupts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows prevents replacing CURRENT while readers retain an open handle")
+	}
 	roots, state := storeRoots(t)
 	first := mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
 	second := mustBuild(t, roots, manifestVariant("b"), []model.Record{testRecord(testRecordB, "b.go", "B", []string{"b"})})
