@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import resource
 import signal
 import stat
 import subprocess
@@ -26,6 +25,11 @@ from .provider_execution_models import (
     InspectionRecord,
     parse_inspection_record,
 )
+
+try:
+    import resource as _resource
+except ModuleNotFoundError:  # Not provided by Python on Windows.
+    _resource = None
 
 
 _PROVIDER_REASON_CODES = frozenset({
@@ -243,7 +247,9 @@ def _execute(
 
 
 def _limit_output_files() -> None:
-    resource.setrlimit(resource.RLIMIT_FSIZE, (300 * 1024, 300 * 1024))
+    if _resource is None:
+        raise ProviderProcessError("provider-isolation-unavailable")
+    _resource.setrlimit(_resource.RLIMIT_FSIZE, (300 * 1024, 300 * 1024))
 
 
 def _isolated_command(
