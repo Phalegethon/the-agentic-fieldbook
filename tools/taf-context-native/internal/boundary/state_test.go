@@ -4,10 +4,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 func TestStateDirectoryCapabilitySurvivesLexicalRootReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows directory handles deny lexical root replacement")
+	}
 	repository := makeRepository(t)
 	base := t.TempDir()
 	state := filepath.Join(base, "state")

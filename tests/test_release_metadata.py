@@ -27,8 +27,8 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertIn("* text=auto eol=lf", attributes)
         self.assertIn("TMPDIR: ${{ runner.temp }}", workflow)
         self.assertIn("Prepare private Windows temp", workflow)
-        self.assertIn("/setowner", workflow)
-        self.assertIn("/inheritance:r", workflow)
+        self.assertIn("DirectorySecurity", workflow)
+        self.assertIn("SetAccessRuleProtection($true, $false)", workflow)
         self.assertIn("release_tag:", workflow)
         self.assertIn("tag_name:", workflow)
 

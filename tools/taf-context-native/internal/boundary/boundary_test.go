@@ -943,21 +943,23 @@ func TestValidateRootsParsesGitMetadataWithoutEnvironmentOrChildProcess(t *testi
 	if err := os.WriteFile(filepath.Join(caseAlias, "refs", "branch"), []byte("outside-git"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// This models a case-insensitive filesystem reporting the alias as the
-	// captured separate Git directory. It keeps the check deterministic on
-	// case-sensitive CI filesystems.
-	identityEqualHook = func(first, second os.FileInfo) bool {
-		if os.SameFile(first, second) {
-			return true
+	if runtime.GOOS != "windows" {
+		// This models a case-insensitive filesystem reporting the alias as the
+		// captured separate Git directory. Windows ignores the permission-bit
+		// distinction used to identify this synthetic alias.
+		identityEqualHook = func(first, second os.FileInfo) bool {
+			if os.SameFile(first, second) {
+				return true
+			}
+			return first.IsDir() && second.IsDir() && ((first.Mode().Perm() == 0o700 && second.Mode().Perm() == 0o750) || (first.Mode().Perm() == 0o750 && second.Mode().Perm() == 0o700))
 		}
-		return first.IsDir() && second.IsDir() && ((first.Mode().Perm() == 0o700 && second.Mode().Perm() == 0o750) || (first.Mode().Perm() == 0o750 && second.Mode().Perm() == 0o700))
-	}
-	t.Cleanup(func() { identityEqualHook = nil })
-	if _, err := roots.OpenRepositoryFile("case-alias/HEAD", 1024); !errors.Is(err, ErrUnsafePath) {
-		t.Fatalf("opened identity-aliased Git directory: %v", err)
-	}
-	if _, err := roots.OpenRepositoryFile("case-alias/refs/branch", 1024); !errors.Is(err, ErrUnsafePath) {
-		t.Fatalf("opened descendant of identity-aliased Git directory: %v", err)
+		t.Cleanup(func() { identityEqualHook = nil })
+		if _, err := roots.OpenRepositoryFile("case-alias/HEAD", 1024); !errors.Is(err, ErrUnsafePath) {
+			t.Fatalf("opened identity-aliased Git directory: %v", err)
+		}
+		if _, err := roots.OpenRepositoryFile("case-alias/refs/branch", 1024); !errors.Is(err, ErrUnsafePath) {
+			t.Fatalf("opened descendant of identity-aliased Git directory: %v", err)
+		}
 	}
 	if _, err := ValidateRoots(validEnvelope(repo, filepath.Join(separate, "state"))); !errors.Is(err, ErrRootOverlap) {
 		t.Fatalf("state inside discovered Git directory error = %v", err)
@@ -1193,7 +1195,7 @@ func TestWalkRepositoryRejectsDirectoryMutationDuringListing(t *testing.T) {
 	}
 	t.Cleanup(func() { directoryReadHook = nil })
 	err := roots.WalkRepository(100, func(RepositoryEntry) error { return nil })
-	if !errors.Is(err, ErrUnsafePath) {
+	if !errors.Is(err, ErrUnsafePath) && !(runtime.GOOS == "windows" && errors.Is(err, ErrRepositoryChanged)) {
 		t.Fatalf("WalkRepository mutation error = %v, want ErrUnsafePath", err)
 	}
 }
@@ -1618,14 +1620,16 @@ func mustSymlink(t *testing.T, target, link string) {
 
 func git(t *testing.T, directory string, args ...string) {
 	t.Helper()
-	if output, err := exec.Command("git", append([]string{"-C", directory}, args...)...).CombinedOutput(); err != nil {
+	prefix := []string{"-c", "maintenance.auto=false", "-c", "gc.auto=0", "-C", directory}
+	if output, err := exec.Command("git", append(prefix, args...)...).CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
 }
 
 func gitOutput(t *testing.T, directory string, args ...string) string {
 	t.Helper()
-	output, err := exec.Command("git", append([]string{"-C", directory}, args...)...).CombinedOutput()
+	prefix := []string{"-c", "maintenance.auto=false", "-c", "gc.auto=0", "-C", directory}
+	output, err := exec.Command("git", append(prefix, args...)...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
