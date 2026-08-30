@@ -588,7 +588,7 @@ func TestGitDiscoveryBindsInitialDotGitEntryIdentity(t *testing.T) {
 			}
 			after := snapshotDirectoryTree(t, originalMetadata)
 			if !reflect.DeepEqual(after, before) {
-				t.Fatal("Git discovery or repository read mutated original metadata")
+				t.Fatalf("Git discovery or repository read mutated original metadata\nbefore: %#v\nafter:  %#v", before, after)
 			}
 		})
 	}
