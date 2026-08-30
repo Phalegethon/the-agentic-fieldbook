@@ -227,6 +227,9 @@ func TestStateControlReaderRejectsHostileEntries(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
+			if runtime.GOOS == "windows" && name == "insecure-permissions" {
+				t.Skip("Windows ACLs are not changed by POSIX chmod mode bits")
+			}
 			roots := makeRoots(t)
 			if err := roots.EnsureState(); err != nil {
 				t.Fatal(err)
@@ -246,6 +249,9 @@ func TestStateControlReaderRejectsHostileEntries(t *testing.T) {
 	}
 
 	t.Run("stat-open-read-replacement", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows denies replacing a directory entry while its file handle is open")
+		}
 		roots := makeRoots(t)
 		if err := roots.EnsureState(); err != nil {
 			t.Fatal(err)

@@ -421,7 +421,7 @@ func (directory *StateDirectory) Sync() error {
 		_ = file.Close()
 		return ErrUnsafeRoot
 	}
-	if err := file.Sync(); err != nil {
+	if err := syncDirectory(file); err != nil {
 		_ = file.Close()
 		return fmt.Errorf("%w: %v", ErrUnsafeRoot, err)
 	}
