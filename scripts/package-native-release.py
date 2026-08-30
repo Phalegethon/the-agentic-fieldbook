@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         asset.chmod(0o755)
     digest = hashlib.sha256(asset.read_bytes()).hexdigest()
     checksum = output / f"{name}.sha256"
-    checksum.write_text(f"{digest}  {name}\n", encoding="ascii")
+    checksum.write_bytes(f"{digest}  {name}\n".encode("ascii"))
     sys.stdout.write(f"{asset}\n{checksum}\n")
     return 0
 
