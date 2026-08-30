@@ -97,6 +97,18 @@ func validateOwnerOnlyACL(descriptor uintptr) error {
 	if result == 0 || present == 0 || dacl == 0 {
 		return ErrUnsafeRoot
 	}
+	token, err := syscall.OpenCurrentProcessToken()
+	if err != nil {
+		return ErrUnsafeRoot
+	}
+	defer token.Close()
+	user, err := token.GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil {
+		return ErrUnsafeRoot
+	}
+	// Elevated Windows processes may assign Administrators as the object owner
+	// while granting access to the process user. Both identities are trusted.
+	currentUser := uintptr(unsafe.Pointer(user.User.Sid))
 	var details aclSizeInformation
 	result, _, _ = getAclInformation.Call(dacl, uintptr(unsafe.Pointer(&details)), unsafe.Sizeof(details), aclSizeInformationClass)
 	if result == 0 {
@@ -116,7 +128,7 @@ func validateOwnerOnlyACL(descriptor uintptr) error {
 			return ErrUnsafeRoot
 		}
 		sid := uintptr(unsafe.Add(ace, 8))
-		if sidEqual(sid, owner) || privilegedSystemSID(sid) {
+		if sidEqual(sid, owner) || sidEqual(sid, currentUser) || privilegedSystemSID(sid) {
 			continue
 		}
 		return ErrUnsafeRoot

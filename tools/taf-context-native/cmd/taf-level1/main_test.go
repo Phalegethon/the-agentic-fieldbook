@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -159,8 +161,9 @@ func (writer errWriter) Write([]byte) (int, error) { return 0, writer.err }
 
 func framedEnvelope(t *testing.T) string {
 	t.Helper()
+	root := filepath.VolumeName(os.TempDir()) + string(filepath.Separator)
 	encoded, err := json.Marshal(wire.Envelope{
-		Phase: "estimate", RepositoryRoot: "/repository", StateRoot: "/state",
+		Phase: "estimate", RepositoryRoot: filepath.Join(root, "repository"), StateRoot: filepath.Join(root, "state"),
 		Request: wire.Request{
 			SchemaVersion: "1", RequestIdentity: "native-cli-001", ConsumerIdentity: "taf.work-recovery",
 			Operation: wire.Estimate, RepositoryIdentity: cliSHA, WorktreeIdentity: cliSHA,

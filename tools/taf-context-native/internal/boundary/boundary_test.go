@@ -103,6 +103,9 @@ func TestValidateRootsCreatesPrivateStateWithoutModifyingRepository(t *testing.T
 }
 
 func TestRootsKeepRepositoryHandleAfterPathReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows directory handles deny lexical root replacement")
+	}
 	repo := makeRepository(t)
 	if err := os.WriteFile(filepath.Join(repo, "safe.go"), []byte("trusted"), 0o600); err != nil {
 		t.Fatal(err)
@@ -132,6 +135,9 @@ func TestRootsKeepRepositoryHandleAfterPathReplacement(t *testing.T) {
 }
 
 func TestRootsKeepStateHandleAfterPathReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows directory handles deny lexical root replacement")
+	}
 	repo := makeRepository(t)
 	state := filepath.Join(t.TempDir(), "state")
 	if err := os.Mkdir(state, 0o700); err != nil {
@@ -1020,13 +1026,15 @@ func TestOpenRepositoryFileRejectsSymlinksAndSpecialFiles(t *testing.T) {
 		}
 	}
 
-	fifo := filepath.Join(roots.Repository, "events.fifo")
-	if err := exec.Command("mkfifo", fifo).Run(); err == nil {
-		if _, err := roots.OpenRepositoryFile("events.fifo", 1024); !errors.Is(err, ErrUnsafePath) {
-			t.Fatalf("FIFO error = %v, want ErrUnsafePath", err)
+	if runtime.GOOS != "windows" {
+		fifo := filepath.Join(roots.Repository, "events.fifo")
+		if err := exec.Command("mkfifo", fifo).Run(); err == nil {
+			if _, err := roots.OpenRepositoryFile("events.fifo", 1024); !errors.Is(err, ErrUnsafePath) {
+				t.Fatalf("FIFO error = %v, want ErrUnsafePath", err)
+			}
+		} else {
+			t.Logf("cannot create FIFO: %v", err)
 		}
-	} else {
-		t.Logf("cannot create FIFO: %v", err)
 	}
 
 	socket := filepath.Join(roots.Repository, "service.sock")
@@ -1110,6 +1118,9 @@ func TestOpenRepositoryFileRejectsGitMetadata(t *testing.T) {
 }
 
 func TestWalkRepositoryUsesCapturedRootAndDoesNotFollowLinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows directory handles deny lexical root replacement")
+	}
 	repository := makeRepository(t)
 	if err := os.WriteFile(filepath.Join(repository, "safe.go"), []byte("trusted"), 0o600); err != nil {
 		t.Fatal(err)

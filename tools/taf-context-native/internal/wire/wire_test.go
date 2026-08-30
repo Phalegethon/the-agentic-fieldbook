@@ -33,7 +33,8 @@ func validRequest() Request {
 }
 
 func validEnvelope() Envelope {
-	return Envelope{Phase: "query", RepositoryRoot: "/repo", StateRoot: "/state", Request: validRequest()}
+	root := filepath.VolumeName(os.TempDir()) + string(filepath.Separator)
+	return Envelope{Phase: "query", RepositoryRoot: filepath.Join(root, "repo"), StateRoot: filepath.Join(root, "state"), Request: validRequest()}
 }
 
 func ptr(value string) *string { return &value }

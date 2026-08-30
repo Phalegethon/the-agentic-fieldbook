@@ -95,7 +95,11 @@ func TestNativeExecutableTurnsAClosedStdoutIntoTheSafeOutputFailure(t *testing.T
 
 func buildNativeBinary(t *testing.T) string {
 	t.Helper()
-	binary := filepath.Join(t.TempDir(), "taf-level1")
+	name := "taf-level1"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	binary := filepath.Join(t.TempDir(), name)
 	command := exec.Command("go", "build", "-mod=vendor", "-trimpath", "-o", binary, "../cmd/taf-level1")
 	command.Dir = "."
 	if output, err := command.CombinedOutput(); err != nil {

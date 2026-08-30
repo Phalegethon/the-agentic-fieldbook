@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
@@ -82,15 +83,20 @@ func TestCollectClassifiesAndBoundsFilesDeterministically(t *testing.T) {
 	if err := os.Symlink(filepath.Join(repository, "source.go"), filepath.Join(repository, "linked.go")); err != nil {
 		t.Fatal(err)
 	}
+	socketCreated := false
 	if runtime.GOOS != "windows" {
 		if err := os.Mkdir(filepath.Join(repository, "special"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		listener, err := net.Listen("unix", filepath.Join(repository, "special.sock"))
-		if err != nil {
+		if err == nil {
+			socketCreated = true
+			defer listener.Close()
+		} else if runtime.GOOS == "darwin" && errors.Is(err, syscall.EINVAL) {
+			t.Logf("cannot create Unix socket fixture: %v", err)
+		} else {
 			t.Fatal(err)
 		}
-		defer listener.Close()
 	}
 
 	result := mustCollect(t, repository, ModeBuild)
@@ -113,7 +119,7 @@ func TestCollectClassifiesAndBoundsFilesDeterministically(t *testing.T) {
 	assertExclusion(t, result, "too-large.go", ExcludedOversized)
 	assertExclusion(t, result, "too-large.md", ExcludedOversized)
 	assertExclusion(t, result, "linked.go", ExcludedUnsafe)
-	if runtime.GOOS != "windows" {
+	if socketCreated {
 		assertExclusion(t, result, "special.sock", ExcludedUnsafe)
 	}
 	if !sort.SliceIsSorted(result.Paths, func(i, j int) bool { return result.Paths[i].RelativePath < result.Paths[j].RelativePath }) {
@@ -238,6 +244,9 @@ func TestCollectPreservesTrackedDescendantOfIgnoredDirectory(t *testing.T) {
 }
 
 func TestCollectParsesSignificantSpacesEscapesAndBracketRanges(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows filenames cannot contain the literal wildcard fixtures")
+	}
 	repository := newRepository(t)
 	writeFile(t, repository, ".gitignore", strings.Join([]string{
 		"plain.go   ",
@@ -458,6 +467,9 @@ func TestParseGitIndexValidatesV2V3AndCompressedV4Entries(t *testing.T) {
 }
 
 func TestParseGitIndexAcceptsRealGitV4WithMultiByteCompression(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the legacy Windows runner path limit rejects this long-name fixture")
+	}
 	repository := t.TempDir()
 	runGit := func(arguments ...string) {
 		t.Helper()

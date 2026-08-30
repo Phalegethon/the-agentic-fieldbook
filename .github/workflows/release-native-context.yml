@@ -54,6 +54,8 @@ jobs:
           $privateTemp = Join-Path $env:RUNNER_TEMP "taf-private"
           New-Item -ItemType Directory -Force -Path $privateTemp | Out-Null
           $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          icacls $privateTemp /setowner "*$userSid"
+          if ($LASTEXITCODE -ne 0) { throw "failed to own Windows temp" }
           icacls $privateTemp /inheritance:r /grant:r "*$($userSid):(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
           if ($LASTEXITCODE -ne 0) { throw "failed to secure Windows temp" }
           "TEMP=$privateTemp" >> $env:GITHUB_ENV
