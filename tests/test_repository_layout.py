@@ -12,6 +12,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).parents[1]
 SKILL = ROOT / "skills" / "branch-handoff"
 WORK_RECOVERY_SKILL = ROOT / "skills" / "work-recovery"
+PREPARE_REPO_CONTEXT_SKILL = ROOT / "skills" / "prepare-repo-context"
 EXPECTED_TAF_CONTEXT_FILES = {
     "__init__.py",
     "__main__.py",
@@ -34,6 +35,7 @@ EXPECTED_TAF_CONTEXT_FILES = {
     "provider_models.py",
     "provider_process.py",
     "provider_state.py",
+    "prepare_cli.py",
     "routing.py",
     "recovery.py",
     "recovery_cli.py",
@@ -290,6 +292,15 @@ class RepositoryLayoutTest(unittest.TestCase):
         self.assertTrue((WORK_RECOVERY_SKILL / "scripts" / "runtime-manifest.json").is_file())
         self.assertTrue((WORK_RECOVERY_SKILL / "references" / "recovery-contract.md").is_file())
 
+    def test_prepare_repo_context_exposes_one_runnable_skill_entrypoint(self) -> None:
+        self.assertTrue((PREPARE_REPO_CONTEXT_SKILL / "SKILL.md").is_file())
+        self.assertTrue(
+            (PREPARE_REPO_CONTEXT_SKILL / "scripts" / "prepare_repo_context.py").is_file()
+        )
+        self.assertTrue(
+            (PREPARE_REPO_CONTEXT_SKILL / "agents" / "openai.yaml").is_file()
+        )
+
     def test_claude_marketplace_exposes_only_the_taf_product(self) -> None:
         marketplace = json.loads(
             (ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
@@ -318,7 +329,7 @@ class RepositoryLayoutTest(unittest.TestCase):
             with self.subTest(manifest=relative.as_posix()):
                 plugin = json.loads((ROOT / relative).read_text(encoding="utf-8"))
                 self.assertEqual("taf", plugin["name"])
-                self.assertEqual("2.0.0", plugin["version"])
+                self.assertEqual("2.1.0", plugin["version"])
                 self.assertEqual("MIT", plugin["license"])
                 self.assertEqual("Gürkan Süerdem", plugin["author"]["name"])
                 self.assertEqual(

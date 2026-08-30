@@ -9,9 +9,10 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 SKILL = ROOT / "skills" / "branch-handoff"
 WORK_RECOVERY = ROOT / "skills" / "work-recovery"
-TAF_VERSION = "2.0.0"
+TAF_VERSION = "2.1.0"
 SKILL_VERSIONS = {
     "branch-handoff": "1.2.1",
+    "prepare-repo-context": "1.0.0",
     "work-recovery": "1.0.1",
 }
 
@@ -91,12 +92,14 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertIn("recover", entry["description"].lower())
         self.assertIn("/taf:branch-handoff", entry["description"])
         self.assertIn("/taf:work-recovery", entry["description"])
+        self.assertIn("/taf:prepare-repo-context", entry["description"])
         self.assertLessEqual(len(entry["description"]), 200)
 
     def test_readme_publishes_one_taf_install_migration_and_update_path(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("## [2.0.0] - 2026-08-27", changelog)
+        self.assertIn("## [2.1.0] - 2026-08-30", changelog)
         for required in (
             "Install TAF once",
             "## Install TAF",
@@ -104,6 +107,7 @@ class ReleaseMetadataTest(unittest.TestCase):
             "codex plugin add taf@the-agentic-fieldbook",
             "/taf:branch-handoff",
             "/taf:work-recovery",
+            "/taf:prepare-repo-context",
             "## Migrate to TAF 2.0",
             "## Update TAF",
             "/plugin update taf@the-agentic-fieldbook",
@@ -143,6 +147,7 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertNotIn("## Update `branch-handoff`", readme)
         self.assertIn("## Use branch-handoff", readme)
         self.assertIn("## Use work-recovery", readme)
+        self.assertIn("## Use prepare-repo-context", readme)
         for phrase in (
             "optional Jira and GitHub context",
             "Git and Python 3",
@@ -150,6 +155,7 @@ class ReleaseMetadataTest(unittest.TestCase):
             "compact continuation prompt",
             "does not build or update an index",
             "does not run tests",
+            "does not load the full repository into model context",
         ):
             self.assertIn(phrase.lower(), normalized)
 

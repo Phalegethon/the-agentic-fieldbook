@@ -1,0 +1,472 @@
+"""User-facing tests for preparing bounded repository context."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from io import StringIO
+import json
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from unittest import mock
+
+from taf_context.cli import main
+from taf_context.prepare_cli import PrepareCLIError, _platform_asset, _state_paths
+
+from .repo_factory import init_committed_repo
+
+
+ROOT = Path(__file__).parents[2]
+
+
+FIXED_NOW = datetime(2026, 8, 30, 18, 0, 0, tzinfo=timezone.utc)
+
+
+def invoke(environment: dict[str, str], *argv: str) -> tuple[int, str, str]:
+    stdout = StringIO()
+    stderr = StringIO()
+    code = main(
+        list(argv),
+        stdout=stdout,
+        stderr=stderr,
+        utc_clock=lambda: FIXED_NOW,
+        environment=environment,
+    )
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def decoded(stdout: str) -> dict[str, object]:
+    value = json.loads(stdout)
+    if not isinstance(value, dict):
+        raise AssertionError("stdout was not a JSON object")
+    return value
+
+
+def write_fake_native_engine(path: Path, invocation_log: Path | None = None) -> None:
+    source = textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import hashlib
+            import json
+            from pathlib import Path
+            import sys
+
+            envelope = json.loads(sys.stdin.read())
+            request = envelope["request"]
+            operation = request["operation"]
+            state = Path(envelope["state_root"])
+            invocation_log = __INVOCATION_LOG__
+            if invocation_log is not None:
+                with Path(invocation_log).open("a", encoding="utf-8") as stream:
+                    stream.write(operation + "\\n")
+            if operation == "build":
+                state.mkdir(parents=True, exist_ok=True)
+                (state / "fake-index").write_text("ready", encoding="utf-8")
+            ready = operation == "build" or (
+                operation in {
+                    "status",
+                    "repository-map",
+                    "search-symbols",
+                    "search-docs",
+                    "source-snippets",
+                }
+                and (state / "fake-index").is_file()
+            )
+            payload = {
+                "schema_version": "1",
+                "request_identity": request["request_identity"],
+                "operation": operation,
+                "status": "ready" if ready else "partial",
+                "provider_identity": "taf-context",
+                "provider_version": "0.1.0",
+                "index_identity": (
+                    "sha256:" + hashlib.sha256(b"fake-index").hexdigest()
+                    if operation == "build" else request["index_identity"]
+                    if ready else None
+                ),
+                "repository_identity": request["repository_identity"],
+                "worktree_identity": request["worktree_identity"],
+                "committed_head": request["committed_head"],
+                "dirty_overlay_fingerprint": request["dirty_overlay_fingerprint"],
+                "freshness": "exact" if ready else "partial",
+                "parser_versions": {},
+                "coverage": {
+                    "path_coverage": 1.0,
+                    "language_coverage": 1.0,
+                    "indexed_path_count": 1,
+                    "excluded_path_count": 0,
+                    "unsupported_language_count": 0,
+                    "parse_failure_count": 0,
+                    "exclusion_reason_counts": {},
+                },
+                "findings": [],
+                "returned_count": 0,
+                "omitted_count": 0,
+                "truncated": False,
+                "output_characters": 0,
+                "warnings": [],
+                "next_safe_action": "use-index" if ready else "build-index",
+            }
+            sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\\n")
+            """
+        ).replace("__INVOCATION_LOG__", repr(None if invocation_log is None else str(invocation_log)))
+    path.write_text(source, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+class PrepareRepoContextCommandTests(unittest.TestCase):
+    def test_explicit_state_home_does_not_require_posix_home_variable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = _state_paths({"TAF_STATE_HOME": directory})
+
+        self.assertEqual(paths.root, Path(directory))
+
+    def test_unpublished_windows_arm_runtime_is_reported_as_unsupported(self) -> None:
+        with mock.patch("taf_context.prepare_cli.sys.platform", "win32"), mock.patch(
+            "taf_context.prepare_cli.platform.machine", return_value="ARM64"
+        ):
+            with self.assertRaisesRegex(PrepareCLIError, "unsupported"):
+                _platform_asset()
+
+    def test_activate_downloads_verified_runtime_builds_context_and_is_reusable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            release = root / "release"
+            release.mkdir()
+            source_binary = root / "source-taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(source_binary, invocation_log)
+            payload = source_binary.read_bytes()
+            for system in ("darwin", "linux", "windows"):
+                for machine in ("amd64", "arm64"):
+                    suffix = ".exe" if system == "windows" else ""
+                    name = f"taf-level1_0.1.0_{system}_{machine}{suffix}"
+                    (release / name).write_bytes(payload)
+                    (release / f"{name}.sha256").write_text(
+                        f"{hashlib.sha256(payload).hexdigest()}  {name}\n",
+                        encoding="ascii",
+                    )
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_NATIVE_RELEASE_BASE_URL": "http://attacker.invalid",
+                "TAF_STATE_HOME": str(state_home),
+            }
+
+            denied = invoke(
+                environment,
+                "prepare",
+                "activate",
+                "--repo",
+                str(repo),
+            )
+            self.assertEqual(denied[0], 2)
+            self.assertIn("explicit network confirmation required", denied[2])
+            self.assertFalse(state_home.exists())
+
+            with mock.patch(
+                "taf_context.prepare_cli._NATIVE_RELEASE_BASE_URL",
+                release.as_uri(),
+                create=True,
+            ):
+                code, stdout, stderr = invoke(
+                    environment,
+                    "prepare",
+                    "activate",
+                    "--repo",
+                    str(repo),
+                    "--confirm-network",
+                    "--confirm-state-write",
+                )
+            self.assertEqual((code, stderr), (0, ""))
+            activated = decoded(stdout)
+            self.assertEqual(activated["mode"], "activate")
+            self.assertEqual(activated["context"]["status"], "ready")
+            self.assertEqual(activated["next_safe_action"], "use-index")
+            self.assertEqual(activated["required_authorizations"], [])
+
+            code, stdout, stderr = invoke(
+                {key: value for key, value in environment.items() if key != "TAF_NATIVE_RELEASE_BASE_URL"},
+                "prepare",
+                "inspect",
+                "--repo",
+                str(repo),
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            inspected = decoded(stdout)
+            self.assertEqual(inspected["engine"]["source"], "managed")
+            self.assertEqual(inspected["context"]["status"], "ready")
+            self.assertEqual(inspected["next_safe_action"], "use-index")
+            self.assertEqual(inspected["required_authorizations"], [])
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["build", "status"],
+            )
+
+    def test_ready_context_can_be_queried_without_rebuilding_or_estimating(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+
+            built = invoke(
+                environment,
+                "prepare",
+                "build",
+                "--repo",
+                str(repo),
+                "--confirm-state-write",
+            )
+            self.assertEqual((built[0], built[2]), (0, ""))
+
+            code, stdout, stderr = invoke(
+                environment,
+                "prepare",
+                "query",
+                "--repo",
+                str(repo),
+                "--operation",
+                "search-symbols",
+                "--query",
+                "Widget",
+                "--maximum-results",
+                "3",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["mode"], "query")
+            self.assertEqual(result["operation"], "search-symbols")
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["required_authorizations"], [])
+            self.assertLessEqual(len(stdout), 4000)
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["build", "status", "search-symbols"],
+            )
+
+    def test_query_requires_an_existing_exact_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log)
+
+            code, stdout, stderr = invoke(
+                {
+                    "TAF_LEVEL1_BINARY": str(native),
+                    "TAF_STATE_HOME": str(root / "state"),
+                },
+                "prepare",
+                "query",
+                "--repo",
+                str(repo),
+                "--operation",
+                "repository-map",
+            )
+
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn("ready context is required", stderr)
+            self.assertFalse(invocation_log.exists())
+
+    def test_activate_rejects_corrupt_download_without_installing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            release = root / "release"
+            release.mkdir()
+            for system in ("darwin", "linux", "windows"):
+                for machine in ("amd64", "arm64"):
+                    suffix = ".exe" if system == "windows" else ""
+                    name = f"taf-level1_0.1.0_{system}_{machine}{suffix}"
+                    (release / name).write_bytes(b"corrupt")
+                    (release / f"{name}.sha256").write_text(
+                        f"{'0' * 64}  {name}\n", encoding="ascii"
+                    )
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_NATIVE_RELEASE_BASE_URL": "http://attacker.invalid",
+                "TAF_STATE_HOME": str(state_home),
+            }
+
+            with mock.patch(
+                "taf_context.prepare_cli._NATIVE_RELEASE_BASE_URL",
+                release.as_uri(),
+                create=True,
+            ):
+                code, _stdout, stderr = invoke(
+                    environment,
+                    "prepare",
+                    "activate",
+                    "--repo",
+                    str(repo),
+                    "--confirm-network",
+                    "--confirm-state-write",
+                )
+
+            self.assertEqual(code, 2)
+            self.assertIn("native engine checksum mismatch", stderr)
+            self.assertFalse(any(state_home.rglob("taf-level1")))
+
+    def test_plugin_skill_entrypoint_runs_inspect_in_a_real_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": str(root / "home"),
+                    "PATH": str(Path(shutil.which("git") or "/usr/bin/git").parent),
+                    "TAF_STATE_HOME": str(root / "state"),
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        ROOT
+                        / "skills"
+                        / "prepare-repo-context"
+                        / "scripts"
+                        / "prepare_repo_context.py"
+                    ),
+                    "inspect",
+                    "--repo",
+                    str(repo),
+                ],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual((completed.returncode, completed.stderr), (0, ""))
+            self.assertEqual(decoded(completed.stdout)["next_safe_action"], "install-native-engine")
+
+    def test_inspect_without_native_engine_is_read_only_and_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_STATE_HOME": str(state_home),
+            }
+
+            code, stdout, stderr = invoke(
+                environment,
+                "prepare",
+                "inspect",
+                "--repo",
+                str(repo),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["mode"], "inspect")
+            self.assertEqual(result["repository"]["tracked_file_count"], 1)
+            self.assertFalse(result["repository"]["dirty"])
+            self.assertEqual(result["engine"]["availability"], "unavailable")
+            self.assertEqual(result["next_safe_action"], "install-native-engine")
+            self.assertEqual(result["required_authorizations"], ["network", "state-write"])
+            self.assertFalse(state_home.exists())
+            self.assertLessEqual(len(stdout), 4000)
+
+    def test_inspect_uses_available_native_engine_without_persistent_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            binary = root / "taf-level1"
+            write_fake_native_engine(binary)
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_LEVEL1_BINARY": str(binary),
+                "TAF_STATE_HOME": str(state_home),
+            }
+
+            code, stdout, stderr = invoke(
+                environment,
+                "prepare",
+                "inspect",
+                "--repo",
+                str(repo),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["engine"]["availability"], "available")
+            self.assertEqual(result["estimate"]["eligible_path_count"], 1)
+            self.assertEqual(result["context"]["freshness"], "partial")
+            self.assertEqual(result["next_safe_action"], "build-index")
+            self.assertEqual(result["required_authorizations"], ["state-write"])
+            self.assertFalse(state_home.exists())
+
+    def test_build_requires_explicit_write_confirmation_then_returns_ready_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            binary = root / "taf-level1"
+            write_fake_native_engine(binary)
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_LEVEL1_BINARY": str(binary),
+                "TAF_STATE_HOME": str(state_home),
+            }
+
+            denied = invoke(
+                environment,
+                "prepare",
+                "build",
+                "--repo",
+                str(repo),
+            )
+            self.assertEqual(denied[0], 2)
+            self.assertIn("explicit state-write confirmation required", denied[2])
+            self.assertFalse(state_home.exists())
+
+            code, stdout, stderr = invoke(
+                environment,
+                "prepare",
+                "build",
+                "--repo",
+                str(repo),
+                "--confirm-state-write",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["mode"], "build")
+            self.assertEqual(result["context"]["status"], "ready")
+            self.assertEqual(result["context"]["freshness"], "exact")
+            self.assertEqual(result["next_safe_action"], "use-index")
+            self.assertEqual(result["required_authorizations"], [])
+            self.assertTrue(state_home.is_dir())
+
+
+if __name__ == "__main__":
+    unittest.main()

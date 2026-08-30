@@ -37,6 +37,7 @@ from .models import (
     canonical_json,
 )
 from .provider_cli import register_provider_commands, run_provider_command
+from .prepare_cli import register_prepare_command, run_prepare_command
 from .recovery import RecoveryError
 from .recovery_cli import register_recovery_command, run_recovery_command
 
@@ -91,6 +92,12 @@ def main(
                 environment=environment,
                 utc_clock=utc_clock,
             )
+        elif args.command == "prepare":
+            result = run_prepare_command(
+                args,
+                environment=environment,
+                utc_clock=utc_clock,
+            )
         elif args.command == "recover":
             stdout.write(run_recovery_command(args))
             return 0
@@ -130,6 +137,7 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("--manifest", required=True)
     register_provider_commands(commands)
     register_recovery_command(commands)
+    register_prepare_command(commands)
     return parser
 
 

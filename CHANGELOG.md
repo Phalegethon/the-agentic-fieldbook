@@ -3,6 +3,22 @@
 All notable TAF product releases and their bundled skill versions are recorded
 here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
+## [2.1.0] - 2026-08-30
+
+### Added
+
+- `prepare-repo-context` 1.0.0 with read-only provider/index inspection,
+  bounded native estimates, explicit write/network gates, and reusable
+  repository/worktree-bound state and read-only evidence queries.
+- Checksum-verified native runtime acquisition for supported macOS, Linux, and
+  Windows targets, plus tagged-release asset automation.
+
+### Changed
+
+- The unified TAF plugin now exposes three independently loaded skills.
+- Repository context remains outside the model context; only compact lifecycle
+  summaries and bounded query results cross the agent boundary.
+
 ## [2.0.0] - 2026-08-27
 
 ### Added

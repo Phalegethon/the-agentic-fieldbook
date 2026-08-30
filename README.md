@@ -15,11 +15,13 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.0.0 | Inspect providers, prepare a reusable native index, and run bounded evidence queries without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.0.1 | Recover interrupted work and the single best next step from bounded, read-only Git evidence. |
 
-Claude Code exposes these as `/taf:branch-handoff` and
-`/taf:work-recovery`. Codex uses the corresponding plugin-qualified TAF
-skills and can select them automatically for relevant requests.
+Claude Code exposes these as `/taf:branch-handoff`,
+`/taf:prepare-repo-context`, and `/taf:work-recovery`. Codex uses the
+corresponding plugin-qualified TAF skills and can select them automatically
+for relevant requests.
 
 Planned names such as `pr-summary`, `release-risk`, `incident-brief`, and
 `dependency-audit` are roadmap items, not shipped skills.
@@ -36,7 +38,7 @@ Add the TAF marketplace, install the single plugin, and reload:
 /reload-plugins
 ```
 
-Open the plugin details to see both contained skills. Installing TAF makes the
+Open the plugin details to see all contained skills. Installing TAF makes the
 collection discoverable; Claude reads a full `SKILL.md` only when that skill
 is invoked or selected.
 
@@ -50,7 +52,8 @@ codex plugin add taf@the-agentic-fieldbook
 ```
 
 In the Codex app, the same plugin can then present
-`taf:branch-handoff` and `taf:work-recovery` beneath TAF. The repository
+`taf:branch-handoff`, `taf:prepare-repo-context`, and `taf:work-recovery`
+beneath TAF. The repository
 contains a native `.codex-plugin/plugin.json`; no copied aggregate skill
 bundle is created.
 
@@ -86,7 +89,8 @@ plugins with one `taf` plugin. Run this clean migration in order:
 ```
 
 The old namespaces are intentionally not retained. After reloading, verify that
-`/taf:branch-handoff` and `/taf:work-recovery` appear under the TAF plugin.
+`/taf:branch-handoff`, `/taf:prepare-repo-context`, and `/taf:work-recovery`
+appear under the TAF plugin.
 Historical Git tags remain available if an installation must be recovered, but
 TAF 2.x is the supported product line.
 
@@ -193,12 +197,40 @@ Default boundaries:
 Runtime requirements are Git and Python 3. The bundled collector uses only the
 Python standard library.
 
+## Use prepare-repo-context
+
+From a Git repository, ask:
+
+```text
+Use /taf:prepare-repo-context to inspect this repository and prepare reusable bounded context.
+```
+
+The first pass is read-only. It reports registered providers, freshness,
+eligible and excluded path counts, the native runtime state, and the next safe
+action. It does not load the full repository into model context.
+
+If no reusable index is ready, the skill asks before any persistent or network
+action. With approval it downloads the matching native runtime from the TAF
+GitHub release, verifies the published SHA-256 checksum, stores it in the
+user-local TAF state directory, and builds the index outside the repository.
+Later sessions reuse the repository/worktree-bound index and receive only
+bounded query results rather than the full index.
+
+Once ready, the same skill can answer repository-map, symbol, and documentation
+questions with bounded results. It retrieves source snippets only for selected
+result identities, keeping paths, line ranges, and evidence class attached.
+
+Runtime requirements are Git and Python 3. Go is not required for normal use.
+The published native runtime supports macOS and Linux on amd64/arm64 and
+Windows on amd64.
+
 ## Versioning and releases
 
 TAF and its skills have separate versions:
 
-- TAF `2.0.0` versions the collection, manifests, namespaces, and release.
+- TAF `2.1.0` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
+- `prepare-repo-context` `1.0.0` versions its behavior contract.
 - `work-recovery` `1.0.1` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with
@@ -219,6 +251,10 @@ the-agentic-fieldbook/
 │   │   ├── agents/openai.yaml
 │   │   ├── references/
 │   │   └── scripts/collect_diff.py
+│   ├── prepare-repo-context/
+│   │   ├── SKILL.md
+│   │   ├── agents/openai.yaml
+│   │   └── scripts/prepare_repo_context.py
 │   └── work-recovery/
 │       ├── SKILL.md
 │       ├── agents/openai.yaml

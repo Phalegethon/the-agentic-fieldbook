@@ -1,0 +1,86 @@
+name: Release native context runtime
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            system: darwin
+            arch: amd64
+            binary: taf-level1
+          - runner: macos-15
+            system: darwin
+            arch: arm64
+            binary: taf-level1
+          - runner: ubuntu-24.04
+            system: linux
+            arch: amd64
+            binary: taf-level1
+          - runner: ubuntu-24.04-arm
+            system: linux
+            arch: arm64
+            binary: taf-level1
+          - runner: windows-2025
+            system: windows
+            arch: amd64
+            binary: taf-level1.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: tools/taf-context-native/go.mod
+          cache-dependency-path: tools/taf-context-native/go.sum
+      - name: Test native runtime
+        working-directory: tools/taf-context-native
+        run: go test ./...
+      - name: Build native runtime
+        working-directory: tools/taf-context-native
+        run: go build -trimpath -mod=vendor -o ../../build/${{ matrix.binary }} ./cmd/taf-level1
+      - name: Smoke test prepare-repo-context
+        env:
+          TAF_LEVEL1_BINARY: ${{ github.workspace }}/build/${{ matrix.binary }}
+          TAF_STATE_HOME: ${{ runner.temp }}/taf-context-state
+        run: |
+          python skills/prepare-repo-context/scripts/prepare_repo_context.py inspect --repo .
+          python skills/prepare-repo-context/scripts/prepare_repo_context.py build --repo . --confirm-state-write
+          python skills/prepare-repo-context/scripts/prepare_repo_context.py inspect --repo .
+          python skills/prepare-repo-context/scripts/prepare_repo_context.py query --repo . --operation repository-map --maximum-results 3
+      - name: Package native runtime
+        run: >-
+          python scripts/package-native-release.py
+          --binary build/${{ matrix.binary }}
+          --system ${{ matrix.system }}
+          --arch ${{ matrix.arch }}
+          --output-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.system }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

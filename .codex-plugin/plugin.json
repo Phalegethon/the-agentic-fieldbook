@@ -1,7 +1,7 @@
 {
   "name": "taf",
-  "version": "2.0.0",
-  "description": "Evidence-backed recovery and handoff skills for reliable software delivery.",
+  "version": "2.1.0",
+  "description": "Evidence-backed recovery, handoff, and bounded repository context for reliable software delivery.",
   "author": {
     "name": "Gürkan Süerdem",
     "url": "https://github.com/Phalegethon"
@@ -13,14 +13,15 @@
     "agent-skills",
     "git",
     "handoff",
+    "repository-context",
     "recovery",
     "software-delivery"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "The Agentic Fieldbook (TAF)",
-    "shortDescription": "Recover work and hand off branches",
-    "longDescription": "Use evidence-backed skills to recover interrupted Git work and prepare bounded branch handoffs. Full skill instructions load only when relevant.",
+    "shortDescription": "Recover, hand off, and prepare bounded context",
+    "longDescription": "Use evidence-backed skills to recover interrupted Git work, prepare bounded branch handoffs, and reuse repository context without loading the full codebase into the model.",
     "developerName": "Gürkan Süerdem",
     "category": "Developer Tools",
     "capabilities": [
@@ -31,7 +32,8 @@
     "websiteURL": "https://github.com/Phalegethon/the-agentic-fieldbook",
     "defaultPrompt": [
       "Tell me where this Git work stopped and what to do next.",
-      "Prepare an evidence-backed DEV and QA branch handoff."
+      "Prepare an evidence-backed DEV and QA branch handoff.",
+      "Inspect this repository and prepare reusable bounded context."
     ]
   }
 }

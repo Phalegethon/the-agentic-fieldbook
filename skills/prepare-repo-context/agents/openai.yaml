@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prepare Repo Context"
+  short_description: "Prepare and query bounded repo context"
+  default_prompt: "Use $prepare-repo-context to inspect this repository, prepare reusable bounded context if needed, and answer from the smallest evidence-backed query."

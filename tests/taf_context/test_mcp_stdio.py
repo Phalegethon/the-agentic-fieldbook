@@ -123,7 +123,7 @@ class MCPStdioTests(unittest.TestCase):
 
     def test_process_and_output_budgets_fail_closed(self) -> None:
         cases = (
-            ("timeout", "timeout", {}),
+            ("timeout", "timeout", {"timeout_seconds": 0.15}),
             ("early-exit", "early-exit", {}),
             ("stdout-overflow", "stdout-budget-exceeded", {}),
             ("stderr-overflow", "stderr-budget-exceeded", {}),
@@ -141,7 +141,7 @@ class MCPStdioTests(unittest.TestCase):
             with self.subTest(mode=mode), self.assertRaisesRegex(
                 MCPProcessError, reason
             ):
-                call(mode, timeout_seconds=0.15, **changes)
+                call(mode, **changes)
 
     def test_tool_errors_are_not_returned_as_evidence(self) -> None:
         for mode in ("tool-rpc-error", "tool-is-error"):
