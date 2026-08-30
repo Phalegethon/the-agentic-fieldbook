@@ -79,11 +79,11 @@ jobs:
         run: go test ./...
       - name: Build native runtime
         working-directory: tools/taf-context-native
-        run: go build -trimpath -mod=vendor -o ../../build/${{ matrix.binary }} ./cmd/taf-level1
+        run: go build -trimpath -mod=vendor -o "${{ runner.temp }}/${{ matrix.binary }}" ./cmd/taf-level1
       - name: Smoke test prepare-repo-context
         env:
-          TAF_LEVEL1_BINARY: ${{ github.workspace }}/build/${{ matrix.binary }}
-          TAF_STATE_HOME: ${{ runner.temp }}/taf-context-state
+          TAF_LEVEL1_BINARY: ${{ runner.temp }}/${{ matrix.binary }}
+          TAF_STATE_HOME: ${{ runner.temp }}/taf-private/taf-context-state
         run: |
           python skills/prepare-repo-context/scripts/prepare_repo_context.py inspect --repo .
           python skills/prepare-repo-context/scripts/prepare_repo_context.py build --repo . --confirm-state-write
@@ -92,7 +92,7 @@ jobs:
       - name: Package native runtime
         run: >-
           python scripts/package-native-release.py
-          --binary build/${{ matrix.binary }}
+          --binary "${{ runner.temp }}/${{ matrix.binary }}"
           --system ${{ matrix.system }}
           --arch ${{ matrix.arch }}
           --output-dir dist
