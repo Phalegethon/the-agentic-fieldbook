@@ -18,6 +18,19 @@ SKILL_VERSIONS = {
 
 
 class ReleaseMetadataTest(unittest.TestCase):
+    def test_native_release_workflow_preserves_cross_platform_security_contract(self) -> None:
+        attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+        workflow = (
+            ROOT / ".github" / "workflows" / "release-native-context.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("* text=auto eol=lf", attributes)
+        self.assertIn("TMPDIR: ${{ runner.temp }}", workflow)
+        self.assertIn("Prepare private Windows temp", workflow)
+        self.assertIn("/inheritance:r", workflow)
+        self.assertIn("release_tag:", workflow)
+        self.assertIn("tag_name:", workflow)
+
     def test_skill_versions_remain_independent_of_the_product_version(self) -> None:
         for skill_name, expected_version in SKILL_VERSIONS.items():
             with self.subTest(skill=skill_name):

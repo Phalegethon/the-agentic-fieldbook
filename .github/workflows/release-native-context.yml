@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to publish after a successful manual rebuild
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -42,7 +47,20 @@ jobs:
         with:
           go-version-file: tools/taf-context-native/go.mod
           cache-dependency-path: tools/taf-context-native/go.sum
+      - name: Prepare private Windows temp
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $privateTemp = Join-Path $env:RUNNER_TEMP "taf-private"
+          New-Item -ItemType Directory -Force -Path $privateTemp | Out-Null
+          $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          icacls $privateTemp /inheritance:r /grant:r "*$($userSid):(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
+          if ($LASTEXITCODE -ne 0) { throw "failed to secure Windows temp" }
+          "TEMP=$privateTemp" >> $env:GITHUB_ENV
+          "TMP=$privateTemp" >> $env:GITHUB_ENV
       - name: Test native runtime
+        env:
+          TMPDIR: ${{ runner.temp }}
         working-directory: tools/taf-context-native
         run: go test ./...
       - name: Build native runtime
@@ -71,7 +89,9 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: >-
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs: build
     runs-on: ubuntu-24.04
     steps:
@@ -82,5 +102,6 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.release_tag }}
           files: dist/*
           fail_on_unmatched_files: true
