@@ -15,7 +15,7 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.0.0 | Inspect providers, prepare a reusable native index, and run bounded evidence queries without loading the full repository into model context. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.0.1 | Inspect providers, prepare a reusable native index, and run bounded evidence queries without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.0.1 | Recover interrupted work and the single best next step from bounded, read-only Git evidence. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
