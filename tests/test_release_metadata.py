@@ -5,11 +5,13 @@ import re
 import unittest
 from pathlib import Path
 
+from taf_context.prepare_cli import _NATIVE_RELEASE_BASE_URL
+
 
 ROOT = Path(__file__).parents[1]
 SKILL = ROOT / "skills" / "branch-handoff"
 WORK_RECOVERY = ROOT / "skills" / "work-recovery"
-TAF_VERSION = "2.1.0"
+TAF_VERSION = "2.1.1"
 SKILL_VERSIONS = {
     "branch-handoff": "1.2.1",
     "prepare-repo-context": "1.0.0",
@@ -57,6 +59,13 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertEqual(
             set(SKILL_VERSIONS),
             {path.parent.name for path in (ROOT / "skills").glob("*/SKILL.md")},
+        )
+
+    def test_native_runtime_download_tracks_the_product_release(self) -> None:
+        self.assertEqual(
+            "https://github.com/Phalegethon/the-agentic-fieldbook/"
+            f"releases/download/v{TAF_VERSION}",
+            _NATIVE_RELEASE_BASE_URL,
         )
 
     def test_marketplace_exposes_one_root_sourced_taf_plugin(self) -> None:
@@ -114,6 +123,7 @@ class ReleaseMetadataTest(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("## [2.0.0] - 2026-08-27", changelog)
         self.assertIn("## [2.1.0] - 2026-08-30", changelog)
+        self.assertIn("## [2.1.1] - 2026-08-31", changelog)
         for required in (
             "Install TAF once",
             "## Install TAF",

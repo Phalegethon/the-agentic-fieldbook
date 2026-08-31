@@ -329,7 +329,7 @@ class RepositoryLayoutTest(unittest.TestCase):
             with self.subTest(manifest=relative.as_posix()):
                 plugin = json.loads((ROOT / relative).read_text(encoding="utf-8"))
                 self.assertEqual("taf", plugin["name"])
-                self.assertEqual("2.1.0", plugin["version"])
+                self.assertEqual("2.1.1", plugin["version"])
                 self.assertEqual("MIT", plugin["license"])
                 self.assertEqual("Gürkan Süerdem", plugin["author"]["name"])
                 self.assertEqual(

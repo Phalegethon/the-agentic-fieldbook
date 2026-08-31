@@ -3,6 +3,17 @@
 All notable TAF product releases and their bundled skill versions are recorded
 here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
+## [2.1.1] - 2026-08-31
+
+### Fixed
+
+- Native context activation now loads reliably from the standalone skill on
+  Windows and preserves durable, owner-protected state across platforms.
+- Release smoke artifacts remain outside the repository snapshot so a clean
+  checkout stays exact during the user-facing build and query flow.
+- Published checksum sidecars use portable LF endings, including when packaged
+  on Windows.
+
 ## [2.1.0] - 2026-08-30
 
 ### Added

@@ -228,7 +228,7 @@ Windows on amd64.
 
 TAF and its skills have separate versions:
 
-- TAF `2.1.0` versions the collection, manifests, namespaces, and release.
+- TAF `2.1.1` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
 - `prepare-repo-context` `1.0.0` versions its behavior contract.
 - `work-recovery` `1.0.1` versions its behavior contract.

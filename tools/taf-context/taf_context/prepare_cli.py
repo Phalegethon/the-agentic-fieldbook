@@ -36,7 +36,7 @@ _BINDING_LIMIT = 16 * 1024
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CHECKSUM = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)\n\Z")
 _NATIVE_ENGINE_VERSION = "0.1.0"
-_TAF_RELEASE_VERSION = "2.1.0"
+_TAF_RELEASE_VERSION = "2.1.1"
 _NATIVE_RELEASE_BASE_URL = (
     "https://github.com/Phalegethon/the-agentic-fieldbook/releases/download/"
     f"v{_TAF_RELEASE_VERSION}"
