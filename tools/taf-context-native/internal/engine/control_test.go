@@ -100,6 +100,54 @@ func TestBuildThenStatusAndMetricsAreExactAndDoNotLeakFindings(t *testing.T) {
 	}
 }
 
+func TestBoundedExtractionPublishesQueryablePartialIndex(t *testing.T) {
+	// This catches deterministic extractor limits being treated as parse
+	// failures that make an otherwise valid persisted index unusable forever.
+	repository, state := controlRoots(t)
+	wide := "{"
+	for index := 0; index <= 64; index++ {
+		if index != 0 {
+			wide += ","
+		}
+		wide += fmt.Sprintf("%q:0", fmt.Sprintf("key-%02d", index))
+	}
+	wide += "}"
+	if err := os.WriteFile(filepath.Join(repository, "wide.json"), []byte(wide), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built.Status != wire.Partial || built.Freshness != "exact" || built.IndexIdentity == nil || built.NextSafeAction != "use-index" {
+		t.Fatalf("build = %#v", built)
+	}
+	if built.Coverage.ParseFailureCount != 0 || !hasWarning(built.Warnings, "json-collection-limit") {
+		t.Fatalf("build coverage/warnings = %#v", built)
+	}
+
+	status, err := engine.Execute(context.Background(), controlEnvelope(wire.StatusOperation, repository, state, built.IndexIdentity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != wire.Partial || status.Freshness != "exact" || status.NextSafeAction != "use-index" || !hasWarning(status.Warnings, "partial-index-coverage") {
+		t.Fatalf("status = %#v", status)
+	}
+
+	queryText := "Main"
+	query := controlEnvelope(wire.SearchSymbols, repository, state, built.IndexIdentity)
+	query.Request.Query = &queryText
+	queried, err := engine.Execute(context.Background(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queried.Status != wire.Partial || queried.Freshness != "exact" || queried.NextSafeAction == "rebuild-index" || len(queried.Findings) == 0 || !hasWarning(queried.Warnings, "json-collection-limit") {
+		t.Fatalf("query = %#v", queried)
+	}
+}
+
 func TestBuildExtractsIndependentFilesConcurrently(t *testing.T) {
 	repository, state := controlRoots(t)
 	for index := 0; index < 24; index++ {

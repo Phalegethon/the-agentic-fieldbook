@@ -198,7 +198,7 @@ func TestQueryPlannerExhaustionIsPartialExactAndRetainsFindings(t *testing.T) {
 	}
 }
 
-func TestQueryPartialOrCorruptStateNeverLoadsOrReturnsFindings(t *testing.T) {
+func TestQueryLoadsUsablePartialStateButRejectsCorruptState(t *testing.T) {
 	repository, state := controlRoots(t)
 	base := New(ProductionDependencies())
 	built, err := base.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
@@ -212,21 +212,24 @@ func TestQueryPartialOrCorruptStateNeverLoadsOrReturnsFindings(t *testing.T) {
 	t.Run("partial", func(t *testing.T) {
 		dependencies := ProductionDependencies()
 		inspect := dependencies.Inspect
+		load := dependencies.Load
 		loaded := false
 		dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
 			status, inspectErr := inspect(ctx, roots)
 			status.Manifest.Coverage.ParseFailureCount = 1
 			return status, inspectErr
 		}
-		dependencies.Load = func(context.Context, *boundary.Roots, string) (store.Snapshot, error) {
+		dependencies.Load = func(ctx context.Context, roots *boundary.Roots, identity string) (store.Snapshot, error) {
 			loaded = true
-			return store.Snapshot{}, nil
+			snapshot, loadErr := load(ctx, roots, identity)
+			snapshot.Manifest.Coverage.ParseFailureCount = 1
+			return snapshot, loadErr
 		}
 		result, executeErr := New(dependencies).Execute(context.Background(), envelope)
 		if executeErr != nil {
 			t.Fatal(executeErr)
 		}
-		if result.Status != wire.Partial || result.Freshness != "partial" || loaded || len(result.Findings) != 0 {
+		if result.Status != wire.Partial || result.Freshness != "exact" || !loaded || len(result.Findings) == 0 || result.NextSafeAction != "use-index" {
 			t.Fatalf("partial state = %#v loaded=%v", result, loaded)
 		}
 	})

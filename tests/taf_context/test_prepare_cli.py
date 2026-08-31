@@ -49,7 +49,12 @@ def decoded(stdout: str) -> dict[str, object]:
     return value
 
 
-def write_fake_native_engine(path: Path, invocation_log: Path | None = None) -> None:
+def write_fake_native_engine(
+    path: Path,
+    invocation_log: Path | None = None,
+    *,
+    partial: bool = False,
+) -> None:
     source = textwrap.dedent(
             """\
             #!/usr/bin/env python3
@@ -83,9 +88,9 @@ def write_fake_native_engine(path: Path, invocation_log: Path | None = None) -> 
                 "schema_version": "1",
                 "request_identity": request["request_identity"],
                 "operation": operation,
-                "status": "ready" if ready else "partial",
+                "status": "partial" if ready and __PARTIAL__ else "ready" if ready else "partial",
                 "provider_identity": "taf-context",
-                "provider_version": "0.1.0",
+                "provider_version": "0.1.1",
                 "index_identity": (
                     "sha256:" + hashlib.sha256(b"fake-index").hexdigest()
                     if operation == "build" else request["index_identity"]
@@ -104,19 +109,21 @@ def write_fake_native_engine(path: Path, invocation_log: Path | None = None) -> 
                     "excluded_path_count": 0,
                     "unsupported_language_count": 0,
                     "parse_failure_count": 0,
-                    "exclusion_reason_counts": {},
+                    "exclusion_reason_counts": {"incomplete-extraction": 1} if __PARTIAL__ else {},
                 },
                 "findings": [],
                 "returned_count": 0,
                 "omitted_count": 0,
                 "truncated": False,
                 "output_characters": 0,
-                "warnings": [],
+                "warnings": ["json-collection-limit"] if ready and __PARTIAL__ else [],
                 "next_safe_action": "use-index" if ready else "build-index",
             }
             sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\\n")
             """
-        ).replace("__INVOCATION_LOG__", repr(None if invocation_log is None else str(invocation_log)))
+        ).replace("__INVOCATION_LOG__", repr(None if invocation_log is None else str(invocation_log))).replace(
+            "__PARTIAL__", repr(partial)
+        )
     path.write_text(source, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
@@ -149,7 +156,7 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             for system in ("darwin", "linux", "windows"):
                 for machine in ("amd64", "arm64"):
                     suffix = ".exe" if system == "windows" else ""
-                    name = f"taf-level1_0.1.0_{system}_{machine}{suffix}"
+                    name = f"taf-level1_0.1.1_{system}_{machine}{suffix}"
                     (release / name).write_bytes(payload)
                     (release / f"{name}.sha256").write_text(
                         f"{hashlib.sha256(payload).hexdigest()}  {name}\n",
@@ -260,6 +267,66 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
                 ["build", "status", "search-symbols"],
             )
 
+    def test_partial_context_is_bound_inspectable_and_queryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log, partial=True)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+
+            code, stdout, stderr = invoke(
+                environment,
+                "prepare",
+                "build",
+                "--repo",
+                str(repo),
+                "--confirm-state-write",
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            built = decoded(stdout)
+            self.assertEqual(built["context"]["status"], "partial")
+            self.assertEqual(built["context"]["freshness"], "exact")
+            self.assertEqual(built["next_safe_action"], "use-index")
+            self.assertEqual(built["context"]["coverage"]["parse_failure_count"], 0)
+            self.assertIn("json-collection-limit", built["warnings"])
+
+            code, stdout, stderr = invoke(
+                environment,
+                "prepare",
+                "inspect",
+                "--repo",
+                str(repo),
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            inspected = decoded(stdout)
+            self.assertEqual(inspected["context"]["status"], "partial")
+            self.assertEqual(inspected["next_safe_action"], "use-index")
+            self.assertEqual(inspected["required_authorizations"], [])
+
+            code, stdout, stderr = invoke(
+                environment,
+                "prepare",
+                "query",
+                "--repo",
+                str(repo),
+                "--operation",
+                "repository-map",
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            queried = decoded(stdout)
+            self.assertEqual(queried["status"], "partial")
+            self.assertEqual(queried["next_safe_action"], "use-index")
+            self.assertIn("json-collection-limit", queried["warnings"])
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["build", "status", "status", "repository-map"],
+            )
+
     def test_query_requires_an_existing_exact_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -295,7 +362,7 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             for system in ("darwin", "linux", "windows"):
                 for machine in ("amd64", "arm64"):
                     suffix = ".exe" if system == "windows" else ""
-                    name = f"taf-level1_0.1.0_{system}_{machine}{suffix}"
+                    name = f"taf-level1_0.1.1_{system}_{machine}{suffix}"
                     (release / name).write_bytes(b"corrupt")
                     (release / f"{name}.sha256").write_text(
                         f"{'0' * 64}  {name}\n", encoding="ascii"

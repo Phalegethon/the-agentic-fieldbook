@@ -19,7 +19,7 @@ import (
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
 
-const engineVersion = "0.1.0"
+const engineVersion = "0.1.1"
 
 const maximumAggregateRecordBytes = 64 << 20
 
@@ -74,8 +74,7 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 			return engine.result(request, wire.Error, "unknown", nil, coverage, "rebuild-index"), nil
 		}
 		coverage.ParseFailureCount += report.ParseFailures
-		if report.Incomplete() && report.ParseFailures == 0 {
-			coverage.ParseFailureCount++
+		if report.Incomplete() {
 			coverage.ExclusionReasonCounts["incomplete-extraction"]++
 		}
 		warnings = appendBoundedWarnings(warnings, report.WarningCodes...)
@@ -96,7 +95,6 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 	}
 	if hasBoundedWarning(warnings, "warning-limit") {
 		coverage.ExclusionReasonCounts["warning-limit"]++
-		coverage.ParseFailureCount++
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Identity < records[j].Identity })
 	for index := 1; index < len(records); index++ {
@@ -122,7 +120,7 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 	engine.rememberSnapshot(snapshot)
 	status, freshness, action := wire.Ready, "exact", "use-index"
 	if !completeCoverage(coverage, false) {
-		status, freshness, action = wire.Partial, "partial", "rebuild-index"
+		status = wire.Partial
 	}
 	result := engine.result(request, status, freshness, ptr(snapshot.IndexIdentity), coverage, action)
 	result.ParserVersions = cloneStrings(parserIDs)
@@ -209,13 +207,17 @@ func (engine *Engine) state(ctx context.Context, roots *boundary.Roots, request 
 	if freshness != "exact" {
 		resultStatus = wire.Stale
 	}
-	if freshness == "partial" {
+	if freshness == "exact" && !completeCoverage(status.Manifest.Coverage, false) {
 		resultStatus = wire.Partial
 	}
 	result := engine.result(request, resultStatus, freshness, request.IndexIdentity, status.Manifest.Coverage, action)
 	result.ParserVersions = cloneStrings(status.Manifest.ParserIdentities)
-	if metrics && resultStatus != wire.Ready {
-		result.Warnings = []string{"metrics-stale"}
+	result.Warnings = sourceCatalogWarnings(status.Manifest.SourceCatalog)
+	if resultStatus == wire.Partial && freshness == "exact" {
+		result.Warnings = appendBoundedWarnings(result.Warnings, "partial-index-coverage")
+	}
+	if metrics && freshness != "exact" {
+		result.Warnings = appendBoundedWarnings(result.Warnings, "metrics-stale")
 	}
 	return result, nil
 }
@@ -248,10 +250,15 @@ func freshnessFor(request wire.Request, manifest model.Manifest, index string, p
 	if manifest.Binding.DirtyOverlayFingerprint != request.DirtyOverlayFingerprint {
 		return "commit-fresh-worktree-stale", "rebuild-index"
 	}
-	if !completeCoverage(manifest.Coverage, false) {
-		return "partial", "rebuild-index"
-	}
 	return "exact", "use-index"
+}
+
+func sourceCatalogWarnings(catalog model.SourceCatalog) []string {
+	warnings := appendBoundedWarnings(nil, catalog.Warnings...)
+	for _, item := range catalog.ExtractionWarnings {
+		warnings = appendBoundedWarnings(warnings, item.Codes...)
+	}
+	return warnings
 }
 
 func sourceBinding(paths []inventory.Path) string {

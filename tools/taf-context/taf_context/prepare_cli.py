@@ -35,8 +35,8 @@ _NATIVE_TIMEOUT_SECONDS = 120
 _BINDING_LIMIT = 16 * 1024
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CHECKSUM = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)\n\Z")
-_NATIVE_ENGINE_VERSION = "0.1.0"
-_TAF_RELEASE_VERSION = "2.1.1"
+_NATIVE_ENGINE_VERSION = "0.1.1"
+_TAF_RELEASE_VERSION = "2.1.2"
 _NATIVE_RELEASE_BASE_URL = (
     "https://github.com/Phalegethon/the-agentic-fieldbook/releases/download/"
     f"v{_TAF_RELEASE_VERSION}"
@@ -179,7 +179,11 @@ def run_prepare_command(
             snapshot,
             index_identity=None,
         )
-        if result.status.value != "ready" or result.index_identity is None:
+        if (
+            result.status.value not in {"ready", "partial"}
+            or result.index_identity is None
+            or result.next_safe_action != "use-index"
+        ):
             raise PrepareCLIError("native context build did not become ready")
         _write_binding(binding_path, snapshot, result.index_identity)
         return _summary(
@@ -614,6 +618,7 @@ def _summary(
             "status": context_status,
             "freshness": freshness,
             "index_identity": None if result is None else result.index_identity,
+            "coverage": None if result is None else result.coverage.to_dict(),
         },
         "estimate": {
             "eligible_path_count": (
@@ -629,7 +634,9 @@ def _summary(
         },
         "required_authorizations": list(authorizations),
         "next_safe_action": next_action,
-        "warnings": list(provider_warnings),
+        "warnings": sorted(
+            set(provider_warnings).union(() if result is None else result.warnings)
+        ),
     }
 
 

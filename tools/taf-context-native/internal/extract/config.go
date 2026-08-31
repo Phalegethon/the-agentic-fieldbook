@@ -270,7 +270,7 @@ func appendConfigurationRecord(records *[]model.Record, qualified string, line i
 }
 
 func configurationLimitReport(parserVersion, warning string) Report {
-	return Report{ParserVersion: parserVersion, ParseFailures: 1, WarningCodes: []string{warning}}
+	return Report{ParserVersion: parserVersion, WarningCodes: []string{warning}}
 }
 
 func stripTOMLComment(line string) (string, bool) {

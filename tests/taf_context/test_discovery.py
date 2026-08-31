@@ -43,7 +43,7 @@ class PassiveDiscoveryTests(unittest.TestCase):
             ProviderDescriptor(
                 schema_version="1",
                 provider_identity="taf-context",
-                provider_version="0.1.0",
+                provider_version="0.1.1",
                 provider_schema_version="1",
                 capabilities=("repository-map", "status"),
                 locality=ProviderLocality.LOCAL,

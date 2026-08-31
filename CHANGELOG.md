@@ -3,6 +3,17 @@
 All notable TAF product releases and their bundled skill versions are recorded
 here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
+## [2.1.2] - 2026-08-31
+
+### Fixed
+
+- Bounded parser limits are reported as coverage warnings instead of parse
+  failures.
+- Exact-binding partial indexes are persisted, activated, inspected, and
+  queried without an endless rebuild recommendation.
+- Preparation summaries now expose native warnings and compact coverage
+  counters for partial indexes.
+
 ## [2.1.1] - 2026-08-31
 
 ### Fixed

@@ -672,7 +672,7 @@ def manifest_from_snapshot(
         head_sha=snapshot.head_sha,
         dirty_fingerprint=snapshot.dirty_fingerprint,
         provider_name="taf-context",
-        provider_version="0.1.0",
+        provider_version="0.1.1",
         provider_index_id=provider_index_id,
         provider_schema_version="1",
         index_levels=("level0",),

@@ -4,7 +4,7 @@ description: Use when a developer wants to inspect, prepare, refresh, query, or 
 license: MIT
 metadata:
   author: The Agentic Fieldbook
-  version: "1.0.0"
+  version: "1.0.1"
 ---
 
 # Prepare Repo Context
@@ -19,4 +19,4 @@ Let `<skill-dir>` be this skill's directory. Resolve the repository, then resolv
 4. If it is `install-native-engine`, explain the estimated scope and ask once for network plus state-write authorization. After approval, run `<python> <skill-dir>/scripts/prepare_repo_context.py activate --repo <repo> --confirm-network --confirm-state-write` exactly once. This downloads the matching release runtime, verifies its SHA-256 checksum, installs it in user-local TAF state, and prepares the index. Report only the compact result.
 5. Once `next_safe_action` is `use-index`, stop if the user asked only to prepare context. If they asked a repository question, run exactly the smallest matching read-only query: `query --operation repository-map`, `query --operation search-symbols --query <term>`, or `query --operation search-docs --query <term>`. Fetch source only when needed with `query --operation source-snippets --result-id <identity>` using identities returned by an earlier query. Keep the default output budget unless the user explicitly needs more evidence.
 
-Treat existing registered providers as candidates, not proof that their index is usable. Current repository identity, worktree identity, commit, dirty fingerprint, provider inspection, and freshness must agree before context is described as ready. Report query findings with their paths and line ranges; do not infer beyond their evidence class. A failed preparation never blocks ordinary Git-based skills.
+Treat existing registered providers as candidates, not proof that their index is usable. Current repository identity, worktree identity, commit, dirty fingerprint, provider inspection, and freshness must agree before context is described as ready. An exact-binding `partial` context with `next_safe_action: use-index` is usable bounded coverage; report its warnings without rebuilding it. Report query findings with their paths and line ranges; do not infer beyond their evidence class. A failed preparation never blocks ordinary Git-based skills.

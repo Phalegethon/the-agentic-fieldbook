@@ -86,14 +86,18 @@ func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, s
 		return wire.Result{}, err
 	}
 	resultStatus, nextAction := wire.Ready, "use-index"
+	if !completeCoverage(snapshot.Manifest.Coverage, false) {
+		resultStatus = wire.Partial
+	}
 	if response.Partial {
 		resultStatus, nextAction = wire.Partial, "refine-query"
 	}
 	result := engine.result(request, resultStatus, "exact", request.IndexIdentity, snapshot.Manifest.Coverage, nextAction)
 	result.Findings = findings(response.Records)
 	result.OmittedCount = response.Omitted
+	result.Warnings = sourceCatalogWarnings(snapshot.Manifest.SourceCatalog)
 	if response.Partial {
-		result.Warnings = []string{"query-frontier-exhausted"}
+		result.Warnings = appendBoundedWarnings(result.Warnings, "query-frontier-exhausted")
 	}
 	return result, nil
 }

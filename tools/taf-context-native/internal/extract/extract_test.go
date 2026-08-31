@@ -257,7 +257,7 @@ func TestJSONExtractorIndexesNestedAndArrayKeysWithoutValues(t *testing.T) {
 func TestConfigurationExtractorsBoundDepthCollectionsAndMalformedInput(t *testing.T) {
 	deep := strings.Repeat(`{"nested":`, maximumJSONDepth+1) + "0" + strings.Repeat("}", maximumJSONDepth+1)
 	records, report := NewRegistry().Extract(stableFile("config/deep.json", deep))
-	if report.ParseFailures != 1 || !contains(report.WarningCodes, "json-depth-limit") || len(records) > maximumJSONDepth {
+	if report.ParseFailures != 0 || !report.Incomplete() || !contains(report.WarningCodes, "json-depth-limit") || len(records) > maximumJSONDepth {
 		t.Fatalf("deep JSON = %d records, report %#v", len(records), report)
 	}
 
@@ -271,7 +271,7 @@ func TestConfigurationExtractorsBoundDepthCollectionsAndMalformedInput(t *testin
 	}
 	wide.WriteByte('}')
 	records, report = NewRegistry().Extract(stableFile("config/wide.json", wide.String()))
-	if report.ParseFailures != 1 || !contains(report.WarningCodes, "json-collection-limit") || len(records) > maximumConfigurationCollectionItems {
+	if report.ParseFailures != 0 || !report.Incomplete() || !contains(report.WarningCodes, "json-collection-limit") || len(records) > maximumConfigurationCollectionItems {
 		t.Fatalf("wide JSON = %d records, report %#v", len(records), report)
 	}
 

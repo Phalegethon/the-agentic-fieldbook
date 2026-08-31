@@ -62,7 +62,7 @@ def native_level0_descriptor(snapshot: RepositorySnapshot) -> ProviderDescriptor
     return ProviderDescriptor(
         schema_version="1",
         provider_identity=_NATIVE_IDENTITY,
-        provider_version="0.1.0",
+        provider_version="0.1.1",
         provider_schema_version="1",
         capabilities=("repository-map", "status"),
         locality=ProviderLocality.LOCAL,

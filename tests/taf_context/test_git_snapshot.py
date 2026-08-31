@@ -534,7 +534,7 @@ class InventoryAndManifestTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(first.repository_identity, snapshot.repository_identity)
             self.assertEqual(first.provider_name, "taf-context")
-            self.assertEqual(first.provider_version, "0.1.0")
+            self.assertEqual(first.provider_version, "0.1.1")
             self.assertEqual(first.provider_schema_version, "1")
             self.assertEqual(first.index_levels, ("level0",))
             self.assertEqual(first.capabilities, ("repository-map", "status"))
