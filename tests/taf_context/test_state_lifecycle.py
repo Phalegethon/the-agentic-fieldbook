@@ -120,6 +120,14 @@ class RemovePlanTests(unittest.TestCase):
                 apply_plan(root, escaping)
             self.assertTrue((outside / "keep").exists())
 
+    def test_apply_on_missing_root_raises_a_stable_state_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "absent"
+            with self.assertRaises(StateError) as caught:
+                apply_plan(root, [Candidate("worktree-entry", "repositories/x/y", 1)])
+            self.assertEqual(caught.exception.code, "state-root-unavailable")
+            self.assertFalse(root.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

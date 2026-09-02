@@ -143,7 +143,10 @@ def plan_remove(root: Path, repository_key: str, worktree_key: str) -> list[Cand
 
 def apply_plan(root: Path, candidates: list[Candidate]) -> list[Candidate]:
     """Delete candidates with a two-phase rename. Validate everything first."""
-    resolved_root = root.resolve(strict=True)
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise StateError("state-root-unavailable") from exc
     targets: list[tuple[Candidate, Path]] = []
     for candidate in candidates:
         target = root / candidate.relative_path
