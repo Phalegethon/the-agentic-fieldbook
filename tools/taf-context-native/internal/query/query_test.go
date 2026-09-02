@@ -295,6 +295,19 @@ func TestRepositoryMapFilterFacetFindsGroupBeyondPersistedFrontier(t *testing.T)
 	}
 }
 
+func TestRepositoryMapFilteredRepresentativePrefersDefinitionOverImport(t *testing.T) {
+	importRecord := testRecord(0, "create", model.Import, model.Verified)
+	importRecord.Path, importRecord.StartLine, importRecord.EndLine = "src/store/authModalStore.ts", 1, 1
+	definition := testRecord(1, "authModalStore.useAuthModalStore", model.Definition, model.Verified)
+	definition.Path, definition.StartLine, definition.EndLine = "src/store/authModalStore.ts", 38, 57
+	request := mapRequest()
+	request.Filters.PathPrefixes = []string{"src/store/"}
+	response := RepositoryMap(indexedSnapshot([]model.Record{importRecord, definition}), request, policy.ProductionLimits())
+	if got := identities(response.Records); !reflect.DeepEqual(got, []string{definition.Identity}) {
+		t.Fatalf("filtered map representative = %#v, want the definition", got)
+	}
+}
+
 func TestRepositoryMapIntersectsAllCompoundFiltersBeforeGrouping(t *testing.T) {
 	const half = 2048
 	records := make([]model.Record, half*2+1)

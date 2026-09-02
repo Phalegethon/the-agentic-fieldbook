@@ -615,15 +615,8 @@ func sourceTier(source string) int {
 	}
 }
 
+// mapKindTier delegates to store.MapKindTier so the query planner's filtered
+// maps and the store's persisted maps pick the same file representative.
 func mapKindTier(kind model.RecordKind) int {
-	switch kind {
-	case model.Module:
-		return 0
-	case model.Heading:
-		return 1
-	case model.DocumentChunk:
-		return 2
-	default:
-		return 3
-	}
+	return store.MapKindTier(kind)
 }

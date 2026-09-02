@@ -1631,17 +1631,27 @@ func rawSourceTier(value []byte) int {
 	return 2
 }
 
+// rawKindTier mirrors MapKindTier for the raw-bytes index validator: same
+// tier numbers, but a byte-level switch instead of a []byte-to-RecordKind
+// conversion, so the hot raw comparison path stays allocation-free. A
+// divergent tie-break here makes every load fail as corrupt.
 func rawKindTier(value []byte) int {
-	if bytes.Equal(value, []byte(model.Module)) {
+	switch {
+	case bytes.Equal(value, []byte(model.Module)):
 		return 0
-	}
-	if bytes.Equal(value, []byte(model.Heading)) {
+	case bytes.Equal(value, []byte(model.Definition)), bytes.Equal(value, []byte(model.EntryPoint)):
 		return 1
-	}
-	if bytes.Equal(value, []byte(model.DocumentChunk)) {
+	case bytes.Equal(value, []byte(model.Heading)):
 		return 2
+	case bytes.Equal(value, []byte(model.Configuration)):
+		return 3
+	case bytes.Equal(value, []byte(model.DocumentChunk)):
+		return 4
+	case bytes.Equal(value, []byte(model.Import)):
+		return 5
+	default:
+		return 6
 	}
-	return 3
 }
 
 func skipRawRecord(decoder *rawBinaryDecoder) error {

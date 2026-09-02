@@ -391,7 +391,7 @@ func compareMapRepresentative(left, right model.Record) int {
 	for _, comparison := range []int{
 		cmp.Compare(queryEvidenceTier(left), queryEvidenceTier(right)),
 		cmp.Compare(querySourceTier(left), querySourceTier(right)),
-		cmp.Compare(queryMapKindTier(left.RecordKind), queryMapKindTier(right.RecordKind)),
+		cmp.Compare(MapKindTier(left.RecordKind), MapKindTier(right.RecordKind)),
 		cmp.Compare(left.StartLine, right.StartLine),
 		cmp.Compare(NormalizeQueryText(left.QualifiedName), NormalizeQueryText(right.QualifiedName)),
 		cmp.Compare(left.Identity, right.Identity),
@@ -425,16 +425,27 @@ func querySourceTier(record model.Record) int {
 	}
 }
 
-func queryMapKindTier(kind model.RecordKind) int {
+// MapKindTier orders the records that can represent one file in a
+// repository map: the module itself, then what the file defines, then its
+// headings, configuration keys, document chunks, and finally its imports.
+// The store and the query planner share it so persisted and filtered maps
+// pick the same representative.
+func MapKindTier(kind model.RecordKind) int {
 	switch kind {
 	case model.Module:
 		return 0
-	case model.Heading:
+	case model.Definition, model.EntryPoint:
 		return 1
-	case model.DocumentChunk:
+	case model.Heading:
 		return 2
-	default:
+	case model.Configuration:
 		return 3
+	case model.DocumentChunk:
+		return 4
+	case model.Import:
+		return 5
+	default:
+		return 6
 	}
 }
 
