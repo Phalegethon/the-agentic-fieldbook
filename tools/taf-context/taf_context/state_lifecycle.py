@@ -23,6 +23,14 @@ _IDENTITY_LENGTH = 64
 _MAX_BINDING_BYTES = 16 * 1024
 
 
+def touch_binding(binding_path: Path) -> None:
+    """Record last use by refreshing the binding mtime; never raise."""
+    try:
+        os.utime(binding_path, None)
+    except OSError:
+        return
+
+
 def summarize_state(root: Path) -> dict[str, int]:
     """Count entries, orphans, stale runtimes, and bytes without following symlinks."""
     summary = {"root_bytes": 0, "entry_count": 0, "orphan_count": 0, "stale_runtime_count": 0}

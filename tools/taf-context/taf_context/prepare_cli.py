@@ -21,7 +21,7 @@ from urllib import request as url_request
 
 from .git_snapshot import collect_snapshot
 from .level1_models import Level1Result, parse_level1_result
-from .state_lifecycle import CURRENT_RUNTIME_VERSION, summarize_state
+from .state_lifecycle import CURRENT_RUNTIME_VERSION, summarize_state, touch_binding
 from .state_paths import StateError, resolve_state_paths
 
 
@@ -135,6 +135,7 @@ def run_prepare_command(
         )
         if status_result.next_safe_action != "use-index":
             raise PrepareCLIError("ready context is required; run prepare inspect")
+        touch_binding(binding_path)
         query_text, result_identities = _validate_query_arguments(args)
         result = _invoke_native(
             binary,
@@ -202,6 +203,8 @@ def run_prepare_command(
                 snapshot,
                 index_identity=binding,
             )
+            if status_result.next_safe_action == "use-index":
+                touch_binding(binding_path)
         if status_result is None or status_result.next_safe_action != "use-index":
             estimate_result = _invoke_native(
                 binary,
