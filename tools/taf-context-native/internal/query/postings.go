@@ -16,10 +16,6 @@ func tokens(value string) []string {
 	return store.QueryTokens(value)
 }
 
-func shortName(value string) string {
-	return store.QueryShortName(value)
-}
-
 // editDistanceAtMost computes a Levenshtein distance with bounded rows. It
 // returns limit+1 as soon as a row proves the candidate cannot qualify.
 func editDistanceAtMost(left, right string, limit int) int {

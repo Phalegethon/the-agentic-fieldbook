@@ -3,7 +3,9 @@ package query
 
 import (
 	"cmp"
+	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/policy"
@@ -11,6 +13,9 @@ import (
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
 
+// Response carries the ranked records, the omissions the ranking counted, and
+// Partial, which is true only when a budget stopped the search before it
+// examined everything it needed to. Omitted > 0 alone never sets Partial.
 type Response struct {
 	Records    []model.Record
 	Omitted    int
@@ -19,6 +24,24 @@ type Response struct {
 	TermVisits int
 }
 
+// Match tiers, lower is better. Fuzzy tiers add the edit distance.
+const (
+	tierExactName  = 0
+	tierExactToken = 1
+	tierPrefix     = 2
+	tierSubstring  = 3
+	tierFuzzyBase  = 4
+)
+
+const (
+	recordBudgetMultiplier = 4
+	minimumFuzzyRunes      = 4
+)
+
+// workBudget charges one unit per posting entry visited and per candidate
+// offered to the ranking; dictionary terms are charged to their own ceiling.
+// Binary searches, map lookups, and ranking comparisons are free because the
+// work already charged bounds them.
 type workBudget struct {
 	records      int
 	maximum      int
@@ -27,8 +50,12 @@ type workBudget struct {
 	exhausted    bool
 }
 
-func newWorkBudget(limits policy.Limits) *workBudget {
-	return &workBudget{maximum: max(0, limits.MaximumLexicalCandidates), maximumTerms: max(0, limits.MaximumFuzzyTerms)}
+func newWorkBudget(limits policy.Limits, recordCount int) *workBudget {
+	maximum := max(0, limits.MaximumLexicalCandidates)
+	if scaled := recordCount * recordBudgetMultiplier; scaled > maximum {
+		maximum = scaled
+	}
+	return &workBudget{maximum: maximum, maximumTerms: max(0, limits.MaximumDictionaryTerms)}
 }
 
 func (budget *workBudget) visitRecord() bool {
@@ -59,204 +86,256 @@ func (budget *workBudget) response(records []model.Record, omitted int, partial 
 	}
 }
 
-// Search plans one bounded union over persisted exact postings, the stable
-// lexical-record frontier, and the bounded prefix/fuzzy token window.
+// Search admits candidates from the exact-name postings and from the sorted
+// token dictionary, intersects the per-word candidate sets, applies the
+// request filters as record predicates, and ranks the survivors.
 func Search(snapshot store.Snapshot, request wire.Request, limits policy.Limits) Response {
-	budget := newWorkBudget(limits)
+	budget := newWorkBudget(limits, len(snapshot.Records))
 	queryText := normalize(deref(request.Query))
-	if queryText == "" || budget.maximum < 1 || budget.maximumTerms < 1 {
-		return budget.response([]model.Record{}, 0, queryText != "" || len(snapshot.Records) != 0)
-	}
-	plan := buildFilterPlan(snapshot, request, budget, true)
-	if plan.impossible {
-		return budget.response([]model.Record{}, 0, false)
+	if queryText == "" || budget.maximum < 1 {
+		return budget.response([]model.Record{}, 0, queryText != "" && len(snapshot.Records) != 0)
 	}
 	collector := candidateCollector{
-		snapshot: snapshot,
-		budget:   budget,
-		plan:     plan,
-		seen:     make(map[uint32]struct{}, min(len(snapshot.Records), budget.maximum)),
-		ranking:  newBoundedRanking(request.MaximumResults, budget),
+		snapshot:  snapshot,
+		budget:    budget,
+		predicate: newFilterPredicate(request),
+		seen:      make(map[uint32]struct{}, 64),
+		ranking:   newBoundedRanking(request.MaximumResults, budget),
 	}
+	collector.admitPosting(snapshot.Query.QualifiedOrdinals(queryText), tierExactName)
+	collector.admitPosting(snapshot.Query.ShortOrdinals(queryText), tierExactName)
 
-	seenExactTerms := make(map[string]struct{}, 8)
-	probe := func(key string, ordinals []uint32, tier int) {
-		if key == "" {
-			return
-		}
-		if _, exists := seenExactTerms[key]; exists {
-			return
-		}
-		seenExactTerms[key] = struct{}{}
-		if budget.visitTerm() {
-			collector.intersect(ordinals, tier)
-		}
+	words := strings.Fields(queryText)
+	matches := make([][]taggedOrdinal, 0, len(words))
+	for _, word := range words {
+		matches = append(matches, collector.matchWord(word, limits.MaximumFuzzyDistance, max(0, limits.MaximumTermsPerWord)))
 	}
-	queryTokens := tokens(queryText)
-	probe("qualified/"+queryText, snapshot.Query.QualifiedOrdinals(queryText), 0)
-	if short := shortName(queryText); short != "" && len(queryTokens) == 1 {
-		probe("short/"+short, snapshot.Query.ShortOrdinals(short), 1)
+	for _, candidate := range intersectWords(matches) {
+		collector.admit(candidate.ordinal, candidate.tier)
 	}
-	probe("token/"+queryText, snapshot.Query.TokenOrdinals(queryText), 2)
-	incompleteTerms := probeFallbackTerms(&collector, queryText, seenExactTerms)
-	// Treat a multi-token phrase as one intent. Unioning broad component words
-	// (for example "level" and "one") can exhaust the record budget and outrank
-	// the exact or fuzzy phrase the caller actually supplied.
-	if len(queryTokens) == 1 {
-		probe("token/"+queryTokens[0], snapshot.Query.TokenOrdinals(queryTokens[0]), 2)
-	}
-
-	incompleteSubstring := probeSubstringFrontier(&collector, queryText)
 	selected, omitted := collector.ranking.records()
-	return budget.response(selected, omitted, plan.partial || collector.partial || incompleteSubstring || incompleteTerms || omitted > 0)
+	return budget.response(selected, omitted, collector.partial)
 }
 
-// probeSubstringFrontier admits the otherwise non-indexable substring tier
-// from a persisted, path-stable ordinal frontier. Exact postings remain
-// unbounded by this frontier; truncation is always surfaced as Partial.
-func probeSubstringFrontier(collector *candidateCollector, queryText string) bool {
-	ordinals := collector.snapshot.Query.PathOrdinals()
-	frontierPartial := len(ordinals) > collector.budget.maximum
-	if len(ordinals) > collector.budget.maximum {
-		ordinals = ordinals[:collector.budget.maximum]
-	}
-	if collector.plan.active {
-		ordinals = collector.plan.ordinals
-		frontierPartial = collector.plan.partial
-	}
+type taggedOrdinal struct {
+	ordinal uint32
+	tier    int
+}
+
+type candidateCollector struct {
+	snapshot  store.Snapshot
+	budget    *workBudget
+	predicate filterPredicate
+	seen      map[uint32]struct{}
+	ranking   boundedRanking
+	partial   bool
+}
+
+func (collector *candidateCollector) admitPosting(ordinals []uint32, tier int) {
 	for _, ordinal := range ordinals {
 		if !collector.budget.visitRecord() {
-			return true
+			collector.partial = true
+			return
 		}
-		if uint64(ordinal) >= uint64(len(collector.snapshot.Records)) {
-			collector.budget.exhausted = true
-			return true
-		}
-		if _, exists := collector.seen[ordinal]; exists {
-			continue
-		}
-		record := collector.snapshot.Records[ordinal]
-		seenTerms := make(map[string]struct{}, min(len(record.SearchTerms)+4, collector.budget.maximumTerms))
-		matched := false
-		visitTerm := func(term string) bool {
-			if !collector.budget.visitTerm() {
-				return false
-			}
-			term = normalize(term)
-			if term == "" {
-				return true
-			}
-			if _, exists := seenTerms[term]; exists {
-				return true
-			}
-			seenTerms[term] = struct{}{}
-			if strings.Contains(term, queryText) {
-				matched = true
-				return false
-			}
-			return true
-		}
-		complete := visitTerm(record.QualifiedName)
-		if complete && !matched {
-			for _, term := range tokens(record.QualifiedName) {
-				if !visitTerm(term) {
-					complete = false
-					break
-				}
-			}
-		}
-		if complete && !matched {
-			for _, term := range record.SearchTerms {
-				if !visitTerm(term) {
-					complete = false
-					break
-				}
-			}
-		}
-		if matched {
-			collector.append(ordinal, 3)
-		}
-		if !complete && !matched {
-			return true
-		}
+		collector.admit(ordinal, tier)
 	}
-	return frontierPartial
 }
 
-// probeFallbackTerms examines either the entire small persisted token
-// dictionary or one deterministic window around its binary-search position.
-// The window contains both prefix successors and fuzzy predecessors, and its
-// incompleteness is reported instead of silently overclaiming completeness.
-func probeFallbackTerms(collector *candidateCollector, queryText string, exact map[string]struct{}) bool {
-	terms := collector.snapshot.Query.TokenTerms()
-	if len(terms) == 0 || collector.budget.exhausted {
-		return false
+// admit offers one record to the ranking at most once. Filters are record
+// predicates evaluated here; they never consult facet postings.
+func (collector *candidateCollector) admit(ordinal uint32, tier int) {
+	if _, exists := collector.seen[ordinal]; exists {
+		return
 	}
+	if uint64(ordinal) >= uint64(len(collector.snapshot.Records)) {
+		collector.budget.exhausted = true
+		collector.partial = true
+		return
+	}
+	collector.seen[ordinal] = struct{}{}
+	record := collector.snapshot.Records[ordinal]
+	if !collector.predicate.permits(record) {
+		return
+	}
+	if !collector.ranking.offer(record, tier) {
+		collector.partial = true
+	}
+}
+
+// matchWord unions the postings of every dictionary term matching one query
+// word. Exact and prefix terms come from the sorted dictionary by binary
+// search. Substring and fuzzy scans are progressive relaxation: they run
+// only when the word matched nothing so far, so ordinary queries never scan
+// the dictionary.
+func (collector *candidateCollector) matchWord(word string, maximumDistance, maximumTerms int) []taggedOrdinal {
+	best := make(map[uint32]int)
+	termsMatched := 0
+	stopped := false
+	admitTerm := func(ordinals []uint32, tier int) bool {
+		if termsMatched >= maximumTerms {
+			collector.partial = true
+			stopped = true
+			return false
+		}
+		termsMatched++
+		for _, ordinal := range ordinals {
+			if !collector.budget.visitRecord() {
+				collector.partial = true
+				stopped = true
+				return false
+			}
+			if current, exists := best[ordinal]; !exists || tier < current {
+				best[ordinal] = tier
+			}
+		}
+		return true
+	}
+	if exact := collector.snapshot.Query.TokenOrdinals(word); len(exact) != 0 {
+		admitTerm(exact, tierExactToken)
+	}
+	terms := collector.snapshot.Query.TokenTerms()
+	position := sort.SearchStrings(terms, word)
+	for index := position; !stopped && index < len(terms) && strings.HasPrefix(terms[index], word); index++ {
+		if terms[index] == word {
+			continue
+		}
+		if !collector.budget.visitTerm() {
+			collector.partial = true
+			stopped = true
+			break
+		}
+		admitTerm(collector.snapshot.Query.TokenOrdinals(terms[index]), tierPrefix)
+	}
+	if !stopped && len(best) == 0 {
+		collector.scanDictionary(position, func(term string) (int, bool) {
+			if strings.HasPrefix(term, word) || !strings.Contains(term, word) {
+				return 0, false
+			}
+			return tierSubstring, true
+		}, admitTerm)
+	}
+	if !stopped && len(best) == 0 && maximumDistance > 0 && utf8.RuneCountInString(word) >= minimumFuzzyRunes {
+		wordRunes := utf8.RuneCountInString(word)
+		collector.scanDictionary(position, func(term string) (int, bool) {
+			if abs(utf8.RuneCountInString(term)-wordRunes) > maximumDistance {
+				return 0, false
+			}
+			distance := editDistanceAtMost(word, term, maximumDistance)
+			if distance == 0 || distance > maximumDistance {
+				return 0, false
+			}
+			return tierFuzzyBase + distance, true
+		}, admitTerm)
+	}
+	output := make([]taggedOrdinal, 0, len(best))
+	for ordinal, tier := range best {
+		output = append(output, taggedOrdinal{ordinal: ordinal, tier: tier})
+	}
+	sort.Slice(output, func(i, j int) bool { return output[i].ordinal < output[j].ordinal })
+	return output
+}
+
+// scanDictionary examines dictionary terms once each against the term budget.
+// When the dictionary exceeds the remaining budget the scan is windowed around
+// the word's sorted position and the response is marked partial.
+func (collector *candidateCollector) scanDictionary(position int, classify func(string) (int, bool), admit func([]uint32, int) bool) {
+	terms := collector.snapshot.Query.TokenTerms()
 	remaining := collector.budget.maximumTerms - collector.budget.terms
 	if remaining <= 0 {
-		return len(terms) != 0
+		if len(terms) != 0 {
+			collector.partial = true
+		}
+		return
 	}
 	start, end := 0, len(terms)
-	incomplete := false
 	if len(terms) > remaining {
-		position := lowerBoundTerm(terms, queryText, collector.budget)
-		remaining = collector.budget.maximumTerms - collector.budget.terms
-		if remaining <= 0 {
-			return true
-		}
-		start = max(0, position-remaining/3)
+		start = max(0, position-remaining/2)
 		end = min(len(terms), start+remaining)
 		start = max(0, end-remaining)
-		incomplete = start != 0 || end != len(terms)
+		collector.partial = true
 	}
 	for _, term := range terms[start:end] {
 		if !collector.budget.visitTerm() {
-			return true
+			collector.partial = true
+			return
 		}
-		if _, exists := exact["token/"+term]; exists {
+		tier, matched := classify(term)
+		if !matched {
 			continue
 		}
-		if strings.HasPrefix(term, queryText) {
-			collector.intersect(collector.snapshot.Query.TokenOrdinals(term), 3)
-			continue
-		}
-		distance := editDistanceAtMost(queryText, term, 2)
-		if distance > 0 && distance <= 2 {
-			collector.intersect(collector.snapshot.Query.TokenOrdinals(term), 3+distance)
+		if !admit(collector.snapshot.Query.TokenOrdinals(term), tier) {
+			return
 		}
 	}
-	return incomplete
 }
 
-func lowerBoundTerm(terms []string, queryText string, budget *workBudget) int {
-	low, high := 0, len(terms)
-	for low < high {
-		if !budget.visitTerm() {
-			return low
-		}
-		middle := low + (high-low)/2
-		if terms[middle] < queryText {
-			low = middle + 1
-		} else {
-			high = middle
+// intersectWords keeps ordinals present in every word's candidate set. The
+// tier of a survivor is its worst tier across words, so a record matching one
+// word exactly and another only fuzzily ranks as a fuzzy match.
+func intersectWords(matches [][]taggedOrdinal) []taggedOrdinal {
+	if len(matches) == 0 {
+		return nil
+	}
+	smallest := 0
+	for index := range matches {
+		if len(matches[index]) < len(matches[smallest]) {
+			smallest = index
 		}
 	}
-	return low
+	output := make([]taggedOrdinal, 0, len(matches[smallest]))
+	for _, candidate := range matches[smallest] {
+		tier := candidate.tier
+		present := true
+		for index, other := range matches {
+			if index == smallest {
+				continue
+			}
+			found := sort.Search(len(other), func(i int) bool { return other[i].ordinal >= candidate.ordinal })
+			if found == len(other) || other[found].ordinal != candidate.ordinal {
+				present = false
+				break
+			}
+			tier = max(tier, other[found].tier)
+		}
+		if present {
+			output = append(output, taggedOrdinal{ordinal: candidate.ordinal, tier: tier})
+		}
+	}
+	return output
+}
+
+type filterPredicate struct {
+	operation     wire.Operation
+	filters       wire.Filters
+	allowInferred bool
+}
+
+func newFilterPredicate(request wire.Request) filterPredicate {
+	return filterPredicate{operation: request.Operation, filters: request.Filters, allowInferred: request.AllowInferred}
+}
+
+func (predicate filterPredicate) permits(record model.Record) bool {
+	if !matchesOperation(record, predicate.operation) {
+		return false
+	}
+	if !predicate.allowInferred && record.EvidenceClass != model.Verified {
+		return false
+	}
+	return matchesFilters(record, predicate.filters)
 }
 
 // RepositoryMap consumes the payload-bound stable structural frontier when
 // no explicit caller filter is present. With filters it drives a bounded group
-// construction from the smallest persisted filter/path category, allowing a
-// selective hit beyond the structural frontier without scanning raw records.
+// construction from the smallest persisted filter/path category.
 func RepositoryMap(snapshot store.Snapshot, request wire.Request, limits policy.Limits) Response {
-	budget := newWorkBudget(limits)
+	budget := newWorkBudget(limits, len(snapshot.Records))
 	if budget.maximum < 1 {
 		return budget.response([]model.Record{}, 0, len(snapshot.Records) != 0)
 	}
 	if !hasExplicitFilters(request.Filters) {
 		return repositoryMapFrontier(snapshot, request, budget)
 	}
-	plan := buildFilterPlan(snapshot, request, budget, false)
+	plan := buildFilterPlan(snapshot, request, budget)
 	if plan.impossible {
 		return budget.response([]model.Record{}, 0, false)
 	}
@@ -278,9 +357,6 @@ func RepositoryMap(snapshot store.Snapshot, request wire.Request, limits policy.
 			pathOrder = append(pathOrder, record.Path)
 			continue
 		}
-		if !budget.visitRecord() {
-			break
-		}
 		if compareRepresentativeCandidate(candidate, current) < 0 {
 			byPath[record.Path] = candidate
 		}
@@ -290,13 +366,10 @@ func RepositoryMap(snapshot store.Snapshot, request wire.Request, limits policy.
 	}
 	ranking := newBoundedRanking(request.MaximumResults, budget)
 	for _, path := range pathOrder {
-		candidate := byPath[path]
-		if !ranking.offerCandidate(candidate) {
-			break
-		}
+		ranking.offerCandidate(byPath[path])
 	}
 	selected, omitted := ranking.records()
-	return budget.response(selected, omitted, plan.partial || omitted > 0)
+	return budget.response(selected, omitted, plan.partial)
 }
 
 func repositoryMapFrontier(snapshot store.Snapshot, request wire.Request, budget *workBudget) Response {
@@ -328,113 +401,11 @@ func repositoryMapFrontier(snapshot store.Snapshot, request wire.Request, budget
 		}
 	}
 	selected, omitted := ranking.records()
-	return budget.response(selected, omitted, frontierPartial || omitted > 0)
-}
-
-type candidateCollector struct {
-	snapshot store.Snapshot
-	budget   *workBudget
-	plan     filterPlan
-	seen     map[uint32]struct{}
-	ranking  boundedRanking
-	partial  bool
-}
-
-func (collector *candidateCollector) intersect(posting []uint32, tier int) {
-	if collector.budget.exhausted || len(posting) == 0 || collector.plan.impossible {
-		return
-	}
-	if collector.plan.active && len(collector.plan.ordinals) < len(posting) {
-		for _, ordinal := range collector.plan.ordinals {
-			if !containsOrdinal(posting, ordinal, collector.budget) {
-				if collector.budget.exhausted {
-					collector.partial = true
-					return
-				}
-				continue
-			}
-			collector.append(ordinal, tier)
-		}
-		return
-	}
-	for _, ordinal := range posting {
-		if !collector.budget.visitRecord() {
-			collector.partial = true
-			return
-		}
-		if collector.plan.active {
-			if _, allowed := collector.plan.allowed[ordinal]; !allowed {
-				continue
-			}
-		}
-		collector.append(ordinal, tier)
-	}
-}
-
-func (collector *candidateCollector) append(ordinal uint32, tier int) {
-	if _, exists := collector.seen[ordinal]; exists {
-		return
-	}
-	if uint64(ordinal) >= uint64(len(collector.snapshot.Records)) {
-		collector.budget.exhausted = true
-		return
-	}
-	record := collector.snapshot.Records[ordinal]
-	if !collector.plan.active {
-		if !collector.plan.permits(collector.snapshot, ordinal, collector.budget) {
-			if collector.budget.exhausted {
-				collector.partial = true
-			}
-			return
-		}
-	}
-	collector.seen[ordinal] = struct{}{}
-	if !collector.ranking.offer(record, tier) {
-		collector.partial = true
-	}
-}
-
-func (plan filterPlan) permits(snapshot store.Snapshot, ordinal uint32, budget *workBudget) bool {
-	if uint64(ordinal) >= uint64(len(snapshot.Records)) {
-		budget.exhausted = true
-		return false
-	}
-	record := snapshot.Records[ordinal]
-	for _, category := range plan.categories {
-		if !category.matchesRecord(record) {
-			return false
-		}
-		if category.path {
-			continue
-		}
-		if !containsAnyOrdinal(category.sources, ordinal, budget) {
-			return false
-		}
-	}
-	return true
-}
-
-func containsOrdinal(ordinals []uint32, target uint32, budget *workBudget) bool {
-	low, high := 0, len(ordinals)
-	for low < high {
-		if !budget.visitRecord() {
-			return false
-		}
-		middle := low + (high-low)/2
-		if ordinals[middle] < target {
-			low = middle + 1
-		} else {
-			high = middle
-		}
-	}
-	return low < len(ordinals) && ordinals[low] == target
+	return budget.response(selected, omitted, frontierPartial)
 }
 
 type filterPlan struct {
 	ordinals   []uint32
-	allowed    map[uint32]struct{}
-	categories []filterCategory
-	active     bool
 	impossible bool
 	partial    bool
 }
@@ -448,21 +419,16 @@ type filterCategory struct {
 	path    bool
 }
 
-func buildFilterPlan(snapshot store.Snapshot, request wire.Request, budget *workBudget, includeOperation bool) filterPlan {
-	explicit := hasExplicitFilters(request.Filters)
-	categories := make([]filterCategory, 0, 7)
+// buildFilterPlan serves RepositoryMap only. It intersects the persisted facet
+// and path categories, charging one unit per driver posting entry visited.
+func buildFilterPlan(snapshot store.Snapshot, request wire.Request, budget *workBudget) filterPlan {
+	categories := make([]filterCategory, 0, 6)
 	impossible := false
-	incomplete := false
 	addFacet := func(facet store.QueryFacet, values []string) {
-		if len(values) == 0 || impossible || incomplete {
+		if len(values) == 0 || impossible {
 			return
 		}
-		var complete bool
-		values, complete = canonicalFilterValues(values, budget)
-		if !complete {
-			incomplete = true
-			return
-		}
+		values = canonicalFilterValues(values)
 		category := filterCategory{facet: facet, values: make(map[string]struct{}, len(values)), ordered: values, sources: make([][]uint32, 0, len(values))}
 		for _, value := range values {
 			category.values[value] = struct{}{}
@@ -477,24 +443,15 @@ func buildFilterPlan(snapshot store.Snapshot, request wire.Request, budget *work
 		categories = append(categories, category)
 	}
 	addPath := func(prefixes []string) {
-		if len(prefixes) == 0 || impossible || incomplete {
+		if len(prefixes) == 0 || impossible {
 			return
 		}
-		var complete bool
-		prefixes, complete = canonicalFilterValues(prefixes, budget)
-		if !complete {
-			incomplete = true
-			return
-		}
+		prefixes = canonicalFilterValues(prefixes)
 		paths := snapshot.Query.PathOrdinals()
 		category := filterCategory{values: make(map[string]struct{}, len(prefixes)), ordered: prefixes, sources: make([][]uint32, 0, len(prefixes)), path: true}
 		for _, prefix := range prefixes {
-			start := lowerBoundPath(snapshot.Records, paths, prefix, budget)
-			end := lowerBoundPath(snapshot.Records, paths, prefix+"\U0010ffff", budget)
-			if budget.exhausted {
-				incomplete = true
-				return
-			}
+			start := lowerBoundPath(snapshot.Records, paths, prefix)
+			end := lowerBoundPath(snapshot.Records, paths, prefix+"\U0010ffff")
 			category.values[prefix] = struct{}{}
 			source := paths[start:end]
 			category.sources = append(category.sources, source)
@@ -506,59 +463,31 @@ func buildFilterPlan(snapshot store.Snapshot, request wire.Request, budget *work
 		}
 		categories = append(categories, category)
 	}
-
-	// Explicit request filters are added first. They form the selective fused
-	// precheck before the operation/evidence sources are verified.
 	addFacet(store.QueryFacetLanguage, request.Filters.Languages)
 	addFacet(store.QueryFacetKind, request.Filters.SymbolKinds)
 	addFacet(store.QueryFacetSource, request.Filters.SourceTypes)
 	addPath(request.Filters.PathPrefixes)
-	if includeOperation {
-		switch request.Operation {
-		case wire.SearchSymbols:
-			addFacet(store.QueryFacetOperation, []string{"symbols"})
-		case wire.SearchDocs:
-			addFacet(store.QueryFacetOperation, []string{"docs"})
-		}
-	}
 	if !request.AllowInferred {
 		addFacet(store.QueryFacetEvidence, []string{string(model.Verified)})
 	}
-	if incomplete {
-		return filterPlan{active: true, partial: true}
-	}
 	if impossible || len(categories) == 0 {
-		return filterPlan{active: true, impossible: impossible}
+		return filterPlan{impossible: impossible}
 	}
-	if !explicit {
-		return filterPlan{categories: categories}
-	}
-
-	// Pick a driver only after retaining every category. The final ordinals are
-	// verified against every other persisted source before query admission.
 	driver := 0
 	for index := 1; index < len(categories); index++ {
-		if !budget.visitRecord() {
-			return filterPlan{active: true, partial: true}
-		}
 		if categories[index].total < categories[driver].total {
 			driver = index
 		}
 	}
-	capacity := min(categories[driver].total, max(0, budget.maximum-budget.records))
-	plan := filterPlan{
-		ordinals:   make([]uint32, 0, capacity),
-		allowed:    make(map[uint32]struct{}, capacity),
-		categories: categories,
-		active:     true,
-	}
+	plan := filterPlan{ordinals: make([]uint32, 0, categories[driver].total)}
+	allowed := make(map[uint32]struct{}, categories[driver].total)
 	for _, source := range categories[driver].sources {
 		for _, ordinal := range source {
 			if !budget.visitRecord() {
 				plan.partial = true
 				return plan
 			}
-			if _, exists := plan.allowed[ordinal]; exists {
+			if _, exists := allowed[ordinal]; exists {
 				continue
 			}
 			if uint64(ordinal) >= uint64(len(snapshot.Records)) {
@@ -573,19 +502,10 @@ func buildFilterPlan(snapshot store.Snapshot, request wire.Request, budget *work
 					matched = false
 					break
 				}
-			}
-			if !matched {
-				continue
-			}
-			for index := range categories {
 				if index == driver || categories[index].path {
 					continue
 				}
-				if !containsAnyOrdinal(categories[index].sources, ordinal, budget) {
-					if budget.exhausted {
-						plan.partial = true
-						return plan
-					}
+				if !containsAnyOrdinal(categories[index].sources, ordinal) {
 					matched = false
 					break
 				}
@@ -593,7 +513,7 @@ func buildFilterPlan(snapshot store.Snapshot, request wire.Request, budget *work
 			if !matched {
 				continue
 			}
-			plan.allowed[ordinal] = struct{}{}
+			allowed[ordinal] = struct{}{}
 			plan.ordinals = append(plan.ordinals, ordinal)
 		}
 	}
@@ -622,14 +542,6 @@ func (category filterCategory) matchesRecord(record model.Record) bool {
 		value = record.SourceType
 	case store.QueryFacetEvidence:
 		value = string(record.EvidenceClass)
-	case store.QueryFacetOperation:
-		if _, symbols := category.values["symbols"]; symbols && matchesOperation(record, wire.SearchSymbols) {
-			return true
-		}
-		if _, docs := category.values["docs"]; docs && matchesOperation(record, wire.SearchDocs) {
-			return true
-		}
-		return false
 	default:
 		return false
 	}
@@ -637,74 +549,39 @@ func (category filterCategory) matchesRecord(record model.Record) bool {
 	return matched
 }
 
-func containsAnyOrdinal(sources [][]uint32, target uint32, budget *workBudget) bool {
+func containsAnyOrdinal(sources [][]uint32, target uint32) bool {
 	for _, source := range sources {
-		if containsOrdinal(source, target, budget) {
+		position := sort.Search(len(source), func(i int) bool { return source[i] >= target })
+		if position < len(source) && source[position] == target {
 			return true
-		}
-		if budget.exhausted {
-			return false
 		}
 	}
 	return false
 }
 
-func canonicalFilterValues(values []string, budget *workBudget) ([]string, bool) {
+func canonicalFilterValues(values []string) []string {
 	canonical := make([]string, 0, len(values))
-	for inputIndex, value := range values {
-		// Reserve the worst-case binary-search and equality comparisons for
-		// this input position. The reservation is independent of caller order,
-		// while still covering every comparison actually performed below.
-		comparisonCredits := 1
-		for size := inputIndex; size > 0; size >>= 1 {
-			comparisonCredits++
-		}
-		for range comparisonCredits {
-			if !budget.visitRecord() {
-				return nil, false
-			}
-		}
-		low, high := 0, len(canonical)
-		for low < high {
-			middle := low + (high-low)/2
-			if canonical[middle] < value {
-				low = middle + 1
-			} else {
-				high = middle
-			}
-		}
-		if low < len(canonical) {
-			if canonical[low] == value {
-				continue
-			}
+	for _, value := range values {
+		position := sort.SearchStrings(canonical, value)
+		if position < len(canonical) && canonical[position] == value {
+			continue
 		}
 		canonical = append(canonical, "")
-		copy(canonical[low+1:], canonical[low:])
-		canonical[low] = value
+		copy(canonical[position+1:], canonical[position:])
+		canonical[position] = value
 	}
-	return canonical, true
+	return canonical
 }
 
-func lowerBoundPath(records []model.Record, ordinals []uint32, value string, budget *workBudget) int {
+func lowerBoundPath(records []model.Record, ordinals []uint32, value string) int {
 	value = normalize(value)
-	low, high := 0, len(ordinals)
-	for low < high {
-		if !budget.visitRecord() {
-			return low
-		}
-		middle := low + (high-low)/2
-		ordinal := ordinals[middle]
+	return sort.Search(len(ordinals), func(i int) bool {
+		ordinal := ordinals[i]
 		if uint64(ordinal) >= uint64(len(records)) {
-			budget.exhausted = true
-			return low
+			return true
 		}
-		if normalize(records[ordinal].Path) < value {
-			low = middle + 1
-		} else {
-			high = middle
-		}
-	}
-	return low
+		return normalize(records[ordinal].Path) >= value
+	})
 }
 
 func hasExplicitFilters(filters wire.Filters) bool {

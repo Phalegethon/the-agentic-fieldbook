@@ -26,7 +26,7 @@ func TestSearchExactPostingFindsHitBeyondCandidateFrontier(t *testing.T) {
 	if len(response.Records) != 1 || response.Records[0].Identity != hit.Identity {
 		t.Fatalf("records = %#v, want exact posting hit %#v", response.Records, hit)
 	}
-	if response.Counters.ConsideredRecords > policy.ProductionLimits().MaximumLexicalCandidates {
+	if response.Counters.ConsideredRecords > scaledBudget(len(records)) {
 		t.Fatalf("response = %#v", response)
 	}
 }
@@ -48,19 +48,6 @@ func TestSearchFiltersBeforeRankingAndNeverPromotesInferredByDefault(t *testing.
 	response = Search(snapshot, request, policy.ProductionLimits())
 	if got, want := identities(response.Records), []string{verified.Identity, inferred.Identity}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("allowed inferred identities = %#v, want %#v", got, want)
-	}
-}
-
-func TestSearchPrefixFallbackIsBoundedAndExplicitlyPartial(t *testing.T) {
-	records := make([]model.Record, 0, 4097)
-	for index := 0; index < 4097; index++ {
-		record := testRecord(index, fmt.Sprintf("prefix%d", index), model.Definition, model.Verified)
-		record.SearchTerms = []string{fmt.Sprintf("prefix%d", index)}
-		records = append(records, record)
-	}
-	response := Search(indexedSnapshot(records), searchRequest("prefix"), policy.ProductionLimits())
-	if !response.Partial || response.Counters.ConsideredRecords > policy.ProductionLimits().MaximumLexicalCandidates || response.TermVisits > policy.ProductionLimits().MaximumFuzzyTerms || response.Omitted != 0 {
-		t.Fatalf("bounded prefix response = %#v", response)
 	}
 }
 
@@ -123,45 +110,6 @@ func TestSearchSupportsQualifiedShortAliasPrefixFuzzyAndDocumentSeparation(t *te
 	}
 }
 
-func TestSearchUsesPersistedFuzzyTermsBeforeSubstringFrontierExhaustion(t *testing.T) {
-	records := make([]model.Record, policy.ProductionLimits().MaximumLexicalCandidates+1)
-	for index := range records {
-		records[index] = testRecord(index, "noise", model.Definition, model.Verified)
-		records[index].SearchTerms = []string{"noise"}
-	}
-	document := testRecord(len(records)-1, "Level One Markdown", model.Heading, model.Verified)
-	document.Path = "markdown/record-00027.md"
-	document.Language = "markdown"
-	document.SourceType = "document"
-	document.SearchTerms = []string{"markdown"}
-	records[len(records)-1] = document
-	request := searchRequest("markdwn")
-	request.Operation = wire.SearchDocs
-	response := Search(indexedSnapshot(records), request, policy.ProductionLimits())
-	if got := identities(response.Records); !reflect.DeepEqual(got, []string{document.Identity}) {
-		t.Fatalf("fuzzy document records = %#v, want %s", got, document.Identity)
-	}
-}
-
-func TestSearchUsesFullPhraseFuzzyFallbackBeforeBroadIndividualTokens(t *testing.T) {
-	records := make([]model.Record, policy.ProductionLimits().MaximumLexicalCandidates+1)
-	for index := range records {
-		records[index] = testRecord(index, fmt.Sprintf("Level One Markdown %d#chunk-1", index+1000), model.DocumentChunk, model.Verified)
-		records[index].Language = "markdown"
-		records[index].SourceType = "document"
-	}
-	target := testRecord(len(records)-1, "Level One Markdown 27#chunk-1", model.DocumentChunk, model.Verified)
-	target.Language = "markdown"
-	target.SourceType = "document"
-	records[len(records)-1] = target
-	request := searchRequest("level one markdown 27#chunk-2")
-	request.Operation = wire.SearchDocs
-	response := Search(indexedSnapshot(records), request, policy.ProductionLimits())
-	if got := identities(response.Records); !reflect.DeepEqual(got, []string{target.Identity}) {
-		t.Fatalf("full-phrase fuzzy records = %#v, want %s", got, target.Identity)
-	}
-}
-
 func TestSearchAdmitsSubstringFromBoundedPersistedFrontier(t *testing.T) {
 	record := testRecord(0, "pkg.ServiceWorker", model.Definition, model.Verified)
 	record.SearchTerms = []string{"serviceworker"}
@@ -171,18 +119,6 @@ func TestSearchAdmitsSubstringFromBoundedPersistedFrontier(t *testing.T) {
 	}
 	if response.Partial {
 		t.Fatalf("complete one-record frontier reported partial: %#v", response)
-	}
-}
-
-func TestSearchReportsPartialWhenSubstringFrontierCannotCoverSnapshot(t *testing.T) {
-	records := make([]model.Record, policy.ProductionLimits().MaximumLexicalCandidates+1)
-	for index := range records {
-		records[index] = testRecord(index, "pkg.Alpha", model.Definition, model.Verified)
-		records[index].SearchTerms = []string{"alpha"}
-	}
-	response := Search(indexedSnapshot(records), searchRequest("zzzz"), policy.ProductionLimits())
-	if !response.Partial || len(response.Records) != 0 {
-		t.Fatalf("truncated substring frontier response = %#v", response)
 	}
 }
 
@@ -248,7 +184,7 @@ func TestSearchUsesFilterFacetBeforeLargeIrrelevantPostingPrefix(t *testing.T) {
 	if got := identities(response.Records); !reflect.DeepEqual(got, []string{hit.Identity}) {
 		t.Fatalf("filtered hit = %#v, want %s", got, hit.Identity)
 	}
-	if response.Counters.ConsideredRecords > policy.ProductionLimits().MaximumLexicalCandidates || response.TermVisits > policy.ProductionLimits().MaximumFuzzyTerms {
+	if response.Counters.ConsideredRecords > scaledBudget(len(records)) || response.TermVisits > policy.ProductionLimits().MaximumDictionaryTerms {
 		t.Fatalf("unbounded response = %#v", response)
 	}
 }
@@ -279,23 +215,8 @@ func TestSearchIntersectsAllCompoundFiltersBeforeLexicalAdmission(t *testing.T) 
 	if got := identities(response.Records); !reflect.DeepEqual(got, []string{hit.Identity}) {
 		t.Fatalf("compound-filter records = %#v, want %s (response=%#v)", got, hit.Identity, response)
 	}
-	if response.Counters.ConsideredRecords > policy.ProductionLimits().MaximumLexicalCandidates || response.TermVisits > policy.ProductionLimits().MaximumFuzzyTerms {
+	if response.Counters.ConsideredRecords > scaledBudget(len(records)) || response.TermVisits > policy.ProductionLimits().MaximumDictionaryTerms {
 		t.Fatalf("compound-filter work exceeded policy: %#v", response)
-	}
-}
-
-func TestSearchChargesRankingMaterializationAndComparisons(t *testing.T) {
-	records := make([]model.Record, 4)
-	for index := range records {
-		records[index] = testRecord(index, "", model.Definition, model.Verified)
-		records[index].SearchTerms = []string{"service"}
-	}
-	response := Search(indexedSnapshot(records), searchRequest("service"), policy.ProductionLimits())
-	if response.Counters.ConsideredRecords <= len(records) {
-		t.Fatalf("ranking work is invisible in counters: %#v", response)
-	}
-	if response.Counters.ConsideredRecords > policy.ProductionLimits().MaximumLexicalCandidates {
-		t.Fatalf("ranking work exceeded policy: %#v", response)
 	}
 }
 
@@ -551,7 +472,7 @@ func FuzzMalformedSnapshotBounded(f *testing.F) {
 		queryIndex := store.BuildQueryIndex([]model.Record{record})
 		for _, snapshot := range []store.Snapshot{{Records: []model.Record{record}, Query: queryIndex}, {Query: queryIndex}} {
 			response := Search(snapshot, searchRequest(term), policy.ProductionLimits())
-			if response.Counters.ConsideredRecords > policy.ProductionLimits().MaximumLexicalCandidates || response.TermVisits > policy.ProductionLimits().MaximumFuzzyTerms {
+			if response.Counters.ConsideredRecords > scaledBudget(len(snapshot.Records)) || response.TermVisits > policy.ProductionLimits().MaximumDictionaryTerms {
 				t.Fatalf("unbounded response %#v", response)
 			}
 		}
@@ -580,7 +501,7 @@ func FuzzCompoundFilterPermutationAndAccounting(f *testing.F) {
 			t.Fatalf("compound filter permutation changed search:\nleft=%#v\nright=%#v", left, right)
 		}
 		for _, response := range []Response{left, right} {
-			if response.Counters.ConsideredRecords > policy.ProductionLimits().MaximumLexicalCandidates || response.TermVisits > policy.ProductionLimits().MaximumFuzzyTerms {
+			if response.Counters.ConsideredRecords > scaledBudget(len(snapshot.Records)) || response.TermVisits > policy.ProductionLimits().MaximumDictionaryTerms {
 				t.Fatalf("unbounded compound response: %#v", response)
 			}
 		}
@@ -589,6 +510,224 @@ func FuzzCompoundFilterPermutationAndAccounting(f *testing.F) {
 			t.Fatalf("compound filter permutation changed map:\nleft=%#v\nright=%#v", leftMap, rightMap)
 		}
 	})
+}
+
+func scaledBudget(recordCount int) int {
+	return max(policy.ProductionLimits().MaximumLexicalCandidates, recordBudgetMultiplier*recordCount)
+}
+
+func scaledBudgetFor(limits policy.Limits, recordCount int) int {
+	return max(limits.MaximumLexicalCandidates, recordBudgetMultiplier*recordCount)
+}
+
+func TestSearchRanksDefinitionBeforeImportsOfTheSameName(t *testing.T) {
+	definition := testRecord(0, "git_snapshot.collect_snapshot", model.Definition, model.Verified)
+	definition.Path, definition.SearchTerms = "tools/git_snapshot.py", []string{"git_snapshot.collect_snapshot", "git_snapshot", "collect_snapshot"}
+	importA := testRecord(1, "collect_snapshot", model.Import, model.Verified)
+	importA.Path, importA.SearchTerms = "a/cli.py", []string{"collect_snapshot"}
+	importB := testRecord(2, "collect_snapshot", model.Import, model.Verified)
+	importB.Path, importB.SearchTerms = "b/test.py", []string{"collect_snapshot"}
+	prefixOnly := testRecord(3, "x.collect_snapshot_list", model.Definition, model.Verified)
+	prefixOnly.Path, prefixOnly.SearchTerms = "a/list.py", []string{"x.collect_snapshot_list", "collect_snapshot_list"}
+	snapshot := indexedSnapshot([]model.Record{prefixOnly, importB, importA, definition})
+	response := Search(snapshot, searchRequest("collect_snapshot"), policy.ProductionLimits())
+	if got, want := identities(response.Records), []string{definition.Identity, importA.Identity, importB.Identity, prefixOnly.Identity}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("order = %#v, want %#v", got, want)
+	}
+	if response.Partial {
+		t.Fatalf("complete search reported partial: %#v", response)
+	}
+}
+
+func TestSearchIntersectsEveryQueryWord(t *testing.T) {
+	installTAF := testRecord(0, "Guide.Install TAF", model.Heading, model.Verified)
+	installCodex := testRecord(1, "Guide.Install Codex", model.Heading, model.Verified)
+	updateTAF := testRecord(2, "Guide.Update TAF", model.Heading, model.Verified)
+	for _, record := range []*model.Record{&installTAF, &installCodex, &updateTAF} {
+		record.SourceType, record.Language = "document", "markdown"
+	}
+	installTAF.SearchTerms, installCodex.SearchTerms, updateTAF.SearchTerms = []string{"install", "taf"}, []string{"install", "codex"}, []string{"update", "taf"}
+	snapshot := indexedSnapshot([]model.Record{installCodex, updateTAF, installTAF})
+	request := searchRequest("taf install")
+	request.Operation = wire.SearchDocs
+	response := Search(snapshot, request, policy.ProductionLimits())
+	if got := identities(response.Records); !reflect.DeepEqual(got, []string{installTAF.Identity}) {
+		t.Fatalf("intersection = %#v, want only %s", got, installTAF.Identity)
+	}
+}
+
+func TestSearchRanksByTheWorstMatchedWord(t *testing.T) {
+	exact := testRecord(0, "pkg.report_build", model.Definition, model.Verified)
+	exact.Path, exact.SearchTerms = "z/exact.go", []string{"report_build", "report", "build"}
+	prefix := testRecord(1, "pkg.reporting_builder", model.Definition, model.Verified)
+	prefix.Path, prefix.SearchTerms = "a/prefix.go", []string{"reporting_builder", "reporting", "builder"}
+	response := Search(indexedSnapshot([]model.Record{prefix, exact}), searchRequest("report build"), policy.ProductionLimits())
+	if got, want := identities(response.Records), []string{exact.Identity, prefix.Identity}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("order = %#v, want exact words before prefix words %#v", got, want)
+	}
+}
+
+func TestSearchUsesFuzzyOnlyWhenNothingElseMatchesTheWord(t *testing.T) {
+	markdown := testRecord(0, "pkg.Markdown", model.Definition, model.Verified)
+	markdown.SearchTerms = []string{"markdown"}
+	marker := testRecord(1, "pkg.Marker", model.Definition, model.Verified)
+	marker.SearchTerms = []string{"marker"}
+	snapshot := indexedSnapshot([]model.Record{markdown, marker})
+	if got := identities(Search(snapshot, searchRequest("markdwn"), policy.ProductionLimits()).Records); !reflect.DeepEqual(got, []string{markdown.Identity}) {
+		t.Fatalf("fuzzy = %#v", got)
+	}
+	response := Search(snapshot, searchRequest("mark"), policy.ProductionLimits())
+	if got := identities(response.Records); !reflect.DeepEqual(got, []string{markdown.Identity, marker.Identity}) {
+		t.Fatalf("prefix = %#v", got)
+	}
+	if got := Search(snapshot, searchRequest("abd"), policy.ProductionLimits()).Records; len(got) != 0 {
+		t.Fatalf("three-rune word must not fuzzy match: %#v", got)
+	}
+}
+
+func TestSearchReportsExhaustionAsPartialWithoutInventingOmissions(t *testing.T) {
+	records := make([]model.Record, 3)
+	for index := range records {
+		records[index] = testRecord(index, fmt.Sprintf("pkg.R%d", index), model.Definition, model.Verified)
+		records[index].SearchTerms = []string{"x1", "x2", "x3", "x4", "x5", "x6"}
+	}
+	limits := policy.ProductionLimits()
+	limits.MaximumLexicalCandidates = 8
+	response := Search(indexedSnapshot(records), searchRequest("x"), limits)
+	if !response.Partial || response.Omitted != 0 {
+		t.Fatalf("exhausted response = %#v, want Partial with zero counted omissions", response)
+	}
+	if response.Counters.ConsideredRecords > scaledBudgetFor(limits, len(records)) {
+		t.Fatalf("budget overrun: %#v", response.Counters)
+	}
+}
+
+func TestSearchWindowedDictionaryStillFindsTermsNearTheQueryPosition(t *testing.T) {
+	records := make([]model.Record, 10)
+	for index := range records {
+		records[index] = testRecord(index, fmt.Sprintf("pkg.Term%d", index), model.Definition, model.Verified)
+		records[index].SearchTerms = []string{fmt.Sprintf("term%d", index)}
+	}
+	limits := policy.ProductionLimits()
+	limits.MaximumDictionaryTerms = 8
+	response := Search(indexedSnapshot(records), searchRequest("erm0"), limits)
+	if !response.Partial || response.TermVisits > limits.MaximumDictionaryTerms {
+		t.Fatalf("windowed response = partial:%v termVisits:%d", response.Partial, response.TermVisits)
+	}
+	if got := identities(response.Records); !reflect.DeepEqual(got, []string{records[0].Identity}) {
+		t.Fatalf("window around the query position must still find pkg.term0: %#v", got)
+	}
+}
+
+func TestSearchScansTheDictionaryOnlyForWordsWithoutExactOrPrefixMatches(t *testing.T) {
+	service := testRecord(0, "pkg.Alpha", model.Definition, model.Verified)
+	service.SearchTerms = []string{"service"}
+	micro := testRecord(1, "pkg.Beta", model.Definition, model.Verified)
+	micro.SearchTerms = []string{"microservice"}
+	snapshot := indexedSnapshot([]model.Record{service, micro})
+	exact := Search(snapshot, searchRequest("service"), policy.ProductionLimits())
+	if got := identities(exact.Records); !reflect.DeepEqual(got, []string{service.Identity}) || exact.TermVisits != 0 {
+		t.Fatalf("exact word must not scan the dictionary: records=%#v termVisits=%d", got, exact.TermVisits)
+	}
+	substring := Search(snapshot, searchRequest("croserv"), policy.ProductionLimits())
+	if got := identities(substring.Records); !reflect.DeepEqual(got, []string{micro.Identity}) || substring.TermVisits == 0 {
+		t.Fatalf("unmatched word must fall back to the substring scan: records=%#v termVisits=%d", got, substring.TermVisits)
+	}
+}
+
+func TestSearchEmptyQueryIsNotExhausted(t *testing.T) {
+	record := testRecord(0, "pkg.Service", model.Definition, model.Verified)
+	response := Search(indexedSnapshot([]model.Record{record}), searchRequest(""), policy.ProductionLimits())
+	if response.Partial || len(response.Records) != 0 {
+		t.Fatalf("empty query = %#v", response)
+	}
+}
+
+func TestRepositoryMapRankingOverflowIsNotPartial(t *testing.T) {
+	records := make([]model.Record, 64)
+	for index := range records {
+		records[index] = testRecord(index, fmt.Sprintf("Module%d", index), model.Module, model.Verified)
+		records[index].Path = fmt.Sprintf("a/%05d.go", index)
+	}
+	request := mapRequest()
+	request.MaximumResults = 8
+	response := RepositoryMap(indexedSnapshot(records), request, policy.ProductionLimits())
+	if response.Partial || len(response.Records) != 8 || response.Omitted != 56 {
+		t.Fatalf("map overflow = partial:%v records:%d omitted:%d, want ready with 56 counted omissions", response.Partial, len(response.Records), response.Omitted)
+	}
+	request.Filters.PathPrefixes = []string{"a/"}
+	filtered := RepositoryMap(indexedSnapshot(records), request, policy.ProductionLimits())
+	if filtered.Partial || len(filtered.Records) != 8 || filtered.Omitted != 56 {
+		t.Fatalf("filtered map overflow = partial:%v records:%d omitted:%d", filtered.Partial, len(filtered.Records), filtered.Omitted)
+	}
+}
+
+func TestSearchChargesEachPostingEntryAndOfferedCandidateOnce(t *testing.T) {
+	// Names avoid the "service" prefix so the only matching dictionary term is
+	// the exact token and the arithmetic below is exact.
+	records := make([]model.Record, 4)
+	for index := range records {
+		records[index] = testRecord(index, fmt.Sprintf("pkg.Alpha%d", index), model.Definition, model.Verified)
+		records[index].SearchTerms = []string{"service"}
+	}
+	response := Search(indexedSnapshot(records), searchRequest("service"), policy.ProductionLimits())
+	if len(response.Records) != 4 || response.Counters.ConsideredRecords != 8 {
+		t.Fatalf("counters = %#v records=%d, want 4 posting visits + 4 offers", response.Counters, len(response.Records))
+	}
+}
+
+func TestSearchScaledBudgetServesLargeSnapshotsWithoutExhaustion(t *testing.T) {
+	// One shared exact token, no prefix expansion: 10,000 posting visits plus
+	// 10,000 offers stay inside the scaled budget of 40,000.
+	records := make([]model.Record, 10000)
+	for index := range records {
+		records[index] = testRecord(index, fmt.Sprintf("pkg.Alpha%d", index), model.Definition, model.Verified)
+		records[index].SearchTerms = []string{"service"}
+	}
+	request := searchRequest("service")
+	request.MaximumResults = 8
+	response := Search(indexedSnapshot(records), request, policy.ProductionLimits())
+	if response.Partial || len(response.Records) != 8 || response.Omitted != len(records)-8 {
+		t.Fatalf("large snapshot response = partial:%v records:%d omitted:%d", response.Partial, len(response.Records), response.Omitted)
+	}
+}
+
+func TestSearchFiltersAreRecordPredicatesOnLargeSnapshots(t *testing.T) {
+	records := make([]model.Record, 5000)
+	for index := range records {
+		records[index] = testRecord(index, "pkg.Service", model.Definition, model.Verified)
+		records[index].Language = "python"
+		records[index].SearchTerms = []string{"service"}
+	}
+	hit := records[4999]
+	hit.Language, hit.Path = "go", "z/hit.go"
+	records[4999] = hit
+	definitionOnly := searchRequest("service")
+	definitionOnly.Filters.Languages = []string{"go"}
+	definitionOnly.Filters.SymbolKinds = []string{"definition"}
+	response := Search(indexedSnapshot(records), definitionOnly, policy.ProductionLimits())
+	if got := identities(response.Records); !reflect.DeepEqual(got, []string{hit.Identity}) || response.Partial {
+		t.Fatalf("filtered = %#v partial=%v", got, response.Partial)
+	}
+	importsOnly := searchRequest("service")
+	importsOnly.Filters.SymbolKinds = []string{"import"}
+	if got := Search(indexedSnapshot(records), importsOnly, policy.ProductionLimits()).Records; len(got) != 0 {
+		t.Fatalf("kind filter leaked = %#v", got)
+	}
+}
+
+func TestRepositoryMapPathPrefixFindsRecordsOnLargeSnapshots(t *testing.T) {
+	records := make([]model.Record, 5000)
+	for index := range records {
+		records[index] = testRecord(index, fmt.Sprintf("Module%d", index), model.Module, model.Verified)
+		records[index].Path = fmt.Sprintf("a/%05d.go", index)
+	}
+	request := mapRequest()
+	request.Filters.PathPrefixes = []string{"a/04999"}
+	response := RepositoryMap(indexedSnapshot(records), request, policy.ProductionLimits())
+	if got := identities(response.Records); !reflect.DeepEqual(got, []string{records[4999].Identity}) || response.Partial {
+		t.Fatalf("map path prefix = %#v partial=%v", got, response.Partial)
+	}
 }
 
 func sign(value int) int {

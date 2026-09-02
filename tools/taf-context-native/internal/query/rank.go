@@ -15,6 +15,7 @@ import (
 type rankedCandidate struct {
 	record         model.Record
 	tier           int
+	kindClass      int
 	evidence       int
 	normalizedPath string
 	startLine      int
@@ -29,6 +30,7 @@ func newRankedCandidate(record model.Record, tier int) rankedCandidate {
 	return rankedCandidate{
 		record:         record,
 		tier:           tier,
+		kindClass:      kindClass(record.RecordKind),
 		evidence:       evidenceTier(record),
 		normalizedPath: normalize(record.Path),
 		startLine:      record.StartLine,
@@ -40,9 +42,23 @@ func newRankedCandidate(record model.Record, tier int) rankedCandidate {
 	}
 }
 
+// kindClass orders record kinds within a tier: places where a name is
+// defined or described come before document chunks, and imports come last.
+func kindClass(kind model.RecordKind) int {
+	switch kind {
+	case model.DocumentChunk:
+		return 1
+	case model.Import:
+		return 2
+	default:
+		return 0
+	}
+}
+
 func compareRankedCandidate(left, right rankedCandidate) int {
 	comparisons := [...]int{
 		cmp.Compare(left.tier, right.tier),
+		cmp.Compare(left.kindClass, right.kindClass),
 		cmp.Compare(left.evidence, right.evidence),
 		cmp.Compare(left.normalizedPath, right.normalizedPath),
 		cmp.Compare(left.startLine, right.startLine),
@@ -75,9 +91,8 @@ func compareRepresentativeCandidate(left, right rankedCandidate) int {
 	return 0
 }
 
-// boundedRanking maintains a sorted top-K incrementally. Every candidate
-// materialization and ordering comparison consumes the shared record budget;
-// there is no uncharged final global sort.
+// boundedRanking maintains a sorted top-K incrementally. Each offered
+// candidate is charged once; the top-K insertion's comparisons are free.
 type boundedRanking struct {
 	items   []rankedCandidate
 	total   int
@@ -99,9 +114,6 @@ func (ranking *boundedRanking) offer(record model.Record, tier int) bool {
 func (ranking *boundedRanking) offerCandidate(candidate rankedCandidate) bool {
 	low, high := 0, len(ranking.items)
 	for low < high {
-		if !ranking.budget.visitRecord() {
-			return false
-		}
 		middle := low + (high-low)/2
 		if compareRankedCandidate(ranking.items[middle], candidate) < 0 {
 			low = middle + 1
