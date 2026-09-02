@@ -63,6 +63,7 @@ def write_fake_native_engine(
     invocation_log: Path | None = None,
     *,
     partial: bool = False,
+    stale: bool = False,
 ) -> None:
     source = textwrap.dedent(
             """\
@@ -128,11 +129,15 @@ def write_fake_native_engine(
                 "warnings": ["json-collection-limit"] if ready and __PARTIAL__ else [],
                 "next_safe_action": "use-index" if ready else "build-index",
             }
+            if operation == "status" and __STALE__:
+                payload["status"] = "stale"
+                payload["freshness"] = "incrementally-stale"
+                payload["next_safe_action"] = "rebuild-index"
             sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\\n")
             """
         ).replace("__INVOCATION_LOG__", repr(None if invocation_log is None else str(invocation_log))).replace(
             "__PARTIAL__", repr(partial)
-        )
+        ).replace("__STALE__", repr(stale))
     path.write_text(source, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
@@ -613,6 +618,33 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             )
             self.assertEqual((code, stderr), (0, ""))
             self.assertGreater(binding.stat().st_mtime, old)
+
+    def test_stale_context_does_not_refresh_binding_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            fresh_binary = root / "taf-level1"
+            write_fake_native_engine(fresh_binary)
+            stale_binary = root / "taf-level1-stale"
+            write_fake_native_engine(stale_binary, stale=True)
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_LEVEL1_BINARY": str(fresh_binary),
+                "TAF_STATE_HOME": str(state_home),
+            }
+            code, _stdout, stderr = invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+            self.assertEqual((code, stderr), (0, ""))
+            binding = next(state_home.glob("repositories/*/*/binding.json"))
+            old = 1_600_000_000
+            os.utime(binding, (old, old))
+
+            environment["TAF_LEVEL1_BINARY"] = str(stale_binary)
+            code, stdout, stderr = invoke(environment, "prepare", "inspect", "--repo", str(repo))
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(decoded(stdout)["next_safe_action"], "rebuild-index")
+            self.assertEqual(binding.stat().st_mtime, old)
 
     def test_remove_is_a_dry_run_until_state_write_is_confirmed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

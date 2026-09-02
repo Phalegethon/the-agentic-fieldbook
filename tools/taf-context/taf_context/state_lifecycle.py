@@ -205,6 +205,7 @@ def plan_gc(root: Path, *, unused_for_days: int, now: float) -> list[Candidate]:
             orphans.append(_candidate("orphan-entry", root, entry))
             doomed_entries.add(entry)
             continue
+        # An entry whose last use is exactly unused_for_days old counts as unused.
         if (entry / BINDING_FILENAME).lstat().st_mtime <= cutoff:
             unused.append(_candidate("unused-entry", root, entry))
             doomed_entries.add(entry)
@@ -232,25 +233,21 @@ def plan_gc(root: Path, *, unused_for_days: int, now: float) -> list[Candidate]:
             continue
         worktrees = _sorted_real_directories(repository)
         if all(worktree in doomed_entries for worktree in worktrees):
-            residual_directories = sum(
-                _tree_bytes(child) for child in worktrees if child not in doomed_entries
-            )
-            residual_files = sum(
-                _file_bytes(item) for item in repository.iterdir() if _is_real_file(item)
-            )
-            empty_parents.append(
-                Candidate(
-                    "empty-parent",
-                    repository.relative_to(root).as_posix(),
-                    residual_directories + residual_files,
+            try:
+                residual_files = sum(
+                    _file_bytes(item) for item in repository.iterdir() if _is_real_file(item)
                 )
+            except OSError:
+                residual_files = 0
+            empty_parents.append(
+                Candidate("empty-parent", repository.relative_to(root).as_posix(), residual_files)
             )
     ordered = orphans + unused + runtimes + generations + legacy + trash + empty_parents
     return [item for group in _group_by_category(ordered) for item in sorted(group, key=lambda c: c.relative_path)]
 
 
 def _unreferenced_generations(root: Path, entry: Path) -> list[Candidate]:
-    """Generations not named by CURRENT. Without a readable CURRENT, propose nothing."""
+    """Generation and staging directories not named by CURRENT. Without an exact CURRENT token, propose nothing."""
     generations = entry / NATIVE_DIRECTORY / GENERATIONS_DIRECTORY
     if not _is_real_directory(generations):
         return []
@@ -265,12 +262,16 @@ def _unreferenced_generations(root: Path, entry: Path) -> list[Candidate]:
 
 
 def _read_current(path: Path) -> str:
+    """Return the CURRENT generation token, or "" unless it is exactly 64 hex characters with at most one trailing newline."""
     try:
         if not _is_real_file(path):
             return ""
-        return path.read_text(encoding="utf-8").strip()
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return ""
+    if text.endswith("\n"):
+        text = text[:-1]
+    return text if _is_identity_name(text) else ""
 
 
 def _is_real_file(path: Path) -> bool:

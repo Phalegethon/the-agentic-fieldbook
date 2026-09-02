@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from taf_context.state_lifecycle import (
     CURRENT_RUNTIME_VERSION,
@@ -264,6 +265,51 @@ class GcPlanTests(unittest.TestCase):
             plan = plan_gc(root, unused_for_days=30, now=time.time())
             parents = [c for c in plan if c.category == "empty-parent"]
             self.assertEqual([c.bytes for c in parents], [5000])
+
+    def test_entry_unused_for_exactly_the_cutoff_is_reclaimed(self) -> None:
+        now = 1_700_000_000.0
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = make_entry(root, "a" * 64, "1" * 64, bound=True)
+            stamp = now - 30 * 86400
+            os.utime(entry / "binding.json", (stamp, stamp))
+            plan = plan_gc(root, unused_for_days=30, now=now)
+            self.assertEqual([c.category for c in plan if c.relative_path.endswith("1" * 64)], ["unused-entry"])
+            os.utime(entry / "binding.json", (stamp + 1, stamp + 1))
+            plan = plan_gc(root, unused_for_days=30, now=now)
+            self.assertEqual([c for c in plan if c.category == "unused-entry"], [])
+
+    def test_current_pointer_with_padding_proposes_no_generation_sweep(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = make_entry(root, "a" * 64, "1" * 64, bound=True)
+            extra = entry / "native" / "generations" / ("f" * 64)
+            extra.mkdir()
+            for token in ("  " + "e" * 64 + "\n", "e" * 64 + "\n\n", "\t" + "e" * 64):
+                (entry / "native" / "CURRENT").write_text(token, encoding="utf-8")
+                plan = plan_gc(root, unused_for_days=30, now=time.time())
+                self.assertEqual([c for c in plan if c.category == "unreferenced-generation"], [], repr(token))
+            (entry / "native" / "CURRENT").write_text("e" * 64 + "\n", encoding="utf-8")
+            plan = plan_gc(root, unused_for_days=30, now=time.time())
+            self.assertEqual(
+                [c.relative_path for c in plan if c.category == "unreferenced-generation"],
+                [f"repositories/{'a' * 64}/{'1' * 64}/native/generations/{'f' * 64}"],
+            )
+
+    def test_repository_directory_vanishing_during_plan_is_not_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_entry(root, "b" * 64, "1" * 64, bound=False)
+            original = Path.iterdir
+
+            def flaky_iterdir(self: Path):
+                if self.name == "b" * 64:
+                    raise FileNotFoundError(str(self))
+                return original(self)
+
+            with mock.patch.object(Path, "iterdir", flaky_iterdir):
+                plan = plan_gc(root, unused_for_days=30, now=time.time())
+            self.assertEqual([c.category for c in plan if c.category == "empty-parent"], ["empty-parent"])
 
 
 if __name__ == "__main__":
