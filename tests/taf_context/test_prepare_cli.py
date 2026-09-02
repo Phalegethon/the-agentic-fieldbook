@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from datetime import datetime, timezone
 from io import StringIO
 import json
@@ -18,7 +19,15 @@ import unittest
 from unittest import mock
 
 from taf_context.cli import main
-from taf_context.prepare_cli import PrepareCLIError, _platform_asset, _state_paths
+from taf_context.prepare_cli import (
+    FILTER_LANGUAGES,
+    FILTER_SYMBOL_KINDS,
+    PrepareCLIError,
+    _platform_asset,
+    _state_paths,
+    normalize_filter_values,
+    register_prepare_command,
+)
 
 from .repo_factory import init_committed_repo
 
@@ -695,6 +704,55 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             code, _stdout, stderr = invoke(environment, "prepare", "gc", "--unused-for", "-1")
             self.assertEqual(code, 2)
             self.assertIn("invalid-unused-for", stderr)
+
+
+class QueryArgumentTests(unittest.TestCase):
+    def test_query_defaults_to_a_four_thousand_character_budget(self) -> None:
+        parser = argparse.ArgumentParser()
+        register_prepare_command(parser.add_subparsers(dest="command"))
+        args = parser.parse_args(["prepare", "query", "--repo", ".", "--operation", "repository-map"])
+        self.assertEqual(args.maximum_output_characters, 4000)
+
+    def test_filter_values_are_lower_cased_deduplicated_and_sorted(self) -> None:
+        self.assertEqual(
+            normalize_filter_values(["Go", "python", "GO"], "--language", FILTER_LANGUAGES),
+            ["go", "python"],
+        )
+        self.assertEqual(
+            normalize_filter_values(["Definition", "heading"], "--symbol-kind", FILTER_SYMBOL_KINDS),
+            ["definition", "heading"],
+        )
+
+    def test_invalid_filter_value_names_the_flag_and_lists_valid_values(self) -> None:
+        with self.assertRaises(PrepareCLIError) as caught:
+            normalize_filter_values(["cobol"], "--language", FILTER_LANGUAGES)
+        message = str(caught.exception)
+        self.assertIn("--language", message)
+        self.assertIn("'cobol'", message)
+        self.assertIn("go, javascript, json, markdown, python, rust, toml, typescript", message)
+
+    def test_query_accepts_mixed_case_filters_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            binary = root / "taf-level1"
+            write_fake_native_engine(binary)
+            environment = {"TAF_LEVEL1_BINARY": str(binary), "TAF_STATE_HOME": str(root / "state")}
+            code, _stdout, stderr = invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+            self.assertEqual((code, stderr), (0, ""))
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo), "--operation", "search-symbols",
+                "--query", "Widget", "--language", "Go", "--symbol-kind", "Definition",
+                "--source-type", "Source",
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(decoded(stdout)["operation"], "search-symbols")
+            code, _stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo), "--operation", "search-symbols",
+                "--query", "Widget", "--symbol-kind", "widget",
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("valid values", stderr)
 
 
 if __name__ == "__main__":

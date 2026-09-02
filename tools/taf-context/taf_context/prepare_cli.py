@@ -46,10 +46,29 @@ _NATIVE_RELEASE_BASE_URL = (
 )
 _MAX_NATIVE_BINARY_BYTES = 64 * 1024 * 1024
 _MAX_CHECKSUM_BYTES = 1024
+FILTER_LANGUAGES = frozenset(
+    {"go", "javascript", "json", "markdown", "python", "rust", "toml", "typescript"}
+)
+FILTER_SYMBOL_KINDS = frozenset(
+    {"configuration", "definition", "document-chunk", "entry-point", "heading", "import", "module"}
+)
 
 
 class PrepareCLIError(ValueError):
     """A concise user-facing preparation error."""
+
+
+def normalize_filter_values(values: list[str], flag: str, valid: frozenset[str]) -> list[str]:
+    """Lower-case, validate, and canonicalize repeatable filter values."""
+    normalized: set[str] = set()
+    for value in values:
+        candidate = value.strip().lower()
+        if candidate not in valid:
+            raise PrepareCLIError(
+                f"invalid {flag} value {value!r}; valid values: {', '.join(sorted(valid))}"
+            )
+        normalized.add(candidate)
+    return sorted(normalized)
 
 
 def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
@@ -98,6 +117,7 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
         "--source-type",
         action="append",
         default=[],
+        type=str.lower,
         choices=("source", "document", "configuration"),
     )
     query.add_argument("--maximum-results", type=int, choices=range(1, 65), default=8)
@@ -105,7 +125,7 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
         "--maximum-output-characters",
         type=int,
         choices=(2000, 4000, 8000, 12000),
-        default=2000,
+        default=4000,
     )
     query.add_argument("--allow-inferred", action="store_true")
 
@@ -180,8 +200,8 @@ def run_prepare_command(
             result_identities=result_identities,
             filters={
                 "path_prefixes": sorted(set(args.path_prefix)),
-                "languages": sorted(set(args.language)),
-                "symbol_kinds": sorted(set(args.symbol_kind)),
+                "languages": normalize_filter_values(args.language, "--language", FILTER_LANGUAGES),
+                "symbol_kinds": normalize_filter_values(args.symbol_kind, "--symbol-kind", FILTER_SYMBOL_KINDS),
                 "source_types": sorted(set(args.source_type)),
             },
             maximum_results=args.maximum_results,
