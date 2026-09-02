@@ -242,6 +242,7 @@ func canonicalStableRelativePath(relative string) bool {
 
 func finalizeRecords(file boundary.StableFile, extractor Extractor, input []model.Record) ([]model.Record, bool) {
 	lineMaximum := sourceLineCount(file.Bytes)
+	lineStarts := sourceLineStarts(file.Bytes)
 	sourceDigest := file.SHA256
 	if !strings.HasPrefix(sourceDigest, "sha256:") {
 		sourceDigest = "sha256:" + sourceDigest
@@ -258,6 +259,7 @@ func finalizeRecords(file boundary.StableFile, extractor Extractor, input []mode
 			continue
 		}
 		record.SearchTerms = normalizedSearchTerms(record.QualifiedName, record.SearchTerms)
+		record.Preview = previewFor(record, file.Bytes, lineStarts)
 		output = append(output, record)
 	}
 	sort.Slice(output, func(i, j int) bool {
