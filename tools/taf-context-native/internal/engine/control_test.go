@@ -7,12 +7,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/extract"
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/inventory"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
@@ -275,4 +277,27 @@ func hasWarning(warnings []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestFreshnessForRejectsAnIndexBuiltUnderTheOlderExtractionPolicy(t *testing.T) {
+	index := "sha256:" + strings.Repeat("a", 64)
+	request := controlEnvelope(wire.SearchSymbols, "", "", &index).Request
+	parsers := ProductionDependencies().ParserIDs()
+	manifest := model.Manifest{
+		InclusionPolicyIdentity: currentInclusionPolicyIdentity(),
+		ExclusionPolicyIdentity: currentExclusionPolicyIdentity(),
+		ParserIdentities:        parsers,
+		Binding: model.Binding{
+			RepositoryIdentity: request.RepositoryIdentity, WorktreeIdentity: request.WorktreeIdentity,
+			CommittedHead: request.CommittedHead, DirtyOverlayFingerprint: request.DirtyOverlayFingerprint,
+		},
+	}
+	if freshness, action := freshnessFor(request, manifest, index, parsers); freshness != "exact" || action != "use-index" {
+		t.Fatalf("current policy = %s/%s", freshness, action)
+	}
+	inclusion, _ := inventory.PolicyIdentities()
+	manifest.InclusionPolicyIdentity = hashParts([]string{"taf-level1-inclusion-composite-v1", inclusion, "extract-v1 path=4096 components=256 warnings=64"})
+	if freshness, action := freshnessFor(request, manifest, index, parsers); freshness != "structurally-stale" || action != "rebuild-index" {
+		t.Fatalf("older policy = %s/%s, want structurally-stale/rebuild-index", freshness, action)
+	}
 }

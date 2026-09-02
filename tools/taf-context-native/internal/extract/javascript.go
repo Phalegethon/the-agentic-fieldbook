@@ -101,7 +101,6 @@ func handleECMAScriptNode(analysis *treeSitterAnalysis, node *sitter.Node, types
 		}
 	case "call_expression":
 		if ecmaDynamicLookup(analysis, node) {
-			analysis.ambiguous = true
 			analysis.addWarning(warningPrefix + "-dynamic-lookup")
 		}
 	}

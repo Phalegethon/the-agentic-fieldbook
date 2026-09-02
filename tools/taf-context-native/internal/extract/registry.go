@@ -79,8 +79,10 @@ var extractorWarningCompleteness = map[string]bool{
 
 // PolicyDescriptor binds registry/path validation ceilings that affect whether
 // a source reaches an extractor. Inputs are constants owned by this package.
+// v2: dynamic constructs and work limits no longer downgrade literal records;
+// the identity change forces a rebuild of v1 indexes.
 func PolicyDescriptor() string {
-	return fmt.Sprintf("extract-v1 path=%d components=%d warnings=%d", maximumStableRelativePathBytes, maximumStableRelativePathComponents, maximumExtractorWarnings)
+	return fmt.Sprintf("extract-v2 path=%d components=%d warnings=%d", maximumStableRelativePathBytes, maximumStableRelativePathComponents, maximumExtractorWarnings)
 }
 
 type Registry struct {

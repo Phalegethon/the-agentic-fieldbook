@@ -55,14 +55,14 @@ func TestPythonExtractorUsesDecoratedAsyncAndLexicalRanges(t *testing.T) {
 	}
 }
 
-func TestPythonDynamicLookupCannotBecomeVerified(t *testing.T) {
-	source := "class Registry:\n    pass\nvalue = globals()[name]\nmodule = __import__(module_name)\n"
+func TestPythonDynamicLookupKeepsLiteralDefinitionsVerified(t *testing.T) {
+	source := "class Registry:\n    pass\nvalue = globals()[name]\nmodule = __import__(module_name)\nplugin = getattr(module, attribute)\n"
 	records, report := NewRegistry().Extract(stableFile("pkg/registry.py", source))
 	record := findRecord(t, records, "registry.Registry")
-	if record.EvidenceClass == model.Verified {
-		t.Fatalf("dynamic lookup left a verified record: %#v", record)
+	if record.EvidenceClass != model.Verified {
+		t.Fatalf("dynamic lookup downgraded a literal class: %#v", record)
 	}
-	if !contains(report.WarningCodes, "python-dynamic-lookup") {
+	if !contains(report.WarningCodes, "python-dynamic-lookup") || report.ParseFailures != 0 {
 		t.Fatalf("report = %#v", report)
 	}
 }
@@ -97,14 +97,41 @@ func TestJavaScriptExtractorUsesImportsExportsMethodsAndJSX(t *testing.T) {
 	}
 }
 
-func TestJavaScriptReflectionAndDynamicImportCannotBecomeVerified(t *testing.T) {
+func TestJavaScriptReflectionAndDynamicImportKeepLiteralDefinitionsVerified(t *testing.T) {
 	source := "export class Registry {}\nconst module = import(name);\nconst value = Reflect.get(object, key);\n"
 	records, report := NewRegistry().Extract(stableFile("web/registry.js", source))
-	if record := findRecord(t, records, "registry.Registry"); record.EvidenceClass == model.Verified {
-		t.Fatalf("reflection left a verified record: %#v", record)
+	if record := findRecord(t, records, "registry.Registry"); record.EvidenceClass != model.Verified {
+		t.Fatalf("reflection downgraded a literal class: %#v", record)
 	}
-	if !contains(report.WarningCodes, "javascript-dynamic-lookup") {
+	if !contains(report.WarningCodes, "javascript-dynamic-lookup") || report.ParseFailures != 0 {
 		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestTypeScriptDynamicRequireKeepsLiteralDefinitionsVerified(t *testing.T) {
+	source := "export class Registry {}\nconst plugin = require(name);\n"
+	records, report := NewRegistry().Extract(stableFile("web/registry.ts", source))
+	if record := findRecord(t, records, "registry.Registry"); record.EvidenceClass != model.Verified {
+		t.Fatalf("dynamic require downgraded a literal class: %#v", record)
+	}
+	if !contains(report.WarningCodes, "typescript-dynamic-lookup") {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestTreeSitterWorkLimitsKeepExtractedRecordsVerified(t *testing.T) {
+	var builder strings.Builder
+	for index := 0; index <= maximumTreeSitterRecords; index++ {
+		fmt.Fprintf(&builder, "def function_%d():\n    return %d\n", index, index)
+	}
+	records, report := NewRegistry().Extract(stableFile("pkg/many.py", builder.String()))
+	if len(records) == 0 || len(records) > maximumTreeSitterRecords || !report.Incomplete() {
+		t.Fatalf("records=%d report=%#v", len(records), report)
+	}
+	for _, record := range records {
+		if record.EvidenceClass != model.Verified {
+			t.Fatalf("work limit downgraded %#v", record)
+		}
 	}
 }
 

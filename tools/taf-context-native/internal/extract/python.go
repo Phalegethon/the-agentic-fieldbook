@@ -78,7 +78,6 @@ func handlePythonNode(analysis *treeSitterAnalysis, node *sitter.Node) {
 		}
 	case "call", "subscript":
 		if pythonDynamicLookup(analysis, node) {
-			analysis.ambiguous = true
 			analysis.addWarning("python-dynamic-lookup")
 		}
 	}

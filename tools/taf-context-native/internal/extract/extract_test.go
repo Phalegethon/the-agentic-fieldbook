@@ -510,6 +510,12 @@ func assertNoStoredValues(t *testing.T, records []model.Record, values ...string
 	}
 }
 
+func TestPolicyDescriptorMarksPerRecordEvidenceRevision(t *testing.T) {
+	if got := PolicyDescriptor(); !strings.HasPrefix(got, "extract-v2 ") {
+		t.Fatalf("policy descriptor = %q, want extract-v2 prefix", got)
+	}
+}
+
 func contains(values []string, wanted string) bool {
 	for _, value := range values {
 		if value == wanted {

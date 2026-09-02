@@ -41,7 +41,6 @@ type treeSitterAnalysis struct {
 	records       []model.Record
 	warnings      []string
 	parseFailures int
-	ambiguous     bool
 	stopped       bool
 }
 
@@ -140,13 +139,6 @@ func extractTreeSitter(ctx context.Context, file boundary.StableFile, grammar tr
 	}
 	if ctx.Err() != nil {
 		return nil, treeSitterFailure(grammar.parserVersion, "tree-sitter-cancelled")
-	}
-	if analysis.ambiguous {
-		for index := range analysis.records {
-			if analysis.records[index].EvidenceClass == model.Verified {
-				analysis.records[index].EvidenceClass = model.Inferred
-			}
-		}
 	}
 	sort.Strings(analysis.warnings)
 	if ctx.Err() != nil {
@@ -367,7 +359,6 @@ func (analysis *treeSitterAnalysis) addWarning(warning string) {
 func (analysis *treeSitterAnalysis) limit(warning string) {
 	analysis.addWarning(warning)
 	analysis.parseFailures = 1
-	analysis.ambiguous = true
 	if warning == "tree-sitter-record-limit" || warning == "tree-sitter-capture-limit" || warning == "tree-sitter-match-limit" {
 		analysis.stopped = true
 	}
