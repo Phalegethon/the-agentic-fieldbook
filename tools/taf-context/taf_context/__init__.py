@@ -39,17 +39,6 @@ def __getattr__(name: str) -> object:
     return value
 
 
-def register_provider_commands(*args: object, **kwargs: object) -> object:
-    """Load the optional provider-control surface only when it is requested."""
-    module = importlib.import_module(".provider_cli", __name__)
-    return module.register_provider_commands(*args, **kwargs)
-
-
-def run_provider_command(*args: object, **kwargs: object) -> object:
-    """Load the optional provider-control surface only when it is requested."""
-    module = importlib.import_module(".provider_cli", __name__)
-    return module.run_provider_command(*args, **kwargs)
-
 __all__ = (
     "CandidateAvailability",
     "CandidateManifest",
@@ -70,6 +59,4 @@ __all__ = (
     "WorkstreamState",
     "parse_level1_request",
     "parse_level1_result",
-    "register_provider_commands",
-    "run_provider_command",
 )

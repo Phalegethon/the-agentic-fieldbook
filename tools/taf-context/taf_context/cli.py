@@ -36,7 +36,6 @@ from .models import (
     RepositorySnapshot,
     canonical_json,
 )
-from .provider_cli import register_provider_commands, run_provider_command
 from .prepare_cli import register_prepare_command, run_prepare_command
 from .recovery import RecoveryError
 from .recovery_cli import register_recovery_command, run_recovery_command
@@ -85,13 +84,6 @@ def main(
             result = _status_command(
                 repo=Path(args.repo), manifest_path=Path(args.manifest)
             )
-        elif args.command in {"providers", "consent"}:
-            result = run_provider_command(
-                args,
-                stdout=stdout,
-                environment=environment,
-                utc_clock=utc_clock,
-            )
         elif args.command == "prepare":
             result = run_prepare_command(
                 args,
@@ -135,7 +127,6 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status")
     status.add_argument("--repo", required=True)
     status.add_argument("--manifest", required=True)
-    register_provider_commands(commands)
     register_recovery_command(commands)
     register_prepare_command(commands)
     return parser
