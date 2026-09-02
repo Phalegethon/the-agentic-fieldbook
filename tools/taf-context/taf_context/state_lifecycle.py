@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import secrets
+import shutil
 import stat
 from typing import Iterator
+
+from .state_paths import StateError
 
 CURRENT_RUNTIME_VERSION = "0.1.1"
 
@@ -117,3 +122,61 @@ def _tree_bytes(path: Path) -> int:
             if stat.S_ISREG(metadata.st_mode):
                 total += metadata.st_size
     return total
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One filesystem entry a plan proposes to remove."""
+
+    category: str
+    relative_path: str
+    bytes: int
+
+
+def plan_remove(root: Path, repository_key: str, worktree_key: str) -> list[Candidate]:
+    """Plan deletion of one worktree entry; empty when it does not exist."""
+    entry = root / REPOSITORIES_DIRECTORY / repository_key / worktree_key
+    if not _is_real_directory(entry):
+        return []
+    return [_candidate("worktree-entry", root, entry)]
+
+
+def apply_plan(root: Path, candidates: list[Candidate]) -> list[Candidate]:
+    """Delete candidates with a two-phase rename. Validate everything first."""
+    resolved_root = root.resolve(strict=True)
+    targets: list[tuple[Candidate, Path]] = []
+    for candidate in candidates:
+        target = root / candidate.relative_path
+        try:
+            metadata = target.lstat()
+        except OSError as exc:
+            raise StateError("state-boundary-violation") from exc
+        if stat.S_ISLNK(metadata.st_mode) or ".." in Path(candidate.relative_path).parts:
+            raise StateError("state-boundary-violation")
+        resolved = target.resolve(strict=True)
+        if resolved == resolved_root or resolved_root not in resolved.parents:
+            raise StateError("state-boundary-violation")
+        targets.append((candidate, target))
+    removed: list[Candidate] = []
+    for candidate, target in targets:
+        trash = root / (TRASH_PREFIX + secrets.token_hex(8))
+        try:
+            trash.mkdir(mode=0o700)
+            os.rename(target, trash / target.name)
+            shutil.rmtree(trash)
+        except OSError as exc:
+            raise StateError("state-removal-failed") from exc
+        removed.append(candidate)
+    return removed
+
+
+def _candidate(category: str, root: Path, path: Path) -> Candidate:
+    size = _tree_bytes(path) if _is_real_directory(path) else _file_bytes(path)
+    return Candidate(category, path.relative_to(root).as_posix(), size)
+
+
+def _file_bytes(path: Path) -> int:
+    try:
+        return path.lstat().st_size
+    except OSError:
+        return 0

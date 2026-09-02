@@ -605,6 +605,45 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             self.assertEqual((code, stderr), (0, ""))
             self.assertGreater(binding.stat().st_mtime, old)
 
+    def test_remove_is_a_dry_run_until_state_write_is_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            binary = root / "taf-level1"
+            write_fake_native_engine(binary)
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_LEVEL1_BINARY": str(binary),
+                "TAF_STATE_HOME": str(state_home),
+            }
+            code, _stdout, stderr = invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+            self.assertEqual((code, stderr), (0, ""))
+            entry = next(state_home.glob("repositories/*/*/binding.json")).parent
+
+            code, stdout, stderr = invoke(environment, "prepare", "remove", "--repo", str(repo))
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["mode"], "remove")
+            self.assertTrue(result["dry_run"])
+            self.assertEqual([c["category"] for c in result["candidates"]], ["worktree-entry"])
+            self.assertEqual(result["removed"], [])
+            self.assertEqual(result["required_authorizations"], ["state-write"])
+            self.assertTrue(entry.exists())
+
+            code, stdout, stderr = invoke(environment, "prepare", "remove", "--repo", str(repo), "--confirm-state-write")
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertFalse(result["dry_run"])
+            self.assertEqual([c["category"] for c in result["removed"]], ["worktree-entry"])
+            self.assertEqual(result["required_authorizations"], [])
+            self.assertFalse(entry.exists())
+
+            code, stdout, stderr = invoke(environment, "prepare", "inspect", "--repo", str(repo))
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(decoded(stdout)["next_safe_action"], "build-index")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,14 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from taf_context.state_lifecycle import CURRENT_RUNTIME_VERSION, summarize_state
+from taf_context.state_lifecycle import (
+    CURRENT_RUNTIME_VERSION,
+    Candidate,
+    apply_plan,
+    plan_remove,
+    summarize_state,
+)
+from taf_context.state_paths import StateError
 
 
 def make_entry(root: Path, repo: str, worktree: str, *, bound: bool, generation: str = "gen-a") -> Path:
@@ -68,6 +75,50 @@ class SummarizeStateTests(unittest.TestCase):
             summary = summarize_state(root)
         self.assertLess(summary["root_bytes"], 100_000)
         self.assertEqual(summary["entry_count"], 1)
+
+
+class RemovePlanTests(unittest.TestCase):
+    def test_plan_names_exactly_the_requested_worktree_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_entry(root, "a" * 64, "1" * 64, bound=True)
+            make_entry(root, "a" * 64, "2" * 64, bound=True)
+            plan = plan_remove(root, "a" * 64, "1" * 64)
+            self.assertEqual([c.category for c in plan], ["worktree-entry"])
+            self.assertEqual(plan[0].relative_path, f"repositories/{'a' * 64}/{'1' * 64}")
+            self.assertGreater(plan[0].bytes, 1000)
+            self.assertEqual(plan_remove(root, "c" * 64, "1" * 64), [])
+
+    def test_apply_deletes_only_the_planned_entry_and_leaves_no_trash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = make_entry(root, "a" * 64, "1" * 64, bound=True)
+            sibling = make_entry(root, "a" * 64, "2" * 64, bound=True)
+            removed = apply_plan(root, plan_remove(root, "a" * 64, "1" * 64))
+            self.assertEqual([c.relative_path for c in removed], [f"repositories/{'a' * 64}/{'1' * 64}"])
+            self.assertFalse(target.exists())
+            self.assertTrue(sibling.exists())
+            self.assertEqual([p for p in root.iterdir() if p.name.startswith(".trash-")], [])
+
+    def test_apply_refuses_symlink_and_outside_candidates_before_deleting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "state"
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            (outside / "keep").write_text("x", encoding="utf-8")
+            make_entry(root, "a" * 64, "1" * 64, bound=True)
+            link = root / "repositories" / ("b" * 64)
+            link.mkdir()
+            os.symlink(outside, link / ("1" * 64))
+            bad = [Candidate("worktree-entry", f"repositories/{'b' * 64}/{'1' * 64}", 1)]
+            with self.assertRaises(StateError) as caught:
+                apply_plan(root, bad)
+            self.assertEqual(caught.exception.code, "state-boundary-violation")
+            self.assertTrue((outside / "keep").exists())
+            escaping = [Candidate("worktree-entry", "../outside", 1)]
+            with self.assertRaises(StateError):
+                apply_plan(root, escaping)
+            self.assertTrue((outside / "keep").exists())
 
 
 if __name__ == "__main__":

@@ -21,7 +21,14 @@ from urllib import request as url_request
 
 from .git_snapshot import collect_snapshot
 from .level1_models import Level1Result, parse_level1_result
-from .state_lifecycle import CURRENT_RUNTIME_VERSION, summarize_state, touch_binding
+from .state_lifecycle import (
+    CURRENT_RUNTIME_VERSION,
+    Candidate,
+    apply_plan,
+    plan_remove,
+    summarize_state,
+    touch_binding,
+)
 from .state_paths import StateError, resolve_state_paths
 
 
@@ -59,6 +66,10 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
     activate.add_argument("--repo", required=True)
     activate.add_argument("--confirm-network", action="store_true")
     activate.add_argument("--confirm-state-write", action="store_true")
+
+    remove = commands.add_parser("remove")
+    remove.add_argument("--repo", required=True)
+    remove.add_argument("--confirm-state-write", action="store_true")
 
     query = commands.add_parser("query")
     query.add_argument("--repo", required=True)
@@ -117,6 +128,13 @@ def run_prepare_command(
     state_root, binding_path = _repository_state_paths(
         paths.root, snapshot.repository_identity, snapshot.worktree_identity
     )
+
+    if args.prepare_command == "remove":
+        repository_key = snapshot.repository_identity.removeprefix("sha256:")
+        worktree_key = snapshot.worktree_identity.removeprefix("sha256:")
+        candidates = plan_remove(paths.root, repository_key, worktree_key)
+        return _lifecycle_summary("remove", paths.root, candidates, confirmed=args.confirm_state_write)
+
     binary, binary_source = _resolve_native_binary(environment, paths.root)
 
     if args.prepare_command == "query":
@@ -537,6 +555,32 @@ def _query_summary(result: Level1Result) -> dict[str, object]:
         "required_authorizations": [],
         "next_safe_action": result.next_safe_action,
     }
+
+
+def _lifecycle_summary(
+    mode: str, root: Path, candidates: list[Candidate], *, confirmed: bool
+) -> dict[str, object]:
+    removed: list[Candidate] = []
+    if confirmed and candidates:
+        try:
+            removed = apply_plan(root, candidates)
+        except StateError as exc:
+            raise PrepareCLIError(exc.code) from exc
+    return {
+        "schema_version": "1",
+        "mode": mode,
+        "dry_run": not confirmed,
+        "candidates": [_candidate_dict(item) for item in candidates],
+        "candidate_bytes": sum(item.bytes for item in candidates),
+        "removed": [_candidate_dict(item) for item in removed],
+        "removed_bytes": sum(item.bytes for item in removed),
+        "required_authorizations": [] if confirmed else ["state-write"],
+        "next_safe_action": "none" if confirmed else "confirm-state-write",
+    }
+
+
+def _candidate_dict(item: Candidate) -> dict[str, object]:
+    return {"category": item.category, "relative_path": item.relative_path, "bytes": item.bytes}
 
 
 def _summary(
