@@ -25,11 +25,18 @@ FIXED_TIMESTAMP = "2026-08-25T12:34:56Z"
 def invoke(*argv: str) -> tuple[int, str, str]:
     stdout = StringIO()
     stderr = StringIO()
+    # These commands (snapshot/status) never read the environment mapping, but
+    # the guard test requires an explicit ``environment=`` on every call to
+    # the broker's ``main`` so no test can silently fall back to the real
+    # process environment. Reuse the guard directory tests/__init__.py already
+    # pinned TAF_STATE_HOME to instead of creating a second temporary one.
+    state_home = os.environ.get("TAF_STATE_HOME", "")
     code = main(
         list(argv),
         stdout=stdout,
         stderr=stderr,
         utc_clock=lambda: FIXED_NOW,
+        environment={"HOME": state_home, "PATH": "", "TAF_STATE_HOME": state_home},
     )
     return code, stdout.getvalue(), stderr.getvalue()
 

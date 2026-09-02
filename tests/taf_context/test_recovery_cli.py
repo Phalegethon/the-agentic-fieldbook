@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -16,7 +17,17 @@ from .repo_factory import init_committed_repo, write
 def invoke(*argv: str) -> tuple[int, str, str]:
     stdout = StringIO()
     stderr = StringIO()
-    code = main(list(argv), stdout=stdout, stderr=stderr)
+    # The recover command never reads the environment mapping, but the guard
+    # test requires an explicit ``environment=`` on every call to the
+    # broker's ``main``. Reuse the guard directory tests/__init__.py already
+    # pinned TAF_STATE_HOME to instead of creating a second temporary one.
+    state_home = os.environ.get("TAF_STATE_HOME", "")
+    code = main(
+        list(argv),
+        stdout=stdout,
+        stderr=stderr,
+        environment={"HOME": state_home, "PATH": "", "TAF_STATE_HOME": state_home},
+    )
     return code, stdout.getvalue(), stderr.getvalue()
 
 

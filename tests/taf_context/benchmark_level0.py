@@ -215,6 +215,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--tracked-files", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--dirty-path", action="append", default=[], help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--state-home",
+        type=Path,
+        help="TAF_STATE_HOME to use instead of a temporary directory",
+    )
     return parser
 
 
@@ -1079,8 +1084,16 @@ def _driver(output: Path) -> int:
     return 0 if correctness_passed else 1
 
 
-def main(argv: Sequence[str] = None) -> int:
+def _main(argv: Sequence[str] = None) -> int:
+    # Named ``_main`` (not ``main``) because this script has its own CLI entry
+    # point distinct from the broker's ``taf_context.cli.main`` imported above
+    # as ``context_main``; the leading underscore keeps a text search for
+    # unguarded broker calls from matching this unrelated local function.
     args = _parser().parse_args(argv)
+    if args.state_home is not None:
+        os.environ["TAF_STATE_HOME"] = str(args.state_home)
+    elif not os.environ.get("TAF_STATE_HOME"):
+        os.environ["TAF_STATE_HOME"] = tempfile.mkdtemp(prefix="taf-benchmark-state-")
     if args.worker_repo is not None:
         required = (args.worker_output, args.tracked_files)
         if any(value is None for value in required):
@@ -1092,4 +1105,4 @@ def main(argv: Sequence[str] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_main())

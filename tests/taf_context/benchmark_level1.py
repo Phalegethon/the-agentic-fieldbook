@@ -586,6 +586,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--corpus-class", choices=("small", "medium", "large"), required=True)
     parser.add_argument("--evidence-root", type=Path, required=True)
     parser.add_argument("--reference-machine", required=True)
+    parser.add_argument(
+        "--state-home",
+        type=Path,
+        help="TAF_STATE_HOME to use instead of a temporary directory",
+    )
     return parser
 
 
@@ -595,6 +600,10 @@ def main(
     execute_factory: Optional[Callable[..., Callable[[BenchmarkSample], Mapping[str, object]]]] = None,
 ) -> int:
     arguments = build_parser().parse_args(argv)
+    if arguments.state_home is not None:
+        os.environ["TAF_STATE_HOME"] = str(arguments.state_home)
+    elif not os.environ.get("TAF_STATE_HOME"):
+        os.environ["TAF_STATE_HOME"] = tempfile.mkdtemp(prefix="taf-benchmark-state-")
     if not arguments.candidate_manifest.is_file():
         raise SystemExit("candidate manifest does not exist")
     if arguments.evidence_root.exists() and any(arguments.evidence_root.iterdir()):

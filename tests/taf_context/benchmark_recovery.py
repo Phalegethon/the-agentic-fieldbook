@@ -7,6 +7,7 @@ import argparse
 from contextlib import contextmanager
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
@@ -326,7 +327,16 @@ def main() -> int:
     parser.add_argument("--output")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument(
+        "--state-home",
+        type=Path,
+        help="TAF_STATE_HOME to use instead of a temporary directory",
+    )
     args = parser.parse_args()
+    if args.state_home is not None:
+        os.environ["TAF_STATE_HOME"] = str(args.state_home)
+    elif not os.environ.get("TAF_STATE_HOME"):
+        os.environ["TAF_STATE_HOME"] = tempfile.mkdtemp(prefix="taf-benchmark-state-")
     if args.check and args.output:
         parser.error("--check and --output are mutually exclusive")
     if args.samples < 1:
