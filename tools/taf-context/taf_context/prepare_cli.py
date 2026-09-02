@@ -19,16 +19,9 @@ from urllib import error as url_error
 from urllib import parse as url_parse
 from urllib import request as url_request
 
-from .discovery import discover_providers
 from .git_snapshot import collect_snapshot
 from .level1_models import Level1Result, parse_level1_result
-from .provider_models import HostInventory
-from .provider_state import (
-    StateError,
-    read_project_registration,
-    read_user_registry,
-    resolve_state_paths,
-)
+from .state_paths import StateError, resolve_state_paths
 
 
 _NATIVE_TIMEOUT_SECONDS = 120
@@ -163,8 +156,6 @@ def run_prepare_command(
         )
         return _query_summary(result)
 
-    providers, provider_warnings = _providers(repository, snapshot, paths)
-
     if args.prepare_command in {"activate", "build"}:
         if binary is None and args.prepare_command == "activate":
             binary = _install_native_engine(environment, paths.root)
@@ -189,8 +180,6 @@ def run_prepare_command(
         return _summary(
             mode=args.prepare_command,
             snapshot=snapshot,
-            providers=providers,
-            provider_warnings=provider_warnings,
             binary=binary,
             binary_source=binary_source,
             result=result,
@@ -231,8 +220,6 @@ def run_prepare_command(
     return _summary(
         mode="inspect",
         snapshot=snapshot,
-        providers=providers,
-        provider_warnings=provider_warnings,
         binary=binary,
         binary_source=binary_source,
         result=result,
@@ -412,35 +399,6 @@ def _validate_binary(path: Path) -> None:
         raise PrepareCLIError("configured native engine is unsafe")
 
 
-def _providers(repository: Path, snapshot: object, paths: object):
-    warnings: list[str] = []
-    try:
-        registry = read_user_registry(paths)
-    except StateError as exc:
-        registry = ()
-        warnings.append(exc.code)
-    try:
-        registration = read_project_registration(
-            repository, snapshot.repository_identity
-        )
-    except StateError as exc:
-        registration = None
-        warnings.append(exc.code)
-    inventory = HostInventory("1", (), 0, (), 0, False)
-    discovery = discover_providers(snapshot, inventory, registry, registration)
-    providers = [
-        {
-            "identity": provider.provider_identity,
-            "availability": provider.availability.value,
-            "freshness": provider.freshness.value,
-            "capabilities": list(provider.capabilities),
-            "locality": provider.locality.value,
-        }
-        for provider in discovery.providers
-    ]
-    return providers, tuple(sorted(set((*warnings, *discovery.warnings))))
-
-
 def _invoke_native(
     binary: Path,
     operation: str,
@@ -579,8 +537,6 @@ def _summary(
     *,
     mode: str,
     snapshot: object,
-    providers: list[dict[str, object]],
-    provider_warnings: tuple[str, ...],
     binary: Path | None,
     binary_source: str | None,
     result: Level1Result | None,
@@ -609,7 +565,6 @@ def _summary(
             "tracked_file_count": len(snapshot.tracked_paths),
             "language_counts": dict(snapshot.language_counts),
         },
-        "providers": providers,
         "engine": {
             "availability": "available" if binary is not None else "unavailable",
             "source": binary_source,
@@ -634,9 +589,7 @@ def _summary(
         },
         "required_authorizations": list(authorizations),
         "next_safe_action": next_action,
-        "warnings": sorted(
-            set(provider_warnings).union(() if result is None else result.warnings)
-        ),
+        "warnings": sorted(set(() if result is None else result.warnings)),
     }
 
 

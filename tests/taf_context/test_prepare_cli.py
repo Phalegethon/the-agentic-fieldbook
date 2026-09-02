@@ -534,6 +534,26 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             self.assertEqual(result["required_authorizations"], [])
             self.assertTrue(state_home.is_dir())
 
+    def test_inspect_output_has_no_provider_list(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            binary = root / "taf-level1"
+            write_fake_native_engine(binary)
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_LEVEL1_BINARY": str(binary),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+
+            code, stdout, stderr = invoke(environment, "prepare", "inspect", "--repo", str(repo))
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertNotIn("providers", result)
+            self.assertEqual(result["engine"]["availability"], "available")
+
 
 if __name__ == "__main__":
     unittest.main()
