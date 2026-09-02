@@ -98,5 +98,6 @@ func rewriteRanksAndCounts(result *wire.Result) {
 		result.Findings[index].Rank = index + 1
 	}
 	result.ReturnedCount = len(result.Findings)
-	result.Truncated = result.OmittedCount > 0
+	// Never clear a truncation the engine already reported; only raise it.
+	result.Truncated = result.Truncated || result.OmittedCount > 0
 }

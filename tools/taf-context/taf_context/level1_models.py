@@ -364,7 +364,7 @@ class Level1Result:
         identities = tuple(item.result_identity for item in findings)
         if len(set(identities)) != len(identities):
             raise Level1ModelError("findings")
-        if truncated is not (omitted_count > 0):
+        if omitted_count > 0 and not truncated:
             raise Level1ModelError("truncated")
         if output_characters > 12000:
             raise Level1ModelError("output_characters")

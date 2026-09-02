@@ -95,6 +95,10 @@ func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, s
 	result := engine.result(request, resultStatus, "exact", request.IndexIdentity, snapshot.Manifest.Coverage, nextAction)
 	result.Findings = findings(response.Records)
 	result.OmittedCount = response.Omitted
+	// Truncated is the honest flag: the finding list is known to be incomplete
+	// because the ranking overflowed, the renderer trimmed, or a budget stopped
+	// the search. Omissions the engine could not count are never estimated.
+	result.Truncated = response.Partial || response.Omitted > 0
 	result.Warnings = sourceCatalogWarnings(snapshot.Manifest.SourceCatalog)
 	if response.Partial {
 		result.Warnings = appendBoundedWarnings(result.Warnings, "query-frontier-exhausted")

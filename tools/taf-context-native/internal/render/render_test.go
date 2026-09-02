@@ -93,6 +93,19 @@ func TestFitRejectsMandatoryResultBeyondBudget(t *testing.T) {
 	}
 }
 
+func TestFitKeepsTruncatedFromAnExhaustedSearch(t *testing.T) {
+	request := renderRequest(12000, 8)
+	input := renderResult([]wire.Finding{renderFinding(1, "a", "α")})
+	input.Truncated = true
+	fitted, err := Fit(request, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fitted.Truncated || fitted.OmittedCount != 0 || fitted.ReturnedCount != 1 {
+		t.Fatalf("fitted = truncated:%v omitted:%d returned:%d, want truncated with zero counted omissions", fitted.Truncated, fitted.OmittedCount, fitted.ReturnedCount)
+	}
+}
+
 func TestFitReducesInitiallyOversizedJSONAndCharacterResults(t *testing.T) {
 	// A final-only encoder used to reject this before the renderer could trim.
 	findings := make([]wire.Finding, 0, 64)

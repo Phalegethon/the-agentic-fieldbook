@@ -173,12 +173,16 @@ func TestQueryPlannerExhaustionIsPartialExactAndRetainsFindings(t *testing.T) {
 		}
 		records := make([]model.Record, 4097)
 		for index := range records {
+			terms := make([]string, 0, 8)
+			for term := 0; term < 8; term++ {
+				terms = append(terms, fmt.Sprintf("prefix%d_%d", index, term))
+			}
 			records[index] = model.Record{
 				Identity: fmt.Sprintf("sha256:%064x", index+1), Path: fmt.Sprintf("pkg/%05d.go", index),
 				StartLine: 1, EndLine: 1, Language: "go", RecordKind: model.Definition,
 				SourceType: "source", QualifiedName: fmt.Sprintf("prefix%d", index),
 				ExtractionMethod: "test", EvidenceClass: model.Verified,
-				SearchTerms: []string{fmt.Sprintf("prefix%d", index)},
+				SearchTerms: terms,
 			}
 		}
 		snapshot.Records = records
@@ -193,8 +197,99 @@ func TestQueryPlannerExhaustionIsPartialExactAndRetainsFindings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != wire.Partial || result.Freshness != "exact" || result.NextSafeAction != "refine-query" || len(result.Findings) == 0 || !hasWarning(result.Warnings, "query-frontier-exhausted") {
+	if result.Status != wire.Partial || result.Freshness != "exact" || result.NextSafeAction != "refine-query" || len(result.Findings) == 0 || !result.Truncated || !hasWarning(result.Warnings, "query-frontier-exhausted") {
 		t.Fatalf("planner exhaustion = %#v", result)
+	}
+}
+
+func TestRankingOverflowIsReadyAndTruncatedWithCountedOmissions(t *testing.T) {
+	repository, state := controlRoots(t)
+	base := New(ProductionDependencies())
+	built, err := base.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencies := ProductionDependencies()
+	load := dependencies.Load
+	dependencies.Load = func(ctx context.Context, roots *boundary.Roots, identity string) (store.Snapshot, error) {
+		snapshot, loadErr := load(ctx, roots, identity)
+		if loadErr != nil {
+			return store.Snapshot{}, loadErr
+		}
+		records := make([]model.Record, 100)
+		for index := range records {
+			records[index] = model.Record{
+				Identity: fmt.Sprintf("sha256:%064x", index+1), Path: fmt.Sprintf("pkg/%05d.go", index),
+				StartLine: 1, EndLine: 1, Language: "go", RecordKind: model.Definition,
+				SourceType: "source", QualifiedName: fmt.Sprintf("pkg.Service%d", index),
+				ExtractionMethod: "test", EvidenceClass: model.Verified, SearchTerms: []string{"service"},
+			}
+		}
+		snapshot.Records = records
+		snapshot.Query = store.BuildQueryIndex(records)
+		return snapshot, nil
+	}
+	queryText := "service"
+	envelope := controlEnvelope(wire.SearchSymbols, repository, state, built.IndexIdentity)
+	envelope.Request.Query = &queryText
+	envelope.Request.MaximumResults = 8
+	result, err := New(dependencies).Execute(context.Background(), envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != wire.Ready || result.NextSafeAction != "use-index" || !result.Truncated || result.OmittedCount != 92 || len(result.Findings) != 8 || hasWarning(result.Warnings, "query-frontier-exhausted") {
+		t.Fatalf("ranking overflow = %#v", result)
+	}
+}
+
+// TestDictionaryExhaustionIsTruncatedWithoutCountedOmissions needs a dictionary
+// larger than the per-query term budget (262,144) so the substring scan windows
+// itself and reports Partial with zero matches; the large fixture is what makes
+// Truncated reachable only through response.Partial, never through Omitted.
+func TestDictionaryExhaustionIsTruncatedWithoutCountedOmissions(t *testing.T) {
+	repository, state := controlRoots(t)
+	base := New(ProductionDependencies())
+	built, err := base.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencies := ProductionDependencies()
+	load := dependencies.Load
+	dependencies.Load = func(ctx context.Context, roots *boundary.Roots, identity string) (store.Snapshot, error) {
+		snapshot, loadErr := load(ctx, roots, identity)
+		if loadErr != nil {
+			return store.Snapshot{}, loadErr
+		}
+		const recordCount = 4100
+		records := make([]model.Record, recordCount)
+		for index := range records {
+			terms := make([]string, 0, 64)
+			for term := 0; term < 64; term++ {
+				terms = append(terms, fmt.Sprintf("t%dx%d", index, term))
+			}
+			records[index] = model.Record{
+				Identity: fmt.Sprintf("sha256:%064x", index+1), Path: fmt.Sprintf("pkg/%05d.go", index),
+				StartLine: 1, EndLine: 1, Language: "go", RecordKind: model.Definition,
+				SourceType: "source", QualifiedName: fmt.Sprintf("pkg.R%d", index),
+				ExtractionMethod: "test", EvidenceClass: model.Verified,
+				SearchTerms: terms,
+			}
+		}
+		snapshot.Records = records
+		snapshot.Query = store.BuildQueryIndex(records)
+		return snapshot, nil
+	}
+	queryEngine := New(dependencies)
+	queryText := "zzzz"
+	envelope := controlEnvelope(wire.SearchSymbols, repository, state, built.IndexIdentity)
+	envelope.Request.Query = &queryText
+	envelope.Request.MaximumResults = 8
+	result, err := queryEngine.Execute(context.Background(), envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != wire.Partial || result.Freshness != "exact" || result.NextSafeAction != "refine-query" || !result.Truncated || result.OmittedCount != 0 || len(result.Findings) != 0 || !hasWarning(result.Warnings, "query-frontier-exhausted") {
+		t.Fatalf("dictionary exhaustion = %#v", result)
 	}
 }
 

@@ -446,6 +446,13 @@ class Level1ResultTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     Level1Result.from_dict(wire)
 
+    def test_exhausted_search_may_be_truncated_without_counted_omissions(self) -> None:
+        value = result_wire()
+        value["truncated"] = True
+        result = Level1Result.from_dict(value)
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.omitted_count, 0)
+
     def test_nonready_build_may_omit_index_but_other_results_may_not(self) -> None:
         build = result_wire()
         build.update(

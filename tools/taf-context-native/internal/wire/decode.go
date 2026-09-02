@@ -260,7 +260,10 @@ func validateResultWithoutBudgets(result Result) error {
 	if result.IndexIdentity == nil && !(result.Operation == Estimate || (result.Operation == Build && result.Status != Ready)) {
 		return ErrInvalidWire
 	}
-	if result.ParserVersions == nil || result.Coverage.ExclusionReasonCounts == nil || result.Findings == nil || result.Warnings == nil || len(result.ParserVersions) > policy.ProductionLimits().MaximumCollectionItems || len(result.Findings) > policy.ProductionLimits().MaximumCollectionItems || len(result.Warnings) > policy.ProductionLimits().MaximumCollectionItems || result.ReturnedCount != len(result.Findings) || !validCounter(result.ReturnedCount) || !validCounter(result.OmittedCount) || result.Truncated != (result.OmittedCount > 0) {
+	// Truncated may be true with OmittedCount == 0 (an exhausted search whose
+	// omissions could not be counted); it must never be false with
+	// OmittedCount > 0 (a counted omission the wire failed to disclose).
+	if result.ParserVersions == nil || result.Coverage.ExclusionReasonCounts == nil || result.Findings == nil || result.Warnings == nil || len(result.ParserVersions) > policy.ProductionLimits().MaximumCollectionItems || len(result.Findings) > policy.ProductionLimits().MaximumCollectionItems || len(result.Warnings) > policy.ProductionLimits().MaximumCollectionItems || result.ReturnedCount != len(result.Findings) || !validCounter(result.ReturnedCount) || !validCounter(result.OmittedCount) || (result.OmittedCount > 0 && !result.Truncated) {
 		return ErrInvalidWire
 	}
 	if !validCounter(result.Coverage.IndexedPathCount) || !validCounter(result.Coverage.ExcludedPathCount) || !validCounter(result.Coverage.UnsupportedLanguageCount) || !validCounter(result.Coverage.ParseFailureCount) || len(result.Coverage.ExclusionReasonCounts) > policy.ProductionLimits().MaximumCollectionItems || !validCounter(result.OutputCharacters) || result.OutputCharacters != renderedOutputCharacters(result) {
