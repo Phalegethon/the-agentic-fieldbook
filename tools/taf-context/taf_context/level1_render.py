@@ -163,6 +163,9 @@ def render_level1_result(
         "findings": [item.to_dict() for item in final_findings],
         "returned_count": len(final_findings),
         "omitted_count": omitted_count,
+        # Legacy renderer kept for its tests; the broker returns the engine's
+        # own result, whose truncated flag may be true with zero counted
+        # omissions.
         "truncated": omitted_count > 0,
         "output_characters": len(model_text),
         "warnings": list(warnings),

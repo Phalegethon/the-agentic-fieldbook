@@ -92,8 +92,9 @@ func (budget *workBudget) response(records []model.Record, omitted int, partial 
 func Search(snapshot store.Snapshot, request wire.Request, limits policy.Limits) Response {
 	budget := newWorkBudget(limits, len(snapshot.Records))
 	queryText := normalize(deref(request.Query))
+	// An empty query or an empty snapshot examines nothing and is not exhausted.
 	if queryText == "" || budget.maximum < 1 {
-		return budget.response([]model.Record{}, 0, queryText != "" && len(snapshot.Records) != 0)
+		return budget.response([]model.Record{}, 0, false)
 	}
 	collector := candidateCollector{
 		snapshot:  snapshot,
@@ -329,8 +330,9 @@ func (predicate filterPredicate) permits(record model.Record) bool {
 // construction from the smallest persisted filter/path category.
 func RepositoryMap(snapshot store.Snapshot, request wire.Request, limits policy.Limits) Response {
 	budget := newWorkBudget(limits, len(snapshot.Records))
+	// An empty query or an empty snapshot examines nothing and is not exhausted.
 	if budget.maximum < 1 {
-		return budget.response([]model.Record{}, 0, len(snapshot.Records) != 0)
+		return budget.response([]model.Record{}, 0, false)
 	}
 	if !hasExplicitFilters(request.Filters) {
 		return repositoryMapFrontier(snapshot, request, budget)
@@ -350,7 +352,7 @@ func RepositoryMap(snapshot store.Snapshot, request wire.Request, limits policy.
 			continue
 		}
 		record := snapshot.Records[ordinal]
-		candidate := newRankedCandidate(record, 0)
+		candidate := newMapCandidate(record)
 		current, exists := byPath[record.Path]
 		if !exists {
 			byPath[record.Path] = candidate
@@ -369,7 +371,10 @@ func RepositoryMap(snapshot store.Snapshot, request wire.Request, limits policy.
 		ranking.offerCandidate(byPath[path])
 	}
 	selected, omitted := ranking.records()
-	return budget.response(selected, omitted, plan.partial)
+	// plan.partial only becomes true alongside budget.exhausted (buildFilterPlan
+	// sets both together), and the exhausted path above already returned, so
+	// plan.partial is always false here.
+	return budget.response(selected, omitted, false)
 }
 
 func repositoryMapFrontier(snapshot store.Snapshot, request wire.Request, budget *workBudget) Response {
@@ -396,7 +401,10 @@ func repositoryMapFrontier(snapshot store.Snapshot, request wire.Request, budget
 		if !request.AllowInferred && record.EvidenceClass != model.Verified {
 			continue
 		}
-		if !ranking.offer(record, 0) {
+		if !budget.visitRecord() {
+			break
+		}
+		if !ranking.offerCandidate(newMapCandidate(record)) {
 			break
 		}
 	}

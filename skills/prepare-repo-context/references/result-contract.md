@@ -9,14 +9,14 @@ Every `query` invocation returns one JSON object. Read these fields before summa
 | `truncated` | `true` when the finding list is known to be incomplete for any reason: more matches than `--maximum-results`, the output budget trimmed findings, or the search was exhausted. | Tell the user the list is a prefix. |
 | `omitted_count` | Omissions the engine actually counted (ranking overflow and output trimming). It is `0` when the engine could not count what it missed; `truncated` is still `true` then. | Never present `omitted_count: 0` as proof of completeness when `truncated` is `true`. |
 | `warnings` | Codes such as `python-dynamic-lookup` (a file uses `getattr`/`eval`/dynamic imports; its literal definitions are still verified) or `query-frontier-exhausted` (a budget stopped the search). | Mention warnings that affect the answer; do not list them all. |
-| `next_safe_action` | `use-index`, `refine-query`, `rebuild-index` (a `query` result never returns `build-index` or `install-native-engine`; the broker refuses to query without a ready context, so those two come only from `inspect`). | Follow it; never invent another action. |
+| `next_safe_action` | `use-index`, `refine-query`, `rebuild-index` (a `query` result never returns `build-index` or `install-native-engine`; the broker refuses to query without a ready context, so those two come from `inspect`, `build`, and `activate`). | Follow it; never invent another action. |
 
 ## Findings
 
 Each finding has `rank`, `result_identity`, `path`, `start_line`, `end_line`, `language`, `record_kind`, `qualified_name`, `evidence_class`, and `preview`.
 
 - `evidence_class` is `verified` when the extractor proved the record from a literal token in the current source, `inferred` otherwise (hidden unless `--allow-inferred`). Never upgrade it in prose.
-- `preview` is one sanitized line: the definition line for functions, classes, and methods; the first body line under a heading. It is a display hint for choosing the right result. It is not evidence; quote source only from `source-snippets`. A heading directly followed by another heading has an empty preview.
+- `preview` is one sanitized line: the first line of the record's range for functions, classes, and methods (for a decorated Python definition that is the decorator line); the first body line under a heading. It is a display hint for choosing the right result. It is not evidence; quote source only from `source-snippets`. A heading directly followed by another heading has an empty preview.
 - `record_kind` tells you what matched: `definition`, `import`, `module`, `entry-point`, `configuration` (a key name), `heading`, `document-chunk`. Within a match tier, findings are ordered: definitions, modules, entry points and headings first; configuration keys and document chunks next; imports last; then by path.
 
 ## Presenting results

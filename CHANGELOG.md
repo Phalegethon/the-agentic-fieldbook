@@ -32,6 +32,9 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
   known to be incomplete. Existing indexes rebuild once on the next `inspect`.
   Substring and fuzzy matching apply only to words with no exact or prefix
   match; configuration keys rank below code definitions.
+- JavaScript and TypeScript module-scope `const`, `let`, and `var`
+  declarations are indexed as definitions, and repository maps represent a
+  file by its definitions before its imports.
 
 ## [2.1.2] - 2026-08-31
 

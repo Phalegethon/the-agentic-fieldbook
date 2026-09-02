@@ -42,6 +42,19 @@ func newRankedCandidate(record model.Record, tier int) rankedCandidate {
 	}
 }
 
+// newMapCandidate builds a ranking candidate for RepositoryMap. Map
+// representatives are already chosen one per file by
+// compareRepresentativeCandidate and mapKindTier, so ranking the
+// representatives together must not regroup them by kind again: kindClass is
+// zeroed here, leaving path order (via compareRankedCandidate's normalizedPath
+// comparison) as the only thing that orders map candidates against each
+// other.
+func newMapCandidate(record model.Record) rankedCandidate {
+	candidate := newRankedCandidate(record, 0)
+	candidate.kindClass = 0
+	return candidate
+}
+
 // kindClass orders record kinds within a tier: places where a name is
 // defined or described come first, configuration keys and document chunks
 // second, imports last.

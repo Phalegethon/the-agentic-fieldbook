@@ -27,7 +27,7 @@ An unknown value fails fast and the error lists the valid values.
 - Exact names win: `collect_snapshot`, `query.Search`, `Install TAF`.
 - Multi-word queries intersect: every word must match some part of the record's name or terms.
 - Prefixes of a word always match. Substrings and close misspellings (edit distance ≤ 2, words of at least four characters) are tried only when a word has no exact or prefix match, so `service` finds `ServiceWorker` but not `microservice`; search for `microservice` or `micro` instead.
-- Quote nothing; punctuation is ignored.
+- Type the bare name: trailing `()` or other punctuation is not stripped from the query.
 
 ## When `grep` or `rg` is the better tool
 

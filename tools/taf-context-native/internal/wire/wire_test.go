@@ -451,6 +451,19 @@ func TestEncodeResultRejectsNilCollectionsInvalidCountersAndDuplicateFindings(t 
 	}
 }
 
+func TestResultValidationRequiresTruncatedWhenOmissionsAreCounted(t *testing.T) {
+	rejected := validResult()
+	rejected.OmittedCount, rejected.Truncated = 1, false
+	if err := EncodeResult(ioDiscard{}, rejected); err == nil {
+		t.Fatal("accepted a counted omission with truncated=false")
+	}
+	accepted := validResult()
+	accepted.OmittedCount, accepted.Truncated = 0, true
+	if err := EncodeResult(ioDiscard{}, accepted); err != nil {
+		t.Fatalf("rejected an exhausted search reporting truncated=true with omitted_count=0: %v", err)
+	}
+}
+
 func TestEncodeResultRejectsFindingLineInt32Overflow(t *testing.T) {
 	for _, field := range []string{"start", "end"} {
 		result := validResult()

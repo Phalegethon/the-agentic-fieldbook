@@ -12,7 +12,7 @@ import (
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
 
-func TestSearchExactPostingFindsHitBeyondCandidateFrontier(t *testing.T) {
+func TestSearchExactPostingFindsHitInALargeSnapshot(t *testing.T) {
 	records := make([]model.Record, 0, 4097)
 	for index := 0; index < 4096; index++ {
 		records = append(records, testRecord(index, "noise", model.Definition, model.Verified))
@@ -110,7 +110,7 @@ func TestSearchSupportsQualifiedShortAliasPrefixFuzzyAndDocumentSeparation(t *te
 	}
 }
 
-func TestSearchAdmitsSubstringFromBoundedPersistedFrontier(t *testing.T) {
+func TestSearchSubstringMatchesThroughTheDictionary(t *testing.T) {
 	record := testRecord(0, "pkg.ServiceWorker", model.Definition, model.Verified)
 	record.SearchTerms = []string{"serviceworker"}
 	response := Search(indexedSnapshot([]model.Record{record}), searchRequest("vice"), policy.ProductionLimits())
@@ -168,7 +168,7 @@ func TestSearchCountsDuplicatePostingVisitsAgainstTheWorkCeiling(t *testing.T) {
 	}
 }
 
-func TestSearchUsesFilterFacetBeforeLargeIrrelevantPostingPrefix(t *testing.T) {
+func TestSearchLanguageFilterFindsTheOnlyMatchingRecordInALargeSnapshot(t *testing.T) {
 	records := make([]model.Record, 4097)
 	for index := range records {
 		records[index] = testRecord(index, "pkg.Service", model.Definition, model.Verified)
@@ -220,7 +220,7 @@ func TestSearchIntersectsAllCompoundFiltersBeforeLexicalAdmission(t *testing.T) 
 	}
 }
 
-func TestSearchFindsMaximumLengthQualifiedAndShortNamesOutsideFallbackFrontier(t *testing.T) {
+func TestSearchFindsMaximumLengthQualifiedAndShortNames(t *testing.T) {
 	records := make([]model.Record, 4097)
 	for index := 0; index < len(records)-1; index++ {
 		records[index] = testRecord(index, "noise", model.Definition, model.Verified)
@@ -237,7 +237,7 @@ func TestSearchFindsMaximumLengthQualifiedAndShortNamesOutsideFallbackFrontier(t
 	}
 }
 
-func TestSearchFindsMaximumLengthHeadingOutsideFallbackFrontier(t *testing.T) {
+func TestSearchFindsMaximumLengthHeading(t *testing.T) {
 	records := make([]model.Record, 4097)
 	for index := 0; index < len(records)-1; index++ {
 		records[index] = testRecord(index, "noise", model.Heading, model.Verified)
@@ -305,6 +305,29 @@ func TestRepositoryMapFilteredRepresentativePrefersDefinitionOverImport(t *testi
 	response := RepositoryMap(indexedSnapshot([]model.Record{importRecord, definition}), request, policy.ProductionLimits())
 	if got := identities(response.Records); !reflect.DeepEqual(got, []string{definition.Identity}) {
 		t.Fatalf("filtered map representative = %#v, want the definition", got)
+	}
+}
+
+func TestRepositoryMapKeepsPathOrderAcrossRepresentativeKinds(t *testing.T) {
+	configuration := testRecord(0, "name", model.Configuration, model.Verified)
+	configuration.Path, configuration.Language, configuration.SourceType = ".claude-plugin/plugin.json", "json", "configuration"
+	heading := testRecord(1, "Changelog", model.Heading, model.Verified)
+	heading.Path, heading.Language, heading.SourceType = "CHANGELOG.md", "markdown", "document"
+	importOnly := testRecord(2, "os", model.Import, model.Verified)
+	importOnly.Path, importOnly.Language = "scripts/tool.py", "python"
+	definition := testRecord(3, "tool.main", model.Definition, model.Verified)
+	definition.Path, definition.Language = "tools/tool.py", "python"
+	snapshot := indexedSnapshot([]model.Record{definition, importOnly, heading, configuration})
+	for _, request := range []wire.Request{mapRequest(), func() wire.Request {
+		r := mapRequest()
+		r.Filters.SourceTypes = []string{"source", "document", "configuration"}
+		return r
+	}()} {
+		response := RepositoryMap(snapshot, request, policy.ProductionLimits())
+		want := []string{configuration.Identity, heading.Identity, importOnly.Identity, definition.Identity}
+		if got := identities(response.Records); !reflect.DeepEqual(got, want) {
+			t.Fatalf("map order = %#v, want path order %#v", got, want)
+		}
 	}
 }
 
