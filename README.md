@@ -223,8 +223,10 @@ result identities, keeping paths, line ranges, and evidence class attached.
 Index state lives in the user-local TAF state directory, never in the
 repository. `prepare_repo_context.py remove --repo <repo>` deletes the entry
 for one repository worktree and `prepare_repo_context.py gc` reclaims orphaned
-entries, unused runtimes, and entries not used for 30 days (`--unused-for`).
-Both commands only report what they would delete until
+entries, entries not used for 30 days (`--unused-for`), runtime versions other
+than the current one, generations no longer referenced by an index, leftover
+control files, interrupted deletions, and the empty parent directories they
+leave behind. Both commands only report what they would delete until
 `--confirm-state-write` is supplied.
 
 Runtime requirements are Git and Python 3. Go is not required for normal use.

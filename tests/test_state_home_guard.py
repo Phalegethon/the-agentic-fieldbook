@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import unittest
 
 import tests
@@ -13,14 +15,23 @@ ROOT = Path(__file__).parents[1]
 
 
 class StateHomeGuardTests(unittest.TestCase):
-    def test_importing_tests_pins_state_home_to_a_temporary_directory(self) -> None:
-        value = os.environ.get("TAF_STATE_HOME")
-        self.assertTrue(value, "TAF_STATE_HOME must be set by tests/__init__.py")
-        guard = tests.install_state_home_guard()
-        self.assertEqual(Path(value), guard)
-        self.assertTrue(guard.is_dir())
+    def test_discovery_pins_state_home_without_importing_the_tests_package(self) -> None:
+        script = (
+            "import os, unittest\n"
+            "unittest.defaultTestLoader.discover('tests', pattern='test_state_paths.py')\n"
+            "print(os.environ.get('TAF_STATE_HOME', ''))\n"
+        )
+        environment = {key: value for key, value in os.environ.items() if key != "TAF_STATE_HOME"}
+        completed = subprocess.run(
+            [sys.executable, "-c", script], cwd=ROOT, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True,
+        )
+        value = completed.stdout.strip()
+        self.assertTrue(value, completed.stderr)
+        self.assertIn("taf-test-state-", value)
         self.assertNotIn("Library/Application Support/TAF", value)
         self.assertNotIn(".local/state/taf", value)
+        self.assertFalse(Path(value).exists(), "guard directory must be removed at interpreter exit")
 
     def test_no_test_calls_the_cli_with_the_process_environment(self) -> None:
         offenders = []

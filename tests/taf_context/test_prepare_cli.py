@@ -644,6 +644,16 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             self.assertEqual((code, stderr), (0, ""))
             self.assertEqual(decoded(stdout)["next_safe_action"], "build-index")
 
+    def test_dry_run_with_nothing_to_reclaim_needs_no_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"HOME": directory, "PATH": "", "TAF_STATE_HOME": str(Path(directory) / "state")}
+            code, stdout, stderr = invoke(environment, "prepare", "gc")
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["candidates"], [])
+            self.assertEqual(result["required_authorizations"], [])
+            self.assertEqual(result["next_safe_action"], "none")
+
     def test_gc_dry_run_then_confirmed_removal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

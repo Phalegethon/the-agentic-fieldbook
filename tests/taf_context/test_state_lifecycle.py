@@ -20,7 +20,7 @@ from taf_context.state_lifecycle import (
 from taf_context.state_paths import StateError
 
 
-def make_entry(root: Path, repo: str, worktree: str, *, bound: bool, generation: str = "gen-a") -> Path:
+def make_entry(root: Path, repo: str, worktree: str, *, bound: bool, generation: str = "e" * 64) -> Path:
     entry = root / "repositories" / repo / worktree
     native = entry / "native" / "generations" / generation
     native.mkdir(parents=True)
@@ -130,6 +130,15 @@ class RemovePlanTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "state-root-unavailable")
             self.assertFalse(root.exists())
 
+    def test_apply_validates_every_candidate_before_deleting_any(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = make_entry(root, "a" * 64, "1" * 64, bound=True)
+            plan = plan_remove(root, "a" * 64, "1" * 64) + [Candidate("worktree-entry", "../outside", 1)]
+            with self.assertRaises(StateError):
+                apply_plan(root, plan)
+            self.assertTrue(valid.exists())
+
 
 class GcPlanTests(unittest.TestCase):
     def _populate(self, root: Path, now: float) -> dict[str, Path]:
@@ -139,7 +148,7 @@ class GcPlanTests(unittest.TestCase):
         stamp = now - 40 * 86400
         os.utime(old / "binding.json", (stamp, stamp))
         orphan = make_entry(root, "b" * 64, "1" * 64, bound=False)
-        extra_generation = fresh / "native" / "generations" / "gen-unreferenced"
+        extra_generation = fresh / "native" / "generations" / ("f" * 64)
         extra_generation.mkdir()
         (extra_generation / "index.bin").write_bytes(b"z" * 10)
         staging = fresh / "native" / "generations" / ".stage-abc"
@@ -168,7 +177,7 @@ class GcPlanTests(unittest.TestCase):
             sorted(by_category["unreferenced-generation"]),
             sorted([
                 f"repositories/{'a' * 64}/{'1' * 64}/native/generations/.stage-abc",
-                f"repositories/{'a' * 64}/{'1' * 64}/native/generations/gen-unreferenced",
+                f"repositories/{'a' * 64}/{'1' * 64}/native/generations/{'f' * 64}",
             ]),
         )
         self.assertEqual(by_category["legacy-control-file"], ["providers.json"])
@@ -197,7 +206,7 @@ class GcPlanTests(unittest.TestCase):
             paths = self._populate(root, now)
             removed = apply_plan(root, plan_gc(root, unused_for_days=30, now=now))
             self.assertTrue(paths["fresh"].exists())
-            self.assertTrue((paths["fresh"] / "native" / "generations" / "gen-a").exists())
+            self.assertTrue((paths["fresh"] / "native" / "generations" / ("e" * 64)).exists())
             for key in ("old", "orphan", "extra", "staging", "trash"):
                 self.assertFalse(paths[key].exists(), key)
             self.assertFalse((root / "runtime" / "0.0.9").exists())
@@ -225,7 +234,36 @@ class GcPlanTests(unittest.TestCase):
             (entry / "native" / "CURRENT").unlink()
             plan = plan_gc(root, unused_for_days=30, now=now)
             self.assertEqual([c for c in plan if c.category == "unreferenced-generation"], [])
-            self.assertTrue((entry / "native" / "generations" / "gen-a").exists())
+            self.assertTrue((entry / "native" / "generations" / ("e" * 64)).exists())
+
+    def test_corrupt_current_pointer_proposes_no_generation(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = make_entry(root, "a" * 64, "1" * 64, bound=True)
+            os.utime(entry / "binding.json", (now, now))
+            (entry / "native" / "CURRENT").write_text("not-a-generation-id\n", encoding="utf-8")
+            plan = plan_gc(root, unused_for_days=30, now=now)
+            self.assertEqual([c for c in plan if c.category == "unreferenced-generation"], [])
+            self.assertTrue((entry / "native" / "generations" / ("e" * 64)).exists())
+
+    def test_unrecognised_repository_directory_is_never_a_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stray = root / "repositories" / "not-an-identity"
+            stray.mkdir(parents=True)
+            (stray / "important.txt").write_text("keep", encoding="utf-8")
+            plan = plan_gc(root, unused_for_days=30, now=time.time())
+            self.assertEqual(plan, [])
+
+    def test_empty_parent_reports_residual_file_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_entry(root, "b" * 64, "1" * 64, bound=False)
+            (root / "repositories" / ("b" * 64) / ".DS_Store").write_bytes(b"x" * 5000)
+            plan = plan_gc(root, unused_for_days=30, now=time.time())
+            parents = [c for c in plan if c.category == "empty-parent"]
+            self.assertEqual([c.bytes for c in parents], [5000])
 
 
 if __name__ == "__main__":

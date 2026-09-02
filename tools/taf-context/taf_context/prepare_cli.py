@@ -588,8 +588,8 @@ def _lifecycle_summary(
         "candidate_bytes": sum(item.bytes for item in candidates),
         "removed": [_candidate_dict(item) for item in removed],
         "removed_bytes": sum(item.bytes for item in removed),
-        "required_authorizations": [] if confirmed else ["state-write"],
-        "next_safe_action": "none" if confirmed else "confirm-state-write",
+        "required_authorizations": [] if confirmed or not candidates else ["state-write"],
+        "next_safe_action": "none" if confirmed or not candidates else "confirm-state-write",
     }
 
 

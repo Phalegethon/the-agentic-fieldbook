@@ -228,9 +228,23 @@ def plan_gc(root: Path, *, unused_for_days: int, now: float) -> list[Candidate]:
     empty_parents: list[Candidate] = []
     repositories = root / REPOSITORIES_DIRECTORY
     for repository in _sorted_real_directories(repositories) if _is_real_directory(repositories) else []:
+        if not _is_identity_name(repository.name):
+            continue
         worktrees = _sorted_real_directories(repository)
         if all(worktree in doomed_entries for worktree in worktrees):
-            empty_parents.append(Candidate("empty-parent", repository.relative_to(root).as_posix(), 0))
+            residual_directories = sum(
+                _tree_bytes(child) for child in worktrees if child not in doomed_entries
+            )
+            residual_files = sum(
+                _file_bytes(item) for item in repository.iterdir() if _is_real_file(item)
+            )
+            empty_parents.append(
+                Candidate(
+                    "empty-parent",
+                    repository.relative_to(root).as_posix(),
+                    residual_directories + residual_files,
+                )
+            )
     ordered = orphans + unused + runtimes + generations + legacy + trash + empty_parents
     return [item for group in _group_by_category(ordered) for item in sorted(group, key=lambda c: c.relative_path)]
 
@@ -241,7 +255,7 @@ def _unreferenced_generations(root: Path, entry: Path) -> list[Candidate]:
     if not _is_real_directory(generations):
         return []
     current = _read_current(entry / NATIVE_DIRECTORY / CURRENT_FILENAME)
-    if not current:
+    if not _is_identity_name(current):
         return []
     return [
         _candidate("unreferenced-generation", root, child)
