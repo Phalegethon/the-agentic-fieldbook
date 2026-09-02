@@ -204,12 +204,15 @@ func QueryTokens(value string) []string {
 	return output
 }
 
+// QueryShortName is the normalized last dot-separated segment of a qualified
+// name: the name an agent types for a method, function, or heading. The
+// camel/snake parts of that segment are indexed separately as tokens.
 func QueryShortName(value string) string {
-	parts := QueryTokens(value)
-	if len(parts) == 0 {
-		return ""
+	value = NormalizeQueryText(value)
+	if last := strings.LastIndexByte(value, '.'); last >= 0 {
+		value = value[last+1:]
 	}
-	return parts[len(parts)-1]
+	return strings.TrimSpace(value)
 }
 
 func canonicalQueryKeys(record model.Record) []string {
