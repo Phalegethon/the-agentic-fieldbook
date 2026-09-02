@@ -217,8 +217,13 @@ Later sessions reuse the repository/worktree-bound index and receive only
 bounded query results rather than the full index.
 
 Once ready, the same skill can answer repository-map, symbol, and documentation
-questions with bounded results. It retrieves source snippets only for selected
-result identities, keeping paths, line ranges, and evidence class attached.
+questions with bounded results. Findings carry paths, line ranges, evidence
+class, and a one-line preview; multi-word queries intersect their words, and
+`--language`, `--symbol-kind`, and `--path-prefix` filters narrow them. The
+skill's `references/query-routing.md` maps questions to queries and
+`references/result-contract.md` explains `status`, `truncated`, and
+`omitted_count`. It retrieves source snippets only for selected result
+identities.
 
 Index state lives in the user-local TAF state directory, never in the
 repository. `prepare_repo_context.py remove --repo <repo>` deletes the entry

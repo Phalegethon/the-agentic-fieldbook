@@ -280,6 +280,15 @@ class RepositoryLayoutTest(unittest.TestCase):
         self.assertTrue(
             (PREPARE_REPO_CONTEXT_SKILL / "agents" / "openai.yaml").is_file()
         )
+        self.assertTrue(
+            (PREPARE_REPO_CONTEXT_SKILL / "references" / "query-routing.md").is_file()
+        )
+        self.assertTrue(
+            (PREPARE_REPO_CONTEXT_SKILL / "references" / "result-contract.md").is_file()
+        )
+        skill_md = (PREPARE_REPO_CONTEXT_SKILL / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("references/query-routing.md", skill_md)
+        self.assertIn("references/result-contract.md", skill_md)
 
     def test_claude_marketplace_exposes_only_the_taf_product(self) -> None:
         marketplace = json.loads(

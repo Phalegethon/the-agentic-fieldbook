@@ -12,6 +12,12 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
   state-write confirmation.
 - Bound index state records its last use so `gc` can reclaim entries unused
   for a configurable number of days.
+- `prepare-repo-context` 1.2.0 ships `references/query-routing.md` and
+  `references/result-contract.md`, one-line previews on definition and
+  heading findings, a 4,000-character default output budget, and
+  case-insensitive filter values with validation.
+- A dogfood recall benchmark (`tools/taf-context-native/testdata/dogfood`)
+  gates symbol and heading recall on this repository.
 
 ### Changed
 
@@ -19,6 +25,13 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
   provider discovery, registry, consent ledger, and adapter execution are
   removed; `prepare` output no longer contains a `providers` field.
 - Tests and benchmarks pin `TAF_STATE_HOME` to a temporary directory.
+- The native engine keeps literal definitions `verified` in files that use
+  dynamic lookups, searches through postings and the token dictionary with a
+  budget that scales with the index, treats filters as record predicates,
+  ranks definitions above imports, and sets `truncated` whenever a result is
+  known to be incomplete. Existing indexes rebuild once on the next `inspect`.
+  Substring and fuzzy matching apply only to words with no exact or prefix
+  match; configuration keys rank below code definitions.
 
 ## [2.1.2] - 2026-08-31
 
