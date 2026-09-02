@@ -229,17 +229,20 @@ def plan_gc(root: Path, *, unused_for_days: int, now: float) -> list[Candidate]:
     repositories = root / REPOSITORIES_DIRECTORY
     for repository in _sorted_real_directories(repositories) if _is_real_directory(repositories) else []:
         worktrees = _sorted_real_directories(repository)
-        if worktrees and all(worktree in doomed_entries for worktree in worktrees):
+        if all(worktree in doomed_entries for worktree in worktrees):
             empty_parents.append(Candidate("empty-parent", repository.relative_to(root).as_posix(), 0))
     ordered = orphans + unused + runtimes + generations + legacy + trash + empty_parents
     return [item for group in _group_by_category(ordered) for item in sorted(group, key=lambda c: c.relative_path)]
 
 
 def _unreferenced_generations(root: Path, entry: Path) -> list[Candidate]:
+    """Generations not named by CURRENT. Without a readable CURRENT, propose nothing."""
     generations = entry / NATIVE_DIRECTORY / GENERATIONS_DIRECTORY
     if not _is_real_directory(generations):
         return []
     current = _read_current(entry / NATIVE_DIRECTORY / CURRENT_FILENAME)
+    if not current:
+        return []
     return [
         _candidate("unreferenced-generation", root, child)
         for child in _sorted_real_directories(generations)

@@ -206,6 +206,27 @@ class GcPlanTests(unittest.TestCase):
             self.assertFalse((root / "repositories" / ("b" * 64)).exists())
             self.assertEqual(len(removed), 8)
 
+    def test_already_empty_repository_directory_is_an_empty_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "repositories" / ("c" * 64)).mkdir(parents=True)
+            plan = plan_gc(root, unused_for_days=30, now=time.time())
+            self.assertEqual(
+                [(c.category, c.relative_path) for c in plan],
+                [("empty-parent", f"repositories/{'c' * 64}")],
+            )
+
+    def test_missing_current_pointer_proposes_no_generation(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = make_entry(root, "a" * 64, "1" * 64, bound=True)
+            os.utime(entry / "binding.json", (now, now))
+            (entry / "native" / "CURRENT").unlink()
+            plan = plan_gc(root, unused_for_days=30, now=now)
+            self.assertEqual([c for c in plan if c.category == "unreferenced-generation"], [])
+            self.assertTrue((entry / "native" / "generations" / "gen-a").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
