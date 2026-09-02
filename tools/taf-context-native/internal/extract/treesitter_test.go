@@ -163,6 +163,52 @@ func TestTypeScriptExtractorUsesTSXAndTypeDefinitions(t *testing.T) {
 	}
 }
 
+func TestTypeScriptModuleScopeConstDeclarationsAreDefinitions(t *testing.T) {
+	source := "import { create } from \"zustand\";\n" +
+		"export const useAuthModalStore = create<AuthModalStore>((set) => ({\n  open: false,\n}));\n" +
+		"const router = createRouter();\n" +
+		"export let counter = 0;\n" +
+		"export const handler = () => {};\n" +
+		"export const { first, second } = pair;\n" +
+		"export function run() {\n  const local = compute();\n  const inner = () => local;\n  return inner;\n}\n"
+	records, report := NewRegistry().Extract(stableFile("src/store/authModalStore.ts", source))
+	if report.ParseFailures != 0 || len(report.WarningCodes) != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	for _, want := range []recordExpectation{
+		{"authModalStore.useAuthModalStore", model.Definition, "source", 2, 4, "typescript", typescriptParserVersion, model.Verified},
+		{"authModalStore.router", model.Definition, "source", 5, 5, "typescript", typescriptParserVersion, model.Verified},
+		{"authModalStore.counter", model.Definition, "source", 6, 6, "typescript", typescriptParserVersion, model.Verified},
+		{"authModalStore.handler", model.Definition, "source", 7, 7, "typescript", typescriptParserVersion, model.Verified},
+		{"authModalStore.run", model.Definition, "source", 9, 13, "typescript", typescriptParserVersion, model.Verified},
+		{"authModalStore.run.inner", model.Definition, "source", 11, 11, "typescript", typescriptParserVersion, model.Verified},
+	} {
+		assertRecord(t, records, want)
+	}
+	for _, unwanted := range []string{"authModalStore.local", "authModalStore.run.local", "authModalStore.first", "authModalStore.second"} {
+		if countQualified(records, unwanted) != 0 {
+			t.Fatalf("unexpected record %s in %#v", unwanted, records)
+		}
+	}
+	if got := countQualified(records, "create"); got != 1 {
+		t.Fatalf("import record count for create = %d", got)
+	}
+}
+
+func TestJavaScriptModuleScopeVarDeclarationsAreDefinitions(t *testing.T) {
+	source := "var legacy = require(\"legacy\");\nconst Button = styled.div`color: red;`;\nfunction wrap() {\n  var scoped = 1;\n  return scoped;\n}\nmodule.exports = { Button };\n"
+	records, report := NewRegistry().Extract(stableFile("web/button.js", source))
+	if report.ParseFailures != 0 || len(report.WarningCodes) != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	assertRecord(t, records, recordExpectation{"button.legacy", model.Definition, "source", 1, 1, "javascript", javascriptParserVersion, model.Verified})
+	assertRecord(t, records, recordExpectation{"button.Button", model.Definition, "source", 2, 2, "javascript", javascriptParserVersion, model.Verified})
+	assertRecord(t, records, recordExpectation{"button.wrap", model.Definition, "source", 3, 6, "javascript", javascriptParserVersion, model.Verified})
+	if countQualified(records, "button.scoped") != 0 || countQualified(records, "button.wrap.scoped") != 0 {
+		t.Fatalf("function-local var was indexed: %#v", records)
+	}
+}
+
 func TestRustExtractorUsesItemsImplContainmentAliasesAndMacros(t *testing.T) {
 	source := "use crate::config::Settings as Config;\n" +
 		"use crate::models::{User, Role as UserRole};\n" +

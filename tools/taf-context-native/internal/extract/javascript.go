@@ -82,12 +82,18 @@ func handleECMAScriptNode(analysis *treeSitterAnalysis, node *sitter.Node, types
 		analysis.appendNodeRecord(node, analysis.qualified(append(prefix, name)...), model.Definition, model.Verified)
 	case "variable_declarator":
 		value := node.ChildByFieldName("value")
-		if value == nil || value.Kind() != "arrow_function" {
+		arrow := value != nil && value.Kind() == "arrow_function"
+		if !arrow && !ecmaModuleScopeDeclarator(node) {
 			return
 		}
 		name, ok := analysis.stableName(node.ChildByFieldName("name"), "identifier")
 		if !ok {
-			analysis.addWarning(warningPrefix + "-generated-name")
+			// Destructuring patterns have no single stable name. Only an arrow
+			// function without one is worth a warning; module-scope patterns are
+			// simply not indexed.
+			if arrow {
+				analysis.addWarning(warningPrefix + "-generated-name")
+			}
 			return
 		}
 		prefix, ok := ecmaLexicalPrefix(analysis, node)
@@ -119,6 +125,26 @@ func ecmaLexicalPrefix(analysis *treeSitterAnalysis, node *sitter.Node) ([]strin
 		}
 		return "", false
 	})
+}
+
+// ecmaModuleScopeDeclarator reports whether a variable_declarator belongs to a
+// declaration at the top of the module, directly or through an export
+// statement. Module-scope constants are how stores, providers, routers, and
+// styled components are defined in JavaScript and TypeScript, so they are
+// definitions; function-local variables are not.
+func ecmaModuleScopeDeclarator(node *sitter.Node) bool {
+	declaration := node.Parent()
+	if declaration == nil || (declaration.Kind() != "lexical_declaration" && declaration.Kind() != "variable_declaration") {
+		return false
+	}
+	container := declaration.Parent()
+	if container == nil {
+		return false
+	}
+	if container.Kind() == "export_statement" {
+		container = container.Parent()
+	}
+	return container != nil && container.Kind() == "program"
 }
 
 func ecmaImportBindings(analysis *treeSitterAnalysis, node *sitter.Node) []string {
