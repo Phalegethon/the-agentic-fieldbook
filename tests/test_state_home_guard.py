@@ -28,20 +28,43 @@ class StateHomeGuardTests(unittest.TestCase):
             if path.name == "test_state_home_guard.py":
                 continue
             text = path.read_text(encoding="utf-8")
-            if CLI_IMPORT not in text and "run_prepare_command" not in text:
+            pattern = _broker_call_pattern(text)
+            if pattern is None:
                 continue
-            for match in CALL.finditer(text):
+            for match in pattern.finditer(text):
                 call = _call_text(text, match.end() - 1)
                 if "environment=" not in call:
                     line = text.count("\n", 0, match.start()) + 1
                     offenders.append(f"{path.relative_to(ROOT)}:{line}")
         self.assertEqual(offenders, [])
 
+    def test_call_pattern_follows_import_aliases(self) -> None:
+        aliased = "from taf_context.cli import main as context_main\ncontext_main([])\n"
+        plain = "from taf_context.cli import main\nmain([])\nunittest.main()\ndef main(): pass\n"
+        self.assertEqual(
+            [m.group(0) for m in _broker_call_pattern(aliased).finditer(aliased)], ["context_main("]
+        )
+        self.assertEqual(
+            [m.group(0) for m in _broker_call_pattern(plain).finditer(plain)], ["main("]
+        )
+        self.assertIsNone(_broker_call_pattern("import os\n"))
 
-CLI_IMPORT = "from taf_context.cli import main"
-# A call to the broker entry point or the prepare runner. Excludes ``def main(``
-# and attribute calls such as ``unittest.main(``.
-CALL = re.compile(r"(?<!def )(?<![\w.])(main|run_prepare_command)\(")
+
+CLI_IMPORT = re.compile(
+    r"^\s*from taf_context\.cli import main(?: as (?P<alias>\w+))?\s*$", re.MULTILINE
+)
+
+
+def _broker_call_pattern(text: str) -> "re.Pattern[str] | None":
+    """Build the call regex for one file from its broker imports, or None."""
+    names = {"run_prepare_command"} if "run_prepare_command" in text else set()
+    for match in CLI_IMPORT.finditer(text):
+        names.add(match.group("alias") or "main")
+    if not names:
+        return None
+    alternatives = "|".join(sorted(re.escape(name) for name in names))
+    # Excludes ``def <name>(`` and attribute calls such as ``unittest.main(``.
+    return re.compile(rf"(?<!def )(?<![\w.])(?:{alternatives})\(")
 
 
 def _call_text(text: str, open_paren: int) -> str:

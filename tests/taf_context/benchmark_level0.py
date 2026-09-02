@@ -611,6 +611,7 @@ def _worker(args: argparse.Namespace) -> int:
             ["snapshot", "--repo", str(repo), "--output-dir", str(output)],
             stdout=stdout,
             stderr=stderr,
+            environment=os.environ.copy(),
         )
         warm_wall = time.perf_counter() - warm_started
         warm_cpu = _times_total(os.times()) - _times_total(process_before)
