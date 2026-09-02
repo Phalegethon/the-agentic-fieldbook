@@ -554,6 +554,27 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             self.assertNotIn("providers", result)
             self.assertEqual(result["engine"]["availability"], "available")
 
+    def test_inspect_reports_state_usage_without_creating_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_STATE_HOME": str(state_home),
+            }
+
+            code, stdout, stderr = invoke(environment, "prepare", "inspect", "--repo", str(repo))
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(
+                result["state"],
+                {"root_bytes": 0, "entry_count": 0, "orphan_count": 0, "stale_runtime_count": 0},
+            )
+            self.assertFalse(state_home.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

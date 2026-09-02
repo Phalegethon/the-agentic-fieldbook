@@ -21,6 +21,7 @@ from urllib import request as url_request
 
 from .git_snapshot import collect_snapshot
 from .level1_models import Level1Result, parse_level1_result
+from .state_lifecycle import CURRENT_RUNTIME_VERSION, summarize_state
 from .state_paths import StateError, resolve_state_paths
 
 
@@ -28,7 +29,7 @@ _NATIVE_TIMEOUT_SECONDS = 120
 _BINDING_LIMIT = 16 * 1024
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CHECKSUM = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)\n\Z")
-_NATIVE_ENGINE_VERSION = "0.1.1"
+_NATIVE_ENGINE_VERSION = CURRENT_RUNTIME_VERSION
 _TAF_RELEASE_VERSION = "2.1.2"
 _NATIVE_RELEASE_BASE_URL = (
     "https://github.com/Phalegethon/the-agentic-fieldbook/releases/download/"
@@ -185,6 +186,7 @@ def run_prepare_command(
             result=result,
             estimate=result,
             authorizations=(),
+            state=summarize_state(paths.root),
         )
 
     binding = _read_binding(binding_path, snapshot)
@@ -225,6 +227,7 @@ def run_prepare_command(
         result=result,
         estimate=estimate_result or status_result,
         authorizations=authorizations,
+        state=summarize_state(paths.root),
     )
 
 
@@ -542,6 +545,7 @@ def _summary(
     result: Level1Result | None,
     estimate: Level1Result | None,
     authorizations: tuple[str, ...],
+    state: dict[str, int],
 ) -> dict[str, object]:
     if binary is None:
         next_action = "install-native-engine"
@@ -587,6 +591,7 @@ def _summary(
                 else estimate.coverage.excluded_path_count
             ),
         },
+        "state": state,
         "required_authorizations": list(authorizations),
         "next_safe_action": next_action,
         "warnings": sorted(set(() if result is None else result.warnings)),
