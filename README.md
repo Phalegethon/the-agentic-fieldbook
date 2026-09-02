@@ -15,7 +15,7 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.0.1 | Inspect providers, prepare a reusable native index, and run bounded evidence queries without loading the full repository into model context. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.1.0 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, and reclaim unused index state without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.0.1 | Recover interrupted work and the single best next step from bounded, read-only Git evidence. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
@@ -205,8 +205,8 @@ From a Git repository, ask:
 Use /taf:prepare-repo-context to inspect this repository and prepare reusable bounded context.
 ```
 
-The first pass is read-only. It reports registered providers, freshness,
-eligible and excluded path counts, the native runtime state, and the next safe
+The first pass is read-only. It reports native engine availability, freshness,
+eligible and excluded path counts, user-local state usage, and the next safe
 action. It does not load the full repository into model context.
 
 If no reusable index is ready, the skill asks before any persistent or network
@@ -220,6 +220,13 @@ Once ready, the same skill can answer repository-map, symbol, and documentation
 questions with bounded results. It retrieves source snippets only for selected
 result identities, keeping paths, line ranges, and evidence class attached.
 
+Index state lives in the user-local TAF state directory, never in the
+repository. `prepare_repo_context.py remove --repo <repo>` deletes the entry
+for one repository worktree and `prepare_repo_context.py gc` reclaims orphaned
+entries, unused runtimes, and entries not used for 30 days (`--unused-for`).
+Both commands only report what they would delete until
+`--confirm-state-write` is supplied.
+
 Runtime requirements are Git and Python 3. Go is not required for normal use.
 The published native runtime supports macOS and Linux on amd64/arm64 and
 Windows on amd64.
@@ -230,7 +237,7 @@ TAF and its skills have separate versions:
 
 - TAF `2.1.2` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.0.1` versions its behavior contract.
+- `prepare-repo-context` `1.1.0` versions its behavior contract.
 - `work-recovery` `1.0.1` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with

@@ -3,6 +3,23 @@
 All notable TAF product releases and their bundled skill versions are recorded
 here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
+## [Unreleased]
+
+### Added
+
+- `prepare-repo-context` 1.1.0 reports user-local state usage in `inspect`
+  and adds `remove` and `gc` commands that only delete with explicit
+  state-write confirmation.
+- Bound index state records its last use so `gc` can reclaim entries unused
+  for a configurable number of days.
+
+### Changed
+
+- The context broker keeps one provider, the native engine. Third-party
+  provider discovery, registry, consent ledger, and adapter execution are
+  removed; `prepare` output no longer contains a `providers` field.
+- Tests and benchmarks pin `TAF_STATE_HOME` to a temporary directory.
+
 ## [2.1.2] - 2026-08-31
 
 ### Fixed
