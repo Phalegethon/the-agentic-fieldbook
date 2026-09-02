@@ -730,6 +730,31 @@ func TestRepositoryMapPathPrefixFindsRecordsOnLargeSnapshots(t *testing.T) {
 	}
 }
 
+func TestSearchRanksDefinitionsBeforeConfigurationKeysOfTheSameName(t *testing.T) {
+	key := testRecord(0, "expected.state", model.Configuration, model.Verified)
+	key.Path, key.Language, key.SourceType, key.SearchTerms = "a/fixture.json", "json", "configuration", []string{"expected.state", "expected", "state"}
+	definition := testRecord(1, "lifecycle.state", model.Definition, model.Verified)
+	definition.Path, definition.SearchTerms = "z/lifecycle.py", []string{"lifecycle.state", "lifecycle", "state"}
+	response := Search(indexedSnapshot([]model.Record{key, definition}), searchRequest("state"), policy.ProductionLimits())
+	if got, want := identities(response.Records), []string{definition.Identity, key.Identity}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("order = %#v, want definition before configuration key %#v", got, want)
+	}
+}
+
+func TestSearchPrefixExpansionUpToFourThousandTermsIsNotExhausted(t *testing.T) {
+	records := make([]model.Record, 3000)
+	for index := range records {
+		records[index] = testRecord(index, fmt.Sprintf("pkg.TestCase%d", index), model.Definition, model.Verified)
+		records[index].SearchTerms = []string{fmt.Sprintf("testcase%d", index)}
+	}
+	request := searchRequest("test")
+	request.MaximumResults = 8
+	response := Search(indexedSnapshot(records), request, policy.ProductionLimits())
+	if response.Partial || len(response.Records) != 8 || response.Omitted != len(records)-8 {
+		t.Fatalf("prefix expansion = partial:%v records:%d omitted:%d", response.Partial, len(response.Records), response.Omitted)
+	}
+}
+
 func sign(value int) int {
 	if value < 0 {
 		return -1

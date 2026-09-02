@@ -20,7 +20,7 @@ func TestLimitsMatchFrozenProductionPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := Limits{SchemaVersion: "1", MaximumWireBytes: 262144, MaximumStdoutBytes: 262144, MaximumStderrBytes: 65536, MaximumCollectionItems: 64, MaximumEligiblePaths: 250000, MaximumChangedPaths: 10000, MaximumEligibleSourceBytes: 4294967296, MaximumSourceFileBytes: 2097152, MaximumMarkdownFileBytes: 8388608, MaximumLexicalCandidates: 4096, MaximumTermsPerWord: 1024, MaximumDictionaryTerms: 262144, MaximumFuzzyDistance: 2, BuildLatencyNSMaximum: 10000000000, QueryLatencyP95NSMaximum: 150000000, UpdateLatencyNSMaximum: 2000000000, PeakMemoryBytesMaximum: 536870912, StorageToSourceRatioMaximum: 1.5}
+	expected := Limits{SchemaVersion: "1", MaximumWireBytes: 262144, MaximumStdoutBytes: 262144, MaximumStderrBytes: 65536, MaximumCollectionItems: 64, MaximumEligiblePaths: 250000, MaximumChangedPaths: 10000, MaximumEligibleSourceBytes: 4294967296, MaximumSourceFileBytes: 2097152, MaximumMarkdownFileBytes: 8388608, MaximumLexicalCandidates: 4096, MaximumTermsPerWord: 4096, MaximumDictionaryTerms: 262144, MaximumFuzzyDistance: 2, BuildLatencyNSMaximum: 10000000000, QueryLatencyP95NSMaximum: 150000000, UpdateLatencyNSMaximum: 2000000000, PeakMemoryBytesMaximum: 536870912, StorageToSourceRatioMaximum: 1.5}
 	if !reflect.DeepEqual(artifact, expected) {
 		t.Fatalf("policy artifact differs from frozen policy: artifact=%+v expected=%+v", artifact, expected)
 	}

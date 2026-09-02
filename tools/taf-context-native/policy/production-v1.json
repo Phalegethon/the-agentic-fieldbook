@@ -10,7 +10,7 @@
   "maximum_source_file_bytes": 2097152,
   "maximum_markdown_file_bytes": 8388608,
   "maximum_lexical_candidates": 4096,
-  "maximum_terms_per_word": 1024,
+  "maximum_terms_per_word": 4096,
   "maximum_dictionary_terms": 262144,
   "maximum_fuzzy_distance": 2,
   "build_latency_ns_maximum": 10000000000,

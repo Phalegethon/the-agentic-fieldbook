@@ -43,10 +43,11 @@ func newRankedCandidate(record model.Record, tier int) rankedCandidate {
 }
 
 // kindClass orders record kinds within a tier: places where a name is
-// defined or described come before document chunks, and imports come last.
+// defined or described come first, configuration keys and document chunks
+// second, imports last.
 func kindClass(kind model.RecordKind) int {
 	switch kind {
-	case model.DocumentChunk:
+	case model.Configuration, model.DocumentChunk:
 		return 1
 	case model.Import:
 		return 2

@@ -34,7 +34,7 @@ var productionV1 = Limits{
 	MaximumStderrBytes: 65536, MaximumCollectionItems: 64, MaximumEligiblePaths: 250000,
 	MaximumChangedPaths: 10000, MaximumEligibleSourceBytes: 4294967296,
 	MaximumSourceFileBytes: 2097152, MaximumMarkdownFileBytes: 8388608,
-	MaximumLexicalCandidates: 4096, MaximumTermsPerWord: 1024,
+	MaximumLexicalCandidates: 4096, MaximumTermsPerWord: 4096,
 	MaximumDictionaryTerms: 262144, MaximumFuzzyDistance: 2,
 	BuildLatencyNSMaximum: 10000000000, QueryLatencyP95NSMaximum: 150000000,
 	UpdateLatencyNSMaximum: 2000000000, PeakMemoryBytesMaximum: 536870912,
