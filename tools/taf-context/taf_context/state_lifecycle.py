@@ -183,3 +183,90 @@ def _file_bytes(path: Path) -> int:
         return path.lstat().st_size
     except OSError:
         return 0
+
+
+LEGACY_CONTROL_FILES = ("audit.jsonl", "consent.json", "providers.json")
+_SECONDS_PER_DAY = 86400
+
+
+def plan_gc(root: Path, *, unused_for_days: int, now: float) -> list[Candidate]:
+    """Plan reclaimable state. Fresh bound entries are never candidates."""
+    if unused_for_days < 0:
+        raise StateError("invalid-unused-for")
+    if not _is_real_directory(root):
+        return []
+    orphans: list[Candidate] = []
+    unused: list[Candidate] = []
+    generations: list[Candidate] = []
+    doomed_entries: set[Path] = set()
+    cutoff = now - unused_for_days * _SECONDS_PER_DAY
+    for entry in iter_entries(root):
+        if not has_valid_binding(entry):
+            orphans.append(_candidate("orphan-entry", root, entry))
+            doomed_entries.add(entry)
+            continue
+        if (entry / BINDING_FILENAME).lstat().st_mtime <= cutoff:
+            unused.append(_candidate("unused-entry", root, entry))
+            doomed_entries.add(entry)
+            continue
+        generations.extend(_unreferenced_generations(root, entry))
+    runtimes = [
+        _candidate("stale-runtime", root, runtime)
+        for runtime in iter_runtime_versions(root)
+        if runtime.name != CURRENT_RUNTIME_VERSION
+    ]
+    legacy = [
+        _candidate("legacy-control-file", root, root / name)
+        for name in LEGACY_CONTROL_FILES
+        if _is_real_file(root / name)
+    ]
+    trash = [
+        _candidate("trash-leftover", root, child)
+        for child in _sorted_real_directories(root)
+        if child.name.startswith(TRASH_PREFIX)
+    ]
+    empty_parents: list[Candidate] = []
+    repositories = root / REPOSITORIES_DIRECTORY
+    for repository in _sorted_real_directories(repositories) if _is_real_directory(repositories) else []:
+        worktrees = _sorted_real_directories(repository)
+        if worktrees and all(worktree in doomed_entries for worktree in worktrees):
+            empty_parents.append(Candidate("empty-parent", repository.relative_to(root).as_posix(), 0))
+    ordered = orphans + unused + runtimes + generations + legacy + trash + empty_parents
+    return [item for group in _group_by_category(ordered) for item in sorted(group, key=lambda c: c.relative_path)]
+
+
+def _unreferenced_generations(root: Path, entry: Path) -> list[Candidate]:
+    generations = entry / NATIVE_DIRECTORY / GENERATIONS_DIRECTORY
+    if not _is_real_directory(generations):
+        return []
+    current = _read_current(entry / NATIVE_DIRECTORY / CURRENT_FILENAME)
+    return [
+        _candidate("unreferenced-generation", root, child)
+        for child in _sorted_real_directories(generations)
+        if child.name != current
+    ]
+
+
+def _read_current(path: Path) -> str:
+    try:
+        if not _is_real_file(path):
+            return ""
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
+def _is_real_file(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _group_by_category(items: list[Candidate]) -> list[list[Candidate]]:
+    order = ["orphan-entry", "unused-entry", "stale-runtime", "unreferenced-generation",
+             "legacy-control-file", "trash-leftover", "empty-parent"]
+    groups: dict[str, list[Candidate]] = {name: [] for name in order}
+    for item in items:
+        groups[item.category].append(item)
+    return [groups[name] for name in order]

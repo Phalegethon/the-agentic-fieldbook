@@ -6,12 +6,14 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 from taf_context.state_lifecycle import (
     CURRENT_RUNTIME_VERSION,
     Candidate,
     apply_plan,
+    plan_gc,
     plan_remove,
     summarize_state,
 )
@@ -127,6 +129,82 @@ class RemovePlanTests(unittest.TestCase):
                 apply_plan(root, [Candidate("worktree-entry", "repositories/x/y", 1)])
             self.assertEqual(caught.exception.code, "state-root-unavailable")
             self.assertFalse(root.exists())
+
+
+class GcPlanTests(unittest.TestCase):
+    def _populate(self, root: Path, now: float) -> dict[str, Path]:
+        fresh = make_entry(root, "a" * 64, "1" * 64, bound=True)
+        os.utime(fresh / "binding.json", (now, now))
+        old = make_entry(root, "a" * 64, "2" * 64, bound=True)
+        stamp = now - 40 * 86400
+        os.utime(old / "binding.json", (stamp, stamp))
+        orphan = make_entry(root, "b" * 64, "1" * 64, bound=False)
+        extra_generation = fresh / "native" / "generations" / "gen-unreferenced"
+        extra_generation.mkdir()
+        (extra_generation / "index.bin").write_bytes(b"z" * 10)
+        staging = fresh / "native" / "generations" / ".stage-abc"
+        staging.mkdir()
+        make_runtime(root, CURRENT_RUNTIME_VERSION)
+        make_runtime(root, "0.0.9")
+        (root / "providers.json").write_text("[]", encoding="utf-8")
+        trash = root / ".trash-deadbeef"
+        trash.mkdir()
+        (trash / "leftover").write_text("x", encoding="utf-8")
+        return {"fresh": fresh, "old": old, "orphan": orphan, "extra": extra_generation, "staging": staging, "trash": trash}
+
+    def test_plan_lists_every_category_and_spares_fresh_state(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._populate(root, now)
+            plan = plan_gc(root, unused_for_days=30, now=now)
+        by_category = {}
+        for item in plan:
+            by_category.setdefault(item.category, []).append(item.relative_path)
+        self.assertEqual(by_category["orphan-entry"], [f"repositories/{'b' * 64}/{'1' * 64}"])
+        self.assertEqual(by_category["unused-entry"], [f"repositories/{'a' * 64}/{'2' * 64}"])
+        self.assertEqual(by_category["stale-runtime"], ["runtime/0.0.9"])
+        self.assertEqual(
+            sorted(by_category["unreferenced-generation"]),
+            sorted([
+                f"repositories/{'a' * 64}/{'1' * 64}/native/generations/.stage-abc",
+                f"repositories/{'a' * 64}/{'1' * 64}/native/generations/gen-unreferenced",
+            ]),
+        )
+        self.assertEqual(by_category["legacy-control-file"], ["providers.json"])
+        self.assertEqual(by_category["trash-leftover"], [".trash-deadbeef"])
+        self.assertEqual(by_category["empty-parent"], [f"repositories/{'b' * 64}"])
+        self.assertNotIn(f"repositories/{'a' * 64}/{'1' * 64}", [c.relative_path for c in plan])
+        self.assertEqual(
+            [c.category for c in plan],
+            sorted([c.category for c in plan], key=["orphan-entry", "unused-entry", "stale-runtime",
+                   "unreferenced-generation", "legacy-control-file", "trash-leftover", "empty-parent"].index),
+        )
+
+    def test_unused_for_zero_treats_every_bound_entry_as_unused(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._populate(root, now)
+            plan = plan_gc(root, unused_for_days=0, now=now + 1)
+        unused = sorted(c.relative_path for c in plan if c.category == "unused-entry")
+        self.assertEqual(unused, [f"repositories/{'a' * 64}/{'1' * 64}", f"repositories/{'a' * 64}/{'2' * 64}"])
+
+    def test_apply_gc_removes_exactly_the_plan(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._populate(root, now)
+            removed = apply_plan(root, plan_gc(root, unused_for_days=30, now=now))
+            self.assertTrue(paths["fresh"].exists())
+            self.assertTrue((paths["fresh"] / "native" / "generations" / "gen-a").exists())
+            for key in ("old", "orphan", "extra", "staging", "trash"):
+                self.assertFalse(paths[key].exists(), key)
+            self.assertFalse((root / "runtime" / "0.0.9").exists())
+            self.assertTrue((root / "runtime" / CURRENT_RUNTIME_VERSION).exists())
+            self.assertFalse((root / "providers.json").exists())
+            self.assertFalse((root / "repositories" / ("b" * 64)).exists())
+            self.assertEqual(len(removed), 8)
 
 
 if __name__ == "__main__":

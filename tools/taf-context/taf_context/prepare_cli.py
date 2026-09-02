@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Mapping
 from urllib import error as url_error
 from urllib import parse as url_parse
@@ -25,6 +26,7 @@ from .state_lifecycle import (
     CURRENT_RUNTIME_VERSION,
     Candidate,
     apply_plan,
+    plan_gc,
     plan_remove,
     summarize_state,
     touch_binding,
@@ -70,6 +72,10 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
     remove = commands.add_parser("remove")
     remove.add_argument("--repo", required=True)
     remove.add_argument("--confirm-state-write", action="store_true")
+
+    gc = commands.add_parser("gc")
+    gc.add_argument("--unused-for", type=int, default=30)
+    gc.add_argument("--confirm-state-write", action="store_true")
 
     query = commands.add_parser("query")
     query.add_argument("--repo", required=True)
@@ -118,6 +124,14 @@ def run_prepare_command(
         raise PrepareCLIError("explicit state-write confirmation required")
     if args.prepare_command == "build" and not args.confirm_state_write:
         raise PrepareCLIError("explicit state-write confirmation required")
+
+    if args.prepare_command == "gc":
+        paths = _state_paths(environment)
+        try:
+            candidates = plan_gc(paths.root, unused_for_days=args.unused_for, now=time.time())
+        except StateError as exc:
+            raise PrepareCLIError(exc.code) from exc
+        return _lifecycle_summary("gc", paths.root, candidates, confirmed=args.confirm_state_write)
 
     repository = Path(args.repo).resolve()
     snapshot = collect_snapshot(repository)

@@ -644,6 +644,48 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             self.assertEqual((code, stderr), (0, ""))
             self.assertEqual(decoded(stdout)["next_safe_action"], "build-index")
 
+    def test_gc_dry_run_then_confirmed_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            environment = {"HOME": str(root / "home"), "PATH": "", "TAF_STATE_HOME": str(state_home)}
+            orphan = state_home / "repositories" / ("b" * 64) / ("1" * 64) / "native" / "generations" / "g"
+            orphan.mkdir(parents=True)
+            (orphan / "index.bin").write_bytes(b"x" * 10)
+            (state_home / "runtime" / "0.0.1" / "darwin-arm64").mkdir(parents=True)
+            (state_home / "runtime" / "0.0.1" / "darwin-arm64" / "taf-level1").write_bytes(b"old")
+
+            code, stdout, stderr = invoke(environment, "prepare", "gc")
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["mode"], "gc")
+            self.assertTrue(result["dry_run"])
+            self.assertEqual(
+                sorted(c["category"] for c in result["candidates"]),
+                ["empty-parent", "orphan-entry", "stale-runtime"],
+            )
+            self.assertTrue(orphan.exists())
+
+            code, stdout, stderr = invoke(environment, "prepare", "gc", "--unused-for", "30", "--confirm-state-write")
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertFalse(result["dry_run"])
+            self.assertEqual(len(result["removed"]), 3)
+            self.assertFalse(orphan.exists())
+            self.assertFalse((state_home / "runtime" / "0.0.1").exists())
+
+            code, stdout, stderr = invoke(environment, "prepare", "inspect", "--repo", str(repo))
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(decoded(stdout)["state"]["orphan_count"], 0)
+
+    def test_gc_rejects_negative_unused_for(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"HOME": directory, "PATH": "", "TAF_STATE_HOME": str(Path(directory) / "state")}
+            code, _stdout, stderr = invoke(environment, "prepare", "gc", "--unused-for", "-1")
+            self.assertEqual(code, 2)
+            self.assertIn("invalid-unused-for", stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
