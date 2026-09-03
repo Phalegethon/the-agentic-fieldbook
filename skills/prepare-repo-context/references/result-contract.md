@@ -1,5 +1,7 @@
 # Query Result Contract
 
+The same object is returned as `structuredContent` (and as compact JSON text) by the `repo-context` MCP tools; a tool call with `isError: true` carries the error message the script would have printed.
+
 Every `query` invocation returns one JSON object. Read these fields before summarizing.
 
 | Field | Meaning | What to do |

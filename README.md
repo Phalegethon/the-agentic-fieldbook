@@ -15,7 +15,7 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.1.0 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, and reclaim unused index state without loading the full repository into model context. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.4.0 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, and reclaim unused index state without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.0.1 | Recover interrupted work and the single best next step from bounded, read-only Git evidence. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
@@ -240,13 +240,42 @@ Runtime requirements are Git and Python 3. Go is not required for normal use.
 The published native runtime supports macOS and Linux on amd64/arm64 and
 Windows on amd64.
 
+### The repo-context MCP server
+
+TAF bundles an MCP stdio server, `repo-context`, that exposes the same
+operations as `prepare-repo-context` as tools: `inspect`, `build`,
+`repository_map`, `search_symbols`, `search_docs`, and `source_snippets`.
+Every tool takes the absolute `repo` path; `build` requires
+`confirm_state_write: true` and is marked so the host asks before running it.
+The server never installs the native engine, never contacts the network, and
+never deletes state; `activate`, `gc`, and `remove` stay skill commands. One
+native engine process serves the whole session and starts on the first tool
+call, so repeated questions do not pay for a process start and index load.
+
+Claude Code starts the server when the plugin is enabled; the tools appear as
+`mcp__plugin_taf_repo-context__<tool>` (permission matcher
+`mcp__plugin_taf_repo-context__*`), reading its manifest from `.mcp.json`
+(`${CLAUDE_PLUGIN_ROOT}`). Codex reads its own `.codex-plugin/mcp.json`
+(`${PLUGIN_ROOT}`), since its Agent Plugins MCP loader does not substitute
+`${CLAUDE_PLUGIN_ROOT}`. If a host does not substitute either variable in the
+command path, register the server manually with an absolute path, for
+example in Codex's `config.toml`:
+
+    [mcp_servers.repo-context]
+    command = "python3"
+    args = ["/absolute/path/to/the-agentic-fieldbook/tools/taf-context/taf_context_mcp.py"]
+    default_tools_approval_mode = "writes"
+
+The manifest names the interpreter `python3`; on Windows installations where
+only `python` exists, register the server manually with that name.
+
 ## Versioning and releases
 
 TAF and its skills have separate versions:
 
 - TAF `2.1.2` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.1.0` versions its behavior contract.
+- `prepare-repo-context` `1.4.0` versions its behavior contract.
 - `work-recovery` `1.0.1` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with
