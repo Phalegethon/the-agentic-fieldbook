@@ -196,6 +196,19 @@ def run_prepare_command(
             allow_inferred=args.allow_inferred,
         )
         if result.status.value not in {"ready", "partial"}:
+            # The engine reports the same status/freshness/next_safe_action
+            # triple both when the index is genuinely stale and when
+            # source-snippets cannot verify the requested result identities
+            # against an otherwise exact index (unknown id, or a record whose
+            # evidence class is not Verified). The wire result carries no
+            # field that tells these apart, so name the snippet case honestly
+            # instead of misdirecting the agent to `prepare inspect`; a
+            # re-run search still produces the correct refusal when the
+            # index really is stale.
+            if args.operation == "source-snippets" and result.status.value == "stale":
+                raise PrepareCLIError(
+                    "result identities could not be verified against the current index; re-run the search query"
+                )
             raise PrepareCLIError("ready context is required; run prepare inspect")
         touch_binding(binding_path)
         return _query_summary(result)

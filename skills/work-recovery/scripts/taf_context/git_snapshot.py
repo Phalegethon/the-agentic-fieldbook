@@ -479,6 +479,12 @@ def _run_concurrently(
     first failing command still raises first. ``threading`` is used instead
     of ``concurrent.futures`` because the latter imports ``logging``, which
     costs about 7 ms on the query path.
+
+    If the platform refuses to start a thread (``RuntimeError``, e.g. thread
+    exhaustion), the jobs that were never picked up by a started worker are
+    run sequentially in the current thread instead of letting the error
+    escape — the sequential fallback can only ever raise ``SnapshotError``,
+    the same as the normal concurrent path.
     """
     outcomes: list[tuple[bool, object]] = [(False, None)] * len(jobs)
     pending = collections.deque(range(len(jobs)))
@@ -498,9 +504,16 @@ def _run_concurrently(
         threading.Thread(target=worker, name=f"taf-git-{ordinal}", daemon=True)
         for ordinal in range(max(1, min(workers, len(jobs))))
     ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
+    started: list[threading.Thread] = []
+    try:
+        for thread in threads:
+            thread.start()
+            started.append(thread)
+    except RuntimeError:
+        # Some threads could not be started; drain whatever jobs are left in
+        # the pending queue on the current thread rather than losing them.
+        worker()
+    for thread in started:
         thread.join()
     return outcomes
 
@@ -508,6 +521,8 @@ def _run_concurrently(
 def _outcome(outcomes: list[tuple[bool, object]], index: int) -> bytes | None:
     ok, value = outcomes[index]
     if not ok:
+        if value is None:
+            raise SnapshotError("local Git command failed")
         raise value  # type: ignore[misc]
     return value  # type: ignore[return-value]
 
@@ -517,9 +532,13 @@ def _rev_parse_identity(repo: Path) -> tuple[str, str, bytes | None]:
 
     One ``rev-parse`` answers all three; ``--git-common-dir`` prints a path
     relative to the current directory, so this runs from the canonical root
-    exactly like the separate calls it replaces. ``--verify HEAD`` fails the
-    whole command on an unborn repository; only then are the two directory
-    queries repeated without it and HEAD is reported absent.
+    exactly like the separate calls it replaces. The combined form can fail
+    for reasons unrelated to HEAD (a rejected combination of arguments), so a
+    failure does not by itself mean the repository is unborn: on the
+    fallback path the two directory queries are repeated without
+    ``--verify``, and HEAD is decided separately by the exact command the
+    pre-branch sequential implementation used, so a combined-call failure
+    can never be silently reported as an unborn repository.
     """
     combined = _git(
         repo, "rev-parse", "--absolute-git-dir", "--git-common-dir", "--verify", "HEAD",
@@ -536,7 +555,10 @@ def _rev_parse_identity(repo: Path) -> tuple[str, str, bytes | None]:
         raise SnapshotError("malformed Git output: repository identity")
     git_dir = _text(lines[0] + b"\n", "Git directory")
     common_value = _text(lines[1] + b"\n", "Git common directory")
-    raw_head = lines[2] + b"\n" if expected_lines == 3 else None
+    if expected_lines == 3:
+        raw_head = lines[2] + b"\n"
+    else:
+        raw_head = _git(repo, "rev-parse", "--verify", "HEAD", allow_failure=True)
     return git_dir, common_value, raw_head
 
 

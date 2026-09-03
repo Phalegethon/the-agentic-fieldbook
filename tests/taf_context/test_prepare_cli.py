@@ -64,6 +64,7 @@ def write_fake_native_engine(
     *,
     partial: bool = False,
     stale: bool = False,
+    snippet_stale: bool = False,
 ) -> None:
     source = textwrap.dedent(
             """\
@@ -139,11 +140,19 @@ def write_fake_native_engine(
                 payload["status"] = "stale"
                 payload["freshness"] = "incrementally-stale"
                 payload["next_safe_action"] = "rebuild-index"
+            if __SNIPPET_STALE__ and operation == "source-snippets":
+                # Mirrors the engine's snippetStale helper: an exact index
+                # that cannot verify the requested result identities reports
+                # the same status/freshness/next_safe_action as a genuinely
+                # stale index (structurally-stale, update-index).
+                payload["status"] = "stale"
+                payload["freshness"] = "structurally-stale"
+                payload["next_safe_action"] = "update-index"
             sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\\n")
             """
         ).replace("__INVOCATION_LOG__", repr(None if invocation_log is None else str(invocation_log))).replace(
             "__PARTIAL__", repr(partial)
-        ).replace("__STALE__", repr(stale))
+        ).replace("__STALE__", repr(stale)).replace("__SNIPPET_STALE__", repr(snippet_stale))
     path.write_text(source, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
@@ -385,17 +394,20 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
                 ["search-symbols"],
             )
 
-    def test_successful_query_touches_binding_once(self) -> None:
+    def test_unverifiable_snippet_identities_are_refused_with_a_specific_message(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = init_committed_repo(root / "repo")
             state_home = root / "state"
-            binary = root / "taf-level1"
-            write_fake_native_engine(binary)
+            fresh_binary = root / "taf-level1"
+            write_fake_native_engine(fresh_binary)
+            snippet_stale_binary = root / "taf-level1-snippet-stale"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(snippet_stale_binary, invocation_log, snippet_stale=True)
             environment = {
                 "HOME": str(root / "home"),
                 "PATH": "",
-                "TAF_LEVEL1_BINARY": str(binary),
+                "TAF_LEVEL1_BINARY": str(fresh_binary),
                 "TAF_STATE_HOME": str(state_home),
             }
             code, _stdout, stderr = invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
@@ -404,14 +416,23 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             old = 1_600_000_000
             os.utime(binding, (old, old))
 
+            environment["TAF_LEVEL1_BINARY"] = str(snippet_stale_binary)
+            result_id = "sha256:" + ("a" * 64)
             code, stdout, stderr = invoke(
                 environment, "prepare", "query", "--repo", str(repo),
-                "--operation", "repository-map",
+                "--operation", "source-snippets", "--result-id", result_id,
             )
 
-            self.assertEqual((code, stderr), (0, ""))
-            self.assertEqual(decoded(stdout)["status"], "ready")
-            self.assertGreater(binding.stat().st_mtime, old)
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn(
+                "result identities could not be verified against the current index; re-run the search query",
+                stderr,
+            )
+            self.assertEqual(binding.stat().st_mtime, old)
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["source-snippets"],
+            )
 
     def test_query_requires_an_existing_exact_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

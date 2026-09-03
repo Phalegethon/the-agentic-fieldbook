@@ -767,6 +767,30 @@ class BoundedGitTests(unittest.TestCase):
                 with self.assertRaises(SnapshotError):
                     collect_snapshot(repo)
 
+    def test_rev_parse_fallback_recovers_head_when_combined_call_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = init_committed_repo(Path(directory) / "repo")
+            expected_head = run(repo, "git", "rev-parse", "HEAD")
+            real_run = subprocess.run
+            combined_rejected = (
+                "rev-parse", "--absolute-git-dir", "--git-common-dir", "--verify", "HEAD",
+            )
+
+            def recording_run(argv: list[str], **kwargs: object):
+                if tuple(argv[1:]) == combined_rejected:
+                    return subprocess.CompletedProcess(
+                        argv, returncode=128, stdout=b"", stderr=b"fatal: simulated rejection\n"
+                    )
+                return real_run(argv, **kwargs)
+
+            with mock.patch(
+                "taf_context.git_snapshot.subprocess.run", side_effect=recording_run
+            ):
+                snapshot = collect_snapshot(repo)
+
+            self.assertEqual(snapshot.head_sha, expected_head)
+            self.assertNotEqual(snapshot.repository_identity, gs._fingerprint([]))
+
     def test_rejects_malformed_git_output(self) -> None:
         malformed = subprocess.CompletedProcess(
             ["git", "rev-parse", "--show-toplevel"],
@@ -1091,6 +1115,34 @@ class ConcurrentSnapshotEquivalenceTests(unittest.TestCase):
             with mock.patch("taf_context.git_snapshot.subprocess.run", side_effect=failing_ls_files):
                 with self.assertRaises(SnapshotError):
                     collect_snapshot(repo)
+
+    def test_thread_start_failure_falls_back_to_sequential_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = init_committed_repo(Path(directory) / "repo")
+            reference = _reference_collect_snapshot(repo)
+
+            with mock.patch(
+                "taf_context.git_snapshot.threading.Thread.start",
+                side_effect=RuntimeError("simulated thread exhaustion"),
+            ):
+                actual = collect_snapshot(repo)
+
+            self.assertEqual(actual, reference)
+
+    def test_concurrent_collector_equals_reference_on_linked_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = init_committed_repo(root / "primary")
+            linked = root / "linked"
+            run(primary, "git", "worktree", "add", "-b", "linked", str(linked), "HEAD")
+            write(linked / "src" / "module.py", "print('linked')\n")
+            write(linked / "tracked.txt", "unstaged change\n")
+
+            for start in (linked, linked / "src"):
+                with self.subTest(start=start.name):
+                    reference = _reference_collect_snapshot(start)
+                    actual = collect_snapshot(start)
+                    self.assertEqual(actual, reference)
 
 
 if __name__ == "__main__":

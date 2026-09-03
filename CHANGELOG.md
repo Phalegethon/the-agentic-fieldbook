@@ -41,7 +41,9 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
   at build time and in `metrics`), the broker collects the Git snapshot with
   concurrent read-only commands, and installer modules load only for
   `activate`. End-to-end query latency on this repository drops from about
-  1.0 s to about 0.3 s.
+  1.0 s to about 0.3 s. A `source-snippets` request whose result identities
+  cannot be verified is refused with a message that says so instead of a
+  stale-context error.
 
 ## [2.1.2] - 2026-08-31
 
