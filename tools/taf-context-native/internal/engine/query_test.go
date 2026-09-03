@@ -404,3 +404,129 @@ func TestCachedEngineServesTwoStateRootsAndTheUpdatedGeneration(t *testing.T) {
 		t.Fatalf("superseded identity must be refused as stale without findings: %#v", result)
 	}
 }
+
+// relatedRoots is one Go package spread over two files, so a call in one file
+// is answered by the definition the other file carries.
+func relatedRoots(t *testing.T) (string, string) {
+	t.Helper()
+	base := t.TempDir()
+	repository := filepath.Join(base, "repository")
+	if err := os.MkdirAll(filepath.Join(repository, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"caller.go": "package sample\n\nfunc Main() {\n\thelper()\n\thelper()\n}\n",
+		"helper.go": "package sample\n\nfunc helper() {}\n",
+	}
+	for name, contents := range files {
+		if err := os.WriteFile(filepath.Join(repository, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return repository, filepath.Join(base, "state")
+}
+
+func relatedEnvelope(repository, state string, index *string, direction string, identities []string) wire.Envelope {
+	envelope := controlEnvelope(wire.RelatedSymbols, repository, state, index)
+	envelope.Request.SchemaVersion = "2"
+	envelope.Request.Direction = &direction
+	envelope.Request.ResultIdentities = identities
+	return envelope
+}
+
+func queryFinding(t *testing.T, result wire.Result, qualified string) wire.Finding {
+	t.Helper()
+	for _, finding := range result.Findings {
+		if finding.QualifiedName == qualified {
+			return finding
+		}
+	}
+	t.Fatalf("no finding named %q in %#v", qualified, result.Findings)
+	return wire.Finding{}
+}
+
+func TestRelatedSymbolsAnswersCallersWithPerEdgeEvidence(t *testing.T) {
+	repository, state := relatedRoots(t)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	search := controlEnvelope(wire.SearchSymbols, repository, state, built.IndexIdentity)
+	text := "helper"
+	search.Request.Query = &text
+	symbols, err := engine.Execute(context.Background(), search)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor := queryFinding(t, symbols, "sample.helper")
+
+	result, err := engine.Execute(context.Background(), relatedEnvelope(repository, state, built.IndexIdentity, "callers", []string{anchor.ResultIdentity}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SchemaVersion != "2" || result.Status != wire.Ready || result.Freshness != "exact" || result.NextSafeAction != "use-index" {
+		t.Fatalf("related result = %#v", result)
+	}
+	caller := queryFinding(t, result, "sample.Main")
+	if caller.Relation != "call" || caller.EdgeEvidence != "verified" || caller.ReferenceLine != 4 || caller.ReferenceCount != 2 {
+		t.Fatalf("caller finding = %#v", caller)
+	}
+	if caller.RecordKind != "definition" || caller.Path != "caller.go" {
+		t.Fatalf("caller record = %#v", caller)
+	}
+
+	callees, err := engine.Execute(context.Background(), relatedEnvelope(repository, state, built.IndexIdentity, "callees", []string{caller.ResultIdentity}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if callee := queryFinding(t, callees, "sample.helper"); callee.Relation != "call" || callee.EdgeEvidence != "verified" || callee.ResultIdentity != anchor.ResultIdentity {
+		t.Fatalf("callee finding = %#v", callee)
+	}
+}
+
+func TestRelatedSymbolsRefusesAnAnchorThatIsNotASymbol(t *testing.T) {
+	repository, state := relatedRoots(t)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := "sha256:" + strings.Repeat("b", 64)
+	result, err := engine.Execute(context.Background(), relatedEnvelope(repository, state, built.IndexIdentity, "callers", []string{unknown}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != wire.Stale || result.Freshness != "structurally-stale" || result.NextSafeAction != "update-index" || len(result.Findings) != 0 {
+		t.Fatalf("unknown anchor = %#v", result)
+	}
+}
+
+// A result always answers in the schema its request asked for, and the edge
+// fields stay empty for every operation that resolves no edge.
+func TestQueryResultsEchoTheRequestSchemaVersion(t *testing.T) {
+	repository, state := relatedRoots(t)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, schema := range []string{"1", "2"} {
+		envelope := controlEnvelope(wire.SearchSymbols, repository, state, built.IndexIdentity)
+		envelope.Request.SchemaVersion = schema
+		text := "helper"
+		envelope.Request.Query = &text
+		result, executeErr := engine.Execute(context.Background(), envelope)
+		if executeErr != nil {
+			t.Fatalf("schema %s: %v", schema, executeErr)
+		}
+		if result.SchemaVersion != schema || len(result.Findings) == 0 {
+			t.Fatalf("schema %s result = %#v", schema, result)
+		}
+		for _, finding := range result.Findings {
+			if finding.Relation != "" || finding.EdgeEvidence != "" || finding.ReferenceLine != 0 || finding.ReferenceCount != 0 {
+				t.Fatalf("schema %s search finding carries edge fields: %#v", schema, finding)
+			}
+		}
+	}
+}

@@ -235,7 +235,9 @@ func (engine *Engine) result(request wire.Request, status wire.Status, freshness
 		index = request.IndexIdentity
 	}
 	return wire.Result{
-		SchemaVersion: "1", RequestIdentity: request.RequestIdentity, Operation: request.Operation,
+		// A result answers in the schema its request asked for; the validated
+		// request already carries a schema the wire admits.
+		SchemaVersion: request.SchemaVersion, RequestIdentity: request.RequestIdentity, Operation: request.Operation,
 		Status: status, ProviderIdentity: "taf-context", ProviderVersion: engineVersion, IndexIdentity: index,
 		RepositoryIdentity: request.RepositoryIdentity, WorktreeIdentity: request.WorktreeIdentity, CommittedHead: request.CommittedHead,
 		DirtyOverlayFingerprint: request.DirtyOverlayFingerprint, Freshness: freshness,

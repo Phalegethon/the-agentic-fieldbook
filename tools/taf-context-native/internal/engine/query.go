@@ -73,12 +73,27 @@ func (engine *Engine) query(ctx context.Context, roots *boundary.Roots, request 
 }
 
 func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, snapshot store.Snapshot) (wire.Result, error) {
-	var response query.Response
+	var (
+		selected []wire.Finding
+		omitted  int
+		partial  bool
+	)
 	switch request.Operation {
 	case wire.RepositoryMap:
-		response = query.RepositoryMap(snapshot, request, productionLimits())
+		response := query.RepositoryMap(snapshot, request, productionLimits())
+		selected, omitted, partial = findings(response.Records), response.Omitted, response.Partial
 	case wire.SearchSymbols, wire.SearchDocs:
-		response = query.Search(snapshot, request, productionLimits())
+		response := query.Search(snapshot, request, productionLimits())
+		selected, omitted, partial = findings(response.Records), response.Omitted, response.Partial
+	case wire.RelatedSymbols:
+		response := query.Related(snapshot, request, productionLimits())
+		// An anchor that is not a record a relationship may start from is
+		// refused the way an unusable snippet identity is: no findings, and an
+		// index refresh as the next safe action.
+		if response.Unknown {
+			return engine.snippetStale(request, snapshot.Manifest.Coverage), nil
+		}
+		selected, omitted, partial = relatedFindings(response.Findings), response.Omitted, response.Partial
 	default:
 		return engine.unsupported(request), nil
 	}
@@ -89,21 +104,39 @@ func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, s
 	if !completeCoverage(snapshot.Manifest.Coverage, false) {
 		resultStatus = wire.Partial
 	}
-	if response.Partial {
+	if partial {
 		resultStatus, nextAction = wire.Partial, "refine-query"
 	}
 	result := engine.result(request, resultStatus, "exact", request.IndexIdentity, snapshot.Manifest.Coverage, nextAction)
-	result.Findings = findings(response.Records)
-	result.OmittedCount = response.Omitted
+	result.Findings = selected
+	result.OmittedCount = omitted
 	// Truncated is the honest flag: the finding list is known to be incomplete
 	// because the ranking overflowed, the renderer trimmed, or a budget stopped
 	// the search. Omissions the engine could not count are never estimated.
-	result.Truncated = response.Partial || response.Omitted > 0
+	result.Truncated = partial || omitted > 0
 	result.Warnings = sourceCatalogWarnings(snapshot.Manifest.SourceCatalog)
-	if response.Partial {
+	if partial {
 		result.Warnings = appendBoundedWarnings(result.Warnings, "query-frontier-exhausted")
 	}
 	return result, nil
+}
+
+// relatedFindings carries the four schema-2 edge fields next to the record the
+// resolution reached, so a reader sees both what was found and how well the
+// edge that led there is evidenced.
+func relatedFindings(edges []query.RelatedFinding) []wire.Finding {
+	records := make([]model.Record, len(edges))
+	for index, edge := range edges {
+		records[index] = edge.Record
+	}
+	output := findings(records)
+	for index, edge := range edges {
+		output[index].Relation = edge.Relation
+		output[index].EdgeEvidence = string(edge.EdgeEvidence)
+		output[index].ReferenceLine = edge.ReferenceLine
+		output[index].ReferenceCount = edge.ReferenceCount
+	}
+	return output
 }
 
 func findings(records []model.Record) []wire.Finding {
