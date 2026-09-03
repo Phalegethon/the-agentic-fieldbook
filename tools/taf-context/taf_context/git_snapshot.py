@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import collections
 import errno
 import hashlib
 import os
 import re
 import stat
 import subprocess
+import threading
 from pathlib import Path, PurePosixPath
+from typing import Callable
 
 from .models import BackgroundState, ContextManifest, RepositorySnapshot
 
@@ -466,6 +469,77 @@ def _is_candidate_artifact(path: str) -> bool:
     return "test-result" in normalized or "benchmark-result" in normalized
 
 
+def _run_concurrently(
+    jobs: list[Callable[[], object]], workers: int = 4
+) -> list[tuple[bool, object]]:
+    """Run independent callables on a bounded number of threads.
+
+    Each outcome is ``(True, value)`` or ``(False, exception)`` at the job's
+    own index, so the caller consumes results in the original order and the
+    first failing command still raises first. ``threading`` is used instead
+    of ``concurrent.futures`` because the latter imports ``logging``, which
+    costs about 7 ms on the query path.
+    """
+    outcomes: list[tuple[bool, object]] = [(False, None)] * len(jobs)
+    pending = collections.deque(range(len(jobs)))
+
+    def worker() -> None:
+        while True:
+            try:
+                index = pending.popleft()
+            except IndexError:
+                return
+            try:
+                outcomes[index] = (True, jobs[index]())
+            except BaseException as exc:  # re-raised by the consumer in order
+                outcomes[index] = (False, exc)
+
+    threads = [
+        threading.Thread(target=worker, name=f"taf-git-{ordinal}", daemon=True)
+        for ordinal in range(max(1, min(workers, len(jobs))))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return outcomes
+
+
+def _outcome(outcomes: list[tuple[bool, object]], index: int) -> bytes | None:
+    ok, value = outcomes[index]
+    if not ok:
+        raise value  # type: ignore[misc]
+    return value  # type: ignore[return-value]
+
+
+def _rev_parse_identity(repo: Path) -> tuple[str, str, bytes | None]:
+    """Return the Git directory, the common directory value, and raw HEAD.
+
+    One ``rev-parse`` answers all three; ``--git-common-dir`` prints a path
+    relative to the current directory, so this runs from the canonical root
+    exactly like the separate calls it replaces. ``--verify HEAD`` fails the
+    whole command on an unborn repository; only then are the two directory
+    queries repeated without it and HEAD is reported absent.
+    """
+    combined = _git(
+        repo, "rev-parse", "--absolute-git-dir", "--git-common-dir", "--verify", "HEAD",
+        allow_failure=True,
+    )
+    expected_lines = 3
+    if combined is None:
+        combined = _git(repo, "rev-parse", "--absolute-git-dir", "--git-common-dir")
+        expected_lines = 2
+    if combined is None or not combined.endswith(b"\n"):
+        raise SnapshotError("malformed Git output: repository identity")
+    lines = combined[:-1].split(b"\n")
+    if len(lines) != expected_lines:
+        raise SnapshotError("malformed Git output: repository identity")
+    git_dir = _text(lines[0] + b"\n", "Git directory")
+    common_value = _text(lines[1] + b"\n", "Git common directory")
+    raw_head = lines[2] + b"\n" if expected_lines == 3 else None
+    return git_dir, common_value, raw_head
+
+
 def collect_snapshot(
     repo: Path, max_dirty_file_bytes: int = 8 * 1024 * 1024
 ) -> RepositorySnapshot:
@@ -493,75 +567,52 @@ def collect_snapshot(
     )
     if configured_filters is not None:
         raise SnapshotError("executable Git filters are not allowed")
-    git_dir = Path(
-        _text(_git(repo, "rev-parse", "--absolute-git-dir"), "Git directory")
-    ).resolve()
-    common_value = _text(
-        _git(repo, "rev-parse", "--git-common-dir"), "Git common directory"
-    )
+    git_dir_value, common_value, raw_head = _rev_parse_identity(repo)
+    git_dir = Path(git_dir_value).resolve()
     git_common_dir = _resolve_common_dir(git_dir, canonical_root, common_value)
 
-    raw_head = _git(repo, "rev-parse", "--verify", "HEAD", allow_failure=True)
     if raw_head is None:
         head_sha = None
-        root_commits: tuple[str, ...] = ()
     else:
         head_values = _object_ids(raw_head, "HEAD")
         if len(head_values) != 1:
             raise SnapshotError("malformed Git output: HEAD")
         head_sha = head_values[0]
-        root_commits = _object_ids(
-            _git(repo, "rev-list", "--max-parents=0", "HEAD"), "root commits"
-        )
 
-    raw_branch = _git(
-        repo, "symbolic-ref", "--short", "-q", "HEAD", allow_failure=True
-    )
+    # Independent read-only commands run concurrently; results are consumed in
+    # the original sequential order so parsing and error precedence do not
+    # change. Command lines are identical to the sequential implementation.
+    jobs: list[Callable[[], object]] = [
+        lambda: _git(repo, "symbolic-ref", "--short", "-q", "HEAD", allow_failure=True),
+        lambda: _git(repo, "ls-files", "-z"),
+        lambda: _git(repo, "ls-files", "--stage", "-z"),
+        lambda: _git(
+            repo, "diff", "--no-renames", "--ignore-submodules=dirty", "--cached", "--name-only", "-z"
+        ),
+        lambda: _git(repo, "diff", "--no-renames", "--ignore-submodules=all", "--name-only", "-z"),
+        lambda: _git(repo, "ls-files", "--others", "--exclude-standard", "-z"),
+        lambda: _git(
+            repo, "status", "--no-renames", "--ignore-submodules=all", "--porcelain=v1",
+            "-z", "--ignored=matching", "--untracked-files=normal",
+        ),
+    ]
+    if head_sha is not None:
+        jobs.insert(0, lambda: _git(repo, "rev-list", "--max-parents=0", "HEAD"))
+    outcomes = _run_concurrently(jobs)
+    offset = 0
+    if head_sha is None:
+        root_commits: tuple[str, ...] = ()
+    else:
+        root_commits = _object_ids(_outcome(outcomes, 0), "root commits")
+        offset = 1
+    raw_branch = _outcome(outcomes, offset)
     branch = None if raw_branch is None else _text(raw_branch, "branch")
-
-    tracked_paths = _z_paths(_git(repo, "ls-files", "-z"), "tracked paths")
-    index_gitlinks = _index_gitlinks(
-        _git(repo, "ls-files", "--stage", "-z")
-    )
-    staged_paths = _z_paths(
-        _git(
-            repo,
-            "diff",
-            "--no-renames",
-            "--ignore-submodules=dirty",
-            "--cached",
-            "--name-only",
-            "-z",
-        ),
-        "staged paths",
-    )
-    unstaged_paths = _z_paths(
-        _git(
-            repo,
-            "diff",
-            "--no-renames",
-            "--ignore-submodules=all",
-            "--name-only",
-            "-z",
-        ),
-        "unstaged paths",
-    )
-    untracked_paths = _z_paths(
-        _git(repo, "ls-files", "--others", "--exclude-standard", "-z"),
-        "untracked paths",
-    )
-    statuses, ignored_entry_count = _status_paths(
-        _git(
-            repo,
-            "status",
-            "--no-renames",
-            "--ignore-submodules=all",
-            "--porcelain=v1",
-            "-z",
-            "--ignored=matching",
-            "--untracked-files=normal",
-        )
-    )
+    tracked_paths = _z_paths(_outcome(outcomes, offset + 1), "tracked paths")
+    index_gitlinks = _index_gitlinks(_outcome(outcomes, offset + 2))
+    staged_paths = _z_paths(_outcome(outcomes, offset + 3), "staged paths")
+    unstaged_paths = _z_paths(_outcome(outcomes, offset + 4), "unstaged paths")
+    untracked_paths = _z_paths(_outcome(outcomes, offset + 5), "untracked paths")
+    statuses, ignored_entry_count = _status_paths(_outcome(outcomes, offset + 6))
 
     dirty_paths = tuple(sorted(set(staged_paths + unstaged_paths + untracked_paths)))
     dirty_values: list[str] = []
