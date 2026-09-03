@@ -107,6 +107,88 @@ func TestBuildContextCancellationDuringPreparationStagesPreservesCurrent(t *test
 	}
 }
 
+func TestPrepareGenerationValidatesInputsWhileEncodingAndDoesNotRevalidateThePayload(t *testing.T) {
+	// Pins the actual publication order: the encoder validates every input
+	// field while producing the plain image (encodeIndex -> validRecordContext
+	// -> ErrInvalidIndex) and Build never creates any state for a rejected
+	// input; for a valid input, the only read-side guarantees on the
+	// just-produced payload are its digest (matching the manifest) and a
+	// successful bounded decode, not a second structural validation pass.
+	t.Run("invalid record rejected before any state is created", func(t *testing.T) {
+		roots, state := storeRoots(t)
+		invalid := testRecord(testRecordA, "a.go", strings.Repeat("q", 513), []string{"a"})
+		if _, err := Build(roots, testManifest(), []model.Record{invalid}); !errors.Is(err, ErrInvalidIndex) {
+			t.Fatalf("Build error = %v, want ErrInvalidIndex", err)
+		}
+		if _, err := os.Stat(state); !os.IsNotExist(err) {
+			t.Fatalf("rejected input created state: %v", err)
+		}
+	})
+
+	t.Run("valid payload is proven by digest and decode, not by a structural pass", func(t *testing.T) {
+		records := buildCancellationRecords(64)
+		artifacts, err := prepareGeneration(testManifest(), records)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := sha256ID(artifacts.payload); got != artifacts.manifestValue.PayloadDigest {
+			t.Fatalf("payload digest = %q, want manifest PayloadDigest %q", got, artifacts.manifestValue.PayloadDigest)
+		}
+		decoded, _, err := decodeIndex(artifacts.payload)
+		if err != nil {
+			t.Fatalf("decodeIndex(payload) = %v", err)
+		}
+		if len(decoded) != len(records) {
+			t.Fatalf("decoded record count = %d, want %d", len(decoded), len(records))
+		}
+	})
+}
+
+func TestVerifyGenerationArtifactsRejectsBytesThatDifferFromTheArtifacts(t *testing.T) {
+	roots, state := storeRoots(t)
+	snapshot := mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	artifacts, err := prepareGeneration(snapshot.Manifest, snapshot.Records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := installedPath(state, snapshot.Manifest.GenerationIdentity, indexFilename)
+	data := mustRead(t, path)
+	data[len(data)-1] ^= 0xff
+	writeExisting(t, path, data)
+	stateDir, generations := openGenerations(t, roots) // helper: open state + generations directories through boundaryFilesystem
+	defer closeDirectories(stateDir, generations)
+	if err := verifyGenerationArtifacts(boundaryFilesystem{}, generations, artifacts); !errors.Is(err, ErrStoreCorrupt) {
+		t.Fatalf("verify error = %v, want ErrStoreCorrupt", err)
+	}
+}
+
+func TestTrustedPublicationRejectsCurrentRenameFault(t *testing.T) {
+	roots, state := storeRoots(t)
+	previous := mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	currentBefore := mustRead(t, filepath.Join(state, currentFilename))
+	injected := errors.New("trusted rename seam")
+	_, err := buildWithFilesystemObservedContextBarrierTrusted(
+		context.Background(),
+		boundaryFilesystem{faults: Faults{BeforeCurrentRename: injected}},
+		roots,
+		manifestVariant("b"),
+		[]model.Record{testRecord(testRecordB, "b.go", "B", []string{"b"})},
+		buildHooks{},
+		nil,
+		&previous,
+	)
+	if !errors.Is(err, injected) {
+		t.Fatalf("trusted rename error = %v, want injected", err)
+	}
+	if currentAfter := mustRead(t, filepath.Join(state, currentFilename)); !bytes.Equal(currentBefore, currentAfter) {
+		t.Fatalf("CURRENT changed after trusted rename fault: before=%q after=%q", currentBefore, currentAfter)
+	}
+	loaded, loadErr := Load(roots, previous.IndexIdentity)
+	if loadErr != nil || loaded.IndexIdentity != previous.IndexIdentity {
+		t.Fatalf("previous generation = %#v, %v", loaded, loadErr)
+	}
+}
+
 func TestBuildContextCancellationDuringLongRecordValidationWinsOverValidity(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -2654,6 +2736,27 @@ func writeExisting(t *testing.T, path string, value []byte) {
 	t.Helper()
 	if err := os.WriteFile(path, value, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func openGenerations(t *testing.T, roots *boundary.Roots) (*boundary.StateDirectory, *boundary.StateDirectory) {
+	t.Helper()
+	filesystem := boundaryFilesystem{}
+	state, err := filesystem.openStateDirectory(roots, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	generations, err := filesystem.openDirectory(state, generationsDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state, generations
+}
+
+func closeDirectories(directories ...*boundary.StateDirectory) {
+	filesystem := boundaryFilesystem{}
+	for _, directory := range directories {
+		_ = filesystem.closeDirectory(directory)
 	}
 }
 

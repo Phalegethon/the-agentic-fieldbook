@@ -140,6 +140,18 @@ func buildWithFilesystemObservedContextBarrier(ctx context.Context, filesystem s
 	return buildWithFilesystemObservedContextBarrierTrusted(ctx, filesystem, roots, manifest, records, hooks, barrier, nil)
 }
 
+// Publication order, relied upon by the Phase 4b cost work: the encoder
+// validates every input field while producing the plain image (bounds,
+// text validity, ordering, duplicates) and then compresses and digests it;
+// the just-encoded payload is not re-validated structurally — staged bytes
+// are re-read and compared with the in-memory artifacts
+// (verifyGenerationArtifacts), and every reader verifies the payload digest
+// and decodes with bounded checks. The raw structural validator over a
+// stored payload runs only in metrics (Inspect) and, when no trusted
+// previous snapshot is given, over the previous generation before an
+// untrusted publication. With a trusted previous snapshot the previous
+// generation is not re-read and CURRENT must still name it at publication
+// (compare-and-swap).
 func buildWithFilesystemObservedContextBarrierTrusted(ctx context.Context, filesystem storeFilesystem, roots *boundary.Roots, manifest model.Manifest, records []model.Record, hooks buildHooks, barrier func() error, trustedPrevious *Snapshot) (Snapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
