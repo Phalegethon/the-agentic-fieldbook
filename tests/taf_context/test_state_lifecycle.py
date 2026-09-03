@@ -21,7 +21,9 @@ from taf_context.state_lifecycle import (
 from taf_context.state_paths import StateError
 
 
-def make_entry(root: Path, repo: str, worktree: str, *, bound: bool, generation: str = "e" * 64) -> Path:
+def make_entry(
+    root: Path, repo: str, worktree: str, *, bound: bool, generation: str = "e" * 64, schema: str = "1"
+) -> Path:
     entry = root / "repositories" / repo / worktree
     native = entry / "native" / "generations" / generation
     native.mkdir(parents=True)
@@ -30,11 +32,21 @@ def make_entry(root: Path, repo: str, worktree: str, *, bound: bool, generation:
     (native / "READY").write_text("sha256:" + generation, encoding="utf-8")
     (entry / "native" / "CURRENT").write_text(generation + "\n", encoding="utf-8")
     if bound:
-        (entry / "binding.json").write_text(
-            json.dumps({"schema_version": "1", "repository_identity": "sha256:" + repo,
-                        "worktree_identity": "sha256:" + worktree, "index_identity": "sha256:" + "0" * 64}),
-            encoding="utf-8",
-        )
+        payload = {
+            "schema_version": schema,
+            "repository_identity": "sha256:" + repo,
+            "worktree_identity": "sha256:" + worktree,
+            "index_identity": "sha256:" + "0" * 64,
+        }
+        if schema == "2":
+            payload.update(
+                {
+                    "head_sha": "a" * 40,
+                    "dirty_fingerprint": "sha256:" + "b" * 64,
+                    "dirty_paths": [],
+                }
+            )
+        (entry / "binding.json").write_text(json.dumps(payload), encoding="utf-8")
     return entry
 
 
@@ -78,6 +90,16 @@ class SummarizeStateTests(unittest.TestCase):
             summary = summarize_state(root)
         self.assertLess(summary["root_bytes"], 100_000)
         self.assertEqual(summary["entry_count"], 1)
+
+    def test_schema_2_binding_is_valid_and_large_bindings_are_allowed_up_to_one_mebibyte(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = make_entry(root, "a" * 64, "1" * 64, bound=True, schema="2")
+            self.assertEqual(summarize_state(root)["orphan_count"], 0)
+            padded = json.loads((entry / "binding.json").read_text(encoding="utf-8"))
+            padded["dirty_paths"] = ["p" * 200] * 4000
+            (entry / "binding.json").write_text(json.dumps(padded), encoding="utf-8")
+            self.assertEqual(summarize_state(root)["orphan_count"], 0)
 
 
 class RemovePlanTests(unittest.TestCase):

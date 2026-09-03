@@ -27,6 +27,7 @@ EXPECTED_TAF_CONTEXT_FILES = {
     "recovery.py",
     "recovery_cli.py",
     "recovery_models.py",
+    "refresh.py",
     "state_lifecycle.py",
     "state_paths.py",
 }

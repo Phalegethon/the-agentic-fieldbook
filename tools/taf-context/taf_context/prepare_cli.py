@@ -15,8 +15,10 @@ import sys
 import time
 from typing import Mapping
 
+from . import refresh
 from .git_snapshot import collect_snapshot
 from .level1_models import Level1Result, parse_level1_result
+from .refresh import Binding, dirty_paths_of
 from .state_lifecycle import (
     CURRENT_RUNTIME_VERSION,
     Candidate,
@@ -30,8 +32,9 @@ from .state_paths import StateError, resolve_state_paths
 
 
 _NATIVE_TIMEOUT_SECONDS = 120
-_BINDING_LIMIT = 16 * 1024
+_BINDING_LIMIT = 1024 * 1024
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _CHECKSUM = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)\n\Z")
 _NATIVE_ENGINE_VERSION = CURRENT_RUNTIME_VERSION
 _TAF_RELEASE_VERSION = "2.1.2"
@@ -182,7 +185,7 @@ def run_prepare_command(
             repository,
             state_root,
             snapshot,
-            index_identity=binding,
+            index_identity=binding.index_identity,
             query=query_text,
             result_identities=result_identities,
             filters={
@@ -256,7 +259,7 @@ def run_prepare_command(
                 repository,
                 state_root,
                 snapshot,
-                index_identity=binding,
+                index_identity=binding.index_identity,
             )
             if status_result.next_safe_action == "use-index":
                 touch_binding(binding_path)
@@ -691,7 +694,7 @@ def _summary(
     }
 
 
-def _read_binding(binding_path: Path, snapshot: object) -> str | None:
+def _read_binding(binding_path: Path, snapshot: object) -> Binding | None:
     try:
         metadata = binding_path.lstat()
     except FileNotFoundError:
@@ -706,20 +709,41 @@ def _read_binding(binding_path: Path, snapshot: object) -> str | None:
     ):
         raise PrepareCLIError("context binding is unsafe")
     try:
-        value = json.loads(binding_path.read_bytes())
+        value = json.loads(binding_path.read_bytes().decode("utf-8", "surrogateescape"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise PrepareCLIError("context binding is invalid") from exc
     expected = {
-        "schema_version": "1",
         "repository_identity": snapshot.repository_identity,
         "worktree_identity": snapshot.worktree_identity,
     }
-    if type(value) is not dict or any(value.get(key) != item for key, item in expected.items()):
+    if (
+        type(value) is not dict
+        or value.get("schema_version") not in {"1", "2"}
+        or any(value.get(key) != item for key, item in expected.items())
+    ):
         return None
     index_identity = value.get("index_identity")
     if not isinstance(index_identity, str) or not _SHA256.fullmatch(index_identity):
         raise PrepareCLIError("context binding is invalid")
-    return index_identity
+    if value["schema_version"] == "1":
+        return Binding(index_identity, None, None, None)
+    head_sha = value.get("head_sha")
+    dirty_fingerprint = value.get("dirty_fingerprint")
+    dirty_paths = value.get("dirty_paths")
+    if (
+        not isinstance(head_sha, str)
+        or not _OBJECT_ID.fullmatch(head_sha)
+        or not isinstance(dirty_fingerprint, str)
+        or not _SHA256.fullmatch(dirty_fingerprint)
+        or not (
+            dirty_paths is None
+            or (isinstance(dirty_paths, list) and all(isinstance(item, str) for item in dirty_paths))
+        )
+    ):
+        raise PrepareCLIError("context binding is invalid")
+    return Binding(
+        index_identity, head_sha, dirty_fingerprint, None if dirty_paths is None else tuple(dirty_paths)
+    )
 
 
 def _write_binding(binding_path: Path, snapshot: object, index_identity: str) -> None:
@@ -737,16 +761,21 @@ def _write_binding(binding_path: Path, snapshot: object, index_identity: str) ->
             parent.chmod(0o700)
         except OSError as exc:
             raise PrepareCLIError("context state is unavailable") from exc
+    dirty_paths = dirty_paths_of(snapshot)
     payload = json.dumps(
         {
-            "schema_version": "1",
+            "schema_version": "2",
             "repository_identity": snapshot.repository_identity,
             "worktree_identity": snapshot.worktree_identity,
             "index_identity": index_identity,
+            "head_sha": snapshot.head_sha,
+            "dirty_fingerprint": snapshot.dirty_fingerprint,
+            "dirty_paths": None if len(dirty_paths) >= refresh.MAXIMUM_BINDING_DIRTY_PATHS else list(dirty_paths),
         },
         sort_keys=True,
         separators=(",", ":"),
-    ).encode("utf-8") + b"\n"
+        ensure_ascii=False,
+    ).encode("utf-8", "surrogateescape") + b"\n"
     descriptor, temporary = tempfile.mkstemp(prefix=".binding-", dir=binding_path.parent)
     temporary_path = Path(temporary)
     try:

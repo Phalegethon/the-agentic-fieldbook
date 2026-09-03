@@ -29,7 +29,7 @@ from taf_context.prepare_cli import (
     register_prepare_command,
 )
 
-from .repo_factory import init_committed_repo
+from .repo_factory import init_committed_repo, write
 
 
 ROOT = Path(__file__).parents[2]
@@ -878,6 +878,57 @@ class QueryArgumentTests(unittest.TestCase):
             )
             self.assertNotEqual(code, 0)
             self.assertIn("valid values", stderr)
+
+
+class BindingSchemaTests(unittest.TestCase):
+    def _built(self, root: Path) -> tuple[Path, Path, dict[str, str]]:
+        repo = init_committed_repo(root / "repo")
+        write(repo / "notes.txt", "untracked\n")
+        binary = root / "taf-level1"
+        write_fake_native_engine(binary)
+        environment = {"HOME": str(root / "home"), "PATH": "", "TAF_LEVEL1_BINARY": str(binary), "TAF_STATE_HOME": str(root / "state")}
+        code, _stdout, stderr = invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+        self.assertEqual((code, stderr), (0, ""))
+        binding = next((root / "state").glob("repositories/*/*/binding.json"))
+        return repo, binding, environment
+
+    def test_build_writes_schema_2_with_head_and_dirty_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, binding, _environment = self._built(Path(directory))
+            value = json.loads(binding.read_text(encoding="utf-8"))
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+            self.assertEqual(value["schema_version"], "2")
+            self.assertEqual(value["head_sha"], head)
+            self.assertRegex(value["dirty_fingerprint"], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(value["dirty_paths"], ["notes.txt"])
+            self.assertEqual(set(value), {"schema_version", "repository_identity", "worktree_identity", "index_identity", "head_sha", "dirty_fingerprint", "dirty_paths"})
+
+    def test_schema_1_binding_is_accepted_without_delta_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, binding, environment = self._built(Path(directory))
+            value = json.loads(binding.read_text(encoding="utf-8"))
+            legacy = {key: value[key] for key in ("repository_identity", "worktree_identity", "index_identity")}
+            legacy["schema_version"] = "1"
+            binding.write_text(json.dumps(legacy), encoding="utf-8")
+            code, stdout, stderr = invoke(environment, "prepare", "query", "--repo", str(repo), "--operation", "repository-map")
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(decoded(stdout)["status"], "ready")
+
+    def test_too_many_dirty_paths_writes_null(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("taf_context.refresh.MAXIMUM_BINDING_DIRTY_PATHS", 1):
+                _repo, binding, _environment = self._built(Path(directory))
+            self.assertIsNone(json.loads(binding.read_text(encoding="utf-8"))["dirty_paths"])
+
+    def test_malformed_schema_2_fields_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, binding, environment = self._built(Path(directory))
+            value = json.loads(binding.read_text(encoding="utf-8"))
+            value["head_sha"] = "not-a-commit"
+            binding.write_text(json.dumps(value), encoding="utf-8")
+            code, stdout, stderr = invoke(environment, "prepare", "query", "--repo", str(repo), "--operation", "repository-map")
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn("context binding is invalid", stderr)
 
 
 class QueryPathImportTests(unittest.TestCase):

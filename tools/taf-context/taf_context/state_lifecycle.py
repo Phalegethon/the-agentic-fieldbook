@@ -25,7 +25,7 @@ STAGING_PREFIX = ".stage-"
 TRASH_PREFIX = ".trash-"
 
 _IDENTITY_LENGTH = 64
-_MAX_BINDING_BYTES = 16 * 1024
+_MAX_BINDING_BYTES = 1024 * 1024
 
 
 def touch_binding(binding_path: Path) -> None:
@@ -86,7 +86,7 @@ def has_valid_binding(entry: Path) -> bool:
         return False
     return (
         type(value) is dict
-        and value.get("schema_version") == "1"
+        and value.get("schema_version") in {"1", "2"}
         and isinstance(value.get("index_identity"), str)
     )
 
