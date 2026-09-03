@@ -18,6 +18,12 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
   case-insensitive filter values with validation.
 - A dogfood recall benchmark (`tools/taf-context-native/testdata/dogfood`)
   gates symbol and heading recall on this repository.
+- `prepare-repo-context` 1.3.0 refreshes a bound index incrementally inside
+  `query` and `inspect` (binding schema 2 remembers the head and dirty paths;
+  the engine's `update` operation is driven with the Level 0 change document),
+  prunes superseded generations older than 60 seconds after a refresh,
+  tolerates parse failures in updated files like `build`, and reports a
+  `refresh` block.
 
 ### Changed
 

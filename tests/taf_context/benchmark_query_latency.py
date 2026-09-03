@@ -10,6 +10,13 @@ query, then reports the median and minimum of N repetitions for each stage:
 Python import, Git snapshot, native status, the native query operation, and
 the end-to-end broker query. Timing is evidence for the execution ledger,
 never a CI gate.
+
+With `--edit`, the script first clones `--repo` into the scratch directory
+(the real checkout is never modified) and builds there. After measuring the
+usual stages against the unedited clone, it also appends a small function to
+`--edit-file` before each of N further end-to-end queries, so every one of
+those queries performs a real incremental refresh; the result is reported as
+the `end-to-end-after-edit` stage.
 """
 
 from __future__ import annotations
@@ -48,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--operation", default="search-symbols")
     parser.add_argument("--query", default="collect_snapshot")
     parser.add_argument("--repetitions", type=int, default=10)
+    parser.add_argument("--edit", action="store_true")
+    parser.add_argument("--edit-file", default="tools/taf-context/taf_context/state_paths.py")
     args = parser.parse_args(argv)
     if os.environ.get("TAF_DOGFOOD") != "1" or not os.environ.get("TAF_LEVEL1_BINARY"):
         print("set TAF_DOGFOOD=1 and TAF_LEVEL1_BINARY to run the latency benchmark", file=sys.stderr)
@@ -57,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     from taf_context import prepare_cli  # noqa: E402
     from taf_context.git_snapshot import collect_snapshot  # noqa: E402
 
-    repository = Path(args.repo).resolve()
+    source_repository = Path(args.repo).resolve()
     with tempfile.TemporaryDirectory(prefix="taf-latency-") as directory:
         environment = {
             "HOME": directory,
@@ -76,6 +85,15 @@ def main(argv: list[str] | None = None) -> int:
             if completed.returncode != 0:
                 raise SystemExit(f"broker failed: {completed.stderr.strip()}")
             return json.loads(completed.stdout)
+
+        if args.edit:
+            repository = Path(directory) / "repo"
+            subprocess.run(
+                ["git", "clone", "-q", "--no-hardlinks", str(source_repository), str(repository)],
+                check=True, capture_output=True,
+            )
+        else:
+            repository = source_repository
 
         built = broker("build", "--repo", str(repository), "--confirm-state-write")
         if built["next_safe_action"] != "use-index":
@@ -107,19 +125,36 @@ def main(argv: list[str] | None = None) -> int:
             "collect-snapshot": _timed(lambda: collect_snapshot(repository), args.repetitions),
             "native-status": _timed(
                 lambda: prepare_cli._invoke_native(
-                    binary, "status", repository, state_root, snapshot, index_identity=binding
+                    binary, "status", repository, state_root, snapshot, index_identity=binding.index_identity
                 ),
                 args.repetitions,
             ),
             f"native-{args.operation}": _timed(
                 lambda: prepare_cli._invoke_native(
                     binary, args.operation, repository, state_root, snapshot,
-                    index_identity=binding, query=query_text,
+                    index_identity=binding.index_identity, query=query_text,
                 ),
                 args.repetitions,
             ),
             "end-to-end": _timed(lambda: broker(*query_command), args.repetitions),
         }
+
+        edit_changed_path_count: int | None = None
+        if args.edit:
+            edit_file = repository / args.edit_file
+            samples: list[float] = []
+            for marker in range(1, args.repetitions + 1):
+                with edit_file.open("a", encoding="utf-8") as handle:
+                    handle.write(f"\n\ndef benchmark_marker_{marker}():\n    return {marker}\n")
+                started = time.perf_counter()
+                edit_result = broker(*query_command)
+                samples.append(time.perf_counter() - started)
+                edit_changed_path_count = edit_result["refresh"]["changed_path_count"]
+            stages["end-to-end-after-edit"] = {
+                "median_seconds": round(statistics.median(samples), 4),
+                "min_seconds": round(min(samples), 4),
+            }
+
         report = {
             "schema_version": "1",
             "repository": repository.name,
@@ -130,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
             "returned_count": first["returned_count"],
             "stages": stages,
         }
+        if args.edit:
+            report["edit"] = {"edit_file": args.edit_file, "changed_path_count": edit_changed_path_count}
         print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

@@ -215,6 +215,8 @@ GitHub release, verifies the published SHA-256 checksum, stores it in the
 user-local TAF state directory, and builds the index outside the repository.
 Later sessions reuse the repository/worktree-bound index and receive only
 bounded query results rather than the full index.
+After commits or edits the next query refreshes the bound index incrementally;
+a full rebuild is only asked for after a runtime upgrade.
 
 Once ready, the same skill can answer repository-map, symbol, and documentation
 questions with bounded results. Findings carry paths, line ranges, evidence
