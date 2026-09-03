@@ -187,14 +187,20 @@ class RefreshLock:
     def __enter__(self) -> "RefreshLock":
         deadline = time.monotonic() + self.wait
         while not self._try_acquire():
+            if time.monotonic() >= deadline:
+                # Proceed without the lock; the engine barrier protects publication.
+                # This also bounds a stale lock whose file cannot be removed (a
+                # read-only directory, or a foreign process recreating it): every
+                # iteration re-checks the deadline before deciding what to do, so
+                # a persistently failing unlink cannot loop forever.
+                self.waited = True
+                break
             if self._is_stale():
                 try:
                     os.unlink(self.path)
                 except OSError:
                     pass
                 continue
-            if time.monotonic() >= deadline:
-                break  # proceed without the lock; the engine barrier protects publication
             self.waited = True
             time.sleep(self.poll)
         return self

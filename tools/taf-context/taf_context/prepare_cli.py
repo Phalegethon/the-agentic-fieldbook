@@ -30,11 +30,10 @@ from .refresh import (
     write_change_document,
 )
 from .state_lifecycle import (
-    CURRENT_FILENAME,
     CURRENT_RUNTIME_VERSION,
     Candidate,
-    _read_current,
     apply_plan,
+    current_generation_token,
     plan_gc,
     plan_prune_generations,
     plan_remove,
@@ -625,13 +624,15 @@ def _refresh_if_stale(
         return binding, idle  # the operation call reports stale; today's refusal follows
     for attempt in range(2):
         started = time.perf_counter()
-        # The generation CURRENT names right now, before this attempt's
-        # update, is a generation a reader may already be using. The store
-        # can reuse an existing generation directory for identical content,
-        # so its mtime alone is not a reliable signal once it is superseded;
-        # name it explicitly so pruning below never removes it.
-        protected_generation = _read_current(state_root / CURRENT_FILENAME) or None
         with RefreshLock(state_root):
+            # The generation CURRENT names right now, before this attempt's
+            # update, is a generation a reader may already be using. The store
+            # can reuse an existing generation directory for identical content,
+            # so its mtime alone is not a reliable signal once it is superseded;
+            # name it explicitly so pruning below never removes it. Read inside
+            # the lock so a concurrent refresh cannot publish between the read
+            # and this attempt's acquisition.
+            protected_generation = current_generation_token(state_root) or None
             try:
                 write_change_document(state_root, build_change_document(binding, snapshot, changed))
             except OSError as exc:
@@ -890,7 +891,7 @@ def _read_binding(binding_path: Path, snapshot: object) -> Binding | None:
 
 
 def _write_binding(binding_path: Path, snapshot: object, index_identity: str) -> None:
-    import tempfile  # build/activate-only dependency; kept off the query path
+    import tempfile  # deferred so importing the CLI stays free of tempfile (Phase 2 import-path test)
 
     if not _SHA256.fullmatch(index_identity):
         raise PrepareCLIError("native engine returned invalid index identity")

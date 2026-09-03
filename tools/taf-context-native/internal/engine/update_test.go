@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
@@ -1189,4 +1190,31 @@ func chainedDocumentAtSameHead(t *testing.T, index *string, head string, paths .
 		t.Fatal(err)
 	}
 	return contents
+}
+
+// TestChangeManifestIdentityMatchesBrokerVectors pins changeManifestIdentity to
+// the same vectors as tests/taf_context/test_refresh.py's
+// ChangeManifestIdentityTests; a change on either side must update both.
+func TestChangeManifestIdentityMatchesBrokerVectors(t *testing.T) {
+	document := model.ChangeDocument{
+		SchemaVersion:                 "1",
+		PriorIndexIdentity:            "sha256:" + strings.Repeat("a", 64),
+		BeforeRepositoryIdentity:      "sha256:" + strings.Repeat("b", 64),
+		BeforeWorktreeIdentity:        "sha256:" + strings.Repeat("c", 64),
+		BeforeCommittedHead:           strings.Repeat("1", 40),
+		BeforeDirtyOverlayFingerprint: "sha256:" + strings.Repeat("d", 64),
+		AfterRepositoryIdentity:       "sha256:" + strings.Repeat("b", 64),
+		AfterWorktreeIdentity:         "sha256:" + strings.Repeat("c", 64),
+		AfterCommittedHead:            strings.Repeat("2", 40),
+		AfterDirtyOverlayFingerprint:  "sha256:" + strings.Repeat("e", 64),
+		ChangedPaths:                  []string{"a&b/<c>.py", "src/app.py", "ünï.txt"},
+	}
+	if got, want := changeManifestIdentity(document), "sha256:44aa89bde5534d67efb628ab0ebfdc5bb4d6cb8903b84e77f17a97a2bff89100"; got != want {
+		t.Fatalf("changeManifestIdentity() = %s, want %s", got, want)
+	}
+
+	document.ChangedPaths = []string{}
+	if got, want := changeManifestIdentity(document), "sha256:4fe339fc1f67421e5fe63940adebf2d35a8ced4db4e360aaea203cf27c3fa638"; got != want {
+		t.Fatalf("changeManifestIdentity() with empty changed paths = %s, want %s", got, want)
+	}
 }

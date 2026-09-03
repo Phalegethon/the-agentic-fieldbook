@@ -217,3 +217,20 @@ class RefreshLockTests(unittest.TestCase):
                 self.assertFalse(lock.waited)
                 self.assertIn(str(os.getpid()), lock_path.read_text(encoding="utf-8"))
             self.assertFalse(lock_path.exists())
+
+    def test_stale_lock_that_cannot_be_removed_is_bypassed_after_wait(self) -> None:
+        # A stale lock whose unlink keeps failing (read-only directory, foreign
+        # process recreating the file) must not loop forever: it proceeds
+        # without the lock once `wait` elapses, exactly like a young lock.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = root / ".refresh.lock"
+            lock_path.write_text("999999 0\n", encoding="utf-8")
+            os.utime(lock_path, (1, 1))
+            started = time.monotonic()
+            with mock.patch("taf_context.refresh.os.unlink", side_effect=PermissionError("locked")):
+                with RefreshLock(root, wait=0.3, poll=0.05) as lock:
+                    self.assertTrue(lock.waited)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.0)
+            self.assertTrue(lock_path.exists())  # never removed: unlink always failed

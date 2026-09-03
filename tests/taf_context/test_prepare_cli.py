@@ -108,7 +108,7 @@ def write_fake_native_engine(
                             "after_dirty_overlay_fingerprint", "level0_change_manifest_identity", "changed_paths"}
                 fields = {key: value for key, value in document.items() if key != "level0_change_manifest_identity"}
                 text = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                for raw, escaped in (("<", "\\\\u003c"), (">", "\\\\u003e"), ("&", "\\\\u0026")):
+                for raw, escaped in (("<", "\\\\u003c"), (">", "\\\\u003e"), ("&", "\\\\u0026"), (" ", "\\\\u2028"), (" ", "\\\\u2029")):
                     text = text.replace(raw, escaped)
                 expected = "sha256:" + hashlib.sha256(b"taf-level0-change-manifest-v1\\x00" + text.encode("utf-8")).hexdigest()
                 valid = (

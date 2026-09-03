@@ -261,6 +261,11 @@ def _unreferenced_generations(root: Path, entry: Path) -> list[Candidate]:
     ]
 
 
+def current_generation_token(state_root: Path) -> str:
+    """Public wrapper: the CURRENT generation token directly under `state_root`, or ""."""
+    return _read_current(state_root / CURRENT_FILENAME)
+
+
 def _read_current(path: Path) -> str:
     """Return the CURRENT generation token, or "" unless it is exactly 64 hex characters with at most one trailing newline."""
     try:
