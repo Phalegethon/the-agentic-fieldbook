@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/extract"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/inventory"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/store"
@@ -173,7 +174,7 @@ func (engine *Engine) update(ctx context.Context, roots *boundary.Roots, request
 		if fileRecords == nil && report.ParserVersion == "" {
 			return engine.updateFailure(request, coverage), nil
 		}
-		if expected := parserIDs[classification.Language]; expected == "" || report.ParserVersion != expected || report.ParseFailures != 0 || report.Incomplete() {
+		if expected := parserIDs[classification.Language]; expected == "" || report.ParserVersion != expected {
 			return engine.updateFailure(request, coverage), nil
 		}
 		counters.ParsedRepositoryFiles++
@@ -249,7 +250,11 @@ func (engine *Engine) update(ctx context.Context, roots *boundary.Roots, request
 		return engine.updateFailure(request, coverage), nil
 	}
 	engine.rememberSnapshot(published)
-	result := engine.result(request, wire.Ready, "exact", ptr(published.IndexIdentity), coverage, "use-index")
+	resultStatus := wire.Ready
+	if !completeCoverage(coverage, false) {
+		resultStatus = wire.Partial
+	}
+	result := engine.result(request, resultStatus, "exact", ptr(published.IndexIdentity), coverage, "use-index")
 	result.ParserVersions = cloneStrings(parserIDs)
 	result.Warnings = warnings
 	return result, nil
@@ -401,6 +406,23 @@ func coverageForCatalog(catalog model.SourceCatalog) model.Coverage {
 	}
 	coverage.ExcludedPathCount = regularExcluded
 	coverage.UnsupportedLanguageCount = coverage.ExclusionReasonCounts[inventory.ExcludedUnsupported]
+	// Build counts parse failures and incomplete extractions per indexed path
+	// from the live extractor reports; the catalog keeps every warning code
+	// per path and Task 1 guarantees a parse-failure code for every failure,
+	// so the same counters are derived here and survive chained updates.
+	for _, item := range catalog.ExtractionWarnings {
+		report := extract.ReportFromCodes(item.Codes)
+		coverage.ParseFailureCount += report.ParseFailures
+		if report.Incomplete() {
+			coverage.ExclusionReasonCounts["incomplete-extraction"]++
+		}
+	}
+	if catalog.Partial {
+		coverage.ExclusionReasonCounts["incomplete-inventory"]++
+	}
+	if hasBoundedWarning(appendBoundedWarnings(nil, allCatalogCodes(catalog)...), "warning-limit") {
+		coverage.ExclusionReasonCounts["warning-limit"]++
+	}
 	denominator := coverage.IndexedPathCount + regularExcluded
 	if denominator > 0 && !catalog.Partial {
 		coverage.PathCoverage = float64(coverage.IndexedPathCount) / float64(denominator)
@@ -410,6 +432,17 @@ func coverageForCatalog(catalog model.SourceCatalog) model.Coverage {
 		coverage.LanguageCoverage = float64(supported) / float64(languageDenominator)
 	}
 	return coverage
+}
+
+// allCatalogCodes gathers every warning code the catalog carries — inventory
+// (catalog.Warnings) and per-path extraction codes — so the warning-limit
+// check derives from the same bounded union build computes it from.
+func allCatalogCodes(catalog model.SourceCatalog) []string {
+	codes := append([]string(nil), catalog.Warnings...)
+	for _, item := range catalog.ExtractionWarnings {
+		codes = append(codes, item.Codes...)
+	}
+	return codes
 }
 
 func catalogExclusionIsRegular(item model.SourceExclusion) bool {

@@ -15,7 +15,6 @@ import (
 	"testing"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
-	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/extract"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/inventory"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/store"
@@ -336,16 +335,14 @@ func TestUpdateRejectsWrongBindingBeforeDeclaredSourceOpen(t *testing.T) {
 	}
 }
 
-func TestUpdatePreservesCurrentOnParseCancellationAndPublicationFailure(t *testing.T) {
+// TestUpdatePreservesCurrentOnCancellationAndPublicationFailure previously
+// also covered a "parse-failure" arrangement, but a changed path's parse
+// failure is no longer a hard-failure condition (it now publishes with the
+// failure recorded in coverage, mirroring build; see
+// TestUpdateToleratesSyntaxErrorsAndMatchesCleanBuildCoverage), so that case
+// was removed rather than adapted to assert on the new tolerant behavior.
+func TestUpdatePreservesCurrentOnCancellationAndPublicationFailure(t *testing.T) {
 	for name, arrange := range map[string]func(*Engine){
-		"parse-failure": func(engine *Engine) {
-			original := engine.dependencies.Extract
-			engine.dependencies.Extract = func(ctx context.Context, file boundary.StableFile) ([]model.Record, extract.Report) {
-				records, report := original(ctx, file)
-				report.ParseFailures = 1
-				return records, report
-			}
-		},
 		"publication-failure": func(engine *Engine) {
 			engine.dependencies.BuildWithBarrier = func(_ context.Context, roots *boundary.Roots, manifest model.Manifest, records []model.Record, _ func() error) (store.Snapshot, error) {
 				return store.BuildWithFaults(roots, manifest, records, store.Faults{BeforeCurrentRename: errors.New("injected publication failure")})
@@ -1079,4 +1076,117 @@ func inspectForUpdate(t *testing.T, engine *Engine, repository, state string) st
 		t.Fatal(err)
 	}
 	return status
+}
+
+func TestUpdateToleratesSyntaxErrorsAndMatchesCleanBuildCoverage(t *testing.T) {
+	// This catches update failing (or silently reporting ready) when a changed
+	// file does not parse, which is the normal state of a file mid-edit.
+	repository, state := controlRoots(t)
+	if err := os.WriteFile(filepath.Join(repository, "broken.py"), []byte("def broken(:\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine := New(ProductionDependencies())
+	built := mustBuildForUpdate(t, engine, repository, state)
+	if built.Status != wire.Partial || built.Coverage.ParseFailureCount != 1 {
+		t.Fatalf("build = %#v", built)
+	}
+
+	// 1. Update an unrelated file: the parse failure recorded at build time
+	//    must survive in coverage (today's code drops it).
+	if err := os.WriteFile(filepath.Join(repository, "main.go"), []byte("package sample\nfunc Changed() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeUpdateDocument(t, state, updateDocumentWithPaths(t, built.IndexIdentity, []string{"main.go"}))
+	request := validUpdateEnvelope(repository, state, built.IndexIdentity)
+	first, err := engine.Execute(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != wire.Partial || first.Freshness != "exact" || first.IndexIdentity == nil || first.Coverage.ParseFailureCount != 1 || first.Coverage.ExclusionReasonCounts["incomplete-extraction"] != 1 {
+		t.Fatalf("update after unrelated edit = %#v", first)
+	}
+	assertCoverageMatchesCleanBuild(t, engine, repository, first.Coverage)
+
+	// 2. Update the broken file itself while it is still broken: publishes.
+	if err := os.WriteFile(filepath.Join(repository, "broken.py"), []byte("def ok():\n    pass\n\ndef broken(:\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeUpdateDocument(t, state, chainedDocumentFor(t, first.IndexIdentity, "broken.py"))
+	second, err := engine.Execute(context.Background(), chainedUpdateEnvelope(repository, state, first.IndexIdentity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Status != wire.Partial || second.IndexIdentity == nil || second.Coverage.ParseFailureCount != 1 {
+		t.Fatalf("update of a broken file = %#v", second)
+	}
+	assertCoverageMatchesCleanBuild(t, engine, repository, second.Coverage)
+
+	// 3. Fix the file: coverage becomes complete and the result ready. This
+	//    update does not move the committed head again (chainedUpdateEnvelope
+	//    already left it at fedcba...98 after step 2), so its document must
+	//    declare that same value as both before and after, unlike
+	//    chainedDocumentFor which is only correct for a first transition away
+	//    from abcdef...01.
+	if err := os.WriteFile(filepath.Join(repository, "broken.py"), []byte("def ok():\n    pass\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeUpdateDocument(t, state, chainedDocumentAtSameHead(t, second.IndexIdentity, "fedcba9876543210fedcba9876543210fedcba98", "broken.py"))
+	third, err := engine.Execute(context.Background(), chainedUpdateEnvelope(repository, state, second.IndexIdentity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Status != wire.Ready || third.Coverage.ParseFailureCount != 0 || third.Coverage.ExclusionReasonCounts["incomplete-extraction"] != 0 {
+		t.Fatalf("update after fix = %#v", third)
+	}
+	assertCoverageMatchesCleanBuild(t, engine, repository, third.Coverage)
+}
+
+// assertCoverageMatchesCleanBuild builds the same working tree into a fresh
+// state root and compares the wire coverage field by field.
+func assertCoverageMatchesCleanBuild(t *testing.T, engine *Engine, repository string, got wire.Coverage) {
+	t.Helper()
+	cleanState := filepath.Join(t.TempDir(), "clean-state")
+	clean := mustBuildForUpdate(t, engine, repository, cleanState)
+	if !reflect.DeepEqual(got, clean.Coverage) {
+		t.Fatalf("coverage after update differs from a clean build:\nupdate %#v\nbuild  %#v", got, clean.Coverage)
+	}
+}
+
+func chainedDocumentFor(t *testing.T, index *string, paths ...string) []byte {
+	t.Helper()
+	var value map[string]any
+	if err := json.Unmarshal(chainedUpdateDocument(t, index, paths...), &value); err != nil {
+		t.Fatal(err)
+	}
+	value["after_committed_head"] = "fedcba9876543210fedcba9876543210fedcba98"
+	contents, err := recomputeUpdateDocumentIdentity(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return contents
+}
+
+func chainedUpdateEnvelope(repository, state string, index *string) wire.Envelope {
+	envelope := validUpdateEnvelope(repository, state, index)
+	envelope.Request.CommittedHead = "fedcba9876543210fedcba9876543210fedcba98"
+	return envelope
+}
+
+// chainedDocumentAtSameHead builds a document for an update that leaves the
+// committed head unchanged from the prior update — the before- and
+// after-committed-head are the same value, unlike chainedDocumentFor which
+// always transitions away from abcdef...01.
+func chainedDocumentAtSameHead(t *testing.T, index *string, head string, paths ...string) []byte {
+	t.Helper()
+	var value map[string]any
+	if err := json.Unmarshal(chainedUpdateDocument(t, index, paths...), &value); err != nil {
+		t.Fatal(err)
+	}
+	value["before_committed_head"] = head
+	value["after_committed_head"] = head
+	contents, err := recomputeUpdateDocumentIdentity(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return contents
 }
