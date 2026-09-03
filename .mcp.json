@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "repo-context": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/tools/taf-context/taf_context_mcp.py"]
+    }
+  }
+}

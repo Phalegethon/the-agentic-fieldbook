@@ -18,6 +18,7 @@
     "software-delivery"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "The Agentic Fieldbook (TAF)",
     "shortDescription": "Recover, hand off, and prepare bounded context",

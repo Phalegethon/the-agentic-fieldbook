@@ -10,6 +10,7 @@
   "homepage": "https://github.com/Phalegethon/the-agentic-fieldbook",
   "repository": "https://github.com/Phalegethon/the-agentic-fieldbook",
   "license": "MIT",
+  "mcpServers": "./.mcp.json",
   "keywords": [
     "agent-skills",
     "git",
