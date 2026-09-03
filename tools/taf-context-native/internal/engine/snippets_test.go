@@ -861,3 +861,63 @@ func sortedSnippetIDs(values ...string) []string {
 	sort.Strings(output)
 	return output
 }
+
+// TestSourceSnippetsRefuseReferenceIdentities keeps source-snippets on
+// structural records: a reference record names a use of a symbol, is not
+// itself a symbol, and its identity is refused exactly like an unknown one
+// while the definition it sits in still returns its source.
+func TestSourceSnippetsRefuseReferenceIdentities(t *testing.T) {
+	repository, state := callingRoots(t)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reference, definition model.Record
+	for _, record := range snippetRecords(t, repository, state, *built.IndexIdentity) {
+		switch record.RecordKind {
+		case model.Reference:
+			reference = record
+		case model.Definition:
+			if definition.Identity == "" {
+				definition = record
+			}
+		}
+	}
+	if reference.Identity == "" || definition.Identity == "" {
+		t.Fatalf("fixture produced reference=%#v definition=%#v", reference, definition)
+	}
+	if _, groupErr := resolveSnippetGroups([]model.Record{reference}, []string{reference.Identity}); groupErr == nil {
+		t.Fatal("a reference record resolved into a snippet group")
+	}
+	result, err := engine.Execute(context.Background(), snippetEnvelope(repository, state, built.IndexIdentity, reference.Identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != wire.Stale || result.Freshness != "structurally-stale" || result.NextSafeAction != "update-index" || len(result.Findings) != 0 {
+		t.Fatalf("reference identity result = %#v", result)
+	}
+	accepted, err := engine.Execute(context.Background(), snippetEnvelope(repository, state, built.IndexIdentity, definition.Identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Status != wire.Ready || len(accepted.Findings) != 1 {
+		t.Fatalf("definition identity result = %#v", accepted)
+	}
+}
+
+// callingRoots is controlRoots with a call site, so the built index carries a
+// reference record next to the definitions of the same file.
+func callingRoots(t *testing.T) (string, string) {
+	t.Helper()
+	base := t.TempDir()
+	repository := filepath.Join(base, "repository")
+	if err := os.MkdirAll(filepath.Join(repository, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source := "package sample\n\nfunc helper() {}\n\nfunc Main() {\n\thelper()\n}\n"
+	if err := os.WriteFile(filepath.Join(repository, "main.go"), []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return repository, filepath.Join(base, "state")
+}

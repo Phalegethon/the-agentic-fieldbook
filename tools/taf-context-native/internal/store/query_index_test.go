@@ -360,3 +360,59 @@ func referenceKindTier(kind model.RecordKind) int {
 		return 6
 	}
 }
+
+// TestReferenceRecordsAreKeyedByTargetNotByEnclosingName freezes the index
+// keys of a reference record: it is found by the names it refers to, so the
+// qualified key of every target name and the short key of that name's last
+// segment carry it, while the enclosing definition's own name keys stay on the
+// definition record alone. Two targets sharing a last segment contribute the
+// short key once: the encoder rejects a record that claims the same key twice.
+func TestReferenceRecordsAreKeyedByTargetNotByEnclosingName(t *testing.T) {
+	definition := testRecord(testRecordA, "pkg/a.py", "a.run", []string{"run"})
+	reference := testRecord(testRecordB, "pkg/a.py", "a.run", []string{"helpers.load", "osp.load"})
+	reference.RecordKind = model.Reference
+	reference.TargetName, reference.ReferenceCount = "helpers.load:5:2;osp.load:7:1", 3
+	records := []model.Record{definition, reference}
+	index := BuildQueryIndex(records)
+
+	for key, want := range map[string][]uint32{"helpers.load": {1}, "osp.load": {1}, "a.run": {0}} {
+		if got := index.QualifiedOrdinals(key); !slices.Equal(got, want) {
+			t.Fatalf("qualified(%q) = %v, want %v", key, got, want)
+		}
+	}
+	if got := index.ShortOrdinals("load"); !slices.Equal(got, []uint32{1}) {
+		t.Fatalf("short(load) = %v, want the reference once", got)
+	}
+	if got := index.ShortOrdinals("run"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("short(run) = %v, the reference must not be keyed by its enclosing name", got)
+	}
+	if got := index.TokenOrdinals("run"); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("token(run) = %v, the reference must not be tokenized by its enclosing name", got)
+	}
+	if got := index.TokenOrdinals("helpers.load"); len(got) != 0 {
+		t.Fatalf("token(helpers.load) = %v, a target name is not sub-tokenized into the token postings", got)
+	}
+	if got := index.FacetOrdinals(QueryFacetKind, string(model.Reference)); !slices.Equal(got, []uint32{1}) {
+		t.Fatalf("kind facet = %v, want the reference record", got)
+	}
+	if got := index.FacetOrdinals(QueryFacetOperation, queryOperationSymbols); !slices.Equal(got, []uint32{0}) {
+		t.Fatalf("symbols facet = %v, want the definition alone", got)
+	}
+	groups, partial := index.MapGroups()
+	for _, group := range groups {
+		if slices.Contains(group.Ordinals, uint32(1)) {
+			t.Fatalf("map groups %#v (partial=%v) must not contain the reference record", groups, partial)
+		}
+	}
+	keys := canonicalQueryKeys(reference)
+	if slices.Compact(slices.Clone(keys)) == nil || len(slices.Compact(slices.Clone(keys))) != len(keys) {
+		t.Fatalf("keys %v repeat: the encoder counts one posting per emitted key", keys)
+	}
+	encoded, err := encodeIndex(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateIndex(encoded); err != nil {
+		t.Fatalf("validateIndex = %v", err)
+	}
+}

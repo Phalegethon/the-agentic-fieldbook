@@ -1868,7 +1868,9 @@ func validRecordContext(ctx context.Context, record model.Record, observed func(
 // import without one as unresolvable rather than invalid.
 func validReferenceFields(record model.Record) bool {
 	isReference := record.RecordKind == model.Reference
-	if record.ReferenceCount < 0 || isReference != (record.ReferenceCount >= 1) {
+	// The count is encoded as a uint32, so a wider one would be written
+	// truncated rather than refused.
+	if record.ReferenceCount < 0 || uint64(record.ReferenceCount) > math.MaxUint32 || isReference != (record.ReferenceCount >= 1) {
 		return false
 	}
 	if isReference {

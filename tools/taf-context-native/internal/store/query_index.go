@@ -258,6 +258,12 @@ func (visitor *queryKeyVisitor) visit(record model.Record, visit func(string) bo
 	if visit == nil {
 		return false
 	}
+	if record.RecordKind == model.Reference {
+		if !visitor.visitReferenceNameKeys(record, visit) {
+			return false
+		}
+		return visitFacetQueryKeys(record, visit)
+	}
 	qualified := NormalizeQueryText(record.QualifiedName)
 	if !visit(queryQualifiedPrefix + qualified) {
 		return false
@@ -280,6 +286,47 @@ func (visitor *queryKeyVisitor) visit(record model.Record, visit func(string) bo
 			return false
 		}
 	}
+	return visitFacetQueryKeys(record, visit)
+}
+
+// visitReferenceNameKeys emits the name keys of a reference record. A
+// reference is found by the names it refers to, never by the name of the
+// definition it sits in, so every target name of its table carries the record
+// under its own qualified key and under the short key of its last segment.
+// SearchTerms already hold those names lower-cased and without
+// sub-tokenization, which is why a reference contributes no token keys. Two
+// targets sharing a name or a last segment contribute their key once: the
+// encoder counts one posting per emitted key and rejects a repeat.
+func (visitor *queryKeyVisitor) visitReferenceNameKeys(record model.Record, visit func(string) bool) bool {
+	emitted := visitor.tokens[:0]
+	for _, term := range record.SearchTerms {
+		name := NormalizeQueryText(term)
+		if name == "" || slices.Contains(emitted, name) {
+			continue
+		}
+		emitted = append(emitted, name)
+		if !visit(queryQualifiedPrefix + name) {
+			visitor.tokens = emitted
+			return false
+		}
+	}
+	emitted = emitted[:0]
+	for _, term := range record.SearchTerms {
+		short := QueryShortName(term)
+		if short == "" || slices.Contains(emitted, short) {
+			continue
+		}
+		emitted = append(emitted, short)
+		if !visit(queryShortPrefix + short) {
+			visitor.tokens = emitted
+			return false
+		}
+	}
+	visitor.tokens = emitted
+	return true
+}
+
+func visitFacetQueryKeys(record model.Record, visit func(string) bool) bool {
 	for _, key := range []string{
 		facetQueryKey(QueryFacetLanguage, record.Language),
 		facetQueryKey(QueryFacetKind, string(record.RecordKind)),

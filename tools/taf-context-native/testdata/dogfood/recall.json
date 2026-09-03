@@ -23,7 +23,7 @@
     {"id": "py-resolve-recovery-base", "operation": "search-symbols", "query": "resolve_recovery_base", "expected_path": "tools/taf-context/taf_context/recovery.py", "expected_symbol": "resolve_recovery_base"},
     {"id": "py-run-prepare-command", "operation": "search-symbols", "query": "run_prepare_command", "expected_path": "tools/taf-context/taf_context/prepare_cli.py", "expected_symbol": "run_prepare_command"},
     {"id": "py-invoke-native", "operation": "search-symbols", "query": "_invoke_native", "expected_path": "tools/taf-context/taf_context/prepare_cli.py", "expected_symbol": "_invoke_native"},
-    {"id": "py-part-fsync", "operation": "search-symbols", "query": "fsync", "expected_path": "tools/taf-context/taf_context/prepare_cli.py", "expected_symbol": "_fsync_directory"},
+    {"id": "py-part-fsync", "operation": "search-symbols", "query": "fsync", "expected_path": "tools/taf-context/taf_context/context_operations.py", "expected_symbol": "_fsync_directory"},
     {"id": "py-part-download", "operation": "search-symbols", "query": "download", "expected_path": "tools/taf-context/taf_context/prepare_cli.py", "expected_symbol": "_download"},
     {"id": "py-plan-gc", "operation": "search-symbols", "query": "plan_gc", "expected_path": "tools/taf-context/taf_context/state_lifecycle.py", "expected_symbol": "plan_gc"},
     {"id": "py-plan-gc-qualified", "operation": "search-symbols", "query": "state_lifecycle.plan_gc", "expected_path": "tools/taf-context/taf_context/state_lifecycle.py", "expected_symbol": "plan_gc"},

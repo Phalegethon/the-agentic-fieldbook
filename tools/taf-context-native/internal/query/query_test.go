@@ -824,3 +824,52 @@ func identities(records []model.Record) []string {
 func indexedSnapshot(records []model.Record) store.Snapshot {
 	return store.Snapshot{Records: records, Query: store.BuildQueryIndex(records)}
 }
+
+// TestSearchAndMapNeverReturnReferenceRecords keeps the four existing
+// operations blind to uses of a name: a reference record is keyed by the name
+// it refers to, so it sits in the very postings a search for that name scans,
+// and only the definition may come back. The repository map describes
+// structure, so the file's definition represents it instead of the reference.
+func TestSearchAndMapNeverReturnReferenceRecords(t *testing.T) {
+	definition := testRecord(0, "pkg.load", model.Definition, model.Verified)
+	definition.Path = "pkg/a.go"
+	definition.SearchTerms = []string{"load"}
+	caller := testRecord(1, "pkg.run", model.Definition, model.Verified)
+	caller.Path = "pkg/b.go"
+	caller.SearchTerms = []string{"run"}
+	reference := testRecord(2, "pkg.run", model.Reference, model.Verified)
+	reference.Path = "pkg/b.go"
+	reference.StartLine, reference.EndLine = 1, 4
+	reference.TargetName, reference.ReferenceCount = "load:2:1", 1
+	reference.SearchTerms = []string{"load"}
+	snapshot := indexedSnapshot([]model.Record{definition, caller, reference})
+
+	for _, operation := range []wire.Operation{wire.SearchSymbols, wire.SearchDocs} {
+		request := searchRequest("load")
+		request.Operation = operation
+		response := Search(snapshot, request, policy.ProductionLimits())
+		for _, record := range response.Records {
+			if record.RecordKind == model.Reference {
+				t.Fatalf("%s returned a reference record: %#v", operation, record)
+			}
+		}
+		if operation == wire.SearchSymbols {
+			if got, want := identities(response.Records), []string{definition.Identity}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("search-symbols identities = %#v, want %#v", got, want)
+			}
+		} else if len(response.Records) != 0 {
+			t.Fatalf("search-docs records = %#v, want none", response.Records)
+		}
+	}
+
+	mapResponse := RepositoryMap(snapshot, mapRequest(), policy.ProductionLimits())
+	if got, want := identities(mapResponse.Records), []string{definition.Identity, caller.Identity}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("map identities = %#v, want %#v", got, want)
+	}
+	filtered := mapRequest()
+	filtered.Filters.Languages = []string{"go"}
+	filteredResponse := RepositoryMap(snapshot, filtered, policy.ProductionLimits())
+	if got, want := identities(filteredResponse.Records), []string{definition.Identity, caller.Identity}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("filtered map identities = %#v, want %#v", got, want)
+	}
+}

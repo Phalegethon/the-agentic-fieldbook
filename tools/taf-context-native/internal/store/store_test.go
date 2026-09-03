@@ -878,6 +878,20 @@ func TestFormatRejectsInconsistentReferenceFields(t *testing.T) {
 	}
 }
 
+// TestFormatRejectsAReferenceCountBeyondTheEncodedWidth guards the uint32 the
+// tuple encodes: a wider count must be refused rather than silently truncated.
+func TestFormatRejectsAReferenceCountBeyondTheEncodedWidth(t *testing.T) {
+	oversized := uint64(math.MaxUint32) + 1
+	if oversized > uint64(math.MaxInt) {
+		t.Skip("int is narrower than the encoded width on this platform")
+	}
+	record := testRecord(testRecordA, "pkg/a.py", "a.run", []string{"run"})
+	record.RecordKind, record.TargetName, record.ReferenceCount = model.Reference, "helpers.load:5:2", int(oversized)
+	if validReferenceFields(record) {
+		t.Fatal("a reference count beyond the encoded uint32 was accepted")
+	}
+}
+
 // TestFormatAcceptsAReferenceTableBeyondTheSpecifierBound proves the target
 // field is bounded by the table maximum rather than by the import specifier
 // maximum: a full table of long names is larger than any module specifier the
