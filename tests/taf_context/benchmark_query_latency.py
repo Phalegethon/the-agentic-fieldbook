@@ -200,34 +200,40 @@ def main(argv: list[str] | None = None) -> int:
             initialize = {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "benchmark", "version": "0"}}
             startup_samples: list[float] = []
             first_call_samples: list[float] = []
+            # Every client is closed on the way out, including the SystemExit
+            # paths below: a leaked server keeps its engine child alive.
             for _ in range(max(3, min(args.repetitions, 5))):
                 started = time.perf_counter()
                 client = Client()
-                client.request("initialize", initialize)
-                startup_samples.append(time.perf_counter() - started)
-                started = time.perf_counter()
-                client.search()  # spawns the engine and loads the prepared index
-                first_call_samples.append(time.perf_counter() - started)
-                client.close()
-            client = Client()
-            client.request("initialize", initialize)
-            client.search()
-            stages["mcp-startup-to-initialize"] = {"median_seconds": round(statistics.median(startup_samples), 4), "min_seconds": round(min(startup_samples), 4)}
-            stages["mcp-first-call"] = {"median_seconds": round(statistics.median(first_call_samples), 4), "min_seconds": round(min(first_call_samples), 4)}
-            stages["mcp-warm"] = _timed(client.search, args.repetitions)
-            if args.edit:
-                edit_file = repository / args.edit_file
-                samples = []
-                for marker in range(1, args.repetitions + 1):
-                    with edit_file.open("a", encoding="utf-8") as handle:
-                        handle.write(f"\n\ndef mcp_benchmark_marker_{marker}():\n    return {marker}\n")
+                try:
+                    client.request("initialize", initialize)
+                    startup_samples.append(time.perf_counter() - started)
                     started = time.perf_counter()
-                    edit_result = client.search()
-                    samples.append(time.perf_counter() - started)
-                    if not edit_result["refresh"]["performed"]:
-                        raise SystemExit("mcp after-edit query did not refresh")
-                stages["mcp-after-edit"] = {"median_seconds": round(statistics.median(samples), 4), "min_seconds": round(min(samples), 4)}
-            client.close()
+                    client.search()  # spawns the engine and loads the prepared index
+                    first_call_samples.append(time.perf_counter() - started)
+                finally:
+                    client.close()
+            client = Client()
+            try:
+                client.request("initialize", initialize)
+                client.search()
+                stages["mcp-startup-to-initialize"] = {"median_seconds": round(statistics.median(startup_samples), 4), "min_seconds": round(min(startup_samples), 4)}
+                stages["mcp-first-call"] = {"median_seconds": round(statistics.median(first_call_samples), 4), "min_seconds": round(min(first_call_samples), 4)}
+                stages["mcp-warm"] = _timed(client.search, args.repetitions)
+                if args.edit:
+                    edit_file = repository / args.edit_file
+                    samples = []
+                    for marker in range(1, args.repetitions + 1):
+                        with edit_file.open("a", encoding="utf-8") as handle:
+                            handle.write(f"\n\ndef mcp_benchmark_marker_{marker}():\n    return {marker}\n")
+                        started = time.perf_counter()
+                        edit_result = client.search()
+                        samples.append(time.perf_counter() - started)
+                        if not edit_result["refresh"]["performed"]:
+                            raise SystemExit("mcp after-edit query did not refresh")
+                    stages["mcp-after-edit"] = {"median_seconds": round(statistics.median(samples), 4), "min_seconds": round(min(samples), 4)}
+            finally:
+                client.close()
 
         report = {
             "schema_version": "1",

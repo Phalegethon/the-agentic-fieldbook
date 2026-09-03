@@ -5,13 +5,17 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 ROOT = Path(__file__).parents[2]
 ENTRY = ROOT / "tools" / "taf-context" / "taf_context_mcp.py"
+RESPONSE_TIMEOUT_SECONDS = 60.0
+EXIT_TIMEOUT_SECONDS = 30.0
 
 
 class McpClient:
@@ -19,6 +23,16 @@ class McpClient:
         self._stderr = stderr_path.open("wb")
         self.process = subprocess.Popen([sys.executable, str(ENTRY)], env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr)
         self._next = 0
+        # A dedicated reader keeps the response wait bounded: a server that
+        # stays alive but stops answering must fail the test, not hang it.
+        self._lines: queue.Queue[bytes] = queue.Queue()
+        self._reader = threading.Thread(target=self._drain, daemon=True)
+        self._reader.start()
+
+    def _drain(self) -> None:
+        for line in iter(self.process.stdout.readline, b""):
+            self._lines.put(line)
+        self._lines.put(b"")  # end of stream
 
     def request(self, method: str, params: dict | None = None) -> dict:
         self._next += 1
@@ -27,7 +41,11 @@ class McpClient:
             message["params"] = params
         self.process.stdin.write(json.dumps(message).encode("utf-8") + b"\n")
         self.process.stdin.flush()
-        line = self.process.stdout.readline()
+        try:
+            line = self._lines.get(timeout=RESPONSE_TIMEOUT_SECONDS)
+        except queue.Empty:
+            raise TimeoutError(f"no answer to {method} within {RESPONSE_TIMEOUT_SECONDS}s")
+        assert line, f"the server closed stdout without answering {method}"
         response = json.loads(line)
         assert response["id"] == self._next, response
         return response
@@ -41,7 +59,13 @@ class McpClient:
 
     def close(self) -> int:
         self.process.stdin.close()
-        code = self.process.wait(timeout=30)
+        try:
+            code = self.process.wait(timeout=EXIT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # Never leave the server (and the engine it started) behind, and
+            # never mask the failure the caller is already unwinding from.
+            self.process.kill()
+            code = self.process.wait()
         self._stderr.close()
         return code
 
@@ -83,6 +107,11 @@ class DogfoodMcpTests(unittest.TestCase):
                 # for collect_snapshot exceed the default budget, so "partial"
                 # is the actual outcome here, not a defect.
                 self.assertIn(snippet["status"], {"ready", "partial"})
+                if snippet["status"] == "partial":
+                    # Both engine paths that shorten a snippet pair "partial"
+                    # with "refine-query" (internal/engine/engine.go and
+                    # internal/engine/snippets.go); nothing else may produce it.
+                    self.assertEqual(snippet["next_safe_action"], "refine-query")
                 target = work / "tools" / "taf-context" / "taf_context" / "state_paths.py"
                 target.write_text(target.read_text(encoding="utf-8") + "\n\ndef mcp_dogfood_marker():\n    return 1\n", encoding="utf-8")
                 refreshed = client.call("search_symbols", repo=str(work), query="mcp_dogfood_marker")
