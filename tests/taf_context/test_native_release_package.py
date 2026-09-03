@@ -43,7 +43,7 @@ class NativeReleasePackageTests(unittest.TestCase):
             )
 
             self.assertEqual((completed.returncode, completed.stderr), (0, ""))
-            asset = output / "taf-level1_0.1.1_darwin_arm64"
+            asset = output / "taf-level1_0.2.0_darwin_arm64"
             checksum = output / f"{asset.name}.sha256"
             self.assertEqual(asset.read_bytes(), payload)
             self.assertEqual(
@@ -82,7 +82,7 @@ class NativeReleasePackageTests(unittest.TestCase):
             )
 
             self.assertEqual((completed.returncode, completed.stderr), (0, ""))
-            asset = output / "taf-level1_0.1.1_windows_amd64.exe"
+            asset = output / "taf-level1_0.2.0_windows_amd64.exe"
             checksum = output / f"{asset.name}.sha256"
             self.assertEqual(
                 checksum.read_bytes(),

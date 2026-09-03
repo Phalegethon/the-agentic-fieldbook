@@ -5,6 +5,14 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-09-03
+
+Native runtime `0.2.0` (every engine change below; `--serve` is required by the
+MCP server). Existing installations report `install-native-engine` on the
+next `inspect` and `activate` downloads the new runtime; existing indexes
+rebuild once. Bundled skills: `branch-handoff` 1.2.1, `prepare-repo-context`
+1.4.0, `work-recovery` 1.0.1.
+
 ### Added
 
 - `prepare-repo-context` 1.1.0 reports user-local state usage in `inspect`

@@ -19,7 +19,7 @@ import (
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
 
-const engineVersion = "0.1.1"
+const engineVersion = "0.2.0"
 
 const maximumAggregateRecordBytes = 64 << 20
 

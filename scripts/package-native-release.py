@@ -10,7 +10,7 @@ import shutil
 import sys
 
 
-ENGINE_VERSION = "0.1.1"
+ENGINE_VERSION = "0.2.0"
 SUPPORTED_TARGETS = {
     ("darwin", "amd64"),
     ("darwin", "arm64"),

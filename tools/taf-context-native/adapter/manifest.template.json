@@ -1,9 +1,9 @@
 {
   "schema_version": "1",
   "adapter_identity": "taf.level1-native",
-  "adapter_version": "0.1.1",
+  "adapter_version": "0.2.0",
   "provider_identity": "taf-context",
-  "provider_version": "0.1.1",
+  "provider_version": "0.2.0",
   "executable": "bin/taf-level1",
   "arguments": [],
   "capabilities": [
