@@ -114,6 +114,7 @@ class HandshakeTests(unittest.TestCase):
                 "search_symbols",
                 "search_docs",
                 "source_snippets",
+                "related_symbols",
             ],
         )
         self.assertTrue(operations.closed)
@@ -160,6 +161,27 @@ class HandshakeTests(unittest.TestCase):
 class ToolListTests(unittest.TestCase):
     def test_tool_definitions_match_the_checked_in_fixture(self) -> None:
         self.assertEqual(tool_definitions(), json.loads(FIXTURE.read_text(encoding="utf-8")))
+
+    def test_the_seven_tools_are_listed_in_a_stable_order(self) -> None:
+        self.assertEqual(
+            [tool["name"] for tool in tool_definitions()],
+            [
+                "inspect",
+                "build",
+                "repository_map",
+                "search_symbols",
+                "search_docs",
+                "source_snippets",
+                "related_symbols",
+            ],
+        )
+        self.assertEqual(SERVER_VERSION, "1.1.0")
+        related = tool_definitions()[-1]["inputSchema"]
+        self.assertEqual(related["required"], ["repo", "result_ids", "direction"])
+        self.assertEqual(
+            related["properties"]["direction"]["enum"],
+            ["callers", "callees", "importers", "imports"],
+        )
 
     def test_build_is_the_only_writing_tool_and_requires_user_interaction(self) -> None:
         tools = {tool["name"]: tool for tool in tool_definitions()}
@@ -249,6 +271,84 @@ class ToolCallTests(unittest.TestCase):
         self.assertEqual(
             (snippets.operation, snippets.result_identities), ("source-snippets", (sha,))
         )
+
+    def test_related_symbols_routes_its_anchors_and_direction(self) -> None:
+        sha = "sha256:" + "c" * 64
+        responses, _, _, operations = run_server(
+            [
+                call(
+                    1,
+                    "related_symbols",
+                    {
+                        "repo": REPO,
+                        "result_ids": [sha, sha],
+                        "direction": "callers",
+                        "path_prefixes": ["tools/"],
+                        "allow_inferred": True,
+                    },
+                )
+            ]
+        )
+        self.assertNotIn("error", responses[0])
+        _, _, related = operations.calls[0]
+        self.assertEqual(
+            (
+                related.operation,
+                related.result_identities,
+                related.direction,
+                related.query,
+                related.path_prefixes,
+                related.allow_inferred,
+            ),
+            ("related-symbols", (sha,), "callers", None, ["tools/"], True),
+        )
+
+    def test_related_symbols_arguments_fail_closed(self) -> None:
+        sha = "sha256:" + "c" * 64
+        cases = [
+            (call(1, "related_symbols", {"repo": REPO, "result_ids": [sha]}), "direction"),
+            (
+                call(
+                    2,
+                    "related_symbols",
+                    {"repo": REPO, "result_ids": [sha], "direction": "sideways"},
+                ),
+                "direction",
+            ),
+            (
+                call(3, "related_symbols", {"repo": REPO, "result_ids": [], "direction": "callers"}),
+                "result_ids",
+            ),
+            (
+                call(
+                    4,
+                    "related_symbols",
+                    {"repo": REPO, "result_ids": ["nope"], "direction": "callers"},
+                ),
+                "result_ids",
+            ),
+            (
+                call(
+                    5,
+                    "related_symbols",
+                    {
+                        "repo": REPO,
+                        "result_ids": ["sha256:" + f"{index:064x}" for index in range(17)],
+                        "direction": "callers",
+                    },
+                ),
+                "result_ids",
+            ),
+            (
+                call(6, "search_symbols", {"repo": REPO, "query": "x", "direction": "callers"}),
+                "direction",
+            ),
+        ]
+        responses, _, _, operations = run_server([message for message, _ in cases])
+        self.assertEqual(operations.calls, [])
+        for response, (_, needle) in zip(responses, cases):
+            self.assertEqual(response["error"]["code"], -32602, response)
+            self.assertIn(needle, response["error"]["message"])
 
     def test_invalid_arguments_are_json_rpc_errors_naming_the_argument(self) -> None:
         cases = [

@@ -70,9 +70,12 @@ class RecordingTransport:
     def __init__(self, binary: Path) -> None:
         self.inner = OneShotTransport(binary)
         self.frames: list[tuple[str, bool]] = []
+        self.requests: list[dict] = []
 
     def exchange(self, wire: bytes, *, idempotent: bool) -> bytes:
-        self.frames.append((json.loads(wire)["request"]["operation"], idempotent))
+        request = json.loads(wire)["request"]
+        self.frames.append((request["operation"], idempotent))
+        self.requests.append(request)
         return self.inner.exchange(wire, idempotent=idempotent)
 
 
@@ -143,6 +146,50 @@ class OperationTests(unittest.TestCase):
                 ],
             )
 
+    def test_only_the_relationship_query_crosses_the_seam_as_schema_two(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = init_committed_repo(Path(directory) / "repo")
+            binary = Path(directory) / "engine"
+            write_fake_native_engine(binary)
+            environment = self._environment(directory, binary)
+            transports: list[RecordingTransport] = []
+
+            def transport_for(path: Path) -> RecordingTransport:
+                transports.append(RecordingTransport(path))
+                return transports[-1]
+
+            run_build(repository, environment=environment, transport_for=transport_for)
+            anchor = "sha256:" + "a" * 64
+            run_query(
+                repository,
+                QueryArguments("search-symbols", "main", (), [], [], [], [], 8, 4000, False),
+                environment=environment,
+                transport_for=transport_for,
+            )
+            related = run_query(
+                repository,
+                QueryArguments(
+                    "related-symbols", None, (anchor,), [], [], [], [], 8, 4000, False, "callers"
+                ),
+                environment=environment,
+                transport_for=transport_for,
+            )
+
+            requests = [request for transport in transports for request in transport.requests]
+            by_operation = {request["operation"]: request for request in requests}
+            self.assertEqual(by_operation["search-symbols"]["schema_version"], "1")
+            self.assertNotIn("direction", by_operation["search-symbols"])
+            self.assertEqual(by_operation["build"]["schema_version"], "1")
+            self.assertNotIn("direction", by_operation["build"])
+            self.assertEqual(by_operation["related-symbols"]["schema_version"], "2")
+            self.assertEqual(by_operation["related-symbols"]["direction"], "callers")
+            self.assertEqual(by_operation["related-symbols"]["result_identities"], [anchor])
+            self.assertIsNone(by_operation["related-symbols"]["query"])
+            self.assertEqual(
+                related["findings"][0]["relation"], "call"
+            )
+            self.assertEqual(related["findings"][0]["edge_evidence"], "verified")
+
     def test_transport_failures_keep_the_cli_messages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repository = init_committed_repo(Path(directory) / "repo")
@@ -195,10 +242,32 @@ class ValidateQueryRequestTests(unittest.TestCase):
             ("source-snippets", None, (), "source-snippets requires at least one --result-id"),
             ("search-symbols", "x", (sha,), "selected query operation does not accept --result-id"),
             ("source-snippets", None, ("bad",), "query result identity is invalid"),
+            ("related-symbols", "x", (sha,), "selected query operation does not accept --query"),
+            ("related-symbols", None, (), "related-symbols requires at least one --result-id"),
         ):
             with self.assertRaises(PrepareCLIError) as caught:
                 validate_query_request(operation, query, ids)
             self.assertEqual(str(caught.exception), message)
+
+    def test_direction_rules_match_the_cli(self) -> None:
+        sha = "sha256:" + "a" * 64
+        self.assertEqual(
+            validate_query_request("related-symbols", None, (sha,), "callers"), (None, (sha,))
+        )
+        self.assertEqual(validate_query_request("search-symbols", "main", ()), ("main", ()))
+        anchors = tuple(sorted("sha256:" + f"{index:064x}" for index in range(17)))
+        for operation, ids, direction, message in (
+            ("related-symbols", (sha,), None, "related-symbols requires --direction"),
+            ("related-symbols", (sha,), "sideways", "selected query direction is invalid"),
+            ("search-symbols", (), "callers", "selected query operation does not accept --direction"),
+            ("source-snippets", (sha,), "callers", "selected query operation does not accept --direction"),
+            ("related-symbols", anchors, "callers", "related-symbols accepts at most 16 --result-id values"),
+        ):
+            with self.subTest(operation=operation, direction=direction):
+                query = "main" if operation == "search-symbols" else None
+                with self.assertRaises(PrepareCLIError) as caught:
+                    validate_query_request(operation, query, ids, direction)
+                self.assertEqual(str(caught.exception), message)
 
 
 if __name__ == "__main__":

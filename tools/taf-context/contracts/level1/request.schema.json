@@ -24,7 +24,7 @@
     "allow_inferred"
   ],
   "properties": {
-    "schema_version": {"const": "1"},
+    "schema_version": {"enum": ["1", "2"]},
     "request_identity": {"$ref": "#/$defs/canonical_id"},
     "consumer_identity": {"$ref": "#/$defs/canonical_id"},
     "operation": {
@@ -37,7 +37,8 @@
         "repository-map",
         "search-symbols",
         "search-docs",
-        "source-snippets"
+        "source-snippets",
+        "related-symbols"
       ]
     },
     "repository_identity": {"$ref": "#/$defs/sha256"},
@@ -61,6 +62,12 @@
       ]
     },
     "query": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 512}, {"type": "null"}]},
+    "direction": {
+      "oneOf": [
+        {"enum": ["callers", "callees", "importers", "imports"]},
+        {"type": "null"}
+      ]
+    },
     "result_identities": {
       "type": "array",
       "maxItems": 64,
@@ -157,6 +164,33 @@
           "result_identities": {"minItems": 1, "maxItems": 64}
         }
       }
+    },
+    {
+      "if": {
+        "properties": {"operation": {"const": "related-symbols"}},
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "schema_version": {"const": "2"},
+          "index_identity": {"$ref": "#/$defs/sha256"},
+          "query": {"type": "null"},
+          "result_identities": {"minItems": 1, "maxItems": 16},
+          "direction": {"enum": ["callers", "callees", "importers", "imports"]}
+        },
+        "required": ["direction"]
+      },
+      "else": {
+        "properties": {"direction": {"type": "null"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1"}},
+        "required": ["schema_version"]
+      },
+      "then": {"not": {"required": ["direction"]}},
+      "else": {"required": ["direction"]}
     }
   ],
   "$defs": {

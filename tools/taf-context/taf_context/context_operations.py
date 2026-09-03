@@ -180,6 +180,7 @@ def _invoke_native(
     index_identity: str | None,
     query: str | None = None,
     result_identities: tuple[str, ...] = (),
+    direction: str | None = None,
     filters: dict[str, list[str]] | None = None,
     maximum_results: int = 8,
     maximum_output_characters: int = 4000,
@@ -192,23 +193,29 @@ def _invoke_native(
         "symbol_kinds": [],
         "source_types": [],
     }
-    request_material = "\0".join(
-        (
-            operation,
-            snapshot.repository_identity,
-            snapshot.worktree_identity,
-            snapshot.head_sha,
-            snapshot.dirty_fingerprint,
-            index_identity or "none",
-            query or "none",
-            json.dumps(result_identities, separators=(",", ":")),
-            json.dumps(request_filters, sort_keys=True, separators=(",", ":")),
-            str(maximum_results),
-            str(maximum_output_characters),
-            str(allow_inferred),
-        )
-    ).encode("utf-8")
+    material = [
+        operation,
+        snapshot.repository_identity,
+        snapshot.worktree_identity,
+        snapshot.head_sha,
+        snapshot.dirty_fingerprint,
+        index_identity or "none",
+        query or "none",
+        json.dumps(result_identities, separators=(",", ":")),
+        json.dumps(request_filters, sort_keys=True, separators=(",", ":")),
+        str(maximum_results),
+        str(maximum_output_characters),
+        str(allow_inferred),
+    ]
+    if direction is not None:
+        # Appended only where it exists, so every schema-1 request identity
+        # stays exactly what it was before the relationship operation.
+        material.append(direction)
+    request_material = "\0".join(material).encode("utf-8")
     request_identity = "taf.prepare." + hashlib.sha256(request_material).hexdigest()[:24]
+    # Schema 2 exists for the one operation that carries a direction; every
+    # other request stays byte-identical to the frozen schema-1 envelope.
+    schema_version = "2" if direction is not None else "1"
     envelope = {
         "phase": {
             "build": "build",
@@ -220,7 +227,7 @@ def _invoke_native(
         "state_root": str(state_root),
         "changed_paths_document": changed_paths_document,
         "request": {
-            "schema_version": "1",
+            "schema_version": schema_version,
             "request_identity": request_identity,
             "consumer_identity": "taf.prepare-repo-context",
             "operation": operation,
@@ -240,6 +247,8 @@ def _invoke_native(
             "allow_inferred": allow_inferred,
         },
     }
+    if schema_version == "2":
+        envelope["request"]["direction"] = direction
     wire = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
     try:
         raw = transport.exchange(wire, idempotent=operation not in {"build", "update"})
@@ -382,7 +391,9 @@ def _query_summary(
         "status": result.status.value,
         "freshness": result.freshness.value,
         "index_identity": result.index_identity,
-        "findings": [item.to_dict() for item in result.findings],
+        # The summary's own schema is unchanged; a relationship result simply
+        # carries the four extra schema-2 keys on each finding.
+        "findings": [item.to_dict(result.schema_version) for item in result.findings],
         "returned_count": result.returned_count,
         "omitted_count": result.omitted_count,
         "truncated": result.truncated,
@@ -598,25 +609,48 @@ class QueryArguments:
     maximum_results: int
     maximum_output_characters: int
     allow_inferred: bool
+    direction: str | None = None
+
+
+QUERY_DIRECTIONS = ("callers", "callees", "importers", "imports")
+# The query operations that name records instead of searching for them.
+IDENTITY_QUERY_OPERATIONS = ("source-snippets", "related-symbols")
+# One relationship request stays cheap to resolve, so it carries few anchors.
+MAXIMUM_RELATED_ANCHORS = 16
 
 
 def validate_query_request(
-    operation: str, query: str | None, result_identities: tuple[str, ...]
+    operation: str,
+    query: str | None,
+    result_identities: tuple[str, ...],
+    direction: str | None = None,
 ) -> tuple[str | None, tuple[str, ...]]:
     """Apply the query/result-identity rules shared by the CLI and the MCP server."""
     query_operations = {"search-symbols", "search-docs"}
+    identity_operations = set(IDENTITY_QUERY_OPERATIONS)
     query_text = query.strip() if isinstance(query, str) else None
     if operation in query_operations and not query_text:
         raise PrepareCLIError("selected query operation requires --query")
     if operation not in query_operations and query_text is not None:
         raise PrepareCLIError("selected query operation does not accept --query")
     identities = tuple(sorted(set(result_identities)))
-    if operation == "source-snippets" and not identities:
-        raise PrepareCLIError("source-snippets requires at least one --result-id")
-    if operation != "source-snippets" and identities:
+    if operation in identity_operations and not identities:
+        raise PrepareCLIError(f"{operation} requires at least one --result-id")
+    if operation not in identity_operations and identities:
         raise PrepareCLIError("selected query operation does not accept --result-id")
     if any(_SHA256.fullmatch(item) is None for item in identities):
         raise PrepareCLIError("query result identity is invalid")
+    if operation == "related-symbols":
+        if direction is None:
+            raise PrepareCLIError("related-symbols requires --direction")
+        if len(identities) > MAXIMUM_RELATED_ANCHORS:
+            raise PrepareCLIError(
+                f"related-symbols accepts at most {MAXIMUM_RELATED_ANCHORS} --result-id values"
+            )
+    elif direction is not None:
+        raise PrepareCLIError("selected query operation does not accept --direction")
+    if direction is not None and direction not in QUERY_DIRECTIONS:
+        raise PrepareCLIError("selected query direction is invalid")
     return query_text, identities
 
 
@@ -666,6 +700,7 @@ def run_query(
         index_identity=binding.index_identity,
         query=arguments.query,
         result_identities=arguments.result_identities,
+        direction=arguments.direction,
         filters={
             "path_prefixes": arguments.path_prefixes,
             "languages": arguments.languages,
@@ -678,15 +713,19 @@ def run_query(
     )
     if result.status.value not in {"ready", "partial"}:
         # The engine reports the same status/freshness/next_safe_action
-        # triple both when the index is genuinely stale and when
-        # source-snippets cannot verify the requested result identities
-        # against an otherwise exact index (unknown id, or a record whose
-        # evidence class is not Verified). The wire result carries no
-        # field that tells these apart, so name the snippet case honestly
-        # instead of misdirecting the agent to `prepare inspect`; a
-        # re-run search still produces the correct refusal when the
-        # index really is stale.
-        if arguments.operation == "source-snippets" and result.status.value == "stale":
+        # triple both when the index is genuinely stale and when an
+        # operation cannot use the requested result identities against an
+        # otherwise exact index: source-snippets cannot verify them
+        # (unknown id, or a record whose evidence class is not Verified),
+        # and related-symbols cannot anchor a relationship on them. The
+        # wire result carries no field that tells these apart, so name the
+        # identity case honestly instead of misdirecting the agent to
+        # `prepare inspect`; a re-run search still produces the correct
+        # refusal when the index really is stale.
+        if (
+            arguments.operation in IDENTITY_QUERY_OPERATIONS
+            and result.status.value == "stale"
+        ):
             raise PrepareCLIError(
                 "result identities could not be verified against the current index; re-run the search query"
             )

@@ -96,6 +96,7 @@ def write_fake_native_engine(
                     "search-symbols",
                     "search-docs",
                     "source-snippets",
+                    "related-symbols",
                 }
                 and (state / "fake-index").is_file()
             )
@@ -128,7 +129,7 @@ def write_fake_native_engine(
                     "error": {"status": "error", "freshness": "unknown", "next_safe_action": "rebuild-index", "index_identity": request["index_identity"]},
                 }[outcome]
             payload = {
-                "schema_version": "1",
+                "schema_version": request["schema_version"],
                 "request_identity": request["request_identity"],
                 "operation": operation,
                 "status": "partial" if ready and __PARTIAL__ else "ready" if ready else "partial",
@@ -170,18 +171,47 @@ def write_fake_native_engine(
                 "search-symbols",
                 "search-docs",
                 "source-snippets",
+                "related-symbols",
             }:
                 payload["status"] = "stale"
                 payload["freshness"] = "incrementally-stale"
                 payload["next_safe_action"] = "rebuild-index"
-            if __SNIPPET_STALE__ and operation == "source-snippets":
+            if __SNIPPET_STALE__ and operation in {"source-snippets", "related-symbols"}:
                 # Mirrors the engine's snippetStale helper: an exact index
-                # that cannot verify the requested result identities reports
-                # the same status/freshness/next_safe_action as a genuinely
-                # stale index (structurally-stale, update-index).
+                # that cannot verify the requested result identities, or an
+                # anchor no relationship may start from, reports the same
+                # status/freshness/next_safe_action as a genuinely stale
+                # index (structurally-stale, update-index).
                 payload["status"] = "stale"
                 payload["freshness"] = "structurally-stale"
                 payload["next_safe_action"] = "update-index"
+            if (
+                operation == "related-symbols"
+                and request["schema_version"] == "2"
+                and payload["status"] in {"ready", "partial"}
+            ):
+                # One resolved edge, so the broker and the CLI carry the four
+                # schema-2 finding fields end to end.
+                payload["findings"] = [{
+                    "rank": 1,
+                    "result_identity": "sha256:" + "e" * 64,
+                    "path": "tools/example/caller.py",
+                    "start_line": 10,
+                    "end_line": 14,
+                    "language": "Python",
+                    "record_kind": "definition",
+                    "source_type": "source",
+                    "qualified_name": "caller.run",
+                    "extraction_method": "fake-engine",
+                    "evidence_class": "verified",
+                    "preview": "",
+                    "relation": "call",
+                    "edge_evidence": "verified",
+                    "reference_line": 12,
+                    "reference_count": 2,
+                }]
+                payload["returned_count"] = 1
+                payload["output_characters"] = 200
             sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\\n")
             """
         ).replace("__INVOCATION_LOG__", repr(None if invocation_log is None else str(invocation_log))).replace(
@@ -334,6 +364,108 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
                 ["build", "search-symbols"],
             )
 
+    def test_related_symbols_query_carries_the_direction_and_the_edge_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            anchor = "sha256:" + "a" * 64
+
+            built = invoke(
+                environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write"
+            )
+            self.assertEqual((built[0], built[2]), (0, ""))
+
+            code, stdout, stderr = invoke(
+                environment,
+                "prepare",
+                "query",
+                "--repo",
+                str(repo),
+                "--operation",
+                "related-symbols",
+                "--result-id",
+                anchor,
+                "--direction",
+                "callers",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["operation"], "related-symbols")
+            self.assertEqual(result["status"], "ready")
+            findings = result["findings"]
+            assert isinstance(findings, list)
+            self.assertEqual(
+                {key: findings[0][key] for key in (
+                    "relation", "edge_evidence", "reference_line", "reference_count"
+                )},
+                {
+                    "relation": "call",
+                    "edge_evidence": "verified",
+                    "reference_line": 12,
+                    "reference_count": 2,
+                },
+            )
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["build", "related-symbols"],
+            )
+
+    def test_direction_and_anchor_rules_are_reported_before_the_engine_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            anchor = "sha256:" + "a" * 64
+            invoke(
+                environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write"
+            )
+
+            cases = (
+                (
+                    ("--operation", "related-symbols", "--result-id", anchor),
+                    "related-symbols requires --direction",
+                ),
+                (
+                    ("--operation", "related-symbols", "--direction", "callers"),
+                    "related-symbols requires at least one --result-id",
+                ),
+                (
+                    (
+                        "--operation",
+                        "search-symbols",
+                        "--query",
+                        "Widget",
+                        "--direction",
+                        "callers",
+                    ),
+                    "selected query operation does not accept --direction",
+                ),
+            )
+            for arguments, message in cases:
+                with self.subTest(arguments=arguments):
+                    code, _stdout, stderr = invoke(
+                        environment, "prepare", "query", "--repo", str(repo), *arguments
+                    )
+                    self.assertEqual(code, 2)
+                    self.assertIn(message, stderr)
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(), ["build"]
+            )
+
     def test_partial_context_is_bound_inspectable_and_queryable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -465,9 +597,21 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
                 stderr,
             )
             self.assertEqual(binding.stat().st_mtime, old)
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo),
+                "--operation", "related-symbols", "--result-id", result_id,
+                "--direction", "callers",
+            )
+
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn(
+                "result identities could not be verified against the current index; re-run the search query",
+                stderr,
+            )
+            self.assertEqual(binding.stat().st_mtime, old)
             self.assertEqual(
                 invocation_log.read_text(encoding="utf-8").splitlines(),
-                ["source-snippets"],
+                ["source-snippets", "related-symbols"],
             )
 
     def test_query_requires_an_existing_exact_context(self) -> None:

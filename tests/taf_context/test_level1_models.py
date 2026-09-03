@@ -23,6 +23,7 @@ from taf_context.level1_models import (
     parse_level1_result,
 )
 from taf_context.level1_render import render_level1_result
+from taf_context.models import Confidence
 
 
 REPOSITORY_IDENTITY = "sha256:" + "1" * 64
@@ -35,7 +36,9 @@ HEAD = "a" * 40
 
 def request_wire(operation: str = "search-symbols") -> dict[str, object]:
     query = "RecoveryDossier" if operation in {"search-symbols", "search-docs"} else None
-    result_identities = [RESULT_IDENTITY] if operation == "source-snippets" else []
+    result_identities = (
+        [RESULT_IDENTITY] if operation in {"source-snippets", "related-symbols"} else []
+    )
     index_identity = None if operation in {"estimate", "build"} else INDEX_IDENTITY
     filters = {
         "path_prefixes": ["tools/taf-context"],
@@ -50,8 +53,8 @@ def request_wire(operation: str = "search-symbols") -> dict[str, object]:
             "symbol_kinds": [],
             "source_types": [],
         }
-    return {
-        "schema_version": "1",
+    wire: dict[str, object] = {
+        "schema_version": "2" if operation == "related-symbols" else "1",
         "request_identity": "request-0001",
         "consumer_identity": "taf.work-recovery",
         "operation": operation,
@@ -70,6 +73,21 @@ def request_wire(operation: str = "search-symbols") -> dict[str, object]:
         "maximum_model_output_characters": 4000,
         "allow_inferred": False,
     }
+    # The direction key exists only in schema 2, where it is non-null exactly
+    # for the one operation that resolves relationships.
+    if operation == "related-symbols":
+        wire["direction"] = "callers"
+    return wire
+
+
+def schema2_request_wire(
+    operation: str = "search-symbols", direction: str | None = None
+) -> dict[str, object]:
+    """A schema-2 request; every schema-2 request spells the direction key out."""
+    wire = request_wire(operation)
+    wire["schema_version"] = "2"
+    wire["direction"] = direction
+    return wire
 
 
 def finding_wire() -> dict[str, object]:
@@ -214,6 +232,33 @@ def result_wire() -> dict[str, object]:
     }
 
 
+def edge_finding_wire(**overrides: object) -> dict[str, object]:
+    """A schema-2 finding carrying one resolved edge."""
+    wire = finding_wire()
+    wire.update(
+        {
+            "relation": "call",
+            "edge_evidence": "verified",
+            "reference_line": 5,
+            "reference_count": 2,
+        }
+    )
+    wire.update(overrides)
+    return wire
+
+
+def related_result_wire() -> dict[str, object]:
+    wire = result_wire()
+    wire.update(
+        {
+            "schema_version": "2",
+            "operation": "related-symbols",
+            "findings": [edge_finding_wire()],
+        }
+    )
+    return wire
+
+
 def ready_candidate_wire() -> dict[str, object]:
     return {
         "schema_version": "1",
@@ -239,7 +284,7 @@ class Level1VocabularyTests(unittest.TestCase):
             [
                 "estimate", "build", "update", "status", "metrics",
                 "repository-map", "search-symbols", "search-docs",
-                "source-snippets",
+                "source-snippets", "related-symbols",
             ],
         )
         self.assertEqual(
@@ -551,6 +596,181 @@ class CandidateManifestTests(unittest.TestCase):
                     CandidateManifest.from_dict(wire)
 
 
+class Level1RelationshipSchemaTests(unittest.TestCase):
+    """Schema 2: the direction selector and the four per-edge finding fields."""
+
+    def test_related_symbols_request_round_trip_carries_its_direction(self) -> None:
+        wire = request_wire("related-symbols")
+        request = Level1Request.from_dict(wire)
+
+        self.assertEqual(request.to_dict(), wire)
+        self.assertEqual(request.schema_version, "2")
+        self.assertIs(request.operation, Level1Operation.RELATED_SYMBOLS)
+        self.assertEqual(request.direction, "callers")
+        self.assertEqual(request.result_identities, (RESULT_IDENTITY,))
+        self.assertIsNone(request.query)
+
+    def test_schema_two_spells_a_null_direction_for_every_other_operation(self) -> None:
+        wire = schema2_request_wire("search-symbols")
+        request = Level1Request.from_dict(wire)
+
+        self.assertEqual(request.to_dict(), wire)
+        self.assertIsNone(request.direction)
+
+    def test_schema_one_refuses_the_direction_key_and_the_relationship_operation(self) -> None:
+        with_direction = request_wire("search-symbols")
+        with_direction["direction"] = None
+        relationship_under_schema_one = request_wire("related-symbols")
+        relationship_under_schema_one["schema_version"] = "1"
+        del relationship_under_schema_one["direction"]
+
+        for wire in (with_direction, relationship_under_schema_one):
+            with self.subTest(wire=wire):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+
+    def test_direction_is_present_and_valid_exactly_for_related_symbols(self) -> None:
+        missing_key = request_wire("related-symbols")
+        del missing_key["direction"]
+        cases = [
+            missing_key,
+            schema2_request_wire("related-symbols", None),
+            schema2_request_wire("related-symbols", "sideways"),
+            schema2_request_wire("related-symbols", "Callers"),
+            schema2_request_wire("search-symbols", "callers"),
+        ]
+
+        for wire in cases:
+            with self.subTest(wire=wire):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+
+    def test_related_symbols_needs_bounded_anchors_and_refuses_a_query(self) -> None:
+        without_anchors = request_wire("related-symbols")
+        without_anchors["result_identities"] = []
+        too_many = request_wire("related-symbols")
+        too_many["result_identities"] = sorted(
+            "sha256:" + f"{index:064x}" for index in range(17)
+        )
+        with_query = request_wire("related-symbols")
+        with_query["query"] = "RecoveryDossier"
+
+        for wire in (without_anchors, too_many, with_query):
+            with self.subTest(wire=wire):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+
+        bounded = request_wire("related-symbols")
+        bounded["result_identities"] = sorted(
+            "sha256:" + f"{index:064x}" for index in range(16)
+        )
+        self.assertEqual(len(Level1Request.from_dict(bounded).result_identities), 16)
+
+    def test_related_result_round_trip_preserves_every_edge_field(self) -> None:
+        wire = related_result_wire()
+        result = Level1Result.from_dict(wire)
+
+        self.assertEqual(result.to_dict(), wire)
+        finding = result.findings[0]
+        self.assertEqual(
+            (
+                finding.relation,
+                finding.edge_evidence,
+                finding.reference_line,
+                finding.reference_count,
+            ),
+            ("call", Confidence.VERIFIED, 5, 2),
+        )
+
+    def test_schema_two_reads_absent_edges_as_empty_strings_or_null(self) -> None:
+        # The Go encoder writes ""/0 for a schema-2 finding with no edge; a
+        # hand-written or future producer may write null. Both mean "no edge".
+        for empty, zero in (("", 0), (None, 0)):
+            wire = result_wire()
+            wire["schema_version"] = "2"
+            wire["findings"] = [
+                edge_finding_wire(
+                    relation=empty,
+                    edge_evidence=empty,
+                    reference_line=zero,
+                    reference_count=zero,
+                )
+            ]
+            with self.subTest(empty=empty):
+                finding = Level1Result.from_dict(wire).findings[0]
+                self.assertIsNone(finding.relation)
+                self.assertIsNone(finding.edge_evidence)
+                self.assertEqual((finding.reference_line, finding.reference_count), (0, 0))
+
+    def test_schema_one_results_carry_no_edge_fields_at_all(self) -> None:
+        for field, value in (
+            ("relation", "call"),
+            ("edge_evidence", "verified"),
+            ("reference_line", 5),
+            ("reference_count", 2),
+        ):
+            wire = result_wire()
+            wire["findings"] = [dict(finding_wire(), **{field: value})]
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    Level1Result.from_dict(wire)
+        self.assertNotIn("relation", Level1Finding.from_dict(finding_wire()).to_dict())
+
+    def test_schema_two_findings_must_spell_every_edge_field(self) -> None:
+        for field in ("relation", "edge_evidence", "reference_line", "reference_count"):
+            wire = related_result_wire()
+            finding = edge_finding_wire()
+            del finding[field]
+            wire["findings"] = [finding]
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    Level1Result.from_dict(wire)
+
+    def test_edge_vocabulary_and_counters_fail_closed(self) -> None:
+        cases: list[dict[str, object]] = []
+        for field, value in (
+            ("relation", "uses"),
+            ("relation", "Call"),
+            ("edge_evidence", "uncertain"),
+            ("edge_evidence", "guessed"),
+            ("reference_line", -1),
+            ("reference_count", True),
+            ("reference_count", "2"),
+        ):
+            wire = related_result_wire()
+            wire["findings"] = [edge_finding_wire(**{field: value})]
+            cases.append(wire)
+        half_edge = related_result_wire()
+        half_edge["findings"] = [edge_finding_wire(edge_evidence="")]
+        cases.append(half_edge)
+        counted_without_relation = related_result_wire()
+        counted_without_relation["findings"] = [
+            edge_finding_wire(relation="", edge_evidence="", reference_count=2)
+        ]
+        cases.append(counted_without_relation)
+        edges_outside_the_relationship_operation = result_wire()
+        edges_outside_the_relationship_operation["schema_version"] = "2"
+        edges_outside_the_relationship_operation["findings"] = [edge_finding_wire()]
+        cases.append(edges_outside_the_relationship_operation)
+
+        for wire in cases:
+            with self.subTest(wire=wire):
+                with self.assertRaises(ValueError):
+                    Level1Result.from_dict(wire)
+
+    def test_parser_accepts_a_schema_two_result_frame(self) -> None:
+        raw = json.dumps(related_result_wire()).encode("utf-8")
+        self.assertEqual(parse_level1_result(raw).schema_version, "2")
+
+    def test_the_wire_schema_vocabulary_is_exactly_one_and_two(self) -> None:
+        for version in ("0", "3", "2.0", 2):
+            wire = result_wire()
+            wire["schema_version"] = version
+            with self.subTest(version=version):
+                with self.assertRaises(ValueError):
+                    Level1Result.from_dict(wire)
+
+
 class ContractSchemaTests(unittest.TestCase):
     def test_json_schemas_publish_the_same_top_level_fields_and_enums(self) -> None:
         root = Path(__file__).parents[2] / "tools" / "taf-context" / "contracts" / "level1"
@@ -568,12 +788,22 @@ class ContractSchemaTests(unittest.TestCase):
             set(Level1Result.__dataclass_fields__),
         )
         self.assertEqual(
+            set(result_schema["$defs"]["finding"]["properties"]),
+            set(Level1Finding.__dataclass_fields__),
+        )
+        self.assertEqual(request_schema["properties"]["schema_version"]["enum"], ["1", "2"])
+        self.assertEqual(result_schema["properties"]["schema_version"]["enum"], ["1", "2"])
+        self.assertEqual(
             request_schema["properties"]["operation"]["enum"],
             [item.value for item in Level1Operation],
         )
         conditioned_operations: set[str] = set()
         for branch in request_schema["allOf"]:
-            operation = branch["if"]["properties"]["operation"]
+            # Some branches condition on the schema version rather than on the
+            # operation; only the operation branches answer this question.
+            operation = branch["if"]["properties"].get("operation")
+            if operation is None:
+                continue
             conditioned_operations.update(
                 operation.get("enum", [operation.get("const")])
             )

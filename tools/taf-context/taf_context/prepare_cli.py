@@ -14,6 +14,7 @@ from .context_operations import (  # noqa: F401 - re-exported for callers and te
     FILTER_LANGUAGES,
     FILTER_SYMBOL_KINDS,
     PrepareCLIError,
+    QUERY_DIRECTIONS,
     QueryArguments,
     _invoke_native,
     _managed_binary_path,
@@ -81,10 +82,12 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
             "search-symbols",
             "search-docs",
             "source-snippets",
+            "related-symbols",
         ),
     )
     query.add_argument("--query")
     query.add_argument("--result-id", action="append", default=[])
+    query.add_argument("--direction", choices=QUERY_DIRECTIONS)
     query.add_argument("--path-prefix", action="append", default=[])
     query.add_argument("--language", action="append", default=[])
     query.add_argument("--symbol-kind", action="append", default=[])
@@ -144,6 +147,7 @@ def run_prepare_command(
             operation=args.operation,
             query=query_text,
             result_identities=result_identities,
+            direction=args.direction,
             path_prefixes=sorted(set(args.path_prefix)),
             languages=normalize_filter_values(args.language, "--language", FILTER_LANGUAGES),
             symbol_kinds=normalize_filter_values(args.symbol_kind, "--symbol-kind", FILTER_SYMBOL_KINDS),
@@ -244,7 +248,9 @@ def _download(url: str, maximum_bytes: int) -> bytes:
 
 
 def _validate_query_arguments(args: argparse.Namespace) -> tuple[str | None, tuple[str, ...]]:
-    return validate_query_request(args.operation, args.query, tuple(args.result_id))
+    return validate_query_request(
+        args.operation, args.query, tuple(args.result_id), args.direction
+    )
 
 
 def _lifecycle_summary(

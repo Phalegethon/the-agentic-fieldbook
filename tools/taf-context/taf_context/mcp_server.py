@@ -13,7 +13,10 @@ from typing import Any, BinaryIO, Callable, Mapping, Protocol, TextIO
 from .context_operations import (
     FILTER_LANGUAGES,
     FILTER_SYMBOL_KINDS,
+    IDENTITY_QUERY_OPERATIONS,
+    MAXIMUM_RELATED_ANCHORS,
     PrepareCLIError,
+    QUERY_DIRECTIONS,
     QueryArguments,
     _SHA256,
     normalize_filter_values,
@@ -26,7 +29,7 @@ from .git_snapshot import SnapshotError
 from .native_transport import NativeTransport
 
 SERVER_NAME = "taf-repo-context"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 LEGACY_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 MODERN_VERSION = "2026-07-28"
 INSTRUCTIONS = (
@@ -53,6 +56,7 @@ _QUERY_TOOLS = {
     "search_symbols": "search-symbols",
     "search_docs": "search-docs",
     "source_snippets": "source-snippets",
+    "related_symbols": "related-symbols",
 }
 
 
@@ -116,7 +120,7 @@ def _schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
 
 
 def tool_definitions() -> list[dict[str, Any]]:
-    """The six tools, in `tools/list` order."""
+    """The seven tools, in `tools/list` order."""
     query_description_suffix = (
         " A query on a bound index behind the working tree refreshes it incrementally first."
     )
@@ -235,6 +239,38 @@ def tool_definitions() -> list[dict[str, Any]]:
             ),
             "annotations": dict(_READ_ONLY),
         },
+        {
+            "name": "related_symbols",
+            "title": "Related symbols",
+            "description": (
+                "Follow the relationships of result identities returned by an earlier query: "
+                "direction callers answers 'who calls X', callees 'what does X depend on', "
+                "importers 'who uses module M', and imports 'what does X import'. Every finding "
+                "carries relation, edge_evidence, reference_line, and reference_count; "
+                "edge_evidence inferred is a name match, never proof, and is returned only with "
+                "allow_inferred." + query_description_suffix
+            ),
+            "inputSchema": _schema(
+                {
+                    "repo": _repo_property(),
+                    "result_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": MAXIMUM_RELATED_ANCHORS,
+                        "description": "result_identity values of the anchor symbols or modules.",
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": list(QUERY_DIRECTIONS),
+                        "description": "Which side of the relationship to return.",
+                    },
+                    **_filter_properties(),
+                },
+                ["repo", "result_ids", "direction"],
+            ),
+            "annotations": dict(_READ_ONLY),
+        },
     ]
 
 
@@ -259,6 +295,8 @@ def _check_schema(schema: dict[str, Any], value: Any, path: str) -> None:
             raise InvalidArguments(f"{path} must be an array")
         if len(value) < schema.get("minItems", 0):
             raise InvalidArguments(f"{path} must not be empty")
+        if len(value) > schema.get("maxItems", len(value)):
+            raise InvalidArguments(f"{path} accepts at most {schema['maxItems']} items")
         for item in value:
             _check_schema(schema["items"], item, path)
     elif kind == "string":
@@ -293,10 +331,15 @@ def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArgument
     ):
         raise InvalidArguments("query must not be empty")
     identities = tuple(sorted(set(arguments.get("result_ids", []))))
-    if operation == "source-snippets" and any(
+    if operation in IDENTITY_QUERY_OPERATIONS and any(
         _SHA256.fullmatch(item) is None for item in identities
     ):
         raise InvalidArguments("result_ids must be sha256:<64 hex> result identities")
+    direction = arguments.get("direction")
+    if direction is not None:
+        # The schema enum accepts any case, as the filter values do; canonicalize
+        # before the broker sees it.
+        direction = direction.strip().lower()
     try:
         languages = normalize_filter_values(
             arguments.get("languages", []), "languages", FILTER_LANGUAGES
@@ -313,6 +356,7 @@ def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArgument
         operation=operation,
         query=query.strip() if isinstance(query, str) else None,
         result_identities=identities,
+        direction=direction,
         path_prefixes=sorted(set(arguments.get("path_prefixes", []))),
         languages=languages,
         symbol_kinds=symbol_kinds,

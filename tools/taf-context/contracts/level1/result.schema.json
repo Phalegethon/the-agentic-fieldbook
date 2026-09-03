@@ -27,7 +27,7 @@
     "next_safe_action"
   ],
   "properties": {
-    "schema_version": {"const": "1"},
+    "schema_version": {"enum": ["1", "2"]},
     "request_identity": {"$ref": "#/$defs/canonical_id"},
     "operation": {
       "enum": [
@@ -39,7 +39,8 @@
         "repository-map",
         "search-symbols",
         "search-docs",
-        "source-snippets"
+        "source-snippets",
+        "related-symbols"
       ]
     },
     "status": {"enum": ["ready", "partial", "stale", "unsupported", "error"]},
@@ -86,6 +87,62 @@
     },
     "next_safe_action": {"$ref": "#/$defs/canonical_id"}
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1"}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "findings": {
+            "items": {
+              "allOf": [
+                {"not": {"required": ["relation"]}},
+                {"not": {"required": ["edge_evidence"]}},
+                {"not": {"required": ["reference_line"]}},
+                {"not": {"required": ["reference_count"]}}
+              ]
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "findings": {
+            "items": {
+              "required": [
+                "relation",
+                "edge_evidence",
+                "reference_line",
+                "reference_count"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"operation": {"const": "related-symbols"}},
+        "required": ["operation"]
+      },
+      "else": {
+        "properties": {
+          "findings": {
+            "items": {
+              "properties": {
+                "relation": {"enum": ["", null]},
+                "edge_evidence": {"enum": ["", null]},
+                "reference_line": {"const": 0},
+                "reference_count": {"const": 0}
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "canonical_id": {
       "type": "string",
@@ -140,7 +197,11 @@
         "qualified_name": {"type": "string", "maxLength": 512},
         "extraction_method": {"type": "string", "minLength": 1, "maxLength": 512},
         "evidence_class": {"enum": ["verified", "inferred", "uncertain"]},
-        "preview": {"type": "string", "maxLength": 12000, "pattern": "^[^\\u0000\\r\\uD800-\\uDFFF]*$"}
+        "preview": {"type": "string", "maxLength": 12000, "pattern": "^[^\\u0000\\r\\uD800-\\uDFFF]*$"},
+        "relation": {"oneOf": [{"enum": ["", "call", "import"]}, {"type": "null"}]},
+        "edge_evidence": {"oneOf": [{"enum": ["", "verified", "inferred"]}, {"type": "null"}]},
+        "reference_line": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "reference_count": {"type": "integer", "minimum": 0, "maximum": 2147483647}
       }
     },
     "coverage": {

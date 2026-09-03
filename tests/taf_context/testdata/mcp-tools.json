@@ -399,5 +399,120 @@
     },
     "name": "source_snippets",
     "title": "Source snippets"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Follow the relationships of result identities returned by an earlier query: direction callers answers 'who calls X', callees 'what does X depend on', importers 'who uses module M', and imports 'what does X import'. Every finding carries relation, edge_evidence, reference_line, and reference_count; edge_evidence inferred is a name match, never proof, and is returned only with allow_inferred. A query on a bound index behind the working tree refreshes it incrementally first.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_inferred": {
+          "default": false,
+          "description": "Include findings whose evidence class is inferred.",
+          "type": "boolean"
+        },
+        "direction": {
+          "description": "Which side of the relationship to return.",
+          "enum": [
+            "callers",
+            "callees",
+            "importers",
+            "imports"
+          ],
+          "type": "string"
+        },
+        "languages": {
+          "items": {
+            "enum": [
+              "go",
+              "javascript",
+              "json",
+              "markdown",
+              "python",
+              "rust",
+              "toml",
+              "typescript"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "maximum_output_characters": {
+          "default": 4000,
+          "enum": [
+            2000,
+            4000,
+            8000,
+            12000
+          ],
+          "type": "integer"
+        },
+        "maximum_results": {
+          "default": 8,
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path_prefixes": {
+          "description": "Repository-relative path prefixes (case-sensitive).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repo": {
+          "description": "Absolute path of the Git repository or worktree.",
+          "type": "string"
+        },
+        "result_ids": {
+          "description": "result_identity values of the anchor symbols or modules.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "source_types": {
+          "items": {
+            "enum": [
+              "source",
+              "document",
+              "configuration"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "symbol_kinds": {
+          "items": {
+            "enum": [
+              "configuration",
+              "definition",
+              "document-chunk",
+              "entry-point",
+              "heading",
+              "import",
+              "module"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "repo",
+        "result_ids",
+        "direction"
+      ],
+      "type": "object"
+    },
+    "name": "related_symbols",
+    "title": "Related symbols"
   }
 ]

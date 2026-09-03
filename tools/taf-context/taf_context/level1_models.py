@@ -31,6 +31,7 @@ class Level1Operation(str, Enum):
     SEARCH_SYMBOLS = "search-symbols"
     SEARCH_DOCS = "search-docs"
     SOURCE_SNIPPETS = "source-snippets"
+    RELATED_SYMBOLS = "related-symbols"
 
 
 class Level1RecordKind(str, Enum):
@@ -77,13 +78,30 @@ _READ_OPERATIONS = {
     Level1Operation.SEARCH_SYMBOLS,
     Level1Operation.SEARCH_DOCS,
     Level1Operation.SOURCE_SNIPPETS,
+    Level1Operation.RELATED_SYMBOLS,
 }
 _CONTROL_OPERATIONS = set(Level1Operation) - _READ_OPERATIONS
 _QUERY_OPERATIONS = {
     Level1Operation.SEARCH_SYMBOLS,
     Level1Operation.SEARCH_DOCS,
 }
+# The two operations that name records instead of searching for them.
+_IDENTITY_OPERATIONS = {
+    Level1Operation.SOURCE_SNIPPETS,
+    Level1Operation.RELATED_SYMBOLS,
+}
 _ALLOWED_BUDGETS = {2000, 4000, 8000, 12000}
+_WIRE_SCHEMAS = ("1", "2")
+_DIRECTIONS = ("callers", "callees", "importers", "imports")
+# One relationship request stays cheap to resolve, so it carries few anchors.
+_MAXIMUM_RELATED_ANCHORS = 16
+_RELATIONS = ("call", "import")
+_EDGE_EVIDENCE = (Confidence.VERIFIED.value, Confidence.INFERRED.value)
+# Keys that exist only in wire schema 2.
+_SCHEMA_TWO_REQUEST_FIELDS = frozenset({"direction"})
+_SCHEMA_TWO_FINDING_FIELDS = frozenset(
+    {"relation", "edge_evidence", "reference_line", "reference_count"}
+)
 
 
 @dataclass(frozen=True)
@@ -140,12 +158,23 @@ class Level1Request:
     maximum_results: int
     maximum_model_output_characters: int
     allow_inferred: bool
+    # Schema 2 only: the relationship direction, non-null exactly for
+    # `related-symbols`. A schema-1 request carries no direction key at all.
+    direction: str | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> "Level1Request":
-        _exact(value, cls.__dataclass_fields__, "request")
-        schema = _schema(value)
+        # The key set depends on the schema version, so read it first.
+        schema = _wire_schema(value, "request")
+        _exact(
+            value,
+            _schema_fields(
+                cls.__dataclass_fields__, schema, _SCHEMA_TWO_REQUEST_FIELDS
+            ),
+            "request",
+        )
         operation = _enum(value, "operation", Level1Operation)
+        direction = _direction(value, schema, operation)
         index_identity = _optional_sha256(value, "index_identity")
         query = _optional_text(value, "query")
         result_identities = _sorted_sha256s(value, "result_identities")
@@ -168,10 +197,15 @@ class Level1Request:
                 raise Level1ModelError("query")
         elif query is not None:
             raise Level1ModelError("query")
-        if operation is Level1Operation.SOURCE_SNIPPETS:
+        if operation in _IDENTITY_OPERATIONS:
             if not result_identities:
                 raise Level1ModelError("result_identities")
         elif result_identities:
+            raise Level1ModelError("result_identities")
+        if (
+            operation is Level1Operation.RELATED_SYMBOLS
+            and len(result_identities) > _MAXIMUM_RELATED_ANCHORS
+        ):
             raise Level1ModelError("result_identities")
         if operation in _CONTROL_OPERATIONS and not filters.is_empty():
             raise Level1ModelError("filters")
@@ -199,10 +233,11 @@ class Level1Request:
             maximum_results,
             maximum_characters,
             _boolean(value, "allow_inferred"),
+            direction,
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        wire: dict[str, object] = {
             "schema_version": self.schema_version,
             "request_identity": self.request_identity,
             "consumer_identity": self.consumer_identity,
@@ -224,6 +259,9 @@ class Level1Request:
             ),
             "allow_inferred": self.allow_inferred,
         }
+        if self.schema_version == "2":
+            wire["direction"] = self.direction
+        return wire
 
 
 @dataclass(frozen=True)
@@ -240,10 +278,25 @@ class Level1Finding:
     extraction_method: str
     evidence_class: Confidence
     preview: str
+    # Schema 2 only: the edge that reached this record. `relation` and
+    # `edge_evidence` are None together when the finding is not a relationship
+    # result, and then both counters are zero.
+    relation: str | None = None
+    edge_evidence: Confidence | None = None
+    reference_line: int = 0
+    reference_count: int = 0
 
     @classmethod
-    def from_dict(cls, value: dict[str, object]) -> "Level1Finding":
-        _exact(value, cls.__dataclass_fields__, "finding")
+    def from_dict(
+        cls, value: dict[str, object], schema: str = "1"
+    ) -> "Level1Finding":
+        _exact(
+            value,
+            _schema_fields(
+                cls.__dataclass_fields__, schema, _SCHEMA_TWO_FINDING_FIELDS
+            ),
+            "finding",
+        )
         rank = _counter(value, "rank")
         start_line = _counter(value, "start_line")
         end_line = _counter(value, "end_line")
@@ -264,10 +317,11 @@ class Level1Finding:
             _text(value, "extraction_method"),
             _enum(value, "evidence_class", Confidence),
             _preview(value, "preview"),
+            *_edge(value, schema),
         )
 
-    def to_dict(self) -> dict[str, object]:
-        return {
+    def to_dict(self, schema: str = "1") -> dict[str, object]:
+        wire: dict[str, object] = {
             "rank": self.rank,
             "result_identity": self.result_identity,
             "path": self.path,
@@ -281,6 +335,14 @@ class Level1Finding:
             "evidence_class": self.evidence_class.value,
             "preview": self.preview,
         }
+        if schema == "2":
+            wire["relation"] = self.relation
+            wire["edge_evidence"] = (
+                None if self.edge_evidence is None else self.edge_evidence.value
+            )
+            wire["reference_line"] = self.reference_line
+            wire["reference_count"] = self.reference_count
+        return wire
 
 
 @dataclass(frozen=True)
@@ -344,11 +406,12 @@ class Level1Result:
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> "Level1Result":
+        schema = _wire_schema(value, "result")
         _exact(value, cls.__dataclass_fields__, "result")
         operation = _enum(value, "operation", Level1Operation)
         status = _enum(value, "status", Level1ResultStatus)
         index_identity = _optional_sha256(value, "index_identity")
-        findings = _findings(value, "findings")
+        findings = _findings(value, "findings", schema)
         returned_count = _counter(value, "returned_count")
         omitted_count = _counter(value, "omitted_count")
         truncated = _boolean(value, "truncated")
@@ -378,6 +441,11 @@ class Level1Result:
             item.evidence_class is Confidence.VERIFIED for item in findings
         ):
             raise Level1ModelError("evidence_class")
+        # Only the operation that resolves relationships carries edge data.
+        if operation is not Level1Operation.RELATED_SYMBOLS and any(
+            item.relation is not None for item in findings
+        ):
+            raise Level1ModelError("relation")
         if index_identity is None and not (
             operation is Level1Operation.ESTIMATE
             or (
@@ -388,7 +456,7 @@ class Level1Result:
             raise Level1ModelError("index_identity")
 
         return cls(
-            _schema(value),
+            schema,
             _canonical_id(value, "request_identity"),
             operation,
             status,
@@ -427,7 +495,9 @@ class Level1Result:
             "freshness": self.freshness.value,
             "parser_versions": dict(self.parser_versions),
             "coverage": self.coverage.to_dict(),
-            "findings": [item.to_dict() for item in self.findings],
+            "findings": [
+                item.to_dict(self.schema_version) for item in self.findings
+            ],
             "returned_count": self.returned_count,
             "omitted_count": self.omitted_count,
             "truncated": self.truncated,
@@ -579,6 +649,87 @@ def _schema(value: dict[str, object]) -> str:
     if _text(value, "schema_version") != "1":
         raise Level1ModelError("schema_version")
     return "1"
+
+
+def _wire_schema(value: object, field: str) -> str:
+    """Read the wire schema version before the key set, which depends on it."""
+    if (
+        not isinstance(value, dict)
+        or (isinstance(value, _ParsedObject) and value.duplicate)
+        or "schema_version" not in value
+    ):
+        raise Level1ModelError(field)
+    version = _text(value, "schema_version")
+    if version not in _WIRE_SCHEMAS:
+        raise Level1ModelError("schema_version")
+    return version
+
+
+def _schema_fields(
+    fields: object, schema: str, schema_two_only: frozenset[str]
+) -> set[str]:
+    """The exact key set a wire object must carry under ``schema``."""
+    names = set(fields)
+    if schema == "1":
+        names -= schema_two_only
+    return names
+
+
+def _direction(
+    value: dict[str, object], schema: str, operation: Level1Operation
+) -> str | None:
+    if schema == "1":
+        # Schema 1 has no direction key at all, so it cannot name the one
+        # operation that needs one.
+        if operation is Level1Operation.RELATED_SYMBOLS:
+            raise Level1ModelError("operation")
+        return None
+    direction = _optional_text(value, "direction")
+    if (direction is not None) != (
+        operation is Level1Operation.RELATED_SYMBOLS
+    ):
+        raise Level1ModelError("direction")
+    if direction is not None and direction not in _DIRECTIONS:
+        raise Level1ModelError("direction")
+    return direction
+
+
+def _edge_label(
+    value: dict[str, object], field: str, allowed: tuple[str, ...]
+) -> str | None:
+    """Read one schema-2 edge label; null and "" both mean "no edge"."""
+    if value[field] is None:
+        return None
+    label = _text(value, field, empty=True)
+    if not label:
+        return None
+    if label not in allowed:
+        raise Level1ModelError(field)
+    return label
+
+
+def _edge(
+    value: dict[str, object], schema: str
+) -> tuple[str | None, Confidence | None, int, int]:
+    if schema != "2":
+        return None, None, 0, 0
+    relation = _edge_label(value, "relation", _RELATIONS)
+    evidence = _edge_label(value, "edge_evidence", _EDGE_EVIDENCE)
+    reference_line = _counter(value, "reference_line")
+    reference_count = _counter(value, "reference_count")
+    if (relation is None) != (evidence is None):
+        raise Level1ModelError("relation")
+    if relation is None:
+        if reference_line:
+            raise Level1ModelError("reference_line")
+        if reference_count:
+            raise Level1ModelError("reference_count")
+    return (
+        relation,
+        None if evidence is None else Confidence(evidence),
+        reference_line,
+        reference_count,
+    )
 
 
 def _valid_unicode(item: str) -> bool:
@@ -823,8 +974,9 @@ def _reason_counts(
 def _findings(
     value: dict[str, object],
     field: str,
+    schema: str = "1",
 ) -> tuple[Level1Finding, ...]:
     raw = value[field]
     if type(raw) is not list or len(raw) > _MAX_COLLECTION:
         raise Level1ModelError(field)
-    return tuple(Level1Finding.from_dict(item) for item in raw)
+    return tuple(Level1Finding.from_dict(item, schema) for item in raw)
