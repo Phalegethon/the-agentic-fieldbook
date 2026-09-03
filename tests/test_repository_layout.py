@@ -19,6 +19,7 @@ EXPECTED_TAF_CONTEXT_FILES = {
     "cli.py",
     "context_operations.py",
     "dossier.py",
+    "engine_session.py",
     "freshness.py",
     "git_snapshot.py",
     "level1_models.py",
