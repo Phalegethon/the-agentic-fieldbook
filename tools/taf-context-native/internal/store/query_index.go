@@ -308,11 +308,20 @@ func facetQueryKey(facet QueryFacet, value string) string {
 }
 
 func querySymbolRecord(record model.Record) bool {
-	return record.RecordKind != model.Heading && record.RecordKind != model.DocumentChunk && record.SourceType != "document"
+	return queryStructuralRecord(record) && record.RecordKind != model.Heading && record.RecordKind != model.DocumentChunk && record.SourceType != "document"
 }
 
 func queryDocumentRecord(record model.Record) bool {
-	return record.RecordKind == model.Heading || record.RecordKind == model.DocumentChunk || record.SourceType == "document"
+	return queryStructuralRecord(record) && (record.RecordKind == model.Heading || record.RecordKind == model.DocumentChunk || record.SourceType == "document")
+}
+
+// queryStructuralRecord reports whether a record describes a structure the
+// existing operations may return. A reference record describes a use of a name
+// rather than a structure, so it never joins search-symbols, search-docs, or
+// the repository map; it is reachable only through the relationship
+// operation.
+func queryStructuralRecord(record model.Record) bool {
+	return record.RecordKind != model.Reference
 }
 
 // canonicalRecords exposes the records the canonical path order sorts, in the
@@ -422,6 +431,7 @@ func buildCanonicalMapGroupsContext(ctx context.Context, records canonicalRecord
 		end := start + 1
 		path := records.At(pathOrdinals[start]).Path
 		best := pathOrdinals[start]
+		represented := queryStructuralRecord(records.At(best))
 		for end < len(pathOrdinals) && records.At(pathOrdinals[end]).Path == path {
 			visited++
 			if visited%contextCheckInterval == 0 {
@@ -432,10 +442,19 @@ func buildCanonicalMapGroupsContext(ctx context.Context, records canonicalRecord
 					return nil, false, err
 				}
 			}
-			if compareCanonicalMapRepresentative(records, pathOrdinals[end], best) < 0 {
-				best = pathOrdinals[end]
+			// A path represented only by references contributes no group: the
+			// map describes structure, and a reference is a use of a name.
+			if queryStructuralRecord(records.At(pathOrdinals[end])) {
+				if !represented || compareCanonicalMapRepresentative(records, pathOrdinals[end], best) < 0 {
+					best = pathOrdinals[end]
+					represented = true
+				}
 			}
 			end++
+		}
+		if !represented {
+			start = end
+			continue
 		}
 		if len(groups) == maximum {
 			partial = true

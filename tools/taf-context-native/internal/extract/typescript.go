@@ -23,6 +23,7 @@ const typescriptQuery = `
   (type_alias_declaration)
   (import_statement)
   (call_expression)
+  (new_expression)
 ] @item
 `
 

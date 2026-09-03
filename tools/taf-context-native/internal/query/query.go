@@ -352,6 +352,9 @@ func RepositoryMap(snapshot store.Snapshot, request wire.Request, limits policy.
 			continue
 		}
 		record := snapshot.Records[ordinal]
+		if !structuralRecord(record) {
+			continue
+		}
 		candidate := newMapCandidate(record)
 		current, exists := byPath[record.Path]
 		if !exists {

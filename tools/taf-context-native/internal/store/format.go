@@ -1843,8 +1843,9 @@ func validRecordContext(ctx context.Context, record model.Record, observed func(
 // reference record merges at least one occurrence and names the target it
 // refers to, only an import record may otherwise name a target (the module
 // specifier it binds), and no other kind carries either field. Import records
-// are still allowed to omit the target while the extractors do not populate
-// it yet.
+// may still omit the target: the frozen synthetic fixtures carry import
+// records without a module specifier, and the resolution rules treat an
+// import without one as unresolvable rather than invalid.
 func validReferenceFields(record model.Record) bool {
 	isReference := record.RecordKind == model.Reference
 	if record.ReferenceCount < 0 || isReference != (record.ReferenceCount >= 1) {

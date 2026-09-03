@@ -169,6 +169,9 @@ func evidenceTier(record model.Record) int {
 }
 
 func matchesOperation(record model.Record, operation wire.Operation) bool {
+	if !structuralRecord(record) {
+		return false
+	}
 	switch operation {
 	case wire.SearchSymbols:
 		return record.RecordKind != model.Heading && record.RecordKind != model.DocumentChunk && record.SourceType != "document"
@@ -177,6 +180,14 @@ func matchesOperation(record model.Record, operation wire.Operation) bool {
 	default:
 		return true
 	}
+}
+
+// structuralRecord reports whether a record describes a structure the existing
+// operations may return. A reference record describes a use of a name, is
+// never admitted to search-symbols, search-docs, or the repository map, and is
+// reachable only through the relationship operation.
+func structuralRecord(record model.Record) bool {
+	return record.RecordKind != model.Reference
 }
 
 func matchesFilters(record model.Record, filters wire.Filters) bool {

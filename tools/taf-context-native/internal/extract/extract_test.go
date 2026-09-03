@@ -585,3 +585,163 @@ func TestEveryExtractorParseFailureCarriesAParseFailureCode(t *testing.T) {
 		}
 	}
 }
+
+// referenceExpectation is the reference-record counterpart of
+// recordExpectation. Reference records carry two fields the positional
+// recordExpectation literals do not have, so they get their own shape rather
+// than rewriting every existing expectation in the package.
+type referenceExpectation struct {
+	qualifiedName string
+	target        string
+	count         int
+	startLine     int
+	endLine       int
+	language      string
+	method        string
+}
+
+func assertReference(t *testing.T, records []model.Record, want referenceExpectation) {
+	t.Helper()
+	for _, record := range records {
+		if record.RecordKind != model.Reference || record.QualifiedName != want.qualifiedName || record.TargetName != want.target {
+			continue
+		}
+		if record.ReferenceCount != want.count || record.StartLine != want.startLine || record.EndLine != want.endLine {
+			t.Fatalf("reference = %#v, want %#v", record, want)
+		}
+		if record.SourceType != "source" || record.Language != want.language || record.ExtractionMethod != want.method || record.EvidenceClass != model.Verified || record.Preview != "" {
+			t.Fatalf("reference = %#v, want %#v", record, want)
+		}
+		if !reflect.DeepEqual(record.SearchTerms, normalizedSearchTerms(want.target, nil)) {
+			t.Fatalf("reference search terms = %#v, want terms of %q", record.SearchTerms, want.target)
+		}
+		return
+	}
+	t.Fatalf("reference %#v missing from %#v", want, records)
+}
+
+func assertImportTarget(t *testing.T, records []model.Record, qualified, target string) {
+	t.Helper()
+	for _, record := range records {
+		if record.RecordKind == model.Import && record.QualifiedName == qualified {
+			if record.TargetName != target {
+				t.Fatalf("import %q target = %q, want %q", qualified, record.TargetName, target)
+			}
+			return
+		}
+	}
+	t.Fatalf("import %q missing from %#v", qualified, records)
+}
+
+func referencesOf(records []model.Record, qualified string) []model.Record {
+	var selected []model.Record
+	for _, record := range records {
+		if record.RecordKind == model.Reference && record.QualifiedName == qualified {
+			selected = append(selected, record)
+		}
+	}
+	return selected
+}
+
+func TestGoExtractorEmitsCallReferencesAndImportTargets(t *testing.T) {
+	file := stableFile("cmd/tool/main.go", `package tool
+import (
+	"fmt"
+	yaml "gopkg.in/yaml.v3"
+)
+var value = compute()
+func compute() int { return 1 }
+func Main() {
+	helper()
+	fmt.Println(value)
+	helper()
+	yaml.Marshal(value)
+}
+func helper() {}
+`)
+	records, report := NewRegistry().Extract(file)
+	if report.ParseFailures != 0 || len(report.WarningCodes) != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	assertImportTarget(t, records, "fmt", "fmt")
+	assertImportTarget(t, records, "yaml", "gopkg.in/yaml.v3")
+	assertReference(t, records, referenceExpectation{"tool", "compute", 1, 6, 6, "go", goParserVersion})
+	assertReference(t, records, referenceExpectation{"tool.Main", "helper", 2, 9, 9, "go", goParserVersion})
+	assertReference(t, records, referenceExpectation{"tool.Main", "fmt.Println", 1, 10, 10, "go", goParserVersion})
+	assertReference(t, records, referenceExpectation{"tool.Main", "yaml.Marshal", 1, 12, 12, "go", goParserVersion})
+	if got := len(referencesOf(records, "tool.Main")); got != 3 {
+		t.Fatalf("references in tool.Main = %d, want 3: %#v", got, referencesOf(records, "tool.Main"))
+	}
+}
+
+func TestGoExtractorSkipsComputedCallTargets(t *testing.T) {
+	file := stableFile("internal/api/dispatch.go", `package api
+func Dispatch(table map[string]func(), name string) {
+	table[name]()
+	factory()()
+}
+func factory() func() { return nil }
+`)
+	records, report := NewRegistry().Extract(file)
+	if report.ParseFailures != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	if !contains(report.WarningCodes, "reference-skipped") {
+		t.Fatalf("report = %#v, want reference-skipped", report)
+	}
+	assertReference(t, records, referenceExpectation{"api.Dispatch", "factory", 1, 4, 4, "go", goParserVersion})
+	if got := len(referencesOf(records, "api.Dispatch")); got != 1 {
+		t.Fatalf("references in api.Dispatch = %#v, want only factory", referencesOf(records, "api.Dispatch"))
+	}
+}
+
+func TestGoExtractorCapsReferencesPerDefinition(t *testing.T) {
+	var source strings.Builder
+	source.WriteString("package wide\nfunc Wide() {\n")
+	for index := 0; index < maximumReferencesPerDefinition+6; index++ {
+		fmt.Fprintf(&source, "\ttarget%d()\n", index)
+	}
+	source.WriteString("}\n")
+	records, report := NewRegistry().Extract(stableFile("internal/wide/wide.go", source.String()))
+	if !contains(report.WarningCodes, "reference-limit") {
+		t.Fatalf("report = %#v, want reference-limit", report)
+	}
+	if got := len(referencesOf(records, "wide.Wide")); got != maximumReferencesPerDefinition {
+		t.Fatalf("references in wide.Wide = %d, want %d", got, maximumReferencesPerDefinition)
+	}
+}
+
+func TestFinalizeRecordsDropsInconsistentReferenceFields(t *testing.T) {
+	file := stableFile("pkg/consistency.go", "package pkg\n")
+	extractor := goExtractor{extensions: []string{".go"}}
+	for name, record := range map[string]model.Record{
+		"reference without target": {StartLine: 1, EndLine: 1, RecordKind: model.Reference, SourceType: "source", QualifiedName: "pkg", EvidenceClass: model.Verified, ReferenceCount: 1},
+		"reference without count":  {StartLine: 1, EndLine: 1, RecordKind: model.Reference, SourceType: "source", QualifiedName: "pkg", EvidenceClass: model.Verified, TargetName: "helper"},
+		"definition with target":   {StartLine: 1, EndLine: 1, RecordKind: model.Definition, SourceType: "source", QualifiedName: "pkg.Value", EvidenceClass: model.Verified, TargetName: "helper"},
+		"definition with count":    {StartLine: 1, EndLine: 1, RecordKind: model.Definition, SourceType: "source", QualifiedName: "pkg.Value", EvidenceClass: model.Verified, ReferenceCount: 2},
+		"target too long":          {StartLine: 1, EndLine: 1, RecordKind: model.Reference, SourceType: "source", QualifiedName: "pkg", EvidenceClass: model.Verified, TargetName: strings.Repeat("x", 513), ReferenceCount: 1},
+		"target with control byte": {StartLine: 1, EndLine: 1, RecordKind: model.Reference, SourceType: "source", QualifiedName: "pkg", EvidenceClass: model.Verified, TargetName: "a\nb", ReferenceCount: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			output, invalid := finalizeRecords(file, extractor, []model.Record{record})
+			if !invalid || len(output) != 0 {
+				t.Fatalf("output = %#v, invalid = %v, want dropped", output, invalid)
+			}
+		})
+	}
+}
+
+func TestRecordIdentityDistinguishesReferenceTargets(t *testing.T) {
+	file := stableFile("pkg/targets.go", "package pkg\n")
+	extractor := goExtractor{extensions: []string{".go"}}
+	first := model.Record{StartLine: 1, EndLine: 1, RecordKind: model.Reference, SourceType: "source", QualifiedName: "pkg", EvidenceClass: model.Verified, TargetName: "alpha", ReferenceCount: 1}
+	second := first
+	second.TargetName = "beta"
+	output, invalid := finalizeRecords(file, extractor, []model.Record{first, second})
+	if invalid || len(output) != 2 {
+		t.Fatalf("output = %#v, invalid = %v", output, invalid)
+	}
+	if output[0].Identity == output[1].Identity {
+		t.Fatalf("two targets share identity %q", output[0].Identity)
+	}
+}

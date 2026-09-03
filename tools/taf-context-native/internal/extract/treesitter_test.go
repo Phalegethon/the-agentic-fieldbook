@@ -965,3 +965,115 @@ func findRecord(t *testing.T, records []model.Record, qualified string) model.Re
 	t.Fatalf("record %q missing from %#v", qualified, records)
 	return model.Record{}
 }
+
+func TestPythonExtractorMergesCallReferencesAndImportTargets(t *testing.T) {
+	source := "import os.path as osp\n" +
+		"from helpers import load\n" +
+		"\n" +
+		"def run():\n" +
+		"    data = load(\"x\")\n" +
+		"    data = load(\"y\")\n" +
+		"    osp.join(\"a\", \"b\")\n" +
+		"    return helper_local()\n" +
+		"\n" +
+		"def helper_local():\n" +
+		"    return 1\n" +
+		"\n" +
+		"value = load(\"z\")\n"
+	records, report := NewRegistry().Extract(stableFile("pkg/mod.py", source))
+	if report.ParseFailures != 0 || len(report.WarningCodes) != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	assertImportTarget(t, records, "osp", "os.path")
+	assertImportTarget(t, records, "load", "helpers")
+	for _, want := range []referenceExpectation{
+		{"mod.run", "load", 2, 5, 5, "python", pythonParserVersion},
+		{"mod.run", "osp.join", 1, 7, 7, "python", pythonParserVersion},
+		{"mod.run", "helper_local", 1, 8, 8, "python", pythonParserVersion},
+		{"mod", "load", 1, 13, 13, "python", pythonParserVersion},
+	} {
+		assertReference(t, records, want)
+	}
+	if got := len(referencesOf(records, "mod.run")); got != 3 {
+		t.Fatalf("references in mod.run = %#v", referencesOf(records, "mod.run"))
+	}
+}
+
+func TestPythonExtractorCapsReferencesPerDefinition(t *testing.T) {
+	var source strings.Builder
+	source.WriteString("def wide():\n")
+	for index := 0; index < maximumReferencesPerDefinition+6; index++ {
+		fmt.Fprintf(&source, "    target%d()\n", index)
+	}
+	records, report := NewRegistry().Extract(stableFile("pkg/wide_calls.py", source.String()))
+	if !contains(report.WarningCodes, "reference-limit") {
+		t.Fatalf("report = %#v, want reference-limit", report)
+	}
+	if got := len(referencesOf(records, "wide_calls.wide")); got != maximumReferencesPerDefinition {
+		t.Fatalf("references in wide_calls.wide = %d, want %d", got, maximumReferencesPerDefinition)
+	}
+}
+
+func TestJavaScriptExtractorEmitsConstructorAndMemberReferences(t *testing.T) {
+	source := "import { Widget } from \"./widget\";\n" +
+		"export class Panel {\n" +
+		"  render(key) {\n" +
+		"    const widget = new Widget();\n" +
+		"    this.emit(\"x\");\n" +
+		"    obj[key]();\n" +
+		"    return widget;\n" +
+		"  }\n" +
+		"}\n"
+	records, report := NewRegistry().Extract(stableFile("web/panel.js", source))
+	if report.ParseFailures != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	if !contains(report.WarningCodes, "reference-skipped") {
+		t.Fatalf("report = %#v, want reference-skipped for the computed call", report)
+	}
+	assertImportTarget(t, records, "Widget", "./widget")
+	assertReference(t, records, referenceExpectation{"panel.Panel.render", "Widget", 1, 4, 4, "javascript", javascriptParserVersion})
+	assertReference(t, records, referenceExpectation{"panel.Panel.render", "this.emit", 1, 5, 5, "javascript", javascriptParserVersion})
+	if got := len(referencesOf(records, "panel.Panel.render")); got != 2 {
+		t.Fatalf("references in panel.Panel.render = %#v", referencesOf(records, "panel.Panel.render"))
+	}
+}
+
+func TestTypeScriptExtractorEmitsReferencesAndImportTargets(t *testing.T) {
+	source := "import { create } from \"zustand\";\n" +
+		"export const store = create();\n" +
+		"export function run(): void {\n" +
+		"  store.reset();\n" +
+		"}\n"
+	records, report := NewRegistry().Extract(stableFile("src/store.ts", source))
+	if report.ParseFailures != 0 || len(report.WarningCodes) != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	assertImportTarget(t, records, "create", "zustand")
+	assertReference(t, records, referenceExpectation{"store", "create", 1, 2, 2, "typescript", typescriptParserVersion})
+	assertReference(t, records, referenceExpectation{"store.run", "store.reset", 1, 4, 4, "typescript", typescriptParserVersion})
+}
+
+func TestRustExtractorEmitsScopedCallMacroAndUseTargets(t *testing.T) {
+	source := "use crate::config::Settings as Config;\n" +
+		"use crate::models::{User, Role as UserRole};\n" +
+		"fn run() {\n" +
+		"    foo::bar();\n" +
+		"    println!(\"x\");\n" +
+		"    helper();\n" +
+		"}\n"
+	records, report := NewRegistry().Extract(stableFile("src/service.rs", source))
+	if report.ParseFailures != 0 || len(report.WarningCodes) != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	assertImportTarget(t, records, "Config", "crate.config.Settings")
+	assertImportTarget(t, records, "crate::models::User", "crate.models.User")
+	assertImportTarget(t, records, "UserRole", "crate.models.Role")
+	for _, want := range []referenceExpectation{
+		{"service.run", "foo.bar", 1, 4, 4, "rust", rustParserVersion},
+		{"service.run", "println", 1, 5, 5, "rust", rustParserVersion},
+		{"service.run", "helper", 1, 6, 6, "rust", rustParserVersion},
+	} {
+		assertReference(t, records, want)
+	}
+}

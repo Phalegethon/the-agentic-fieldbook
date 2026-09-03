@@ -21,6 +21,7 @@ const javascriptQuery = `
   (variable_declarator)
   (import_statement)
   (call_expression)
+  (new_expression)
 ] @item
 `
 
@@ -103,17 +104,38 @@ func handleECMAScriptNode(analysis *treeSitterAnalysis, node *sitter.Node, types
 		analysis.appendNodeRecord(node, analysis.qualified(append(prefix, name)...), model.Definition, model.Verified)
 	case "import_statement":
 		for _, binding := range ecmaImportBindings(analysis, node) {
-			analysis.appendNodeRecord(node, binding, model.Import, model.Verified)
+			analysis.appendImportRecord(node, binding.name, binding.target)
 		}
-	case "call_expression":
-		if ecmaDynamicLookup(analysis, node) {
+	case "call_expression", "new_expression":
+		if node.Kind() == "call_expression" && ecmaDynamicLookup(analysis, node) {
 			analysis.addWarning(warningPrefix + "-dynamic-lookup")
 		}
+		enclosing, ok := analysis.enclosingName(node, ecmaScope(analysis))
+		if !ok {
+			return
+		}
+		callee := node.ChildByFieldName("function")
+		if callee == nil {
+			callee = node.ChildByFieldName("constructor")
+		}
+		target, _ := analysis.dottedTarget(callee, ecmaTargetRules, 0)
+		analysis.appendReference(node, enclosing, target)
 	}
 }
 
+var ecmaTargetRules = dottedTargetRules{
+	leaf:       []string{"identifier", "property_identifier", "private_property_identifier", "this", "super"},
+	containers: []dottedContainer{{kind: "member_expression", object: "object", property: "property"}},
+}
+
 func ecmaLexicalPrefix(analysis *treeSitterAnalysis, node *sitter.Node) ([]string, bool) {
-	return analysis.lexicalPrefix(node, func(parent *sitter.Node) (string, bool) {
+	return analysis.lexicalPrefix(node, ecmaScope(analysis))
+}
+
+// ecmaScope names the definitions that lexically contain a node: classes,
+// functions, methods, and arrow functions bound to a name.
+func ecmaScope(analysis *treeSitterAnalysis) func(*sitter.Node) (string, bool) {
+	return func(parent *sitter.Node) (string, bool) {
 		switch parent.Kind() {
 		case "class_declaration", "function_declaration", "method_definition":
 			return analysis.stableName(parent.ChildByFieldName("name"), "identifier", "type_identifier", "property_identifier", "private_property_identifier")
@@ -124,7 +146,7 @@ func ecmaLexicalPrefix(analysis *treeSitterAnalysis, node *sitter.Node) ([]strin
 			}
 		}
 		return "", false
-	})
+	}
 }
 
 // ecmaModuleScopeDeclarator reports whether a variable_declarator belongs to a
@@ -147,21 +169,21 @@ func ecmaModuleScopeDeclarator(node *sitter.Node) bool {
 	return container != nil && container.Kind() == "program"
 }
 
-func ecmaImportBindings(analysis *treeSitterAnalysis, node *sitter.Node) []string {
+func ecmaImportBindings(analysis *treeSitterAnalysis, node *sitter.Node) []importBinding {
+	specifier := ""
+	if text, ok := analysis.nodeText(node.ChildByFieldName("source")); ok {
+		if unquoted, unquotedOK := unquotedString(text); unquotedOK {
+			specifier = unquoted
+		}
+	}
 	clause := analysis.childByKind(node, "import_clause")
 	if clause == nil {
-		source := node.ChildByFieldName("source")
-		text, ok := analysis.nodeText(source)
-		if !ok {
+		if specifier == "" {
 			return nil
 		}
-		name, ok := unquotedString(text)
-		if !ok || name == "" {
-			return nil
-		}
-		return []string{name}
+		return []importBinding{{name: specifier, target: specifier}}
 	}
-	bindings := make([]string, 0, 4)
+	bindings := make([]importBinding, 0, 4)
 	childCount := analysis.boundedNamedChildCount(clause, maximumTreeSitterImportNodes, "tree-sitter-import-limit")
 	for index := uint(0); index < childCount; index++ {
 		child := clause.NamedChild(index)
@@ -171,11 +193,11 @@ func ecmaImportBindings(analysis *treeSitterAnalysis, node *sitter.Node) []strin
 		switch child.Kind() {
 		case "identifier":
 			if name, ok := analysis.stableName(child, "identifier"); ok {
-				bindings = append(bindings, name)
+				bindings = append(bindings, importBinding{name: name, target: specifier})
 			}
 		case "namespace_import":
 			if name, ok := analysis.stableName(child.NamedChild(0), "identifier"); ok {
-				bindings = append(bindings, name)
+				bindings = append(bindings, importBinding{name: name, target: specifier})
 			}
 		case "named_imports":
 			itemCount := analysis.boundedNamedChildCount(child, maximumTreeSitterImportNodes, "tree-sitter-import-limit")
@@ -189,7 +211,7 @@ func ecmaImportBindings(analysis *treeSitterAnalysis, node *sitter.Node) []strin
 					binding = item.ChildByFieldName("name")
 				}
 				if name, ok := analysis.stableName(binding, "identifier", "string"); ok {
-					bindings = append(bindings, strings.Trim(name, "\"'"))
+					bindings = append(bindings, importBinding{name: strings.Trim(name, "\"'"), target: specifier})
 				}
 			}
 		}

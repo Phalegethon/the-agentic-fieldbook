@@ -18,6 +18,13 @@ const (
 	maximumTreeSitterRecords     = 4096
 	maximumTreeSitterImportNodes = 4096
 	treeSitterQueryMatchLimit    = 4096
+	// maximumReferencesPerDefinition bounds how many distinct targets one
+	// enclosing definition contributes, so a generated or very long function
+	// cannot dominate the reference section of an index.
+	maximumReferencesPerDefinition = 64
+	maximumReferenceTargetBytes    = 256
+	maximumDottedTargetDepth       = 32
+	maximumTargetSpecifierBytes    = 512
 )
 
 var (
@@ -42,6 +49,15 @@ type treeSitterAnalysis struct {
 	warnings      []string
 	parseFailures int
 	stopped       bool
+	// references maps "enclosing\x00target" to its index in referenceOrder so
+	// repeated uses of one target merge into a single record, and
+	// referenceOrder keeps the first-occurrence order the records are flushed
+	// in. referencePerDef counts distinct targets per enclosing definition.
+	references        map[string]int
+	referenceOrder    []model.Record
+	referencePerDef   map[string]int
+	referenceLimited  bool
+	skippedReferences int
 }
 
 func extractTreeSitter(ctx context.Context, file boundary.StableFile, grammar treeSitterGrammar) ([]model.Record, Report) {
@@ -137,6 +153,7 @@ func extractTreeSitter(ctx context.Context, file boundary.StableFile, grammar tr
 	if cursor.DidExceedMatchLimit() {
 		analysis.limit("tree-sitter-match-limit")
 	}
+	analysis.flushReferences()
 	if ctx.Err() != nil {
 		return nil, treeSitterFailure(grammar.parserVersion, "tree-sitter-cancelled")
 	}
@@ -295,6 +312,135 @@ func (analysis *treeSitterAnalysis) appendNodeRecord(node *sitter.Node, qualifie
 		QualifiedName: qualified,
 		EvidenceClass: evidence,
 	})
+}
+
+// appendImportRecord records one bound local name of an import statement
+// together with the module specifier it was imported from. An unusable
+// specifier only leaves the target empty; the binding itself stays indexed.
+func (analysis *treeSitterAnalysis) appendImportRecord(node *sitter.Node, binding, target string) {
+	if target != "" && (len(target) > maximumTargetSpecifierBytes || strings.ContainsAny(target, "\x00\n\r")) {
+		target = ""
+	}
+	before := len(analysis.records)
+	analysis.appendNodeRecord(node, binding, model.Import, model.Verified)
+	if len(analysis.records) > before {
+		analysis.records[len(analysis.records)-1].TargetName = target
+	}
+}
+
+// appendReference merges one use of target inside the enclosing definition
+// into a file-local reference record. The first occurrence fixes the line
+// range; every later occurrence only raises the count. Targets that are not
+// stable written names are counted as skipped instead of recorded.
+func (analysis *treeSitterAnalysis) appendReference(node *sitter.Node, enclosing, target string) {
+	if analysis.stopped || enclosing == "" {
+		return
+	}
+	if target == "" || len(target) > maximumReferenceTargetBytes || strings.ContainsAny(target, "\x00\n\r") {
+		analysis.skippedReferences++
+		return
+	}
+	key := enclosing + "\x00" + target
+	if index, ok := analysis.references[key]; ok {
+		analysis.referenceOrder[index].ReferenceCount++
+		return
+	}
+	if analysis.referencePerDef[enclosing] >= maximumReferencesPerDefinition {
+		if !analysis.referenceLimited {
+			analysis.referenceLimited = true
+			analysis.addWarning("reference-limit")
+		}
+		return
+	}
+	start, end, ok := analysis.nodeLines(node)
+	if !ok {
+		return
+	}
+	if analysis.references == nil {
+		analysis.references = make(map[string]int)
+		analysis.referencePerDef = make(map[string]int)
+	}
+	analysis.references[key] = len(analysis.referenceOrder)
+	analysis.referencePerDef[enclosing]++
+	analysis.referenceOrder = append(analysis.referenceOrder, model.Record{
+		StartLine:      start,
+		EndLine:        end,
+		RecordKind:     model.Reference,
+		SourceType:     "source",
+		QualifiedName:  enclosing,
+		EvidenceClass:  model.Verified,
+		TargetName:     target,
+		ReferenceCount: 1,
+	})
+}
+
+// flushReferences appends the merged reference records after every structural
+// record of the file, so the per-file record limit drops references before it
+// drops a definition.
+func (analysis *treeSitterAnalysis) flushReferences() {
+	for index := range analysis.referenceOrder {
+		if len(analysis.records) >= maximumTreeSitterRecords {
+			analysis.limit("tree-sitter-record-limit")
+			break
+		}
+		analysis.records = append(analysis.records, analysis.referenceOrder[index])
+	}
+	if analysis.skippedReferences > 0 {
+		analysis.addWarning("reference-skipped")
+	}
+}
+
+// enclosingName is the qualified name of the definition that lexically
+// contains node, or the module's own qualified name at file scope. It is the
+// same name the enclosing definition record carries.
+func (analysis *treeSitterAnalysis) enclosingName(node *sitter.Node, scope func(*sitter.Node) (string, bool)) (string, bool) {
+	prefix, ok := analysis.lexicalPrefix(node, scope)
+	if !ok {
+		return "", false
+	}
+	return analysis.qualified(prefix...), true
+}
+
+// dottedTarget renders a call target as a dotted name. leaf names the node
+// kinds that are one component on their own; dotted names the kinds that join
+// an object field and a property field with a dot. Anything else - a computed
+// member, a call returning a callable, a generated name - has no stable
+// written name and is reported as unusable.
+type dottedTargetRules struct {
+	leaf       []string
+	containers []dottedContainer
+}
+
+// dottedContainer is one grammar node that joins a qualifying expression with
+// the name it selects, named by their field names in that grammar.
+type dottedContainer struct {
+	kind     string
+	object   string
+	property string
+}
+
+func (analysis *treeSitterAnalysis) dottedTarget(node *sitter.Node, rules dottedTargetRules, depth int) (string, bool) {
+	if node == nil || depth > maximumDottedTargetDepth {
+		return "", false
+	}
+	if name, ok := analysis.stableName(node, rules.leaf...); ok {
+		return name, true
+	}
+	for _, container := range rules.containers {
+		if node.Kind() != container.kind {
+			continue
+		}
+		object, objectOK := analysis.dottedTarget(node.ChildByFieldName(container.object), rules, depth+1)
+		if !objectOK {
+			return "", false
+		}
+		property, propertyOK := analysis.stableName(node.ChildByFieldName(container.property), rules.leaf...)
+		if !propertyOK {
+			return "", false
+		}
+		return object + "." + property, true
+	}
+	return "", false
 }
 
 func (analysis *treeSitterAnalysis) qualified(parts ...string) string {

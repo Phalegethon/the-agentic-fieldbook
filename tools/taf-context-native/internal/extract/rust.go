@@ -24,6 +24,7 @@ const rustQuery = `
   (use_declaration)
   (macro_definition)
   (macro_invocation)
+  (call_expression)
 ] @item
 `
 
@@ -77,7 +78,7 @@ func handleRustNode(analysis *treeSitterAnalysis, node *sitter.Node) {
 	case "use_declaration":
 		argument := node.ChildByFieldName("argument")
 		for _, binding := range rustUseBindings(analysis, argument) {
-			analysis.appendNodeRecord(node, binding, model.Import, model.Verified)
+			analysis.appendImportRecord(node, binding.name, binding.target)
 		}
 	case "macro_invocation":
 		macro, ok := analysis.nodeText(node.ChildByFieldName("macro"))
@@ -90,11 +91,41 @@ func handleRustNode(analysis *treeSitterAnalysis, node *sitter.Node) {
 			return
 		}
 		analysis.appendNodeRecord(node, analysis.qualified(append(prefix, macro+"!")...), model.Definition, model.Inferred)
+		// The expanded macro is invisible here, so the invocation is recorded
+		// as a use of the macro name itself.
+		analysis.appendReference(node, analysis.qualified(prefix...), dottedRustPath(macro))
+	case "call_expression":
+		enclosing, ok := analysis.enclosingName(node, rustScope(analysis))
+		if !ok {
+			return
+		}
+		target, _ := analysis.dottedTarget(node.ChildByFieldName("function"), rustTargetRules, 0)
+		analysis.appendReference(node, enclosing, target)
 	}
 }
 
+var rustTargetRules = dottedTargetRules{
+	leaf: []string{"identifier", "field_identifier", "type_identifier", "crate", "self", "super"},
+	containers: []dottedContainer{
+		{kind: "scoped_identifier", object: "path", property: "name"},
+		{kind: "field_expression", object: "value", property: "field"},
+	},
+}
+
+// dottedRustPath renders a Rust path in the dotted form every language uses
+// for reference and import targets.
+func dottedRustPath(value string) string {
+	return strings.ReplaceAll(value, "::", ".")
+}
+
 func rustLexicalPrefix(analysis *treeSitterAnalysis, node *sitter.Node) ([]string, bool) {
-	return analysis.lexicalPrefix(node, func(parent *sitter.Node) (string, bool) {
+	return analysis.lexicalPrefix(node, rustScope(analysis))
+}
+
+// rustScope names the items that lexically contain a node: modules, traits,
+// functions, and the type an impl block applies to.
+func rustScope(analysis *treeSitterAnalysis) func(*sitter.Node) (string, bool) {
+	return func(parent *sitter.Node) (string, bool) {
 		switch parent.Kind() {
 		case "mod_item", "trait_item", "function_item", "function_signature_item":
 			return analysis.stableName(parent.ChildByFieldName("name"), "identifier", "type_identifier")
@@ -107,7 +138,7 @@ func rustLexicalPrefix(analysis *treeSitterAnalysis, node *sitter.Node) ([]strin
 			return name, true
 		}
 		return "", false
-	})
+	}
 }
 
 type rustUseWork struct {
@@ -116,12 +147,12 @@ type rustUseWork struct {
 	depth  int
 }
 
-func rustUseBindings(analysis *treeSitterAnalysis, root *sitter.Node) []string {
+func rustUseBindings(analysis *treeSitterAnalysis, root *sitter.Node) []importBinding {
 	if root == nil {
 		return nil
 	}
 	work := []rustUseWork{{node: root, depth: 1}}
-	bindings := make([]string, 0, 4)
+	bindings := make([]importBinding, 0, 4)
 	visits := 0
 	for len(work) > 0 {
 		last := len(work) - 1
@@ -139,7 +170,11 @@ func rustUseBindings(analysis *treeSitterAnalysis, root *sitter.Node) []string {
 		switch item.node.Kind() {
 		case "use_as_clause":
 			if alias, ok := analysis.stableName(item.node.ChildByFieldName("alias"), "identifier"); ok {
-				bindings = append(bindings, alias)
+				target := ""
+				if pathText, pathOK := analysis.nodeText(item.node.ChildByFieldName("path")); pathOK {
+					target = dottedRustPath(joinRustPath(item.prefix, pathText))
+				}
+				bindings = append(bindings, importBinding{name: alias, target: target})
 			}
 		case "scoped_use_list":
 			pathText, ok := analysis.nodeText(item.node.ChildByFieldName("path"))
@@ -162,7 +197,8 @@ func rustUseBindings(analysis *treeSitterAnalysis, root *sitter.Node) []string {
 		case "scoped_identifier", "identifier", "crate", "self", "super", "use_wildcard":
 			name, ok := analysis.nodeText(item.node)
 			if ok && name != "" && !strings.ContainsAny(name, "\x00\n\r") {
-				bindings = append(bindings, joinRustPath(item.prefix, name))
+				full := joinRustPath(item.prefix, name)
+				bindings = append(bindings, importBinding{name: full, target: dottedRustPath(full)})
 			}
 		case "metavariable":
 			analysis.addWarning("rust-generated-name")

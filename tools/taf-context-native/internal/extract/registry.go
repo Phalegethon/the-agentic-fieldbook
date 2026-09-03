@@ -70,6 +70,7 @@ var extractorWarningCompleteness = map[string]bool{
 	"json-depth-limit": true, "json-collection-limit": true, "json-record-limit": true, "toml-record-limit": true, "toml-parse-failure": true,
 	"javascript-generated-name": false, "javascript-dynamic-lookup": false, "typescript-generated-name": false, "typescript-dynamic-lookup": false,
 	"python-generated-name": false, "python-dynamic-lookup": false, "rust-generated-name": false,
+	"reference-limit": true, "reference-skipped": false,
 	"json-parse-failure": true, "unsupported-language": true,
 	"python-parse-failure": true, "python-query-failure": true, "python-syntax-error": true,
 	"javascript-parse-failure": true, "javascript-query-failure": true, "javascript-syntax-error": true,
@@ -299,7 +300,17 @@ func finalizeRecords(file boundary.StableFile, extractor Extractor, input []mode
 			invalid = true
 			continue
 		}
-		record.SearchTerms = normalizedSearchTerms(record.QualifiedName, record.SearchTerms)
+		if !consistentReferenceFields(record) {
+			invalid = true
+			continue
+		}
+		if record.RecordKind == model.Reference {
+			// A reference is found by the name it refers to, not by the name of
+			// the definition it sits in.
+			record.SearchTerms = normalizedSearchTerms(record.TargetName, nil)
+		} else {
+			record.SearchTerms = normalizedSearchTerms(record.QualifiedName, record.SearchTerms)
+		}
 		record.Preview = previewFor(record, file.Bytes, lineStarts)
 		output = append(output, record)
 	}
@@ -316,6 +327,9 @@ func finalizeRecords(file boundary.StableFile, extractor Extractor, input []mode
 		}
 		if left.QualifiedName != right.QualifiedName {
 			return left.QualifiedName < right.QualifiedName
+		}
+		if left.TargetName != right.TargetName {
+			return left.TargetName < right.TargetName
 		}
 		if left.SourceType != right.SourceType {
 			return left.SourceType < right.SourceType
@@ -349,9 +363,30 @@ func finalizeRecords(file boundary.StableFile, extractor Extractor, input []mode
 		if left.QualifiedName != right.QualifiedName {
 			return left.QualifiedName < right.QualifiedName
 		}
+		if left.TargetName != right.TargetName {
+			return left.TargetName < right.TargetName
+		}
 		return left.Identity < right.Identity
 	})
 	return output, invalid
+}
+
+// consistentReferenceFields mirrors the store's format-4 rule: a reference
+// record merges at least one occurrence and names the target it refers to,
+// only an import record may otherwise name a target (the module specifier it
+// binds), and no other kind carries either field.
+func consistentReferenceFields(record model.Record) bool {
+	if len(record.TargetName) > 512 || !utf8.ValidString(record.TargetName) || strings.ContainsAny(record.TargetName, "\x00\n\r") {
+		return false
+	}
+	isReference := record.RecordKind == model.Reference
+	if record.ReferenceCount < 0 || isReference != (record.ReferenceCount >= 1) {
+		return false
+	}
+	if isReference {
+		return record.TargetName != ""
+	}
+	return record.TargetName == "" || record.RecordKind == model.Import
 }
 
 func recordIdentity(record model.Record, occurrence int) string {
@@ -367,6 +402,11 @@ func recordIdentity(record model.Record, occurrence int) string {
 	writeIdentityPart(hash, record.ExtractionMethod)
 	writeIdentityPart(hash, string(record.EvidenceClass))
 	writeIdentityPart(hash, record.SourceDigest)
+	// Only a record that actually names a target contributes the part, so the
+	// identity of every record without one is exactly what it was in format 3.
+	if record.TargetName != "" {
+		writeIdentityPart(hash, record.TargetName)
+	}
 	writeIdentityPart(hash, fmt.Sprintf("%d", occurrence))
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
 }

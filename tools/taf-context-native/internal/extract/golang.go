@@ -56,7 +56,11 @@ func (extractor goExtractor) Extract(file boundary.StableFile) ([]model.Record, 
 			continue
 		}
 		start, end = astLines(fileSet, imported.Pos(), imported.End())
-		if !appendRecord(structuralRecord(name, model.Import, "source", start, end)) {
+		record := structuralRecord(name, model.Import, "source", start, end)
+		if specifier, unquoteErr := strconv.Unquote(imported.Path.Value); unquoteErr == nil {
+			record.TargetName = specifier
+		}
+		if !appendRecord(record) {
 			break
 		}
 	}
@@ -96,7 +100,119 @@ declarations:
 			}
 		}
 	}
+	warnings = append(warnings, goCollectReferences(fileSet, parsed, packageName, appendRecord)...)
 	return records, Report{ParserVersion: goParserVersion, WarningCodes: warnings}
+}
+
+// goCollectReferences records where each declaration uses another name. Calls
+// inside a function body belong to that function; calls in a package-level
+// variable initializer belong to the file's package record, which is the
+// qualified name that record carries. Targets are merged per (enclosing
+// definition, target) in first-occurrence order.
+func goCollectReferences(fileSet *token.FileSet, parsed *ast.File, packageName string, appendRecord func(model.Record) bool) []string {
+	references := make(map[string]int)
+	perDefinition := make(map[string]int)
+	var order []model.Record
+	limited, skipped := false, 0
+	var warnings []string
+	appendReference := func(enclosing string, call *ast.CallExpr) {
+		target, ok := goCallTarget(call.Fun, 0)
+		if !ok {
+			skipped++
+			return
+		}
+		key := enclosing + "\x00" + target
+		if index, merged := references[key]; merged {
+			order[index].ReferenceCount++
+			return
+		}
+		if perDefinition[enclosing] >= maximumReferencesPerDefinition {
+			if !limited {
+				limited = true
+				warnings = append(warnings, "reference-limit")
+			}
+			return
+		}
+		start, end := astLines(fileSet, call.Pos(), call.End())
+		record := structuralRecord(enclosing, model.Reference, "source", start, end)
+		record.TargetName, record.ReferenceCount = target, 1
+		references[key] = len(order)
+		perDefinition[enclosing]++
+		order = append(order, record)
+	}
+	collect := func(enclosing string, node ast.Node) {
+		if node == nil || enclosing == "" {
+			return
+		}
+		ast.Inspect(node, func(visited ast.Node) bool {
+			if call, ok := visited.(*ast.CallExpr); ok {
+				appendReference(enclosing, call)
+			}
+			return true
+		})
+	}
+	for _, declaration := range parsed.Decls {
+		switch node := declaration.(type) {
+		case *ast.GenDecl:
+			if node.Tok != token.VAR && node.Tok != token.CONST {
+				continue
+			}
+			for _, item := range node.Specs {
+				value, ok := item.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for _, expression := range value.Values {
+					collect(packageName, expression)
+				}
+			}
+		case *ast.FuncDecl:
+			collect(goDeclarationName(packageName, node), node.Body)
+		}
+	}
+	for _, record := range order {
+		if !appendRecord(record) {
+			break
+		}
+	}
+	if skipped > 0 {
+		warnings = append(warnings, "reference-skipped")
+	}
+	return warnings
+}
+
+// goDeclarationName is the qualified name the declaration's own definition
+// record carries, so a reference names its enclosing definition exactly.
+func goDeclarationName(packageName string, node *ast.FuncDecl) string {
+	if node.Recv != nil && len(node.Recv.List) != 0 {
+		receiver := goReceiverName(node.Recv.List[0].Type)
+		if receiver == "" {
+			return ""
+		}
+		return packageName + "." + receiver + "." + node.Name.Name
+	}
+	return packageName + "." + node.Name.Name
+}
+
+// goCallTarget renders a call target as the dotted name it is written with.
+// A computed callee - an index expression, a call returning a function, a
+// literal - has no stable written name.
+func goCallTarget(expression ast.Expr, depth int) (string, bool) {
+	if depth > maximumDottedTargetDepth {
+		return "", false
+	}
+	switch node := expression.(type) {
+	case *ast.Ident:
+		return node.Name, true
+	case *ast.SelectorExpr:
+		qualifier, ok := goCallTarget(node.X, depth+1)
+		if !ok || node.Sel == nil {
+			return "", false
+		}
+		return qualifier + "." + node.Sel.Name, true
+	default:
+		return "", false
+	}
 }
 
 func goMainEntryPointSignature(function *ast.FuncType) bool {

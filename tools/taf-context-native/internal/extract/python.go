@@ -55,12 +55,7 @@ func handlePythonNode(analysis *treeSitterAnalysis, node *sitter.Node) {
 			analysis.addWarning("python-generated-name")
 			return
 		}
-		prefix, ok := analysis.lexicalPrefix(node, func(parent *sitter.Node) (string, bool) {
-			if parent.Kind() != "class_definition" && parent.Kind() != "function_definition" {
-				return "", false
-			}
-			return analysis.stableName(parent.ChildByFieldName("name"), "identifier")
-		})
+		prefix, ok := analysis.lexicalPrefix(node, pythonScope(analysis))
 		if !ok {
 			return
 		}
@@ -74,18 +69,57 @@ func handlePythonNode(analysis *treeSitterAnalysis, node *sitter.Node) {
 		analysis.appendNodeRecord(rangeNode, analysis.qualified(append(prefix, name)...), model.Definition, model.Verified)
 	case "import_statement", "import_from_statement":
 		for _, binding := range pythonImportBindings(analysis, node) {
-			analysis.appendNodeRecord(node, binding, model.Import, model.Verified)
+			analysis.appendImportRecord(node, binding.name, binding.target)
 		}
 	case "call", "subscript":
 		if pythonDynamicLookup(analysis, node) {
 			analysis.addWarning("python-dynamic-lookup")
 		}
+		if node.Kind() != "call" {
+			return
+		}
+		enclosing, ok := analysis.enclosingName(node, pythonScope(analysis))
+		if !ok {
+			return
+		}
+		target, _ := analysis.dottedTarget(node.ChildByFieldName("function"), pythonTargetRules, 0)
+		analysis.appendReference(node, enclosing, target)
 	}
 }
 
-func pythonImportBindings(analysis *treeSitterAnalysis, node *sitter.Node) []string {
-	bindings := make([]string, 0, 4)
+// pythonScope names the definitions that lexically contain a node: classes and
+// functions, in source order from the outermost one.
+func pythonScope(analysis *treeSitterAnalysis) func(*sitter.Node) (string, bool) {
+	return func(parent *sitter.Node) (string, bool) {
+		if parent.Kind() != "class_definition" && parent.Kind() != "function_definition" {
+			return "", false
+		}
+		return analysis.stableName(parent.ChildByFieldName("name"), "identifier")
+	}
+}
+
+var pythonTargetRules = dottedTargetRules{
+	leaf:       []string{"identifier"},
+	containers: []dottedContainer{{kind: "attribute", object: "object", property: "attribute"}},
+}
+
+// importBinding is one local name an import statement binds together with the
+// module specifier it was imported from, as written in the source.
+type importBinding struct {
+	name   string
+	target string
+}
+
+func pythonImportBindings(analysis *treeSitterAnalysis, node *sitter.Node) []importBinding {
+	bindings := make([]importBinding, 0, 4)
 	module := node.ChildByFieldName("module_name")
+	fromImport := node.Kind() == "import_from_statement"
+	moduleName := ""
+	if fromImport {
+		if text, ok := analysis.nodeText(module); ok && text != "" && !strings.ContainsAny(text, "\x00\n\r") {
+			moduleName = text
+		}
+	}
 	childCount := analysis.boundedNamedChildCount(node, maximumTreeSitterImportNodes, "tree-sitter-import-limit")
 	for index := uint(0); index < childCount; index++ {
 		child := node.NamedChild(index)
@@ -94,21 +128,32 @@ func pythonImportBindings(analysis *treeSitterAnalysis, node *sitter.Node) []str
 		}
 		switch child.Kind() {
 		case "aliased_import":
-			if alias, ok := analysis.stableName(child.ChildByFieldName("alias"), "identifier"); ok {
-				bindings = append(bindings, alias)
+			alias, ok := analysis.stableName(child.ChildByFieldName("alias"), "identifier")
+			if !ok {
+				continue
 			}
+			target := moduleName
+			if !fromImport {
+				if text, textOK := analysis.nodeText(child.ChildByFieldName("name")); textOK && text != "" && !strings.ContainsAny(text, "\x00\n\r") {
+					target = text
+				} else {
+					target = ""
+				}
+			}
+			bindings = append(bindings, importBinding{name: alias, target: target})
 		case "dotted_name":
 			if name, ok := analysis.nodeText(child); ok && name != "" && !strings.ContainsAny(name, "\x00\n\r") {
-				if node.Kind() == "import_from_statement" {
-					if last := strings.LastIndexByte(name, '.'); last >= 0 {
-						name = name[last+1:]
-					}
+				target := moduleName
+				if !fromImport {
+					target = name
+				} else if last := strings.LastIndexByte(name, '.'); last >= 0 {
+					name = name[last+1:]
 				}
-				bindings = append(bindings, name)
+				bindings = append(bindings, importBinding{name: name, target: target})
 			}
 		case "wildcard_import":
-			if moduleName, ok := analysis.nodeText(module); ok {
-				bindings = append(bindings, moduleName+".*")
+			if moduleName != "" {
+				bindings = append(bindings, importBinding{name: moduleName + ".*", target: moduleName})
 			}
 		}
 	}
