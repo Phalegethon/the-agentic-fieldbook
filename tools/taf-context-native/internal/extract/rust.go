@@ -93,9 +93,13 @@ func handleRustNode(analysis *treeSitterAnalysis, node *sitter.Node) {
 		analysis.appendNodeRecord(node, analysis.qualified(append(prefix, macro+"!")...), model.Definition, model.Inferred)
 		// The expanded macro is invisible here, so the invocation is recorded
 		// as a use of the macro name itself.
-		analysis.appendReference(node, analysis.qualified(prefix...), dottedRustPath(macro))
+		enclosing, ok := analysis.enclosingScope(node, rustScope(analysis), nil)
+		if !ok {
+			return
+		}
+		analysis.appendReference(node, enclosing, dottedRustPath(macro))
 	case "call_expression":
-		enclosing, ok := analysis.enclosingName(node, rustScope(analysis))
+		enclosing, ok := analysis.enclosingScope(node, rustScope(analysis), nil)
 		if !ok {
 			return
 		}

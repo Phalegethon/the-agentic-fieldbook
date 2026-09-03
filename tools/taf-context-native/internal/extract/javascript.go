@@ -110,7 +110,7 @@ func handleECMAScriptNode(analysis *treeSitterAnalysis, node *sitter.Node, types
 		if node.Kind() == "call_expression" && ecmaDynamicLookup(analysis, node) {
 			analysis.addWarning(warningPrefix + "-dynamic-lookup")
 		}
-		enclosing, ok := analysis.enclosingName(node, ecmaScope(analysis))
+		enclosing, ok := analysis.enclosingScope(node, ecmaScope(analysis), nil)
 		if !ok {
 			return
 		}

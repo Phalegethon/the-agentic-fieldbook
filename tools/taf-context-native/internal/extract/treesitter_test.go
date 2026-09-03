@@ -966,7 +966,7 @@ func findRecord(t *testing.T, records []model.Record, qualified string) model.Re
 	return model.Record{}
 }
 
-func TestPythonExtractorMergesCallReferencesAndImportTargets(t *testing.T) {
+func TestPythonExtractorGroupsCallReferencesPerDefinition(t *testing.T) {
 	source := "import os.path as osp\n" +
 		"from helpers import load\n" +
 		"\n" +
@@ -986,35 +986,34 @@ func TestPythonExtractorMergesCallReferencesAndImportTargets(t *testing.T) {
 	}
 	assertImportTarget(t, records, "osp", "os.path")
 	assertImportTarget(t, records, "load", "helpers")
-	for _, want := range []referenceExpectation{
-		{"mod.run", "load", 2, 5, 5, "python", pythonParserVersion},
-		{"mod.run", "osp.join", 1, 7, 7, "python", pythonParserVersion},
-		{"mod.run", "helper_local", 1, 8, 8, "python", pythonParserVersion},
-		{"mod", "load", 1, 13, 13, "python", pythonParserVersion},
-	} {
-		assertReference(t, records, want)
-	}
-	if got := len(referencesOf(records, "mod.run")); got != 3 {
-		t.Fatalf("references in mod.run = %#v", referencesOf(records, "mod.run"))
-	}
+	assertReference(t, records, referenceExpectation{"mod.run", 4, 8, "python", pythonParserVersion, []model.ReferenceEntry{
+		{Name: "load", Line: 5, Count: 2},
+		{Name: "osp.join", Line: 7, Count: 1},
+		{Name: "helper_local", Line: 8, Count: 1},
+	}})
+	// A call at module level groups under the module's own name and covers the
+	// whole file, which is the module's range.
+	assertReference(t, records, referenceExpectation{"mod", 1, 13, "python", pythonParserVersion, []model.ReferenceEntry{
+		{Name: "load", Line: 13, Count: 1},
+	}})
 }
 
-func TestPythonExtractorCapsReferencesPerDefinition(t *testing.T) {
+func TestPythonExtractorCapsTableEntriesPerDefinition(t *testing.T) {
 	var source strings.Builder
 	source.WriteString("def wide():\n")
-	for index := 0; index < maximumReferencesPerDefinition+6; index++ {
+	for index := 0; index < model.MaximumReferenceTableEntries+6; index++ {
 		fmt.Fprintf(&source, "    target%d()\n", index)
 	}
 	records, report := NewRegistry().Extract(stableFile("pkg/wide_calls.py", source.String()))
 	if !contains(report.WarningCodes, "reference-limit") {
 		t.Fatalf("report = %#v, want reference-limit", report)
 	}
-	if got := len(referencesOf(records, "wide_calls.wide")); got != maximumReferencesPerDefinition {
-		t.Fatalf("references in wide_calls.wide = %d, want %d", got, maximumReferencesPerDefinition)
+	if got := len(referenceEntriesOf(t, records, "wide_calls.wide")); got != model.MaximumReferenceTableEntries {
+		t.Fatalf("entries in wide_calls.wide = %d, want %d", got, model.MaximumReferenceTableEntries)
 	}
 }
 
-func TestJavaScriptExtractorEmitsConstructorAndMemberReferences(t *testing.T) {
+func TestJavaScriptExtractorGroupsConstructorAndMemberReferences(t *testing.T) {
 	source := "import { Widget } from \"./widget\";\n" +
 		"export class Panel {\n" +
 		"  render(key) {\n" +
@@ -1032,14 +1031,13 @@ func TestJavaScriptExtractorEmitsConstructorAndMemberReferences(t *testing.T) {
 		t.Fatalf("report = %#v, want reference-skipped for the computed call", report)
 	}
 	assertImportTarget(t, records, "Widget", "./widget")
-	assertReference(t, records, referenceExpectation{"panel.Panel.render", "Widget", 1, 4, 4, "javascript", javascriptParserVersion})
-	assertReference(t, records, referenceExpectation{"panel.Panel.render", "this.emit", 1, 5, 5, "javascript", javascriptParserVersion})
-	if got := len(referencesOf(records, "panel.Panel.render")); got != 2 {
-		t.Fatalf("references in panel.Panel.render = %#v", referencesOf(records, "panel.Panel.render"))
-	}
+	assertReference(t, records, referenceExpectation{"panel.Panel.render", 3, 8, "javascript", javascriptParserVersion, []model.ReferenceEntry{
+		{Name: "Widget", Line: 4, Count: 1},
+		{Name: "this.emit", Line: 5, Count: 1},
+	}})
 }
 
-func TestTypeScriptExtractorEmitsReferencesAndImportTargets(t *testing.T) {
+func TestTypeScriptExtractorGroupsReferencesAndKeepsImportTargets(t *testing.T) {
 	source := "import { create } from \"zustand\";\n" +
 		"export const store = create();\n" +
 		"export function run(): void {\n" +
@@ -1050,16 +1048,21 @@ func TestTypeScriptExtractorEmitsReferencesAndImportTargets(t *testing.T) {
 		t.Fatalf("report = %#v", report)
 	}
 	assertImportTarget(t, records, "create", "zustand")
-	assertReference(t, records, referenceExpectation{"store", "create", 1, 2, 2, "typescript", typescriptParserVersion})
-	assertReference(t, records, referenceExpectation{"store.run", "store.reset", 1, 4, 4, "typescript", typescriptParserVersion})
+	assertReference(t, records, referenceExpectation{"store", 1, 5, "typescript", typescriptParserVersion, []model.ReferenceEntry{
+		{Name: "create", Line: 2, Count: 1},
+	}})
+	assertReference(t, records, referenceExpectation{"store.run", 3, 5, "typescript", typescriptParserVersion, []model.ReferenceEntry{
+		{Name: "store.reset", Line: 4, Count: 1},
+	}})
 }
 
-func TestRustExtractorEmitsScopedCallMacroAndUseTargets(t *testing.T) {
+func TestRustExtractorGroupsScopedCallAndMacroReferences(t *testing.T) {
 	source := "use crate::config::Settings as Config;\n" +
 		"use crate::models::{User, Role as UserRole};\n" +
 		"fn run() {\n" +
 		"    foo::bar();\n" +
 		"    println!(\"x\");\n" +
+		"    helper();\n" +
 		"    helper();\n" +
 		"}\n"
 	records, report := NewRegistry().Extract(stableFile("src/service.rs", source))
@@ -1069,11 +1072,32 @@ func TestRustExtractorEmitsScopedCallMacroAndUseTargets(t *testing.T) {
 	assertImportTarget(t, records, "Config", "crate.config.Settings")
 	assertImportTarget(t, records, "crate::models::User", "crate.models.User")
 	assertImportTarget(t, records, "UserRole", "crate.models.Role")
-	for _, want := range []referenceExpectation{
-		{"service.run", "foo.bar", 1, 4, 4, "rust", rustParserVersion},
-		{"service.run", "println", 1, 5, 5, "rust", rustParserVersion},
-		{"service.run", "helper", 1, 6, 6, "rust", rustParserVersion},
-	} {
-		assertReference(t, records, want)
+	assertReference(t, records, referenceExpectation{"service.run", 3, 8, "rust", rustParserVersion, []model.ReferenceEntry{
+		{Name: "foo.bar", Line: 4, Count: 1},
+		{Name: "println", Line: 5, Count: 1},
+		{Name: "helper", Line: 6, Count: 2},
+	}})
+}
+
+// TestPythonReferenceRangeMatchesTheDecoratedDefinitionRecord keeps a
+// reference record's range identical to the range of the definition record it
+// groups under, decorators included, so an anchor and its uses describe the
+// same lines.
+func TestPythonReferenceRangeMatchesTheDecoratedDefinitionRecord(t *testing.T) {
+	source := "import functools\n" +
+		"\n" +
+		"@functools.cache\n" +
+		"def run():\n" +
+		"    return helper()\n"
+	records, report := NewRegistry().Extract(stableFile("pkg/decorated.py", source))
+	if report.ParseFailures != 0 || len(report.WarningCodes) != 0 {
+		t.Fatalf("report = %#v", report)
 	}
+	definition := findRecord(t, records, "decorated.run")
+	if definition.RecordKind != model.Definition || definition.StartLine != 3 || definition.EndLine != 5 {
+		t.Fatalf("definition = %#v", definition)
+	}
+	assertReference(t, records, referenceExpectation{"decorated.run", definition.StartLine, definition.EndLine, "python", pythonParserVersion, []model.ReferenceEntry{
+		{Name: "helper", Line: 5, Count: 1},
+	}})
 }

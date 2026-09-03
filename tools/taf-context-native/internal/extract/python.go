@@ -59,14 +59,7 @@ func handlePythonNode(analysis *treeSitterAnalysis, node *sitter.Node) {
 		if !ok {
 			return
 		}
-		rangeNode := node
-		if parent := node.Parent(); parent != nil && parent.Kind() == "decorated_definition" {
-			definition := parent.ChildByFieldName("definition")
-			if definition != nil && definition.Id() == node.Id() && !parent.HasError() && !parent.IsMissing() {
-				rangeNode = parent
-			}
-		}
-		analysis.appendNodeRecord(rangeNode, analysis.qualified(append(prefix, name)...), model.Definition, model.Verified)
+		analysis.appendNodeRecord(pythonDefinitionRange(node), analysis.qualified(append(prefix, name)...), model.Definition, model.Verified)
 	case "import_statement", "import_from_statement":
 		for _, binding := range pythonImportBindings(analysis, node) {
 			analysis.appendImportRecord(node, binding.name, binding.target)
@@ -78,13 +71,27 @@ func handlePythonNode(analysis *treeSitterAnalysis, node *sitter.Node) {
 		if node.Kind() != "call" {
 			return
 		}
-		enclosing, ok := analysis.enclosingName(node, pythonScope(analysis))
+		enclosing, ok := analysis.enclosingScope(node, pythonScope(analysis), pythonDefinitionRange)
 		if !ok {
 			return
 		}
 		target, _ := analysis.dottedTarget(node.ChildByFieldName("function"), pythonTargetRules, 0)
 		analysis.appendReference(node, enclosing, target)
 	}
+}
+
+// pythonDefinitionRange is the node whose range a class or function record
+// carries: the decorated definition when the definition is decorated, so the
+// decorators belong to the record.
+func pythonDefinitionRange(node *sitter.Node) *sitter.Node {
+	parent := node.Parent()
+	if parent == nil || parent.Kind() != "decorated_definition" || parent.HasError() || parent.IsMissing() {
+		return node
+	}
+	if definition := parent.ChildByFieldName("definition"); definition != nil && definition.Id() == node.Id() {
+		return parent
+	}
+	return node
 }
 
 // pythonScope names the definitions that lexically contain a node: classes and

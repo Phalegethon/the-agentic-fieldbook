@@ -774,15 +774,16 @@ func TestIndexV3RejectsPreCatalogV2Payload(t *testing.T) {
 }
 
 // TestFormatRoundTripsReferenceFields freezes the two record fields the
-// format-4 tuple adds after the preview: a reference record carries the
-// referenced name and the number of merged occurrences, an import record
-// carries only the imported module specifier, and every other kind carries
-// neither. The raw validator must accept the same bytes the decoder returns.
+// format-4 tuple adds after the preview: a reference record carries the target
+// table of the definition it belongs to and the number of merged occurrences,
+// an import record carries only the imported module specifier, and every other
+// kind carries neither. The raw validator must accept the same bytes the
+// decoder returns.
 func TestFormatRoundTripsReferenceFields(t *testing.T) {
 	definition := testRecord(testRecordA, "pkg/a.py", "a.run", []string{"run"})
-	reference := testRecord(testRecordB, "pkg/a.py", "a.run", []string{"helpers", "helpers.load", "load"})
+	reference := testRecord(testRecordB, "pkg/a.py", "a.run", []string{"helpers.load", "osp.join"})
 	reference.RecordKind = model.Reference
-	reference.TargetName, reference.ReferenceCount = "helpers.load", 3
+	reference.TargetName, reference.ReferenceCount = "helpers.load:5:2;osp.join:7:1", 3
 	imported := testRecord(testRecordD, "pkg/a.py", "helpers", []string{"helpers"})
 	imported.RecordKind = model.Import
 	imported.TargetName = "pkg.helpers"
@@ -806,7 +807,7 @@ func TestFormatRoundTripsReferenceFields(t *testing.T) {
 	for _, record := range decoded {
 		byIdentity[record.Identity] = record
 	}
-	if got := byIdentity[testRecordB]; got.RecordKind != model.Reference || got.TargetName != "helpers.load" || got.ReferenceCount != 3 {
+	if got := byIdentity[testRecordB]; got.RecordKind != model.Reference || got.TargetName != "helpers.load:5:2;osp.join:7:1" || got.ReferenceCount != 3 {
 		t.Fatalf("reference round trip = %#v", got)
 	}
 	if got := byIdentity[testRecordD]; got.TargetName != "pkg.helpers" || got.ReferenceCount != 0 {
@@ -818,28 +819,52 @@ func TestFormatRoundTripsReferenceFields(t *testing.T) {
 }
 
 // TestFormatRejectsInconsistentReferenceFields keeps the two new fields tied
-// to the record kind: only reference records count occurrences, and only
-// reference and import records name a target.
+// to the record kind: only reference records count occurrences, only reference
+// and import records name a target, a reference target is a well-formed table,
+// and the record's count is the total the table declares.
 func TestFormatRejectsInconsistentReferenceFields(t *testing.T) {
 	cases := map[string]func(*model.Record){
-		"reference without count":  func(record *model.Record) { record.RecordKind = model.Reference; record.TargetName = "x" },
+		"reference without count":  func(record *model.Record) { record.RecordKind = model.Reference; record.TargetName = "x:1:1" },
 		"reference without target": func(record *model.Record) { record.RecordKind = model.Reference; record.ReferenceCount = 1 },
 		"definition with count":    func(record *model.Record) { record.ReferenceCount = 1 },
 		"definition with target":   func(record *model.Record) { record.TargetName = "x" },
 		"negative count": func(record *model.Record) {
 			record.RecordKind = model.Reference
-			record.TargetName = "x"
+			record.TargetName = "x:1:1"
 			record.ReferenceCount = -1
 		},
-		"target too long": func(record *model.Record) {
+		"target that is a plain name": func(record *model.Record) {
 			record.RecordKind = model.Reference
 			record.ReferenceCount = 1
-			record.TargetName = strings.Repeat("x", 513)
+			record.TargetName = "helpers.load"
+		},
+		"count that is not the table total": func(record *model.Record) {
+			record.RecordKind = model.Reference
+			record.ReferenceCount = 2
+			record.TargetName = "helpers.load:5:2;osp.join:7:1"
+		},
+		"table beyond the entry bound": func(record *model.Record) {
+			entries := make([]model.ReferenceEntry, 0, model.MaximumReferenceTableEntries+1)
+			for index := range model.MaximumReferenceTableEntries + 1 {
+				entries = append(entries, model.ReferenceEntry{Name: "target" + strconv.Itoa(index), Line: index + 1, Count: 1})
+			}
+			record.RecordKind = model.Reference
+			record.ReferenceCount = len(entries)
+			record.TargetName = model.FormatReferenceTable(entries)
+		},
+		"table beyond the byte bound": func(record *model.Record) {
+			record.RecordKind = model.Reference
+			record.ReferenceCount = 1
+			record.TargetName = strings.Repeat("x", model.MaximumReferenceTableBytes) + ":1:1"
 		},
 		"target with control character": func(record *model.Record) {
 			record.RecordKind = model.Reference
 			record.ReferenceCount = 1
-			record.TargetName = "load\n"
+			record.TargetName = "load\n:1:1"
+		},
+		"import specifier beyond the specifier bound": func(record *model.Record) {
+			record.RecordKind = model.Import
+			record.TargetName = strings.Repeat("x", maximumTargetNameBytes+1)
 		},
 	}
 	for name, mutate := range cases {
@@ -853,14 +878,82 @@ func TestFormatRejectsInconsistentReferenceFields(t *testing.T) {
 	}
 }
 
+// TestFormatAcceptsAReferenceTableBeyondTheSpecifierBound proves the target
+// field is bounded by the table maximum rather than by the import specifier
+// maximum: a full table of long names is larger than any module specifier the
+// format accepts.
+func TestFormatAcceptsAReferenceTableBeyondTheSpecifierBound(t *testing.T) {
+	entries := make([]model.ReferenceEntry, 0, 8)
+	for index := range 8 {
+		entries = append(entries, model.ReferenceEntry{Name: strings.Repeat("t", 100) + strconv.Itoa(index), Line: index + 1, Count: 1})
+	}
+	table := model.FormatReferenceTable(entries)
+	if len(table) <= maximumTargetNameBytes || len(table) > model.MaximumReferenceTableBytes {
+		t.Fatalf("table length = %d, want between %d and %d", len(table), maximumTargetNameBytes, model.MaximumReferenceTableBytes)
+	}
+	record := testRecord(testRecordA, "pkg/a.py", "a.run", []string{"run"})
+	record.RecordKind = model.Reference
+	record.TargetName, record.ReferenceCount = table, len(entries)
+	encoded, err := encodeIndex([]model.Record{record})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateIndex(encoded); err != nil {
+		t.Fatalf("validateIndex = %v", err)
+	}
+	decoded, _, err := decodeIndex(encoded)
+	if err != nil || len(decoded) != 1 || decoded[0].TargetName != table {
+		t.Fatalf("decoded = %#v, err = %v", decoded, err)
+	}
+}
+
+// TestValidateIndexDerivesTheSameMapGroupsAsTheEncoder keeps the raw
+// validator's group derivation identical to the encoder's now that references
+// are excluded from the repository map: a path whose records are all
+// references contributes no group, and a reference never represents a path
+// even when the structural record there carries weaker evidence.
+func TestValidateIndexDerivesTheSameMapGroupsAsTheEncoder(t *testing.T) {
+	referenceOnly := testRecord(testRecordA, "pkg/calls.py", "calls", []string{"calls"})
+	referenceOnly.RecordKind = model.Reference
+	referenceOnly.TargetName, referenceOnly.ReferenceCount = "helpers.load:5:2", 2
+	inferred := testRecord(testRecordB, "src/macros.rs", "macros.trace", []string{"trace"})
+	inferred.EvidenceClass = model.Inferred
+	verifiedReference := testRecord(testRecordD, "src/macros.rs", "macros", []string{"println"})
+	verifiedReference.RecordKind = model.Reference
+	verifiedReference.TargetName, verifiedReference.ReferenceCount = "println:3:1", 1
+	records := []model.Record{referenceOnly, inferred, verifiedReference}
+	encoded, err := encodeIndex(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateIndex(encoded); err != nil {
+		t.Fatalf("validateIndex = %v", err)
+	}
+	_, _, queryIndex, err := decodeIndexContext(context.Background(), encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups, _ := queryIndex.MapGroups()
+	if len(groups) != 1 || groups[0].Path != "src/macros.rs" {
+		t.Fatalf("map groups = %#v, want only the path with a structural record", groups)
+	}
+	decoded, _, err := decodeIndex(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups[0].Ordinals) != 1 || decoded[groups[0].Ordinals[0]].Identity != inferred.Identity {
+		t.Fatalf("representative = %#v, want the definition record", groups[0].Ordinals)
+	}
+}
+
 // TestValidateIndexRejectsCorruptedReferenceCount exercises the raw validator
 // on the encoded bytes: zeroing the occurrence count of a reference record
 // leaves every length intact, so only the kind/count consistency rule can
 // catch it.
 func TestValidateIndexRejectsCorruptedReferenceCount(t *testing.T) {
-	reference := testRecord(testRecordA, "pkg/a.py", "a.run", []string{"load"})
+	reference := testRecord(testRecordA, "pkg/a.py", "a.run", []string{"helpers.load"})
 	reference.RecordKind = model.Reference
-	reference.TargetName, reference.ReferenceCount = "helpers.load", 2
+	reference.TargetName, reference.ReferenceCount = "helpers.load:5:2", 2
 	encoded, err := encodeIndex([]model.Record{reference})
 	if err != nil {
 		t.Fatal(err)

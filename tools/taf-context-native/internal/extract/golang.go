@@ -50,6 +50,9 @@ func (extractor goExtractor) Extract(file boundary.StableFile) ([]model.Record, 
 	packageName := parsed.Name.Name
 	start, end := astLines(fileSet, parsed.Package, parsed.Name.End())
 	appendRecord(structuralRecord(packageName, model.Module, "source", start, end))
+	// A use outside any declaration belongs to the module record, so it
+	// carries that record's name and range.
+	moduleScope := referenceScope{name: packageName, start: start, end: end}
 	for _, imported := range parsed.Imports {
 		name := goImportName(imported)
 		if name == "" {
@@ -100,54 +103,31 @@ declarations:
 			}
 		}
 	}
-	warnings = append(warnings, goCollectReferences(fileSet, parsed, packageName, appendRecord)...)
+	warnings = append(warnings, goCollectReferences(fileSet, parsed, moduleScope, appendRecord)...)
 	return records, Report{ParserVersion: goParserVersion, WarningCodes: warnings}
 }
 
 // goCollectReferences records where each declaration uses another name. Calls
 // inside a function body belong to that function; calls in a package-level
-// variable initializer belong to the file's package record, which is the
-// qualified name that record carries. Targets are merged per (enclosing
-// definition, target) in first-occurrence order.
-func goCollectReferences(fileSet *token.FileSet, parsed *ast.File, packageName string, appendRecord func(model.Record) bool) []string {
-	references := make(map[string]int)
-	perDefinition := make(map[string]int)
-	var order []model.Record
-	limited, skipped := false, 0
-	var warnings []string
-	appendReference := func(enclosing string, call *ast.CallExpr) {
-		target, ok := goCallTarget(call.Fun, 0)
-		if !ok {
-			skipped++
-			return
-		}
-		key := enclosing + "\x00" + target
-		if index, merged := references[key]; merged {
-			order[index].ReferenceCount++
-			return
-		}
-		if perDefinition[enclosing] >= maximumReferencesPerDefinition {
-			if !limited {
-				limited = true
-				warnings = append(warnings, "reference-limit")
-			}
-			return
-		}
-		start, end := astLines(fileSet, call.Pos(), call.End())
-		record := structuralRecord(enclosing, model.Reference, "source", start, end)
-		record.TargetName, record.ReferenceCount = target, 1
-		references[key] = len(order)
-		perDefinition[enclosing]++
-		order = append(order, record)
-	}
-	collect := func(enclosing string, node ast.Node) {
-		if node == nil || enclosing == "" {
+// variable initializer belong to the file's package record. Every target of
+// one declaration is merged into that declaration's single reference record.
+func goCollectReferences(fileSet *token.FileSet, parsed *ast.File, moduleScope referenceScope, appendRecord func(model.Record) bool) []string {
+	collector := referenceCollector{}
+	collect := func(scope referenceScope, node ast.Node) {
+		if node == nil || scope.name == "" {
 			return
 		}
 		ast.Inspect(node, func(visited ast.Node) bool {
-			if call, ok := visited.(*ast.CallExpr); ok {
-				appendReference(enclosing, call)
+			call, ok := visited.(*ast.CallExpr)
+			if !ok {
+				return true
 			}
+			target, named := goCallTarget(call.Fun, 0)
+			if !named {
+				target = ""
+			}
+			line, _ := astLines(fileSet, call.Pos(), call.End())
+			collector.add(scope, target, line)
 			return true
 		})
 	}
@@ -163,20 +143,19 @@ func goCollectReferences(fileSet *token.FileSet, parsed *ast.File, packageName s
 					continue
 				}
 				for _, expression := range value.Values {
-					collect(packageName, expression)
+					collect(moduleScope, expression)
 				}
 			}
 		case *ast.FuncDecl:
-			collect(goDeclarationName(packageName, node), node.Body)
+			start, end := astLines(fileSet, node.Pos(), node.End())
+			collect(referenceScope{name: goDeclarationName(moduleScope.name, node), start: start, end: end}, node.Body)
 		}
 	}
-	for _, record := range order {
+	records, warnings := collector.flush()
+	for _, record := range records {
 		if !appendRecord(record) {
 			break
 		}
-	}
-	if skipped > 0 {
-		warnings = append(warnings, "reference-skipped")
 	}
 	return warnings
 }

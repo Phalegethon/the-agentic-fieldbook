@@ -18,13 +18,8 @@ const (
 	maximumTreeSitterRecords     = 4096
 	maximumTreeSitterImportNodes = 4096
 	treeSitterQueryMatchLimit    = 4096
-	// maximumReferencesPerDefinition bounds how many distinct targets one
-	// enclosing definition contributes, so a generated or very long function
-	// cannot dominate the reference section of an index.
-	maximumReferencesPerDefinition = 64
-	maximumReferenceTargetBytes    = 256
-	maximumDottedTargetDepth       = 32
-	maximumTargetSpecifierBytes    = 512
+	maximumDottedTargetDepth     = 32
+	maximumTargetSpecifierBytes  = 512
 )
 
 var (
@@ -49,15 +44,10 @@ type treeSitterAnalysis struct {
 	warnings      []string
 	parseFailures int
 	stopped       bool
-	// references maps "enclosing\x00target" to its index in referenceOrder so
-	// repeated uses of one target merge into a single record, and
-	// referenceOrder keeps the first-occurrence order the records are flushed
-	// in. referencePerDef counts distinct targets per enclosing definition.
-	references        map[string]int
-	referenceOrder    []model.Record
-	referencePerDef   map[string]int
-	referenceLimited  bool
-	skippedReferences int
+	// references groups the uses of names by the definition that contains
+	// them, so the file contributes at most one reference record per
+	// definition.
+	references referenceCollector
 }
 
 func extractTreeSitter(ctx context.Context, file boundary.StableFile, grammar treeSitterGrammar) ([]model.Record, Report) {
@@ -329,76 +319,65 @@ func (analysis *treeSitterAnalysis) appendImportRecord(node *sitter.Node, bindin
 }
 
 // appendReference merges one use of target inside the enclosing definition
-// into a file-local reference record. The first occurrence fixes the line
-// range; every later occurrence only raises the count. Targets that are not
-// stable written names are counted as skipped instead of recorded.
-func (analysis *treeSitterAnalysis) appendReference(node *sitter.Node, enclosing, target string) {
-	if analysis.stopped || enclosing == "" {
+// into that definition's reference record. Targets that are not stable written
+// names are counted as skipped instead of recorded.
+func (analysis *treeSitterAnalysis) appendReference(node *sitter.Node, scope referenceScope, target string) {
+	if analysis.stopped {
 		return
 	}
-	if target == "" || len(target) > maximumReferenceTargetBytes || strings.ContainsAny(target, "\x00\n\r") {
-		analysis.skippedReferences++
-		return
-	}
-	key := enclosing + "\x00" + target
-	if index, ok := analysis.references[key]; ok {
-		analysis.referenceOrder[index].ReferenceCount++
-		return
-	}
-	if analysis.referencePerDef[enclosing] >= maximumReferencesPerDefinition {
-		if !analysis.referenceLimited {
-			analysis.referenceLimited = true
-			analysis.addWarning("reference-limit")
+	line := 0
+	if model.ValidReferenceTargetName(target) {
+		start, _, ok := analysis.nodeLines(node)
+		if !ok {
+			return
 		}
-		return
+		line = start
 	}
-	start, end, ok := analysis.nodeLines(node)
-	if !ok {
-		return
-	}
-	if analysis.references == nil {
-		analysis.references = make(map[string]int)
-		analysis.referencePerDef = make(map[string]int)
-	}
-	analysis.references[key] = len(analysis.referenceOrder)
-	analysis.referencePerDef[enclosing]++
-	analysis.referenceOrder = append(analysis.referenceOrder, model.Record{
-		StartLine:      start,
-		EndLine:        end,
-		RecordKind:     model.Reference,
-		SourceType:     "source",
-		QualifiedName:  enclosing,
-		EvidenceClass:  model.Verified,
-		TargetName:     target,
-		ReferenceCount: 1,
-	})
+	analysis.references.add(scope, target, line)
 }
 
-// flushReferences appends the merged reference records after every structural
+// flushReferences appends the grouped reference records after every structural
 // record of the file, so the per-file record limit drops references before it
 // drops a definition.
 func (analysis *treeSitterAnalysis) flushReferences() {
-	for index := range analysis.referenceOrder {
+	records, warnings := analysis.references.flush()
+	for index := range records {
 		if len(analysis.records) >= maximumTreeSitterRecords {
 			analysis.limit("tree-sitter-record-limit")
 			break
 		}
-		analysis.records = append(analysis.records, analysis.referenceOrder[index])
+		analysis.records = append(analysis.records, records[index])
 	}
-	if analysis.skippedReferences > 0 {
-		analysis.addWarning("reference-skipped")
+	for _, warning := range warnings {
+		analysis.addWarning(warning)
 	}
 }
 
-// enclosingName is the qualified name of the definition that lexically
-// contains node, or the module's own qualified name at file scope. It is the
-// same name the enclosing definition record carries.
-func (analysis *treeSitterAnalysis) enclosingName(node *sitter.Node, scope func(*sitter.Node) (string, bool)) (string, bool) {
-	prefix, ok := analysis.lexicalPrefix(node, scope)
+// enclosingScope is the definition that lexically contains node: its qualified
+// name exactly as its own definition record carries it, and its line range. At
+// file scope it is the module's name and the whole file, which is the module's
+// range. rangeOf promotes the scope node to the node whose range the
+// definition record uses (a decorated definition, for example); it may be nil.
+func (analysis *treeSitterAnalysis) enclosingScope(node *sitter.Node, scope func(*sitter.Node) (string, bool), rangeOf func(*sitter.Node) *sitter.Node) (referenceScope, bool) {
+	prefix, innermost, ok := analysis.lexicalScope(node, scope)
 	if !ok {
-		return "", false
+		return referenceScope{}, false
 	}
-	return analysis.qualified(prefix...), true
+	enclosing := referenceScope{name: analysis.qualified(prefix...), start: 1, end: len(analysis.lineStarts)}
+	if innermost == nil {
+		return enclosing, enclosing.end >= enclosing.start
+	}
+	if rangeOf != nil {
+		if promoted := rangeOf(innermost); promoted != nil {
+			innermost = promoted
+		}
+	}
+	start, end, ok := analysis.nodeLines(innermost)
+	if !ok {
+		return referenceScope{}, false
+	}
+	enclosing.start, enclosing.end = start, end
+	return enclosing, true
 }
 
 // dottedTarget renders a call target as a dotted name. leaf names the node
@@ -457,22 +436,34 @@ func (analysis *treeSitterAnalysis) qualified(parts ...string) string {
 }
 
 func (analysis *treeSitterAnalysis) lexicalPrefix(node *sitter.Node, scope func(*sitter.Node) (string, bool)) ([]string, bool) {
+	prefix, _, ok := analysis.lexicalScope(node, scope)
+	return prefix, ok
+}
+
+// lexicalScope returns the names of the definitions that lexically contain
+// node, outermost first, together with the innermost of those nodes (nil at
+// file scope).
+func (analysis *treeSitterAnalysis) lexicalScope(node *sitter.Node, scope func(*sitter.Node) (string, bool)) ([]string, *sitter.Node, bool) {
 	var reversed []string
+	var innermost *sitter.Node
 	depth := 0
 	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
 		depth++
 		if depth > maximumTreeSitterDepth {
 			analysis.limit("tree-sitter-depth-limit")
-			return nil, false
+			return nil, nil, false
 		}
 		if name, ok := scope(parent); ok {
 			reversed = append(reversed, name)
+			if innermost == nil {
+				innermost = parent
+			}
 		}
 	}
 	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
 		reversed[left], reversed[right] = reversed[right], reversed[left]
 	}
-	return reversed, true
+	return reversed, innermost, true
 }
 
 func (analysis *treeSitterAnalysis) stableName(node *sitter.Node, kinds ...string) (string, bool) {

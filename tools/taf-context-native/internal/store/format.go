@@ -39,7 +39,10 @@ const (
 	maximumEncodedIndexBytes             = 64 << 20
 	maximumManifestBytes                 = 256 << 10
 	maximumIndexStringBytes              = 4096
-	maximumTargetNameBytes               = 512
+	// maximumTargetNameBytes bounds the module specifier an import record
+	// names; a reference record names a target table instead, bounded by
+	// model.MaximumReferenceTableBytes.
+	maximumTargetNameBytes = 512
 	// rawRecordMetadataBytes is the in-memory size of one rawRecordMetadata:
 	// eight rawField locators, the term section, the start line, and the
 	// reference count.
@@ -1263,8 +1266,8 @@ func validateIndexContextWithLiveBytes(ctx context.Context, encoded []byte, addi
 		if err != nil || !validTextBytes(preview, maximumIndexStringBytes, true) {
 			return 0, 0, ErrInvalidIndex
 		}
-		target, err := decoder.readString(maximumTargetNameBytes)
-		if err != nil || !validTextBytes(target, maximumTargetNameBytes, true) {
+		target, err := decoder.readString(model.MaximumReferenceTableBytes)
+		if err != nil || !validTextBytes(target, model.MaximumReferenceTableBytes, true) {
 			return 0, 0, ErrInvalidIndex
 		}
 		metadata.target = rawFieldAt(&decoder, target)
@@ -1591,6 +1594,7 @@ func rawMapGroupsContext(ctx context.Context, plain []byte, records []rawRecordM
 		end := start + 1
 		path := records[pathOrdinals[start]].path.bytes(plain)
 		best := pathOrdinals[start]
+		represented := rawStructuralRecord(plain, records[best])
 		for end < len(pathOrdinals) && bytes.Equal(records[pathOrdinals[end]].path.bytes(plain), path) {
 			visited++
 			if visited%contextCheckInterval == 0 {
@@ -1598,10 +1602,20 @@ func rawMapGroupsContext(ctx context.Context, plain []byte, records []rawRecordM
 					return nil, false, err
 				}
 			}
-			if rawCompareMapRepresentative(plain, records[pathOrdinals[end]], records[best]) < 0 {
-				best = pathOrdinals[end]
+			// Mirrors buildCanonicalMapGroupsContext: the map describes
+			// structure, so a reference never represents a path and a path
+			// represented only by references contributes no group.
+			if rawStructuralRecord(plain, records[pathOrdinals[end]]) {
+				if !represented || rawCompareMapRepresentative(plain, records[pathOrdinals[end]], records[best]) < 0 {
+					best = pathOrdinals[end]
+					represented = true
+				}
 			}
 			end++
+		}
+		if !represented {
+			start = end
+			continue
 		}
 		if len(groups) == maximum {
 			partial = true
@@ -1614,6 +1628,10 @@ func rawMapGroupsContext(ctx context.Context, plain []byte, records []rawRecordM
 		return nil, false, err
 	}
 	return groups, partial, nil
+}
+
+func rawStructuralRecord(plain []byte, record rawRecordMetadata) bool {
+	return !bytes.Equal(record.kind.bytes(plain), []byte(model.Reference))
 }
 
 func rawCompareMapRepresentative(plain []byte, left, right rawRecordMetadata) int {
@@ -1706,7 +1724,7 @@ func skipRawRecord(decoder *rawBinaryDecoder) error {
 			return err
 		}
 	}
-	for _, maximum := range []int{71, maximumIndexStringBytes, maximumTargetNameBytes} {
+	for _, maximum := range []int{71, maximumIndexStringBytes, model.MaximumReferenceTableBytes} {
 		if _, err := decoder.readString(maximum); err != nil {
 			return err
 		}
@@ -1745,9 +1763,10 @@ func validReferenceFieldBytes(kind, target []byte, referenceCount uint32) bool {
 		return false
 	}
 	if isReference {
-		return len(target) != 0
+		_, total, ok := model.ScanReferenceTable(target)
+		return ok && total == uint64(referenceCount)
 	}
-	return len(target) == 0 || bytes.Equal(kind, []byte(model.Import))
+	return len(target) == 0 || (len(target) <= maximumTargetNameBytes && bytes.Equal(kind, []byte(model.Import)))
 }
 
 func validEvidenceClassBytes(value []byte) bool {
@@ -1829,7 +1848,7 @@ func validRecordContext(ctx context.Context, record model.Record, observed func(
 		{value: record.QualifiedName, maximum: 512},
 		{value: record.ExtractionMethod, maximum: 512},
 		{value: record.Preview, maximum: maximumIndexStringBytes, empty: true},
-		{value: record.TargetName, maximum: maximumTargetNameBytes, empty: true},
+		{value: record.TargetName, maximum: model.MaximumReferenceTableBytes, empty: true},
 	} {
 		valid, err = validTextContext(ctx, field.value, field.maximum, field.empty, observed)
 		if err != nil || !valid {
@@ -1840,11 +1859,12 @@ func validRecordContext(ctx context.Context, record model.Record, observed func(
 }
 
 // validReferenceFields ties the two format-4 fields to the record kind: a
-// reference record merges at least one occurrence and names the target it
-// refers to, only an import record may otherwise name a target (the module
-// specifier it binds), and no other kind carries either field. Import records
-// may still omit the target: the frozen synthetic fixtures carry import
-// records without a module specifier, and the resolution rules treat an
+// reference record names the target table of the definition it belongs to and
+// counts exactly the occurrences that table declares, only an import record
+// may otherwise name a target (the module specifier it binds, bounded by
+// maximumTargetNameBytes), and no other kind carries either field. Import
+// records may still omit the target: the frozen synthetic fixtures carry
+// import records without a module specifier, and the resolution rules treat an
 // import without one as unresolvable rather than invalid.
 func validReferenceFields(record model.Record) bool {
 	isReference := record.RecordKind == model.Reference
@@ -1852,9 +1872,10 @@ func validReferenceFields(record model.Record) bool {
 		return false
 	}
 	if isReference {
-		return record.TargetName != ""
+		_, total, ok := model.ScanReferenceTable([]byte(record.TargetName))
+		return ok && total == uint64(record.ReferenceCount)
 	}
-	return record.TargetName == "" || record.RecordKind == model.Import
+	return record.TargetName == "" || (len(record.TargetName) <= maximumTargetNameBytes && record.RecordKind == model.Import)
 }
 
 func validSHA256IdentityString(value string) bool {
@@ -2174,7 +2195,7 @@ func (decoder *binaryDecoder) readRecord() (model.Record, error) {
 	if record.Preview, err = decoder.readString(maximumIndexStringBytes); err != nil {
 		return model.Record{}, err
 	}
-	if record.TargetName, err = decoder.readString(maximumTargetNameBytes); err != nil {
+	if record.TargetName, err = decoder.readString(model.MaximumReferenceTableBytes); err != nil {
 		return model.Record{}, err
 	}
 	referenceCount, err := decoder.readUint32()

@@ -305,9 +305,9 @@ func finalizeRecords(file boundary.StableFile, extractor Extractor, input []mode
 			continue
 		}
 		if record.RecordKind == model.Reference {
-			// A reference is found by the name it refers to, not by the name of
-			// the definition it sits in.
-			record.SearchTerms = normalizedSearchTerms(record.TargetName, nil)
+			// A reference is found by the names it refers to, not by the name
+			// of the definition it sits in.
+			record.SearchTerms = referenceSearchTerms(record.TargetName)
 		} else {
 			record.SearchTerms = normalizedSearchTerms(record.QualifiedName, record.SearchTerms)
 		}
@@ -372,11 +372,12 @@ func finalizeRecords(file boundary.StableFile, extractor Extractor, input []mode
 }
 
 // consistentReferenceFields mirrors the store's format-4 rule: a reference
-// record merges at least one occurrence and names the target it refers to,
-// only an import record may otherwise name a target (the module specifier it
-// binds), and no other kind carries either field.
+// record carries the target table of the definition it belongs to and counts
+// exactly the occurrences that table declares, only an import record may
+// otherwise name a target (the module specifier it binds), and no other kind
+// carries either field.
 func consistentReferenceFields(record model.Record) bool {
-	if len(record.TargetName) > 512 || !utf8.ValidString(record.TargetName) || strings.ContainsAny(record.TargetName, "\x00\n\r") {
+	if !utf8.ValidString(record.TargetName) || strings.ContainsAny(record.TargetName, "\x00\n\r") {
 		return false
 	}
 	isReference := record.RecordKind == model.Reference
@@ -384,9 +385,33 @@ func consistentReferenceFields(record model.Record) bool {
 		return false
 	}
 	if isReference {
-		return record.TargetName != ""
+		_, total, valid := model.ScanReferenceTable([]byte(record.TargetName))
+		return valid && total == uint64(record.ReferenceCount)
 	}
-	return record.TargetName == "" || record.RecordKind == model.Import
+	return record.TargetName == "" || (len(record.TargetName) <= maximumTargetSpecifierBytes && record.RecordKind == model.Import)
+}
+
+// referenceSearchTerms are the lower-cased target names of a reference
+// record's table, without sub-tokenization: a reference is found by the whole
+// name it refers to, so the index keys of the record are the keys of its
+// targets.
+func referenceSearchTerms(table string) []string {
+	entries, ok := model.ParseReferenceTable(table)
+	if !ok {
+		return nil
+	}
+	terms := make([]string, 0, len(entries))
+	seen := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		term := strings.ToLower(strings.TrimSpace(entry.Name))
+		if term == "" || len(term) > 128 || seen[term] {
+			continue
+		}
+		seen[term] = true
+		terms = append(terms, term)
+	}
+	sort.Strings(terms)
+	return terms
 }
 
 func recordIdentity(record model.Record, occurrence int) string {
