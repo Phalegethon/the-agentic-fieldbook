@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -151,3 +152,56 @@ def remove_change_document(state_root: Path) -> None:
         os.unlink(state_root / CHANGE_DOCUMENT_NAME)
     except OSError:
         return
+
+
+class RefreshLock:
+    """Best-effort mutual exclusion between concurrent refreshes of one state root.
+
+    The engine's publication barrier is the real safety; this only avoids
+    duplicate work. Portable: O_EXCL creation, a PID + timestamp payload, a
+    staleness age, and a bounded wait after which the refresh proceeds anyway.
+    """
+
+    def __init__(self, state_root: Path, *, stale_after: float = 30.0, wait: float = 5.0, poll: float = 0.1) -> None:
+        self.path = state_root / ".refresh.lock"
+        self.stale_after, self.wait, self.poll = stale_after, wait, poll
+        self.waited = False
+        self._owned = False
+
+    def _try_acquire(self) -> bool:
+        try:
+            descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return False
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(f"{os.getpid()} {time.time():.0f}\n")
+        self._owned = True
+        return True
+
+    def _is_stale(self) -> bool:
+        try:
+            return time.time() - self.path.lstat().st_mtime > self.stale_after
+        except OSError:
+            return True  # vanished: retry the acquisition
+
+    def __enter__(self) -> "RefreshLock":
+        deadline = time.monotonic() + self.wait
+        while not self._try_acquire():
+            if self._is_stale():
+                try:
+                    os.unlink(self.path)
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                break  # proceed without the lock; the engine barrier protects publication
+            self.waited = True
+            time.sleep(self.poll)
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self._owned:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass

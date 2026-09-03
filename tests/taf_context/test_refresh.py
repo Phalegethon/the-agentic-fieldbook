@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -13,6 +15,7 @@ from taf_context.git_snapshot import collect_snapshot
 from taf_context.refresh import (
     CHANGE_DOCUMENT_NAME,
     Binding,
+    RefreshLock,
     build_change_document,
     change_manifest_identity,
     changed_paths_between,
@@ -183,3 +186,34 @@ class ChangeDocumentTests(unittest.TestCase):
             remove_change_document(state_root)
             self.assertFalse(path.exists())
             remove_change_document(state_root)  # idempotent
+
+
+class RefreshLockTests(unittest.TestCase):
+    def test_lock_is_created_and_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with RefreshLock(root) as lock:
+                self.assertTrue((root / ".refresh.lock").is_file())
+                self.assertFalse(lock.waited)
+            self.assertFalse((root / ".refresh.lock").exists())
+
+    def test_young_foreign_lock_is_waited_for_then_bypassed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".refresh.lock").write_text("999999 0\n", encoding="utf-8")
+            started = time.monotonic()
+            with RefreshLock(root, wait=0.3, poll=0.05) as lock:
+                self.assertTrue(lock.waited)
+            self.assertGreaterEqual(time.monotonic() - started, 0.25)
+            self.assertTrue((root / ".refresh.lock").exists())  # not ours: left alone
+
+    def test_stale_foreign_lock_is_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = root / ".refresh.lock"
+            lock_path.write_text("999999 0\n", encoding="utf-8")
+            os.utime(lock_path, (1, 1))
+            with RefreshLock(root) as lock:
+                self.assertFalse(lock.waited)
+                self.assertIn(str(os.getpid()), lock_path.read_text(encoding="utf-8"))
+            self.assertFalse(lock_path.exists())

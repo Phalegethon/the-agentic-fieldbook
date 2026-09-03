@@ -281,6 +281,20 @@ def _is_real_file(path: Path) -> bool:
         return False
 
 
+def plan_prune_generations(root: Path, entry: Path, *, now: float, grace_seconds: float = 60.0) -> list[Candidate]:
+    """Unreferenced generations old enough that no reader can still be loading them."""
+    cutoff = now - grace_seconds
+    aged: list[Candidate] = []
+    for candidate in _unreferenced_generations(root, entry):
+        try:
+            modified = (root / candidate.relative_path).lstat().st_mtime
+        except OSError:
+            continue
+        if modified <= cutoff:
+            aged.append(candidate)
+    return aged
+
+
 def _group_by_category(items: list[Candidate]) -> list[list[Candidate]]:
     order = ["orphan-entry", "unused-entry", "stale-runtime", "unreferenced-generation",
              "legacy-control-file", "trash-leftover", "empty-parent"]

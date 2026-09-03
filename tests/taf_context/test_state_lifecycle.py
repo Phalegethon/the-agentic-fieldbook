@@ -15,6 +15,7 @@ from taf_context.state_lifecycle import (
     Candidate,
     apply_plan,
     plan_gc,
+    plan_prune_generations,
     plan_remove,
     summarize_state,
 )
@@ -332,6 +333,39 @@ class GcPlanTests(unittest.TestCase):
             with mock.patch.object(Path, "iterdir", flaky_iterdir):
                 plan = plan_gc(root, unused_for_days=30, now=time.time())
             self.assertEqual([c.category for c in plan if c.category == "empty-parent"], ["empty-parent"])
+
+
+class PruneGenerationsTests(unittest.TestCase):
+    def test_prunes_only_unreferenced_generations_older_than_the_grace_period(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = make_entry(root, "a" * 64, "1" * 64, bound=True, schema="2", generation="c" * 64)
+            generations = entry / "native" / "generations"
+            old, young, staging = generations / ("0" * 64), generations / ("1" * 64), generations / ".stage-abc"
+            for path in (old, young, staging):
+                path.mkdir()
+                (path / "index.bin").write_bytes(b"x")
+            now = 1_700_000_000.0
+            os.utime(old, (now - 120, now - 120))
+            os.utime(staging, (now - 120, now - 120))
+            os.utime(young, (now - 10, now - 10))
+            plan = plan_prune_generations(root, entry, now=now)
+            self.assertEqual(sorted(c.relative_path for c in plan), sorted([
+                old.relative_to(root).as_posix(), staging.relative_to(root).as_posix(),
+            ]))
+            self.assertTrue(all(c.category == "unreferenced-generation" for c in plan))
+            apply_plan(root, plan)
+            self.assertEqual(sorted(p.name for p in generations.iterdir()), sorted(["1" * 64, "c" * 64]))
+
+    def test_unreadable_current_pointer_prunes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = make_entry(root, "a" * 64, "1" * 64, bound=True)
+            (entry / "native" / "CURRENT").write_text("garbage\n", encoding="utf-8")
+            stale = entry / "native" / "generations" / ("0" * 64)
+            stale.mkdir()
+            os.utime(stale, (1, 1))
+            self.assertEqual(plan_prune_generations(root, entry, now=1_700_000_000.0), [])
 
 
 if __name__ == "__main__":
