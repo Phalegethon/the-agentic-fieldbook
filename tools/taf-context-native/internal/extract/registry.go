@@ -75,6 +75,47 @@ var extractorWarningCompleteness = map[string]bool{
 	"javascript-parse-failure": true, "javascript-query-failure": true, "javascript-syntax-error": true,
 	"typescript-parse-failure": true, "typescript-query-failure": true, "typescript-syntax-error": true,
 	"rust-parse-failure": true, "rust-query-failure": true, "rust-syntax-error": true,
+	"parse-failure": true,
+}
+
+// parseFailureCodes are the warning codes an extractor emits together with
+// ParseFailures == 1. boundedReport guarantees that every parse failure
+// carries one of them (adding the generic "parse-failure" otherwise), so a
+// report can be reconstructed from the codes the source catalog persists.
+var parseFailureCodes = map[string]bool{
+	"parse-failure": true, "invalid-stable-file": true, "extractor-panic": true,
+	"go-parse-failure": true, "json-parse-failure": true, "toml-parse-failure": true,
+	"markdown-invalid-utf8": true, "markdown-unterminated-fence": true, "markdown-heading-limit": true, "markdown-record-limit": true,
+	"python-parse-failure": true, "python-syntax-error": true,
+	"javascript-parse-failure": true, "javascript-syntax-error": true,
+	"typescript-parse-failure": true, "typescript-syntax-error": true,
+	"rust-parse-failure": true, "rust-syntax-error": true,
+}
+
+// ReportFromCodes rebuilds the completeness view of a persisted extraction
+// report from its warning codes. It is exact because boundedReport guarantees
+// a parse-failure code for every parse failure.
+func ReportFromCodes(codes []string) Report {
+	report := Report{}
+	if len(codes) != 0 {
+		report.WarningCodes = append([]string(nil), codes...)
+	}
+	for _, code := range codes {
+		if parseFailureCodes[code] {
+			report.ParseFailures = 1
+			break
+		}
+	}
+	return report
+}
+
+func hasParseFailureCode(codes []string) bool {
+	for _, code := range codes {
+		if parseFailureCodes[code] {
+			return true
+		}
+	}
+	return false
 }
 
 // PolicyDescriptor binds registry/path validation ceilings that affect whether
@@ -379,6 +420,9 @@ func sourceLineCount(source []byte) int {
 func boundedReport(report Report) Report {
 	if report.ParseFailures < 0 || report.ParseFailures > 1 {
 		report.ParseFailures = 1
+	}
+	if report.ParseFailures == 1 && !hasParseFailureCode(report.WarningCodes) {
+		report.WarningCodes = append(report.WarningCodes, "parse-failure")
 	}
 	sort.Strings(report.WarningCodes)
 	warnings := report.WarningCodes[:0]

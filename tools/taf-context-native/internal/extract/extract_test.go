@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
@@ -523,4 +524,64 @@ func contains(values []string, wanted string) bool {
 		}
 	}
 	return false
+}
+
+func TestBoundedReportGuaranteesAParseFailureCode(t *testing.T) {
+	// A parse failure without one of the known parse-failure codes would be
+	// invisible in the source catalog, so update could not derive coverage.
+	report := boundedReport(Report{ParserVersion: "x", ParseFailures: 1, WarningCodes: []string{"tree-sitter-record-limit"}})
+	if !contains(report.WarningCodes, "parse-failure") || !sort.StringsAreSorted(report.WarningCodes) {
+		t.Fatalf("report = %#v, want a sorted list containing parse-failure", report)
+	}
+	unchanged := boundedReport(Report{ParserVersion: "x", ParseFailures: 1, WarningCodes: []string{"go-parse-failure"}})
+	if contains(unchanged.WarningCodes, "parse-failure") {
+		t.Fatalf("redundant generic code added: %#v", unchanged)
+	}
+	clean := boundedReport(Report{ParserVersion: "x", WarningCodes: []string{"python-dynamic-lookup"}})
+	if clean.ParseFailures != 0 || contains(clean.WarningCodes, "parse-failure") {
+		t.Fatalf("clean report changed: %#v", clean)
+	}
+}
+
+func TestReportFromCodesRoundTripsParseFailureAndCompleteness(t *testing.T) {
+	for code := range parseFailureCodes {
+		report := ReportFromCodes([]string{code})
+		if report.ParseFailures != 1 || !report.Incomplete() {
+			t.Fatalf("%s: report = %#v, want a parse failure", code, report)
+		}
+		if _, known := extractorWarningCompleteness[code]; !known {
+			t.Fatalf("%s is a parse-failure code but not in the completeness vocabulary", code)
+		}
+	}
+	if report := ReportFromCodes([]string{"python-dynamic-lookup"}); report.ParseFailures != 0 || report.Incomplete() {
+		t.Fatalf("complete report = %#v", report)
+	}
+	if report := ReportFromCodes([]string{"markdown-line-too-long"}); report.ParseFailures != 0 || !report.Incomplete() {
+		t.Fatalf("incomplete-but-parsed report = %#v", report)
+	}
+	if report := ReportFromCodes(nil); report.ParseFailures != 0 || report.Incomplete() || report.WarningCodes != nil {
+		t.Fatalf("empty report = %#v", report)
+	}
+}
+
+func TestEveryExtractorParseFailureCarriesAParseFailureCode(t *testing.T) {
+	registry := NewRegistry()
+	sources := map[string]string{
+		"pkg/broken.py":    "def broken(:\n",
+		"web/broken.js":    "export function (\n",
+		"web/broken.ts":    "export const x: = ;\n",
+		"crate/broken.rs":  "fn broken( {\n",
+		"pkg/broken.go":    "package sample\nfunc broken( {\n",
+		"conf/broken.json": "{\"a\": }\n",
+		"conf/broken.toml": "a = \n",
+	}
+	for relative, source := range sources {
+		_, report := registry.Extract(stableFile(relative, source))
+		if report.ParseFailures != 1 {
+			t.Fatalf("%s: expected a parse failure, got %#v", relative, report)
+		}
+		if derived := ReportFromCodes(report.WarningCodes); derived.ParseFailures != 1 {
+			t.Fatalf("%s: codes %v do not encode the parse failure", relative, report.WarningCodes)
+		}
+	}
 }
