@@ -112,6 +112,74 @@ func TestCanonicalPathOrderIsUnchangedByPrecomputedKeys(t *testing.T) {
 	}
 }
 
+// TestCanonicalPathOrderBreaksTiesOnNormalizedNameLikeTheReference targets the
+// fifth comparator key on its own. mixedCaseRecords never lets a comparison
+// reach the normalized-name key while the normalized names actually differ:
+// every pair in that fixture is decided earlier (exact path, start line, or
+// kind) or arrives at the name key already normalized-equal, so the identity
+// tie-break decides instead. nameTieRecords isolates the key by holding path,
+// start line, and kind fixed within each family and varying only the
+// qualified name, so some pairs are normalized-equal (identity decides, as
+// before) and others have genuinely different normalized names (this key must
+// decide).
+func TestCanonicalPathOrderBreaksTiesOnNormalizedNameLikeTheReference(t *testing.T) {
+	records := nameTieRecords(400)
+	got := BuildQueryIndex(records)
+	want := referenceQueryIndex(records)
+	if !slices.Equal(got.PathOrdinals(), want.PathOrdinals()) {
+		t.Fatalf("byPath differs from the frozen reference order")
+	}
+	gotGroups, gotPartial := got.MapGroups()
+	wantGroups, wantPartial := want.MapGroups()
+	if gotPartial != wantPartial || !reflect.DeepEqual(gotGroups, wantGroups) {
+		t.Fatalf("map groups differ from the frozen reference (partial got=%v want=%v)", gotPartial, wantPartial)
+	}
+}
+
+// nameTieRecords holds path, start line, and record kind fixed within each
+// four-record family so the canonical comparator can only be decided by the
+// normalized-name key or, when that ties, the identity key. Slots 0 and 1
+// share a normalized qualified name ("alpha") but differ in case and
+// surrounding whitespace, so NormalizeQueryText must equalize them before the
+// identity tie-break can run. Slots 2 and 3 mirror that shape around "beta",
+// and "alpha" sorts before "beta" only after normalization strips the case
+// and whitespace noise, so a comparator that ignored this key entirely would
+// also happen to reorder slot 0/1 against slot 2/3.
+func nameTieRecords(count int) []model.Record {
+	records := make([]model.Record, 0, count)
+	for index := 0; len(records) < count; index++ {
+		family := index / 4
+		slot := index % 4
+		path := fmt.Sprintf("src/tie/Module%03d.go", family)
+		var qualifiedName string
+		switch slot {
+		case 0:
+			qualifiedName = fmt.Sprintf("  MODULE%03d.ALPHA  ", family)
+		case 1:
+			qualifiedName = fmt.Sprintf("module%03d.alpha", family)
+		case 2:
+			qualifiedName = fmt.Sprintf("  MODULE%03d.BETA  ", family)
+		case 3:
+			qualifiedName = fmt.Sprintf("module%03d.beta", family)
+		}
+		records = append(records, model.Record{
+			Identity:         fmt.Sprintf("sha256:%064x", index),
+			Path:             path,
+			StartLine:        1,
+			EndLine:          9,
+			Language:         "go",
+			RecordKind:       model.Definition,
+			SourceType:       "source",
+			QualifiedName:    qualifiedName,
+			ExtractionMethod: "go/parser@go1.27",
+			EvidenceClass:    model.Verified,
+			SearchTerms:      []string{"tie", fmt.Sprintf("module%03d", family)},
+			SourceDigest:     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		})
+	}
+	return records
+}
+
 // mixedCaseRecords is deterministic and exercises every level of the canonical
 // path comparator: differing normalized paths, equal normalized paths that
 // differ in case, equal paths differing in start line and in record kind, and

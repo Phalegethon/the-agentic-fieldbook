@@ -324,7 +324,6 @@ type canonicalRecords interface {
 	At(uint32) model.Record
 	NormalizedPath(uint32) string
 	NormalizedName(uint32) string
-	Len() int
 }
 
 type directRecords struct {
@@ -347,8 +346,6 @@ func (records directRecords) NormalizedPath(ordinal uint32) string {
 func (records directRecords) NormalizedName(ordinal uint32) string {
 	return records.normalizedNames[ordinal]
 }
-
-func (records directRecords) Len() int { return len(records.records) }
 
 type recordsByCanonicalOrder struct {
 	records         []model.Record
@@ -373,8 +370,6 @@ func (records recordsByCanonicalOrder) NormalizedPath(ordinal uint32) string {
 func (records recordsByCanonicalOrder) NormalizedName(ordinal uint32) string {
 	return records.normalizedNames[ordinal]
 }
-
-func (records recordsByCanonicalOrder) Len() int { return len(records.order) }
 
 func normalizedCanonicalKeys(count int, at func(int) model.Record) ([]string, []string) {
 	paths := make([]string, count)
