@@ -1,0 +1,338 @@
+[
+  {
+    "name": "exact-qualified",
+    "identities": [
+      "sha256:a31a6d2f48e9b567d5f71d19f790060e2bd80a7188413634cf6cdec1af01ff22"
+    ],
+    "omitted": 0,
+    "partial": false,
+    "considered_records": 3,
+    "term_visits": 0
+  },
+  {
+    "name": "exact-short-function",
+    "identities": [
+      "sha256:a31a6d2f48e9b567d5f71d19f790060e2bd80a7188413634cf6cdec1af01ff22"
+    ],
+    "omitted": 0,
+    "partial": false,
+    "considered_records": 3,
+    "term_visits": 0
+  },
+  {
+    "name": "exact-short-class",
+    "identities": [
+      "sha256:586825ac1ae1c60a878cd5240e59ce007c3dab68ca505fbfd883e5968edc8896"
+    ],
+    "omitted": 0,
+    "partial": false,
+    "considered_records": 3,
+    "term_visits": 0
+  },
+  {
+    "name": "exact-module",
+    "identities": [
+      "sha256:71c6f402e33d352cc197844f487dc036b843eb5f944ccedd39d5693864147f51",
+      "sha256:cec6f4753c8c4b8c1acfabd5eadca949a60bd238c8090fb64a10103198879c93",
+      "sha256:4ee0be86b2242cc25a47881783a3d5fd42fd4d3da2347e1e0d6ca959c6b7d796",
+      "sha256:6dfc9114231cac3a82458f497a5a6d876021d4cf5b20acd47e3a72f28acf7b8c",
+      "sha256:6cbadc308bdf8b2eb3c7d12bce8e940710ff91cf8044ebd0ff39a0582c4e8fea",
+      "sha256:c4bdb157f59d637b4d32b77d3154c5eb8eb5fa5ed83c537b87fbb2e1cbd40ea9",
+      "sha256:21e34f88f9d2e7051acdf022c035aa27456478cf39ba8569a30ea9a556aa6938",
+      "sha256:d11f726785a78e22c92b19fb9287d221dcb7f95bd485dc626474903c8612356b"
+    ],
+    "omitted": 43,
+    "partial": false,
+    "considered_records": 154,
+    "term_visits": 50
+  },
+  {
+    "name": "prefix-narrow",
+    "identities": [
+      "sha256:416bff4a9869092f34f70b4183220eee82c5c3d29dce04c7a689ad950a4b2160",
+      "sha256:81606f5ef5ead222ffbe0e44310d85a20b00a1b800c1df0fad55ba3bbc0bc503",
+      "sha256:f10a1745959abab4ff07384102567fc9e6f59c39a3abf87e6ee25e65eb867783",
+      "sha256:389d72d17795d206e363ba0b46b693149145b77926e4ed7567c7a6473f3f2b10",
+      "sha256:ca5529e58876c9a48b9ac2e22eb28b86f2b1c8251fff3dac347e601ac4e048d5",
+      "sha256:bed84a2d2b01fed7442d9a9ce518ea17983ab4aa33fe4e1570d3b50121765e0c",
+      "sha256:ebd298299eee728825035872c68e4c5c51d927101414592d6456348f2f4744ac",
+      "sha256:a31a6d2f48e9b567d5f71d19f790060e2bd80a7188413634cf6cdec1af01ff22"
+    ],
+    "omitted": 2,
+    "partial": false,
+    "considered_records": 20,
+    "term_visits": 10
+  },
+  {
+    "name": "prefix-wide",
+    "identities": [
+      "sha256:4e5ae99f71f942a2e9e248166e805008611ee6895371cbb760e5e81b690909b4",
+      "sha256:4617dcea946a155d28054dd620faa37358b78984175db8173d6c2916b6958d02",
+      "sha256:c24bd905c9690353a619a24e0b98e0d806f1a41484d4007655c026dde1b30f3c",
+      "sha256:95930d1420ebd3e6fe52283c82f7ed8030df63b65d4ff1e80242af3f1eddfc11",
+      "sha256:1c745bf82a440a780c105d6ecc09d97b8ea5596eb2afa558336a30c0dcf47e17",
+      "sha256:d6cd97b88747860fb9efc0915f73179cb369f82dbaf0096b9f9757d9c8286d65",
+      "sha256:6bb625b38bd8eeb41abda736ad01869eae537f26ce262b0d6bbf5d7740fe9440",
+      "sha256:37ed83c94d5d40002bfb3cea0c57f6bf8a42463b5e3ec2b8a479bb47e664a4fb"
+    ],
+    "omitted": 2492,
+    "partial": false,
+    "considered_records": 5000,
+    "term_visits": 2500
+  },
+  {
+    "name": "prefix-widget-wide",
+    "identities": [
+      "sha256:e25969695fc5ea2d17cae492b6515c60c7a2e71acdac6154a5e9c55316d386d8",
+      "sha256:3f5ea4e26f531b2f313e24c6db407a68c4fc183810da4ca99fee31a3e68c81b3",
+      "sha256:0754969ecc37cfdca2212d86940947446e8ef5d221a70b2bcc34efcb4a73464d",
+      "sha256:67d89942b7d631ed3d34f9a0bf2ed5a1159953739e278b666e03a5088fd27751",
+      "sha256:076d58fa600facd0d8c005f856385a8ee0e5e53423b0852fa926348f31e42631",
+      "sha256:d84d19ac647ae6de20fbd66f52af01b3aa7cdafe3fcd3ec4d29ec1048e30bb56",
+      "sha256:4653494beb6852c310b83b29cd4a9b26b33dd33dd7b8f823ad4d5e04d42654a2",
+      "sha256:8925bda5e2de55a6c36db7b9caa30fc880c63d56963f83c0ab09c668e1f612c7",
+      "sha256:b877118cfb8e826653a3bb57a45907c3f2b26073d5bbbeecc62179c8872057b1",
+      "sha256:9b550dadd9c602d9790a937c22dfd0c677a14e40ca3abb9239b2ae5594950d20",
+      "sha256:f4b0816e31b164250c562f71a55bb5ee5ee1b912800f10324ec4b3f92ec0ecc3",
+      "sha256:a2483c5832dbed8d4cef2303006db06f5b3d5ae1046ca697799a332901d57798",
+      "sha256:155458952bbe5fc87a0ead5b2fae3efc63bf2fb4480f1c720815883709565f43",
+      "sha256:61143543ad5d8176d5d1ffb8554ca7c7c59c6b51c0023a303f57af6f96fba67c",
+      "sha256:94ba973e0a2627851f225734d311c7a265d8c078cd4077954524abf1cf8c9d22",
+      "sha256:e245fc3655f6dfc556c4fd1d99214780a4afea05d81391cfb3a30c0533ce685f",
+      "sha256:e11a3cd130ab23f8ec6bddf7579e2988a128aca6ffb16fd2cfa4cb6430654cc4",
+      "sha256:6da3af771ca327d826bf0ac8adce8cd833ed553bcb1e2f4d56fc672aafcd0607",
+      "sha256:feb18d38dd0a3f7a87603d75b59ab87ef46ea28cea03792f63331c7b842c4810",
+      "sha256:7b76d9276df06d9be0303e310681afd883ef7f65019ab34cbd6dd33b906d9374",
+      "sha256:90d53aba85bb2817db13459037d8f3dc94205ac142bc8b6be0f2c483372c526d",
+      "sha256:37b6bd7da822cdddfc3c11a9e91d361ca1464cf61bbfe918d6b405033d5442ec",
+      "sha256:a711048cdf739e27755620c96254e67213434ff27b693a96d82e6af8daf2f6f3",
+      "sha256:98ab3f190e949524546f06a5fe5e9e90884f0578362c3eee213f5594b49af5e9",
+      "sha256:2af6cb5df40c12e6b454a2526f35a413f9f9436fd86d1c087d74f38bb1d13e13",
+      "sha256:6e0081aadd9f1d181aac2f08cc49e53b46fbf3dd165412ed6887ee881cab4c88",
+      "sha256:fdfa4dd98f38d75dbb236cc24930e026a2417ba85d9a86719d2a222adb87c73b",
+      "sha256:792f13a23533e49e625f2007f3acc7a4d98153f481c69c56e121cf4bcf0055d7",
+      "sha256:f50c964d7e5d371b7c7f071a14ad0987650d2580f91b0ca45de2f57dbeb84d45",
+      "sha256:87a138610d3ad482c714dd1df2acece908d6e6d284451f38d75a6bd21178cfac",
+      "sha256:dc59f6d975366c38e2b3aa8dbac22b3baf1716247e25f30e6c619e5139e762d1",
+      "sha256:80e3a96db84179c0b90714a38177f013d9a5416bd34bd9546326199a1d245d2c",
+      "sha256:4a8bd7f56cb24e6d9672ab96f264c28ee2a2077f19f0f4f3ee3c521e7daa69b6",
+      "sha256:9fce6470e8406a9014424506e28bf742e06ceeb28ab0e152beb66172374e8b32",
+      "sha256:bf71b1bbb323725f3ae6546f19ece6a5474680a67cfe6320003fc8215bec4814",
+      "sha256:6ab4c8e6aafab30b706b826047c2b654c36e4b5012ae1ea5166528337c17d4e9",
+      "sha256:d312e4d452f7dae3ec00bf6cc107d9a33d7bbc584a32891e046706654f147eac",
+      "sha256:f77e3e0690a8522fe17eb5afc32987d736fa1ceb9228acc520e57e4cdb43d811",
+      "sha256:42ce46303730d5643a966360fe821b6d8001565c108467b6f17c5f90e3798293",
+      "sha256:b3fb10eb63c5bfc32ebbe5f2d19d8de9d400f2c39979fe831382ce52d4b1889f",
+      "sha256:99104178c85f8158ced75edbbaf4b6f9d6a3c337b634ec0c2a75dfc55925e21e",
+      "sha256:8568f3fcad292323cc954507b4c1c607a4f46ca9fba6be924010a745d475dc12",
+      "sha256:bc7a9d1597a5b582e69c2bcaccd0f795225d1824338ae4303fca61ea223821db",
+      "sha256:ef17151b3991df5a95ee3323bfb21e6f56a08ed8471303af5164402dfc909a43",
+      "sha256:052d8dcfb0e03d4d16779478a602c5db2c9167c527ca7e27368be2ec0be913ad",
+      "sha256:e8c91718e2afe104a17255141fc7fd3764891fcab2ed67f2fb8dce848fa3444a",
+      "sha256:80c2ee59c1d4ade9788bd9d454501c79f9ec12d00b37c9fe9a34500ddff92c7e",
+      "sha256:3bf90b3f6f1ece0df08f3241ab832453820754b017c2131df46b4522daa81b1f",
+      "sha256:b0f3fc104a17720465ab18bfbd2c21c442d64e7106c67ffaa904742cd7acb132",
+      "sha256:6fd046d096f4dc5a1c4a97da046bdd5de2e03624bc8e56498c85889f3b7bbb9c",
+      "sha256:27978e15bcdbf8248784ced165c1dffbeda8200100acad232a4ad3caa4e53b67",
+      "sha256:b1835fd263e18fee443bc2c46b749d09caef872f93bfac343588654c48f8642f",
+      "sha256:c9974e2ba62d6a57076ed6531b466415cf736172faf96bf965247b593a394ef1",
+      "sha256:b93907f590ccccb45a2a479ae41ceda5922133030c917adfe7e0d6d64bf69c01",
+      "sha256:56dd7679d06738c21b8010a03e5679ccd4e63399d04b1ef30309295ce9b4e334",
+      "sha256:56463a396ff827a1900fde7ea74084c063c5b77472006691d1b74ac7e0aa0742",
+      "sha256:e97bac49708e42d9902eaccf4e85277d2edd1a55550192a4c36efcda24993215",
+      "sha256:fb4aab64ff5efacd1765ddcc27588af42e596807f7a6d14a73c3ae94e51ce140",
+      "sha256:d370578757bebf3dff97c9221044502d76f13c75ca230398fe8d1553faacd8cb",
+      "sha256:0bff24d4a41c0bf98406c0aa226f7500af052287d36dbec4799d8ce122e5b7dd",
+      "sha256:1eefc7a4d5857601b6b1709aeb02bd65a99a02de1ae9029279c57db39df2ffdd",
+      "sha256:0a4cfc5acb9bede41aef6ebbd9d65414908c5433ed300ae06d4917835d64629b",
+      "sha256:1787d65f9345f4dc81f1b4c05f16bb6dd329c58bddfa060450d5239aa5cce11c",
+      "sha256:58fb9a0f4e2467a764ec40dfdb5b73ac18a549c5f996d928a9714f1bb9359773"
+    ],
+    "omitted": 2436,
+    "partial": false,
+    "considered_records": 7500,
+    "term_visits": 2600
+  },
+  {
+    "name": "broad-word-function",
+    "identities": [
+      "sha256:1423b499a7d76cb6bc9b312aa520ebc9d393c89bb359a5787be4a3c7a19dc1cf",
+      "sha256:612de50ea8210af9c9326cd1639e9ff3695224644055250e63b86866fed9d269",
+      "sha256:02de34c96673420419c7b0544868b2af249a0bff97b59e5be3c84064a0767ccd",
+      "sha256:3e8124627b5283872b843313318e29f2f3334e4fcb651990a029909ce9fa955f",
+      "sha256:155132b86f3f3c522f6d70d69063461bafa91a8f1c93e7054666791b14a0a9e8",
+      "sha256:c9ae2fa72316d5181d6aae8d227af734da30e46b510a28ac20f00dd4a57b507a",
+      "sha256:d4b839eb05254ee60c6423dd08f43cd2a0e64e74720f4928b47c797521e1700c",
+      "sha256:74e7cd0e1e55df6901fcfcc40eaa865d9b976f3159b6bf668f186aff9a8e77a0"
+    ],
+    "omitted": 48992,
+    "partial": true,
+    "considered_records": 102095,
+    "term_visits": 4096
+  },
+  {
+    "name": "broad-word-widget",
+    "identities": [
+      "sha256:4571f941dd6d18c5afd82bf5a732b60be8ec561bbc71eab49b506b1e4abd2bad",
+      "sha256:89c85166da3b078d9e6eab251fe37ddbd45e74db73e539cccc3ad5ccf77da9d8",
+      "sha256:5e4c330a957d42a59792b42405b8d952a00d679ee8e80b78a7dc07b06c17aa02",
+      "sha256:267ad4b00d7172c27e5e61eb611cac9edc4f0436f12754620485b67deaff5719",
+      "sha256:274cc0bf465ca5262442c6f33c88922d481788954b23fa1f98fec4e285190880",
+      "sha256:65b40d2158d920ecba6fbfee5a862faa18cbe4752c274bac51e73175984d5c67",
+      "sha256:011eaf765f9f7d90e3de7b60da361155fe272d52b9859c6bf730000ae5d0b240",
+      "sha256:f0fa75b5985b45b84e31bd6dee8c739c9cfcb89578260fb13d095b674f1a6bfc"
+    ],
+    "omitted": 48992,
+    "partial": true,
+    "considered_records": 105887,
+    "term_visits": 4096
+  },
+  {
+    "name": "substring",
+    "identities": [
+      "sha256:cec6f4753c8c4b8c1acfabd5eadca949a60bd238c8090fb64a10103198879c93",
+      "sha256:4ee0be86b2242cc25a47881783a3d5fd42fd4d3da2347e1e0d6ca959c6b7d796",
+      "sha256:6dfc9114231cac3a82458f497a5a6d876021d4cf5b20acd47e3a72f28acf7b8c",
+      "sha256:6cbadc308bdf8b2eb3c7d12bce8e940710ff91cf8044ebd0ff39a0582c4e8fea",
+      "sha256:c4bdb157f59d637b4d32b77d3154c5eb8eb5fa5ed83c537b87fbb2e1cbd40ea9",
+      "sha256:21e34f88f9d2e7051acdf022c035aa27456478cf39ba8569a30ea9a556aa6938",
+      "sha256:d11f726785a78e22c92b19fb9287d221dcb7f95bd485dc626474903c8612356b",
+      "sha256:3e3473bf4e2cc7adfeaa2c5de317af552ff8b3bfa3ce3c2dc3cbf8abe42ee78e"
+    ],
+    "omitted": 17,
+    "partial": false,
+    "considered_records": 75,
+    "term_visits": 201908
+  },
+  {
+    "name": "fuzzy-typo",
+    "identities": [],
+    "omitted": 0,
+    "partial": true,
+    "considered_records": 0,
+    "term_visits": 262144
+  },
+  {
+    "name": "fuzzy-widget",
+    "identities": [
+      "sha256:586825ac1ae1c60a878cd5240e59ce007c3dab68ca505fbfd883e5968edc8896"
+    ],
+    "omitted": 0,
+    "partial": true,
+    "considered_records": 2,
+    "term_visits": 262144
+  },
+  {
+    "name": "multi-word-hit",
+    "identities": [
+      "sha256:ea8c538cb46472bc37e3fe86ad321d79fba0144e194228f7ab9e80bdfb02b36b",
+      "sha256:6c977f000c0dacfae19f59de1134a7a2eaedef689a5577dd840cd78ba08a7c3a",
+      "sha256:47008af3ec1cdda659fd3505b1b1586fb016c880556b06103cdf210d0593c562",
+      "sha256:5f596c35fc48998fe3b98216e7914ab3687ed56b92ea4a6361d80a8c63ea71c1",
+      "sha256:155b39f2549a8930d608d04c7dd1f41c525a976107759d9c498a4d215af7516e",
+      "sha256:5dd406762a5ee346c9fb27adbd68e2f0e8ca845937930ca01bb0931104651681",
+      "sha256:1e75479e476bcf5e53adc715be1b84161c6ff80134c1e27a6d1ccbce85a8aeb3",
+      "sha256:1fc7aded6c66747d19ef30d929afe08502c3a74cc0a0a95d4719d913ceb707f6"
+    ],
+    "omitted": 17,
+    "partial": true,
+    "considered_records": 57013,
+    "term_visits": 4146
+  },
+  {
+    "name": "multi-word-miss",
+    "identities": [],
+    "omitted": 0,
+    "partial": true,
+    "considered_records": 101,
+    "term_visits": 262144
+  },
+  {
+    "name": "filter-language",
+    "identities": [
+      "sha256:a31a6d2f48e9b567d5f71d19f790060e2bd80a7188413634cf6cdec1af01ff22"
+    ],
+    "omitted": 0,
+    "partial": false,
+    "considered_records": 3,
+    "term_visits": 0
+  },
+  {
+    "name": "filter-kind",
+    "identities": [
+      "sha256:cec6f4753c8c4b8c1acfabd5eadca949a60bd238c8090fb64a10103198879c93",
+      "sha256:4ee0be86b2242cc25a47881783a3d5fd42fd4d3da2347e1e0d6ca959c6b7d796",
+      "sha256:6dfc9114231cac3a82458f497a5a6d876021d4cf5b20acd47e3a72f28acf7b8c",
+      "sha256:6cbadc308bdf8b2eb3c7d12bce8e940710ff91cf8044ebd0ff39a0582c4e8fea",
+      "sha256:c4bdb157f59d637b4d32b77d3154c5eb8eb5fa5ed83c537b87fbb2e1cbd40ea9",
+      "sha256:21e34f88f9d2e7051acdf022c035aa27456478cf39ba8569a30ea9a556aa6938",
+      "sha256:d11f726785a78e22c92b19fb9287d221dcb7f95bd485dc626474903c8612356b",
+      "sha256:3e3473bf4e2cc7adfeaa2c5de317af552ff8b3bfa3ce3c2dc3cbf8abe42ee78e"
+    ],
+    "omitted": 42,
+    "partial": false,
+    "considered_records": 153,
+    "term_visits": 50
+  },
+  {
+    "name": "filter-path",
+    "identities": [
+      "sha256:1423b499a7d76cb6bc9b312aa520ebc9d393c89bb359a5787be4a3c7a19dc1cf",
+      "sha256:612de50ea8210af9c9326cd1639e9ff3695224644055250e63b86866fed9d269",
+      "sha256:02de34c96673420419c7b0544868b2af249a0bff97b59e5be3c84064a0767ccd",
+      "sha256:3e8124627b5283872b843313318e29f2f3334e4fcb651990a029909ce9fa955f",
+      "sha256:155132b86f3f3c522f6d70d69063461bafa91a8f1c93e7054666791b14a0a9e8",
+      "sha256:c9ae2fa72316d5181d6aae8d227af734da30e46b510a28ac20f00dd4a57b507a",
+      "sha256:d4b839eb05254ee60c6423dd08f43cd2a0e64e74720f4928b47c797521e1700c",
+      "sha256:74e7cd0e1e55df6901fcfcc40eaa865d9b976f3159b6bf668f186aff9a8e77a0"
+    ],
+    "omitted": 2492,
+    "partial": true,
+    "considered_records": 55595,
+    "term_visits": 4096
+  },
+  {
+    "name": "filter-source",
+    "identities": [
+      "sha256:4571f941dd6d18c5afd82bf5a732b60be8ec561bbc71eab49b506b1e4abd2bad",
+      "sha256:89c85166da3b078d9e6eab251fe37ddbd45e74db73e539cccc3ad5ccf77da9d8",
+      "sha256:5e4c330a957d42a59792b42405b8d952a00d679ee8e80b78a7dc07b06c17aa02",
+      "sha256:267ad4b00d7172c27e5e61eb611cac9edc4f0436f12754620485b67deaff5719",
+      "sha256:274cc0bf465ca5262442c6f33c88922d481788954b23fa1f98fec4e285190880",
+      "sha256:65b40d2158d920ecba6fbfee5a862faa18cbe4752c274bac51e73175984d5c67",
+      "sha256:011eaf765f9f7d90e3de7b60da361155fe272d52b9859c6bf730000ae5d0b240",
+      "sha256:f0fa75b5985b45b84e31bd6dee8c739c9cfcb89578260fb13d095b674f1a6bfc"
+    ],
+    "omitted": 48992,
+    "partial": true,
+    "considered_records": 105887,
+    "term_visits": 4096
+  },
+  {
+    "name": "docs-miss",
+    "identities": [],
+    "omitted": 0,
+    "partial": true,
+    "considered_records": 53095,
+    "term_visits": 4096
+  },
+  {
+    "name": "map-prefix",
+    "identities": [
+      "sha256:9b8dc756450a42f859e135d6255b5b4155fa5f08529dd9be4463135ba83739f3",
+      "sha256:b0538ad05a8e393f99551e85844262de80a716f4327ece6bc416afded8325fa8",
+      "sha256:e5cf9075a2bac36603af51caeaadbaf4ec6b498f3623d7a78dfe38f84c087176",
+      "sha256:1a08af555625bd2629bccdf6fd6f0e1710c2e4a84747d82c6a71360c72a39629",
+      "sha256:aea98b9b01f84345277647e258e48ca7e8258327b596b00173d79b8677152d5c",
+      "sha256:bf8fe89da133903ef52fd35495f0614cd0b54b2c1759e0716aec78a620516df2",
+      "sha256:da93d779604a86d73b387c6e117aa26dc6ac9d1d4b79adc6a47733c1ad6ce5b6",
+      "sha256:c2a8c91854b58910143b987b572be87c44d55c36325ae7687d1f3d9fa3a91f6f",
+      "sha256:f85b1b9ea72206b83a359710afaea2e96dda0b0f3942f18ae40152a9ab39d3d9",
+      "sha256:139944c5dc354a018f3a5592854209dfa12171325606f55d05353495b1c88129"
+    ],
+    "omitted": 0,
+    "partial": false,
+    "considered_records": 1020,
+    "term_visits": 0
+  }
+]
