@@ -27,6 +27,12 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ### Changed
 
+- The native engine's incremental `update` now peeks at the current
+  generation and publishes through a compare-and-swap on the previous
+  generation, making a one-file refresh cheaper than a full build and safe
+  against concurrent refreshes; search admission skips normalizing
+  candidates that cannot rank, cutting query time on very large indexes.
+  Results are unchanged (a frozen synthetic oracle guards them).
 - The context broker keeps one provider, the native engine. Third-party
   provider discovery, registry, consent ledger, and adapter execution are
   removed; `prepare` output no longer contains a `providers` field.
