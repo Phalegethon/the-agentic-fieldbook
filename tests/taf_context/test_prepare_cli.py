@@ -15,10 +15,12 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from unittest import mock
 
 from taf_context.cli import main
+from taf_context.git_snapshot import collect_snapshot
 from taf_context.prepare_cli import (
     FILTER_LANGUAGES,
     FILTER_SYMBOL_KINDS,
@@ -28,8 +30,9 @@ from taf_context.prepare_cli import (
     normalize_filter_values,
     register_prepare_command,
 )
+from taf_context.refresh import CHANGE_DOCUMENT_NAME
 
-from .repo_factory import init_committed_repo, write
+from .repo_factory import commit_all, init_committed_repo, write
 
 
 ROOT = Path(__file__).parents[2]
@@ -65,6 +68,7 @@ def write_fake_native_engine(
     partial: bool = False,
     stale: bool = False,
     snippet_stale: bool = False,
+    update_outcome: str = "ready",
 ) -> None:
     source = textwrap.dedent(
             """\
@@ -95,6 +99,34 @@ def write_fake_native_engine(
                 }
                 and (state / "fake-index").is_file()
             )
+            if operation == "update":
+                document_path = state / envelope["changed_paths_document"]
+                document = json.loads(document_path.read_bytes().decode("utf-8"))
+                required = {"schema_version", "prior_index_identity", "before_repository_identity",
+                            "before_worktree_identity", "before_committed_head", "before_dirty_overlay_fingerprint",
+                            "after_repository_identity", "after_worktree_identity", "after_committed_head",
+                            "after_dirty_overlay_fingerprint", "level0_change_manifest_identity", "changed_paths"}
+                fields = {key: value for key, value in document.items() if key != "level0_change_manifest_identity"}
+                text = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                for raw, escaped in (("<", "\\\\u003c"), (">", "\\\\u003e"), ("&", "\\\\u0026")):
+                    text = text.replace(raw, escaped)
+                expected = "sha256:" + hashlib.sha256(b"taf-level0-change-manifest-v1\\x00" + text.encode("utf-8")).hexdigest()
+                valid = (
+                    set(document) == required
+                    and document["level0_change_manifest_identity"] == expected
+                    and document["prior_index_identity"] == request["index_identity"]
+                    and document["after_committed_head"] == request["committed_head"]
+                    and document["after_dirty_overlay_fingerprint"] == request["dirty_overlay_fingerprint"]
+                    and (state / "fake-index").is_file()
+                )
+                outcome = __UPDATE_OUTCOME__ if valid else "stale"
+                new_identity = "sha256:" + hashlib.sha256(("fake-index:" + request["dirty_overlay_fingerprint"] + request["committed_head"]).encode()).hexdigest()
+                ready = outcome == "ready"
+                payload_override = {
+                    "ready": {"status": "ready", "freshness": "exact", "next_safe_action": "use-index", "index_identity": new_identity},
+                    "stale": {"status": "stale", "freshness": "structurally-stale", "next_safe_action": "rebuild-index", "index_identity": request["index_identity"]},
+                    "error": {"status": "error", "freshness": "unknown", "next_safe_action": "rebuild-index", "index_identity": request["index_identity"]},
+                }[outcome]
             payload = {
                 "schema_version": "1",
                 "request_identity": request["request_identity"],
@@ -130,6 +162,8 @@ def write_fake_native_engine(
                 "warnings": ["json-collection-limit"] if ready and __PARTIAL__ else [],
                 "next_safe_action": "use-index" if ready else "build-index",
             }
+            if operation == "update":
+                payload.update(payload_override)
             if __STALE__ and operation in {
                 "status",
                 "repository-map",
@@ -152,7 +186,9 @@ def write_fake_native_engine(
             """
         ).replace("__INVOCATION_LOG__", repr(None if invocation_log is None else str(invocation_log))).replace(
             "__PARTIAL__", repr(partial)
-        ).replace("__STALE__", repr(stale)).replace("__SNIPPET_STALE__", repr(snippet_stale))
+        ).replace("__STALE__", repr(stale)).replace("__SNIPPET_STALE__", repr(snippet_stale)).replace(
+            "__UPDATE_OUTCOME__", repr(update_outcome)
+        )
     path.write_text(source, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
@@ -829,6 +865,295 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             code, _stdout, stderr = invoke(environment, "prepare", "gc", "--unused-for", "-1")
             self.assertEqual(code, 2)
             self.assertIn("invalid-unused-for", stderr)
+
+    def _prepared(self, root: Path, **fake_kwargs: object) -> tuple[Path, dict[str, str], Path, Path]:
+        """Build a ready context with a logging fake engine; return (repo, environment, invocation_log, binding_path)."""
+        repo = init_committed_repo(root / "repo")
+        state_home = root / "state"
+        binary = root / "taf-level1"
+        invocation_log = root / "native-invocations.log"
+        write_fake_native_engine(binary, invocation_log, **fake_kwargs)
+        environment = {
+            "HOME": str(root / "home"),
+            "PATH": "",
+            "TAF_LEVEL1_BINARY": str(binary),
+            "TAF_STATE_HOME": str(state_home),
+        }
+        code, _stdout, stderr = invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+        self.assertEqual((code, stderr), (0, ""))
+        binding_path = next(state_home.glob("repositories/*/*/binding.json"))
+        return repo, environment, invocation_log, binding_path
+
+    def test_unchanged_repository_queries_with_one_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, invocation_log, _binding_path = self._prepared(root)
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo),
+                "--operation", "search-symbols", "--query", "Widget",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(
+                result["refresh"], {"performed": False, "changed_path_count": 0, "duration_ms": 0}
+            )
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(), ["build", "search-symbols"]
+            )
+
+    def test_edit_triggers_update_then_query_and_rewrites_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, invocation_log, binding_path = self._prepared(root)
+            old_value = json.loads(binding_path.read_text(encoding="utf-8"))
+            write(repo / "tracked.txt", "edited\n")
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo),
+                "--operation", "search-symbols", "--query", "Widget",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["status"], "ready")
+            refresh = result["refresh"]
+            self.assertEqual(set(refresh), {"performed", "changed_path_count", "duration_ms"})
+            self.assertTrue(refresh["performed"])
+            self.assertEqual(refresh["changed_path_count"], 1)
+            self.assertIsInstance(refresh["duration_ms"], int)
+            self.assertGreaterEqual(refresh["duration_ms"], 0)
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(), ["build", "update", "search-symbols"]
+            )
+            new_value = json.loads(binding_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(new_value["index_identity"], old_value["index_identity"])
+            self.assertEqual(new_value["head_sha"], old_value["head_sha"])
+            self.assertEqual(new_value["dirty_paths"], ["tracked.txt"])
+            current_snapshot = collect_snapshot(repo)
+            self.assertEqual(new_value["dirty_fingerprint"], current_snapshot.dirty_fingerprint)
+            state_root = binding_path.parent / "native"
+            self.assertFalse((state_root / CHANGE_DOCUMENT_NAME).exists())
+
+    def test_commit_triggers_update_with_committed_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, invocation_log, binding_path = self._prepared(root)
+            write(repo / "tracked.txt", "edited\n")
+            new_head = commit_all(repo, "change")
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo), "--operation", "repository-map",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["build", "update", "repository-map"],
+            )
+            value = json.loads(binding_path.read_text(encoding="utf-8"))
+            self.assertEqual(value["head_sha"], new_head)
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo), "--operation", "repository-map",
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["build", "update", "repository-map", "repository-map"],
+            )
+
+    def test_stale_update_is_refused_without_touching_binding_or_leaving_the_document(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, _invocation_log, binding_path = self._prepared(root)
+            write(repo / "tracked.txt", "edited\n")
+            old = 1_600_000_000
+            os.utime(binding_path, (old, old))
+            before_bytes = binding_path.read_bytes()
+            stale_binary = root / "taf-level1-stale"
+            invocation_log = root / "native-invocations-stale.log"
+            write_fake_native_engine(stale_binary, invocation_log, update_outcome="stale")
+            environment["TAF_LEVEL1_BINARY"] = str(stale_binary)
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo),
+                "--operation", "search-symbols", "--query", "Widget",
+            )
+
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn("ready context is required; run prepare inspect", stderr)
+            self.assertEqual(binding_path.read_bytes(), before_bytes)
+            self.assertEqual(binding_path.stat().st_mtime, old)
+            state_root = binding_path.parent / "native"
+            self.assertFalse((state_root / CHANGE_DOCUMENT_NAME).exists())
+            self.assertEqual(invocation_log.read_text(encoding="utf-8").splitlines(), ["update"])
+
+    def test_update_error_retries_once_then_names_the_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, _invocation_log, binding_path = self._prepared(root)
+            write(repo / "tracked.txt", "edited\n")
+            before_bytes = binding_path.read_bytes()
+            error_binary = root / "taf-level1-error"
+            invocation_log = root / "native-invocations-error.log"
+            write_fake_native_engine(error_binary, invocation_log, update_outcome="error")
+            environment["TAF_LEVEL1_BINARY"] = str(error_binary)
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo),
+                "--operation", "search-symbols", "--query", "Widget",
+            )
+
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn(
+                "incremental refresh failed; run prepare build --confirm-state-write", stderr
+            )
+            self.assertEqual(invocation_log.read_text(encoding="utf-8").splitlines(), ["update", "update"])
+            self.assertEqual(binding_path.read_bytes(), before_bytes)
+            state_root = binding_path.parent / "native"
+            self.assertFalse((state_root / CHANGE_DOCUMENT_NAME).exists())
+
+    def test_inspect_refreshes_and_reports_use_index(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, invocation_log, _binding_path = self._prepared(root)
+            write(repo / "tracked.txt", "edited\n")
+
+            code, stdout, stderr = invoke(environment, "prepare", "inspect", "--repo", str(repo))
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["next_safe_action"], "use-index")
+            self.assertEqual(result["context"]["status"], "ready")
+            self.assertTrue(result["refresh"]["performed"])
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(), ["build", "update", "status"]
+            )
+
+    def test_inspect_falls_back_to_rebuild_when_the_refresh_is_refused(self) -> None:
+        # Global constraint: inspect never fails because of a refresh refusal.
+        # When the update itself reports the index structurally stale, inspect
+        # swallows that PrepareCLIError and continues with today's status /
+        # estimate reporting instead of raising.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, _invocation_log, binding_path = self._prepared(root)
+            write(repo / "tracked.txt", "edited\n")
+            before_bytes = binding_path.read_bytes()
+            stale_binary = root / "taf-level1-stale"
+            invocation_log = root / "native-invocations-stale.log"
+            write_fake_native_engine(stale_binary, invocation_log, update_outcome="stale", stale=True)
+            environment["TAF_LEVEL1_BINARY"] = str(stale_binary)
+
+            code, stdout, stderr = invoke(environment, "prepare", "inspect", "--repo", str(repo))
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["next_safe_action"], "rebuild-index")
+            self.assertEqual(
+                result["refresh"], {"performed": False, "changed_path_count": 0, "duration_ms": 0}
+            )
+            self.assertEqual(binding_path.read_bytes(), before_bytes)
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(), ["update", "status", "estimate"]
+            )
+
+    def test_schema_1_binding_with_stale_index_keeps_todays_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, _invocation_log, binding_path = self._prepared(root)
+            value = json.loads(binding_path.read_text(encoding="utf-8"))
+            legacy = {
+                key: value[key] for key in ("repository_identity", "worktree_identity", "index_identity")
+            }
+            legacy["schema_version"] = "1"
+            binding_path.write_text(json.dumps(legacy), encoding="utf-8")
+            write(repo / "tracked.txt", "edited\n")
+            stale_binary = root / "taf-level1-stale"
+            invocation_log = root / "native-invocations-stale.log"
+            write_fake_native_engine(stale_binary, invocation_log, stale=True)
+            environment["TAF_LEVEL1_BINARY"] = str(stale_binary)
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo),
+                "--operation", "search-symbols", "--query", "Widget",
+            )
+
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn("ready context is required", stderr)
+            self.assertEqual(invocation_log.read_text(encoding="utf-8").splitlines(), ["search-symbols"])
+
+    def test_refresh_prunes_aged_unreferenced_generations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, _invocation_log, binding_path = self._prepared(root)
+            state_root = binding_path.parent / "native"
+            generations = state_root / "generations"
+            aged = generations / ("0" * 64)
+            recent = generations / ("1" * 64)
+            current_generation = generations / ("c" * 64)
+            for path in (aged, recent, current_generation):
+                path.mkdir(parents=True)
+            (state_root / "CURRENT").write_text(("c" * 64) + "\n", encoding="utf-8")
+            now = time.time()
+            os.utime(aged, (now - 120, now - 120))
+            os.utime(recent, (now - 5, now - 5))
+            write(repo / "tracked.txt", "edited\n")
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo),
+                "--operation", "search-symbols", "--query", "Widget",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertFalse(aged.exists())
+            self.assertTrue(recent.exists())
+            self.assertTrue(current_generation.exists())
+
+    def test_refresh_never_deletes_the_generation_current_named_before_the_update(self) -> None:
+        # The store may reuse an existing generation directory when identical
+        # content recurs, so a generation's mtime can be old even though it
+        # was CURRENT an instant ago. Simulate the real engine rotating
+        # CURRENT to a fresh token as a side effect of `update`, and confirm
+        # the generation that was CURRENT right before the call survives
+        # pruning even though its mtime alone looks aged and unreferenced.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, _invocation_log, binding_path = self._prepared(root)
+            state_root = binding_path.parent / "native"
+            generations = state_root / "generations"
+            generations.mkdir(parents=True, exist_ok=True)
+            pre_update_current = "d" * 64
+            protected = generations / pre_update_current
+            protected.mkdir()
+            (state_root / "CURRENT").write_text(pre_update_current + "\n", encoding="utf-8")
+            now = time.time()
+            os.utime(protected, (now - 120, now - 120))
+            write(repo / "tracked.txt", "edited\n")
+
+            from taf_context import prepare_cli
+
+            real_invoke = prepare_cli._invoke_native
+
+            def rotate_current_after_update(binary, operation, *args, **kwargs):
+                result = real_invoke(binary, operation, *args, **kwargs)
+                if operation == "update":
+                    (state_root / "CURRENT").write_text(("e" * 64) + "\n", encoding="utf-8")
+                return result
+
+            with mock.patch(
+                "taf_context.prepare_cli._invoke_native", side_effect=rotate_current_after_update
+            ):
+                code, stdout, stderr = invoke(
+                    environment, "prepare", "query", "--repo", str(repo),
+                    "--operation", "search-symbols", "--query", "Widget",
+                )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertTrue(protected.exists())
 
 
 class QueryArgumentTests(unittest.TestCase):

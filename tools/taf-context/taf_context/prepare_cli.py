@@ -18,12 +18,25 @@ from typing import Mapping
 from . import refresh
 from .git_snapshot import collect_snapshot
 from .level1_models import Level1Result, parse_level1_result
-from .refresh import Binding, dirty_paths_of
+from .refresh import (
+    Binding,
+    CHANGE_DOCUMENT_NAME,
+    MAXIMUM_BINDING_DIRTY_PATHS,
+    RefreshLock,
+    build_change_document,
+    changed_paths_between,
+    dirty_paths_of,
+    remove_change_document,
+    write_change_document,
+)
 from .state_lifecycle import (
+    CURRENT_FILENAME,
     CURRENT_RUNTIME_VERSION,
     Candidate,
+    _read_current,
     apply_plan,
     plan_gc,
+    plan_prune_generations,
     plan_remove,
     summarize_state,
     touch_binding,
@@ -176,9 +189,13 @@ def run_prepare_command(
         if binding is None:
             raise PrepareCLIError("ready context is required; run prepare inspect")
         query_text, result_identities = _validate_query_arguments(args)
+        binding, refresh_summary = _refresh_if_stale(
+            binary, repository, state_root, binding_path, binding, snapshot, paths.root
+        )
         # The engine evaluates the binding's freshness on every query, so the
         # query result carries exactly what a separate status call would have
-        # reported. One native process per query instead of two.
+        # reported. One native process per query instead of two, plus the one
+        # `update` call the refresh above already made when the binding was stale.
         result = _invoke_native(
             binary,
             args.operation,
@@ -214,7 +231,7 @@ def run_prepare_command(
                 )
             raise PrepareCLIError("ready context is required; run prepare inspect")
         touch_binding(binding_path)
-        return _query_summary(result)
+        return _query_summary(result, refresh_summary)
 
     if args.prepare_command in {"activate", "build"}:
         if binary is None and args.prepare_command == "activate":
@@ -251,8 +268,17 @@ def run_prepare_command(
     binding = _read_binding(binding_path, snapshot)
     status_result: Level1Result | None = None
     estimate_result: Level1Result | None = None
+    refresh_summary: dict[str, object] | None = None
     if binary is not None:
         if binding is not None:
+            try:
+                binding, refresh_summary = _refresh_if_stale(
+                    binary, repository, state_root, binding_path, binding, snapshot, paths.root
+                )
+            except PrepareCLIError:
+                # Inspect never fails because of a refresh refusal; it falls
+                # back to today's status/estimate reporting (rebuild-index).
+                refresh_summary = None
             status_result = _invoke_native(
                 binary,
                 "status",
@@ -289,6 +315,7 @@ def run_prepare_command(
         estimate=estimate_result or status_result,
         authorizations=authorizations,
         state=summarize_state(paths.root),
+        refresh=refresh_summary,
     )
 
 
@@ -486,6 +513,7 @@ def _invoke_native(
     maximum_results: int = 8,
     maximum_output_characters: int = 4000,
     allow_inferred: bool = False,
+    changed_paths_document: str | None = None,
 ) -> Level1Result:
     request_filters = filters or {
         "path_prefixes": [],
@@ -515,10 +543,11 @@ def _invoke_native(
             "build": "build",
             "estimate": "estimate",
             "status": "inspect",
+            "update": "update",
         }.get(operation, "query"),
         "repository_root": str(repository),
         "state_root": str(state_root),
-        "changed_paths_document": None,
+        "changed_paths_document": changed_paths_document,
         "request": {
             "schema_version": "1",
             "request_identity": request_identity,
@@ -570,6 +599,108 @@ def _invoke_native(
     return result
 
 
+def _refresh_if_stale(
+    binary: Path,
+    repository: Path,
+    state_root: Path,
+    binding_path: Path,
+    binding: Binding,
+    snapshot: object,
+    state_home: Path,
+) -> tuple[Binding, dict[str, object]]:
+    """Bring the bound index to the current snapshot with one `update` when possible.
+
+    Returns the binding to query with and the summary `refresh` block. The
+    binding is standing consent for incremental refresh; a full rebuild stays
+    explicit, so an uncomputable delta or a structurally stale index falls
+    back to the existing refusal.
+    """
+    idle = {"performed": False, "changed_path_count": 0, "duration_ms": 0}
+    if not binding.has_delta_inputs:
+        return binding, idle
+    if binding.head_sha == snapshot.head_sha and binding.dirty_fingerprint == snapshot.dirty_fingerprint:
+        return binding, idle
+    changed = changed_paths_between(binding, snapshot)
+    if changed is None:
+        return binding, idle  # the operation call reports stale; today's refusal follows
+    for attempt in range(2):
+        started = time.perf_counter()
+        # The generation CURRENT names right now, before this attempt's
+        # update, is a generation a reader may already be using. The store
+        # can reuse an existing generation directory for identical content,
+        # so its mtime alone is not a reliable signal once it is superseded;
+        # name it explicitly so pruning below never removes it.
+        protected_generation = _read_current(state_root / CURRENT_FILENAME) or None
+        with RefreshLock(state_root):
+            try:
+                write_change_document(state_root, build_change_document(binding, snapshot, changed))
+            except OSError as exc:
+                raise PrepareCLIError("context state is unavailable") from exc
+            try:
+                result = _invoke_native(
+                    binary, "update", repository, state_root, snapshot,
+                    index_identity=binding.index_identity, changed_paths_document=CHANGE_DOCUMENT_NAME,
+                )
+            finally:
+                remove_change_document(state_root)
+            if result.status.value in {"ready", "partial"} and result.index_identity is not None:
+                _write_binding(binding_path, snapshot, result.index_identity)
+                prune_warnings = _prune_generations(state_home, binding_path.parent, protected_generation)
+                duration = int((time.perf_counter() - started) * 1000)
+                dirty_paths = dirty_paths_of(snapshot)
+                refreshed = Binding(
+                    result.index_identity,
+                    snapshot.head_sha,
+                    snapshot.dirty_fingerprint,
+                    None if len(dirty_paths) > MAXIMUM_BINDING_DIRTY_PATHS else dirty_paths,
+                )
+                block: dict[str, object] = {
+                    "performed": True,
+                    "changed_path_count": len(changed),
+                    "duration_ms": duration,
+                }
+                if prune_warnings:
+                    block["warnings"] = prune_warnings
+                return refreshed, block
+        if result.status.value == "stale":
+            raise PrepareCLIError("ready context is required; run prepare inspect")
+        if attempt == 0:
+            # Another process may have published a newer generation and rewritten
+            # the binding; re-read once and retry with the same snapshot.
+            reread = _read_binding(binding_path, snapshot)
+            if reread is None:
+                break
+            binding = reread
+            if binding.head_sha == snapshot.head_sha and binding.dirty_fingerprint == snapshot.dirty_fingerprint:
+                return binding, idle
+            changed = changed_paths_between(binding, snapshot)
+            if changed is None:
+                break
+    raise PrepareCLIError("incremental refresh failed; run prepare build --confirm-state-write")
+
+
+def _prune_generations(state_home: Path, entry: Path, protected: str | None = None) -> list[str]:
+    """Delete generations no reader can still be using; never raise.
+
+    `protected` names the generation CURRENT pointed at immediately before
+    this refresh's `update` call; it is excluded from the plan even if its
+    mtime alone would otherwise look aged and unreferenced.
+    """
+    try:
+        # `entry` (binding_path.parent) is built from a symlink-resolved root
+        # (see _repository_state_paths); resolve state_home the same way so
+        # candidate relative paths stay consistent with it (macOS commonly
+        # maps a temp/state path through /var -> /private/var).
+        root = state_home.resolve(strict=False)
+        plan = plan_prune_generations(root, entry, now=time.time())
+        if protected:
+            plan = [candidate for candidate in plan if not candidate.relative_path.endswith(protected)]
+        apply_plan(root, plan)
+    except (StateError, OSError, ValueError):
+        return ["retention-prune-incomplete"]
+    return []
+
+
 def _validate_query_arguments(args: argparse.Namespace) -> tuple[str | None, tuple[str, ...]]:
     query_operations = {"search-symbols", "search-docs"}
     query_text = args.query.strip() if isinstance(args.query, str) else None
@@ -587,7 +718,14 @@ def _validate_query_arguments(args: argparse.Namespace) -> tuple[str | None, tup
     return query_text, result_identities
 
 
-def _query_summary(result: Level1Result) -> dict[str, object]:
+def _query_summary(
+    result: Level1Result, refresh: dict[str, object] | None = None
+) -> dict[str, object]:
+    refresh = dict(refresh) if refresh else {"performed": False, "changed_path_count": 0, "duration_ms": 0}
+    prune_warnings = refresh.pop("warnings", [])
+    warnings = list(result.warnings)
+    if prune_warnings:
+        warnings = sorted(set(warnings) | set(prune_warnings))
     return {
         "schema_version": "1",
         "mode": "query",
@@ -600,9 +738,10 @@ def _query_summary(result: Level1Result) -> dict[str, object]:
         "omitted_count": result.omitted_count,
         "truncated": result.truncated,
         "output_characters": result.output_characters,
-        "warnings": list(result.warnings),
+        "warnings": warnings,
         "required_authorizations": [],
         "next_safe_action": result.next_safe_action,
+        "refresh": refresh,
     }
 
 
@@ -642,6 +781,7 @@ def _summary(
     estimate: Level1Result | None,
     authorizations: tuple[str, ...],
     state: dict[str, int],
+    refresh: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if binary is None:
         next_action = "install-native-engine"
@@ -651,6 +791,8 @@ def _summary(
         next_action = result.next_safe_action
     context_status = "unavailable" if result is None else result.status.value
     freshness = "unknown" if result is None else result.freshness.value
+    refresh = dict(refresh) if refresh else {"performed": False, "changed_path_count": 0, "duration_ms": 0}
+    prune_warnings = refresh.pop("warnings", [])
     return {
         "schema_version": "1",
         "mode": mode,
@@ -690,7 +832,8 @@ def _summary(
         "state": state,
         "required_authorizations": list(authorizations),
         "next_safe_action": next_action,
-        "warnings": sorted(set(() if result is None else result.warnings)),
+        "warnings": sorted(set(() if result is None else result.warnings) | set(prune_warnings)),
+        "refresh": refresh,
     }
 
 
