@@ -15,7 +15,6 @@ from .context_operations import (  # noqa: F401 - re-exported for callers and te
     FILTER_SYMBOL_KINDS,
     PrepareCLIError,
     QueryArguments,
-    _NATIVE_ENGINE_VERSION,
     _invoke_native,
     _managed_binary_path,
     _platform_asset,

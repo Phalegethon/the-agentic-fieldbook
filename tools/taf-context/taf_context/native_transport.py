@@ -7,6 +7,10 @@ import subprocess
 from typing import Protocol
 
 
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
+"""The deadline every transport gives one engine request."""
+
+
 class NativeTransportError(RuntimeError):
     """The engine could not be reached or refused; ``reason`` is a stable code."""
 
@@ -24,7 +28,9 @@ class NativeTransport(Protocol):
 class OneShotTransport:
     """One engine process per request: the broker's original behaviour."""
 
-    def __init__(self, binary: Path, *, timeout_seconds: float = 120.0) -> None:
+    def __init__(
+        self, binary: Path, *, timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
+    ) -> None:
         self._binary = binary
         self._timeout_seconds = timeout_seconds
 

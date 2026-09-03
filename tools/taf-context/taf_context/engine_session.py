@@ -10,12 +10,47 @@ import subprocess
 import threading
 from typing import Callable
 
-from .native_transport import NativeTransportError
+from .native_transport import DEFAULT_REQUEST_TIMEOUT_SECONDS, NativeTransportError
 
 READY_MARKER = b"__TAF_LEVEL1_SERVER_READY_V1__"
 MAXIMUM_RESPONSE_BYTES = 262144  # the engine's MaximumStdoutBytes
 MAXIMUM_STDERR_BYTES = 65536  # the engine's MaximumStderrBytes
 _RETRYABLE = frozenset({"rejected", "timeout"})
+
+
+class StderrRing:
+    """One child generation's bounded stderr tail, newest bytes last.
+
+    The reader thread is handed its generation's ring as an argument, so a
+    reader that outlived its child cannot write into the next child's tail.
+    ``appended`` counts every byte ever written, which lets a caller mark the
+    start of a request and read back only what was written after it even
+    though the ring itself keeps discarding its oldest bytes.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._data = bytearray()
+        self._appended = 0
+
+    def append(self, chunk: bytes) -> None:
+        with self._lock:
+            self._data.extend(chunk)
+            self._appended += len(chunk)
+            if len(self._data) > MAXIMUM_STDERR_BYTES:
+                del self._data[: len(self._data) - MAXIMUM_STDERR_BYTES]
+
+    @property
+    def appended(self) -> int:
+        with self._lock:
+            return self._appended
+
+    def tail(self, since: int = 0) -> str:
+        with self._lock:
+            # The retained bytes span [appended - len(data), appended); a mark
+            # older than that has already been discarded, so keep everything.
+            skip = min(max(0, since - (self._appended - len(self._data))), len(self._data))
+            return bytes(self._data[skip:]).decode("utf-8", "replace")
 
 
 class Level1Session:
@@ -25,7 +60,7 @@ class Level1Session:
         self,
         binary: Path,
         *,
-        request_timeout_seconds: float = 120.0,
+        request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         ready_timeout_seconds: float = 5.0,
         idle_timeout_seconds: float = 600.0,
         on_start: Callable[[int], None] | None = None,
@@ -41,9 +76,9 @@ class Level1Session:
         self._process: subprocess.Popen[bytes] | None = None
         self._responses: queue.Queue[tuple[str, bytes]] = queue.Queue()
         self._ready = threading.Event()
-        self._stderr = bytearray()
-        self._stderr_lock = threading.Lock()
-        self._threads: list[threading.Thread] = []
+        self._stderr = StderrRing()
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
         self._idle_timer: threading.Timer | None = None
         self._idle_generation = 0
 
@@ -54,19 +89,21 @@ class Level1Session:
 
     @property
     def stderr_tail(self) -> str:
-        with self._stderr_lock:
-            return bytes(self._stderr).decode("utf-8", "replace")
+        return self._stderr.tail()
 
     def exchange(self, wire: bytes) -> bytes:
         with self._lock:
             self._cancel_idle_timer()
             try:
                 process = self._ensure_started()
+                # Only stderr written from here on belongs to this request; an
+                # earlier request's diagnostic must not become this detail.
+                since = self._stderr.appended
                 try:
                     process.stdin.write(wire)
                     process.stdin.flush()
                 except (BrokenPipeError, OSError):
-                    detail = self._last_stderr_line()
+                    detail = self._last_stderr_line(since)
                     self._kill()
                     raise NativeTransportError("rejected", detail)
                 try:
@@ -81,7 +118,7 @@ class Level1Session:
                     raise NativeTransportError("rejected", "oversized response")
                 # The child closed stdout without answering: read its reason
                 # before the streams are torn down.
-                detail = self._last_stderr_line()
+                detail = self._last_stderr_line(since)
                 self._kill()
                 raise NativeTransportError("rejected", detail)
             finally:
@@ -114,8 +151,7 @@ class Level1Session:
         self._forget()
         self._ready = threading.Event()
         self._responses = queue.Queue()
-        with self._stderr_lock:
-            self._stderr = bytearray()
+        self._stderr = StderrRing()
         try:
             process = subprocess.Popen(
                 [str(self._binary), "--serve"],
@@ -127,27 +163,31 @@ class Level1Session:
         except OSError as exc:
             raise NativeTransportError("invocation-failed") from exc
         self._process = process
-        self._threads = [
-            threading.Thread(
-                target=self._drain_stdout,
-                args=(process, self._responses),
-                daemon=True,
-            ),
-            threading.Thread(
-                target=self._drain_stderr,
-                args=(process, self._ready),
-                daemon=True,
-            ),
-        ]
-        for thread in self._threads:
-            thread.start()
+        self._stdout_thread = threading.Thread(
+            target=self._drain_stdout,
+            args=(process, self._responses),
+            daemon=True,
+        )
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            args=(process, self._ready, self._stderr),
+            daemon=True,
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
         if not self._ready.wait(self._ready_timeout) or process.poll() is not None:
             self._kill()
             raise NativeTransportError(
                 "invocation-failed", "engine did not signal readiness"
             )
         if self._on_start is not None:
-            self._on_start(process.pid)
+            try:
+                self._on_start(process.pid)
+            except Exception:
+                # The hook is a diagnostic and the session owns no stream to
+                # report its failure on; a raising hook must neither fail the
+                # exchange nor leave a started child unaccounted for.
+                pass
         return process
 
     def _drain_stdout(
@@ -170,25 +210,41 @@ class Level1Session:
             responses.put(("eof", b""))
 
     def _drain_stderr(
-        self, process: subprocess.Popen[bytes], ready: threading.Event
+        self,
+        process: subprocess.Popen[bytes],
+        ready: threading.Event,
+        ring: StderrRing,
     ) -> None:
         stream = process.stderr
         try:
-            for line in iter(stream.readline, b""):
+            while True:
+                # Bounded like the stdout drain: one newline-free line is never
+                # buffered beyond what the ring is allowed to retain.
+                line = stream.readline(MAXIMUM_STDERR_BYTES + 1)
+                if not line:
+                    return
                 if line.rstrip(b"\r\n") == READY_MARKER:
                     ready.set()
                     continue
-                with self._stderr_lock:
-                    self._stderr.extend(line)
-                    if len(self._stderr) > MAXIMUM_STDERR_BYTES:
-                        del self._stderr[: len(self._stderr) - MAXIMUM_STDERR_BYTES]
+                ring.append(line)
         except (OSError, ValueError):
             return
 
-    def _last_stderr_line(self) -> str:
-        for thread in self._threads:
-            thread.join(timeout=0.5)
-        lines = [line for line in self.stderr_tail.splitlines() if line.strip()]
+    def _last_stderr_line(self, since: int = 0) -> str:
+        process = self._process
+        if process is not None:
+            # Wait for the child rather than guess at a join timeout: the
+            # stderr reader is guaranteed to reach EOF once the child's file
+            # descriptors are gone, so the join below needs no bound.
+            self._kill_process(process)
+            try:
+                process.wait()
+            except OSError:
+                pass
+        reader = self._stderr_thread
+        if reader is not None:
+            reader.join()
+        lines = [line for line in self._stderr.tail(since).splitlines() if line.strip()]
         return lines[-1][:200] if lines else ""
 
     def _kill(self) -> None:
@@ -214,17 +270,30 @@ class Level1Session:
             pass
 
     def _forget(self) -> None:
-        for thread in self._threads:
-            thread.join(timeout=1.0)
-        self._threads = []
+        readers = (self._stdout_thread, self._stderr_thread)
+        for thread in readers:
+            if thread is not None:
+                thread.join(timeout=1.0)
         process = self._process
         if process is not None:
-            for stream in (process.stdin, process.stdout, process.stderr):
+            for stream, reader in (
+                (process.stdin, None),
+                (process.stdout, self._stdout_thread),
+                (process.stderr, self._stderr_thread),
+            ):
+                if stream is None:
+                    continue
+                if reader is not None and reader.is_alive():
+                    # ``close()`` waits for the buffer lock a reader blocked in
+                    # ``readline`` holds, i.e. forever. The daemon reader dies
+                    # with the process; leave the descriptor to ``Popen``.
+                    continue
                 try:
-                    if stream is not None:
-                        stream.close()
+                    stream.close()
                 except OSError:
                     pass
+        self._stdout_thread = None
+        self._stderr_thread = None
         self._process = None
 
     def _arm_idle_timer(self) -> None:

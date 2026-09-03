@@ -8,6 +8,7 @@ from pathlib import Path
 import stat
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 
@@ -43,6 +44,12 @@ def write_fake_serve_engine(path: Path, mode: str, marker: Path) -> Path:
                 sys.stderr.write("invalid-native-level1-request\\n")
                 sys.stderr.flush()
                 sys.exit(2)
+            if mode == "noisy-then-silent-exit":
+                if count == 1:
+                    sys.stderr.write("stale-diagnostic-of-an-earlier-request\\n")
+                    sys.stderr.flush()
+                else:
+                    sys.exit(3)
             if mode == "slow-once" and not marker.exists():
                 marker.touch()
                 time.sleep(5)
@@ -163,6 +170,72 @@ class Level1SessionTests(unittest.TestCase):
         session.exchange(frame("r1"))
         session.exchange(frame("r2"))
         self.assertEqual(pids, [session.child_pid])
+
+    def test_a_raising_start_hook_never_fails_the_exchange(self) -> None:
+        # The hook is a diagnostic; the session has no stream of its own to
+        # report a failing one on, so it must be swallowed.
+        pids: list[int] = []
+
+        def hook(pid: int) -> None:
+            pids.append(pid)
+            raise RuntimeError("the caller's diagnostic stream is gone")
+
+        session = self._session("echo", on_start=hook)
+        answer = json.loads(session.exchange(frame("r1")))
+        self.assertEqual(answer["request_identity"], "r1")
+        self.assertEqual(pids, [session.child_pid])
+        again = json.loads(session.exchange(frame("r2")))
+        self.assertEqual((again["sequence"], again["pid"]), (2, answer["pid"]))
+
+    def test_a_rejected_detail_reports_only_the_current_request(self) -> None:
+        session = self._session("noisy-then-silent-exit")
+        session.exchange(frame("r1"))
+        with self.assertRaises(NativeTransportError) as caught:
+            session.exchange(frame("r2"))
+        self.assertEqual((caught.exception.reason, caught.exception.detail), ("rejected", ""))
+
+    def test_each_child_generation_gets_its_own_stderr_ring(self) -> None:
+        session = self._session("echo")
+        session.exchange(frame("r1"))
+        previous = session._stderr
+        session.close()
+        session.exchange(frame("r2"))
+        # A reader that outlived its child keeps writing into the ring it was
+        # handed, so its late output cannot land in the next generation's tail.
+        previous.append(b"output-of-a-previous-generation\n")
+        self.assertNotIn("output-of-a-previous-generation", session.stderr_tail)
+
+    def test_forget_leaves_open_a_stream_whose_reader_is_still_running(self) -> None:
+        # Closing a stream another thread is blocked in ``readline`` on waits
+        # for the buffer lock that reader holds, i.e. forever.
+        class Stream:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class Process:
+            def __init__(self) -> None:
+                self.stdin, self.stdout, self.stderr = Stream(), Stream(), Stream()
+
+            def poll(self) -> int:
+                return 0
+
+        release = threading.Event()
+        reader = threading.Thread(target=lambda: release.wait(10.0), daemon=True)
+        reader.start()
+        session = Level1Session(self.root / "unused-engine")
+        process = Process()
+        session._process = process
+        session._stdout_thread = reader
+        try:
+            session._forget()
+        finally:
+            release.set()
+        self.assertFalse(process.stdout.closed)
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stderr.closed)
 
 
 class SessionTransportTests(unittest.TestCase):

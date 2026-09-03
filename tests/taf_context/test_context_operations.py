@@ -19,7 +19,7 @@ from taf_context.context_operations import (
 )
 from taf_context.native_transport import NativeTransportError, OneShotTransport
 
-from .repo_factory import init_committed_repo
+from .repo_factory import init_committed_repo, write
 from .test_prepare_cli import write_fake_native_engine
 
 
@@ -111,6 +111,37 @@ class OperationTests(unittest.TestCase):
             self.assertEqual((inspected["mode"], inspected["next_safe_action"]), ("inspect", "use-index"))
             frames = [frame for transport in transports for frame in transport.frames]
             self.assertEqual(frames, [("build", False), ("search-symbols", True), ("status", True)])
+
+    def test_an_edit_sends_the_refresh_update_across_the_seam_as_non_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = init_committed_repo(Path(directory) / "repo")
+            binary = Path(directory) / "engine"
+            write_fake_native_engine(binary)
+            environment = self._environment(directory, binary)
+            transports: list[RecordingTransport] = []
+
+            def transport_for(path: Path) -> RecordingTransport:
+                transports.append(RecordingTransport(path))
+                return transports[-1]
+
+            run_build(repository, environment=environment, transport_for=transport_for)
+            arguments = QueryArguments("search-symbols", "main", (), [], [], [], [], 8, 4000, False)
+            run_query(repository, arguments, environment=environment, transport_for=transport_for)
+            write(repository / "tracked.txt", "edited\n")
+            refreshed = run_query(
+                repository, arguments, environment=environment, transport_for=transport_for
+            )
+            self.assertTrue(refreshed["refresh"]["performed"])
+            frames = [frame for transport in transports for frame in transport.frames]
+            self.assertEqual(
+                frames,
+                [
+                    ("build", False),
+                    ("search-symbols", True),
+                    ("update", False),
+                    ("search-symbols", True),
+                ],
+            )
 
     def test_transport_failures_keep_the_cli_messages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
