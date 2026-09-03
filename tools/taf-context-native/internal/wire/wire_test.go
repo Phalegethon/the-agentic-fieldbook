@@ -152,6 +152,7 @@ func TestDecodeEnvelopeEnforcesAdvertisedPhaseOperationMapping(t *testing.T) {
 		{"query", SearchDocs},
 		{"query", SearchSymbols},
 		{"query", SourceSnippets},
+		{"query", RelatedSymbols},
 	}
 	for _, item := range cases {
 		t.Run(item.phase+"-"+string(item.operation), func(t *testing.T) {
@@ -197,6 +198,12 @@ func envelopeForOperation(phase string, operation Operation) Envelope {
 		envelope.Request.ResultIdentities = []string{resultIdentity}
 		envelope.Request.Filters = validRequest().Filters
 	}
+	if operation == RelatedSymbols {
+		envelope.Request.SchemaVersion = "2"
+		envelope.Request.ResultIdentities = []string{resultIdentity}
+		envelope.Request.Direction = ptr("callers")
+		envelope.Request.Filters = validRequest().Filters
+	}
 	return envelope
 }
 
@@ -216,7 +223,7 @@ func TestRequestRequiresOperationCapabilityParity(t *testing.T) {
 }
 
 func TestRequestAcceptsEveryFrozenOperation(t *testing.T) {
-	expected := []Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets}
+	expected := []Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets, RelatedSymbols}
 	if got := Operations(); !equalOperations(got, expected) {
 		t.Fatalf("operations = %v", got)
 	}
@@ -244,6 +251,12 @@ func TestRequestAcceptsEveryFrozenOperation(t *testing.T) {
 		}
 		if operation == SourceSnippets {
 			request.ResultIdentities = []string{resultIdentity}
+			request.Filters = validRequest().Filters
+		}
+		if operation == RelatedSymbols {
+			request.SchemaVersion = "2"
+			request.ResultIdentities = []string{resultIdentity}
+			request.Direction = ptr("callers")
 			request.Filters = validRequest().Filters
 		}
 		if err := ValidateRequest(request); err != nil {
@@ -493,6 +506,281 @@ func TestTaggedGrammarSourcesAreVendored(t *testing.T) {
 		if _, err := os.Stat(filepath.Join("..", "..", "vendor", path)); err != nil {
 			t.Fatalf("missing vendored grammar source %s: %v", path, err)
 		}
+	}
+}
+
+func relatedRequest() Request {
+	request := validRequest()
+	request.SchemaVersion = "2"
+	request.Operation, request.RequiredCapability = RelatedSymbols, "related-symbols"
+	request.Query = nil
+	request.ResultIdentities = []string{resultIdentity}
+	request.Direction = ptr("callers")
+	return request
+}
+
+// envelopeWithRequestKeys re-encodes a framed envelope with the request keys
+// replaced or, for a nil value, removed; schema-2 requests need the direction
+// key spelled out even when it is null, which struct marshaling omits.
+func envelopeWithRequestKeys(t *testing.T, envelope Envelope, overrides map[string]json.RawMessage) []byte {
+	t.Helper()
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outer map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &outer); err != nil {
+		t.Fatal(err)
+	}
+	var request map[string]json.RawMessage
+	if err := json.Unmarshal(outer["request"], &request); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range overrides {
+		if value == nil {
+			delete(request, key)
+			continue
+		}
+		request[key] = value
+	}
+	if outer["request"], err = json.Marshal(request); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(encoded, '\n')
+}
+
+func TestDecodeEnvelopeRejectsDirectionUnderSchemaOne(t *testing.T) {
+	envelope := validEnvelope()
+	for _, direction := range []json.RawMessage{json.RawMessage(`"callers"`), json.RawMessage("null")} {
+		raw := envelopeWithRequestKeys(t, envelope, map[string]json.RawMessage{"direction": direction})
+		if _, err := DecodeEnvelope(bytes.NewReader(raw)); !errors.Is(err, ErrInvalidWire) {
+			t.Fatalf("schema-1 direction %s: error = %v", direction, err)
+		}
+	}
+	request := validRequest()
+	request.Direction = ptr("callers")
+	if err := ValidateRequest(request); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("typed schema-1 direction: error = %v", err)
+	}
+}
+
+func TestRequestRejectsRelatedSymbolsUnderSchemaOne(t *testing.T) {
+	request := relatedRequest()
+	request.SchemaVersion = "1"
+	request.Direction = nil
+	if err := ValidateRequest(request); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestDecodeEnvelopeAcceptsSchemaTwoRelatedSymbols(t *testing.T) {
+	envelope := validEnvelope()
+	envelope.Request = relatedRequest()
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeEnvelope(bytes.NewReader(append(raw, '\n')))
+	if err != nil {
+		t.Fatalf("rejected schema-2 related-symbols: %v", err)
+	}
+	if decoded.Request.Direction == nil || *decoded.Request.Direction != "callers" {
+		t.Fatalf("direction = %v", decoded.Request.Direction)
+	}
+}
+
+func TestDecodeEnvelopeAcceptsSchemaTwoNullDirectionForOtherOperations(t *testing.T) {
+	envelope := validEnvelope()
+	envelope.Request.SchemaVersion = "2"
+	raw := envelopeWithRequestKeys(t, envelope, map[string]json.RawMessage{"direction": json.RawMessage("null")})
+	decoded, err := DecodeEnvelope(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("rejected schema-2 search-symbols with a null direction: %v", err)
+	}
+	if decoded.Request.Direction != nil {
+		t.Fatalf("direction = %q", *decoded.Request.Direction)
+	}
+}
+
+func TestDecodeEnvelopeRejectsInvalidSchemaTwoDirections(t *testing.T) {
+	related := validEnvelope()
+	related.Request = relatedRequest()
+	for name, override := range map[string]map[string]json.RawMessage{
+		"related without direction": {"direction": json.RawMessage("null")},
+		"related missing key":       {"direction": nil},
+		"unknown direction":         {"direction": json.RawMessage(`"sideways"`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := envelopeWithRequestKeys(t, related, override)
+			if _, err := DecodeEnvelope(bytes.NewReader(raw)); !errors.Is(err, ErrInvalidWire) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+	directed := validEnvelope()
+	directed.Request.SchemaVersion = "2"
+	directed.Request.Direction = ptr("callers")
+	raw, err := json.Marshal(directed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeEnvelope(bytes.NewReader(append(raw, '\n'))); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("accepted a direction on search-symbols: %v", err)
+	}
+}
+
+func TestRequestRejectsUnknownSchemaVersions(t *testing.T) {
+	for _, version := range []string{"", "0", "3", "2.0"} {
+		request := validRequest()
+		request.SchemaVersion = version
+		if err := ValidateRequest(request); err == nil {
+			t.Fatalf("accepted schema version %q", version)
+		}
+	}
+}
+
+func TestRequestBoundsRelatedSymbolsAnchors(t *testing.T) {
+	empty := relatedRequest()
+	empty.ResultIdentities = []string{}
+	if err := ValidateRequest(empty); err == nil {
+		t.Fatal("accepted related-symbols without anchors")
+	}
+	withQuery := relatedRequest()
+	withQuery.Query = ptr("anchor")
+	if err := ValidateRequest(withQuery); err == nil {
+		t.Fatal("accepted related-symbols carrying a query")
+	}
+	tooMany := relatedRequest()
+	tooMany.ResultIdentities = make([]string, 0, maximumRelatedAnchors+1)
+	for index := 0; index <= maximumRelatedAnchors; index++ {
+		tooMany.ResultIdentities = append(tooMany.ResultIdentities, fmt.Sprintf("sha256:%064x", index))
+	}
+	if err := ValidateRequest(tooMany); err == nil {
+		t.Fatalf("accepted %d related-symbols anchors", len(tooMany.ResultIdentities))
+	}
+	bounded := relatedRequest()
+	bounded.ResultIdentities = tooMany.ResultIdentities[:maximumRelatedAnchors]
+	if err := ValidateRequest(bounded); err != nil {
+		t.Fatalf("rejected %d related-symbols anchors: %v", maximumRelatedAnchors, err)
+	}
+}
+
+func relatedResult() Result {
+	result := validResult()
+	result.SchemaVersion = "2"
+	result.Operation = RelatedSymbols
+	result.Findings[0].Relation = "call"
+	result.Findings[0].EdgeEvidence = "verified"
+	result.Findings[0].ReferenceLine = 42
+	result.Findings[0].ReferenceCount = 3
+	result.OutputCharacters = renderedOutputCharacters(result)
+	return result
+}
+
+func TestEncodeResultOmitsEdgeFieldsUnderSchemaOne(t *testing.T) {
+	var schemaOne bytes.Buffer
+	if err := EncodeResult(&schemaOne, validResult()); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"relation", "edge_evidence", "reference_line", "reference_count"} {
+		if strings.Contains(schemaOne.String(), key) {
+			t.Fatalf("schema-1 result carries %q: %s", key, schemaOne.String())
+		}
+	}
+	var schemaTwo bytes.Buffer
+	if err := EncodeResult(&schemaTwo, relatedResult()); err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{`"relation":"call"`, `"edge_evidence":"verified"`, `"reference_line":42`, `"reference_count":3`} {
+		if !strings.Contains(schemaTwo.String(), fragment) {
+			t.Fatalf("schema-2 result missing %s: %s", fragment, schemaTwo.String())
+		}
+	}
+}
+
+func TestEncodeResultKeepsSchemaOneFindingKeysComplete(t *testing.T) {
+	var schemaOne, schemaTwo bytes.Buffer
+	if err := EncodeResult(&schemaOne, validResult()); err != nil {
+		t.Fatal(err)
+	}
+	two := validResult()
+	two.SchemaVersion = "2"
+	if err := EncodeResult(&schemaTwo, two); err != nil {
+		t.Fatal(err)
+	}
+	got, want := findingKeys(t, schemaOne.Bytes()), findingKeys(t, schemaTwo.Bytes())
+	for _, key := range []string{"relation", "edge_evidence", "reference_line", "reference_count"} {
+		delete(want, key)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("schema-1 finding keys = %v, want %v", got, want)
+	}
+	for key := range want {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("schema-1 finding dropped %q", key)
+		}
+	}
+}
+
+func findingKeys(t *testing.T, encoded []byte) map[string]struct{} {
+	t.Helper()
+	var result struct {
+		Findings []map[string]json.RawMessage `json:"findings"`
+	}
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Findings) != 1 {
+		t.Fatalf("findings = %d", len(result.Findings))
+	}
+	keys := map[string]struct{}{}
+	for key := range result.Findings[0] {
+		keys[key] = struct{}{}
+	}
+	return keys
+}
+
+func TestValidateResultRejectsInconsistentEdgeFields(t *testing.T) {
+	cases := map[string]func(*Result){
+		"schema one relation":      func(result *Result) { result.Findings[0].Relation = "call" },
+		"schema one evidence":      func(result *Result) { result.Findings[0].EdgeEvidence = "verified" },
+		"schema one line":          func(result *Result) { result.Findings[0].ReferenceLine = 1 },
+		"schema one count":         func(result *Result) { result.Findings[0].ReferenceCount = 1 },
+		"unknown relation":         func(result *Result) { result.SchemaVersion, result.Findings[0].Relation = "2", "sideways" },
+		"unknown edge evidence":    func(result *Result) { result.SchemaVersion, result.Findings[0].EdgeEvidence = "2", "guessed" },
+		"negative reference line":  func(result *Result) { result.SchemaVersion, result.Findings[0].ReferenceLine = "2", -1 },
+		"negative reference count": func(result *Result) { result.SchemaVersion, result.Findings[0].ReferenceCount = "2", -1 },
+		"unknown result schema":    func(result *Result) { result.SchemaVersion = "3" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			result := validResult()
+			mutate(&result)
+			result.OutputCharacters = renderedOutputCharacters(result)
+			if err := EncodeResult(ioDiscard{}, result); err == nil {
+				t.Fatalf("accepted %s", name)
+			}
+		})
+	}
+}
+
+func TestOutputCharactersCoverSchemaTwoEdgeFields(t *testing.T) {
+	related := relatedResult()
+	plain := relatedResult()
+	plain.Findings[0].Relation, plain.Findings[0].EdgeEvidence = "", ""
+	plain.Findings[0].ReferenceLine, plain.Findings[0].ReferenceCount = 0, 0
+	got := renderedOutputCharacters(related) - renderedOutputCharacters(plain)
+	if want := len(" relation=call edge=verified ref=42x3"); got != want {
+		t.Fatalf("edge annotation characters = %d, want %d", got, want)
+	}
+	frozen := validResult()
+	frozen.SchemaVersion = "2"
+	if OutputCharacters(frozen) != renderedOutputCharacters(validResult()) {
+		t.Fatal("schema-2 findings without a relation changed the frozen calculation")
 	}
 }
 

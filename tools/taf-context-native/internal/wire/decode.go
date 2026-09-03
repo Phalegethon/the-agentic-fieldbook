@@ -67,7 +67,16 @@ func validateEnvelopeShape(raw []byte) error {
 		return ErrInvalidWire
 	}
 	required := []string{"schema_version", "request_identity", "consumer_identity", "operation", "repository_identity", "worktree_identity", "committed_head", "dirty_overlay_fingerprint", "provider_identity", "index_identity", "required_capability", "minimum_freshness", "query", "result_identities", "filters", "maximum_results", "maximum_model_output_characters", "allow_inferred"}
-	if err := requireKeys(request, required, map[string]bool{"index_identity": true, "query": true}); err != nil {
+	nullable := map[string]bool{"index_identity": true, "query": true}
+	// The key set is schema-dependent: schema 2 requires direction (possibly
+	// null), schema 1 must not carry it at all. A malformed schema_version
+	// falls through to the schema-1 key set and the typed validator rejects it.
+	var schemaVersion string
+	if err := json.Unmarshal(request["schema_version"], &schemaVersion); err == nil && schemaVersion == "2" {
+		required = append(required, "direction")
+		nullable["direction"] = true
+	}
+	if err := requireKeys(request, required, nullable); err != nil {
 		return err
 	}
 	var filters map[string]json.RawMessage
@@ -115,7 +124,7 @@ func validPhaseOperation(phase string, operation Operation) bool {
 	case "update":
 		return operation == Update
 	case "query":
-		return operation == RepositoryMap || operation == SearchDocs || operation == SearchSymbols || operation == SourceSnippets
+		return operation == RepositoryMap || operation == SearchDocs || operation == SearchSymbols || operation == SourceSnippets || operation == RelatedSymbols
 	default:
 		return false
 	}
@@ -197,7 +206,7 @@ func requireEOF(decoder *json.Decoder) error {
 }
 
 func ValidateRequest(request Request) error {
-	if request.SchemaVersion != "1" || !validID(request.RequestIdentity) || !validID(request.ConsumerIdentity) || !validOperation(request.Operation) || !validSHA(request.RepositoryIdentity) || !validSHA(request.WorktreeIdentity) || !validObject(request.CommittedHead) || !validSHA(request.DirtyOverlayFingerprint) || request.ProviderIdentity != "taf-context" || !validID(request.RequiredCapability) || !validFreshness(request.MinimumFreshness) {
+	if !validSchemaVersion(request.SchemaVersion) || !validID(request.RequestIdentity) || !validID(request.ConsumerIdentity) || !validOperation(request.Operation) || !validSHA(request.RepositoryIdentity) || !validSHA(request.WorktreeIdentity) || !validObject(request.CommittedHead) || !validSHA(request.DirtyOverlayFingerprint) || request.ProviderIdentity != "taf-context" || !validID(request.RequiredCapability) || !validFreshness(request.MinimumFreshness) {
 		return ErrInvalidWire
 	}
 	if request.RequiredCapability != string(request.Operation) {
@@ -220,12 +229,22 @@ func ValidateRequest(request Request) error {
 	if queryOperation != (request.Query != nil) {
 		return ErrInvalidWire
 	}
-	if request.Operation == SourceSnippets {
+	if err := validateDirection(request); err != nil {
+		return err
+	}
+	switch request.Operation {
+	case SourceSnippets:
 		if request.Query != nil || len(request.ResultIdentities) == 0 {
 			return ErrInvalidWire
 		}
-	} else if len(request.ResultIdentities) != 0 {
-		return ErrInvalidWire
+	case RelatedSymbols:
+		if request.Query != nil || len(request.ResultIdentities) == 0 || len(request.ResultIdentities) > maximumRelatedAnchors {
+			return ErrInvalidWire
+		}
+	default:
+		if len(request.ResultIdentities) != 0 {
+			return ErrInvalidWire
+		}
 	}
 	if request.Operation == Estimate || request.Operation == Build {
 		if request.IndexIdentity != nil {
@@ -235,6 +254,29 @@ func ValidateRequest(request Request) error {
 		return ErrInvalidWire
 	}
 	if isControlOperation(request.Operation) && !filtersEmpty(request.Filters) {
+		return ErrInvalidWire
+	}
+	return nil
+}
+
+// maximumRelatedAnchors bounds the anchors a single relationship request may
+// carry, keeping the query-time edge resolution work predictable.
+const maximumRelatedAnchors = 16
+
+// validateDirection enforces the schema-2 relationship selector: schema 1 never
+// carries a direction and never names related-symbols, and under schema 2 the
+// direction is present exactly for related-symbols.
+func validateDirection(request Request) error {
+	if request.SchemaVersion == "1" {
+		if request.Direction != nil || request.Operation == RelatedSymbols {
+			return ErrInvalidWire
+		}
+		return nil
+	}
+	if (request.Direction != nil) != (request.Operation == RelatedSymbols) {
+		return ErrInvalidWire
+	}
+	if request.Direction != nil && !oneOf(*request.Direction, "callers", "callees", "importers", "imports") {
 		return ErrInvalidWire
 	}
 	return nil
@@ -251,7 +293,7 @@ func validateResult(result Result) error {
 }
 
 func validateResultWithoutBudgets(result Result) error {
-	if result.SchemaVersion != "1" || !validID(result.RequestIdentity) || !validOperation(result.Operation) || !validStatus(result.Status) || result.ProviderIdentity != "taf-context" || !validText(result.ProviderVersion, false) || !validSHA(result.RepositoryIdentity) || !validSHA(result.WorktreeIdentity) || !validObject(result.CommittedHead) || !validSHA(result.DirtyOverlayFingerprint) || !validFreshness(result.Freshness) || !validID(result.NextSafeAction) {
+	if !validSchemaVersion(result.SchemaVersion) || !validID(result.RequestIdentity) || !validOperation(result.Operation) || !validStatus(result.Status) || result.ProviderIdentity != "taf-context" || !validText(result.ProviderVersion, false) || !validSHA(result.RepositoryIdentity) || !validSHA(result.WorktreeIdentity) || !validObject(result.CommittedHead) || !validSHA(result.DirtyOverlayFingerprint) || !validFreshness(result.Freshness) || !validID(result.NextSafeAction) {
 		return ErrInvalidWire
 	}
 	if result.IndexIdentity != nil && !validSHA(*result.IndexIdentity) {
@@ -287,7 +329,7 @@ func validateResultWithoutBudgets(result Result) error {
 		}
 	}
 	for index, finding := range result.Findings {
-		if err := validateFinding(finding, index+1, result.Freshness); err != nil {
+		if err := validateFinding(finding, index+1, result.Freshness, result.SchemaVersion); err != nil {
 			return err
 		}
 		if _, exists := identities[finding.ResultIdentity]; exists {
@@ -308,7 +350,11 @@ func renderedOutputCharacters(result Result) int {
 	fmt.Fprintf(&text, "LEVEL1 status=%s operation=%s freshness=%s returned=%d omitted=%d warnings=%d\n", result.Status, result.Operation, result.Freshness, len(result.Findings), result.OmittedCount, len(result.Warnings))
 	fmt.Fprintf(&text, "COVERAGE paths=%.3f languages=%.3f unsupported=%d parse_failures=%d\n", result.Coverage.PathCoverage, result.Coverage.LanguageCoverage, result.Coverage.UnsupportedLanguageCount, result.Coverage.ParseFailureCount)
 	for _, finding := range result.Findings {
-		fmt.Fprintf(&text, "FINDING %s %s %s:%d-%d %s %s method=%s\n", finding.EvidenceClass, finding.RecordKind, finding.Path, finding.StartLine, finding.EndLine, finding.Language, finding.QualifiedName, finding.ExtractionMethod)
+		fmt.Fprintf(&text, "FINDING %s %s %s:%d-%d %s %s method=%s", finding.EvidenceClass, finding.RecordKind, finding.Path, finding.StartLine, finding.EndLine, finding.Language, finding.QualifiedName, finding.ExtractionMethod)
+		if result.SchemaVersion == "2" && finding.Relation != "" {
+			fmt.Fprintf(&text, " relation=%s edge=%s ref=%dx%d", finding.Relation, finding.EdgeEvidence, finding.ReferenceLine, finding.ReferenceCount)
+		}
+		text.WriteString("\n")
 		if finding.Preview != "" || result.Operation == SourceSnippets {
 			for _, line := range strings.Split(finding.Preview, "\n") {
 				fmt.Fprintf(&text, "PREVIEW %s\n", line)
@@ -319,11 +365,27 @@ func renderedOutputCharacters(result Result) int {
 	return utf8.RuneCountInString(text.String())
 }
 
-func validateFinding(finding Finding, rank int, freshness string) error {
+func validateFinding(finding Finding, rank int, freshness string, schemaVersion string) error {
 	if finding.Rank != rank || !validSHA(finding.ResultIdentity) || !validPath(finding.Path) || finding.StartLine < 1 || finding.EndLine < finding.StartLine || !validCounter(finding.StartLine) || !validCounter(finding.EndLine) || !validText(finding.Language, false) || !oneOf(finding.RecordKind, "module", "definition", "import", "entry-point", "configuration", "heading", "document-chunk") || !oneOf(finding.SourceType, "source", "document", "configuration") || !validText(finding.QualifiedName, true) || !validText(finding.ExtractionMethod, false) || !validPreview(finding.Preview) || !oneOf(finding.EvidenceClass, "verified", "inferred", "uncertain") {
 		return ErrInvalidWire
 	}
 	if freshness != "exact" && finding.EvidenceClass == "verified" {
+		return ErrInvalidWire
+	}
+	return validateEdgeFields(finding, schemaVersion)
+}
+
+// validateEdgeFields keeps the two schemas honest in both directions: schema 1
+// carries no edge data at all (it would be silently dropped by the encoder),
+// and schema 2 admits only the frozen relation and evidence vocabularies.
+func validateEdgeFields(finding Finding, schemaVersion string) error {
+	if schemaVersion != "2" {
+		if finding.Relation != "" || finding.EdgeEvidence != "" || finding.ReferenceLine != 0 || finding.ReferenceCount != 0 {
+			return ErrInvalidWire
+		}
+		return nil
+	}
+	if !oneOf(finding.Relation, "", "call", "import") || !oneOf(finding.EdgeEvidence, "", "verified", "inferred") || !validCounter(finding.ReferenceLine) || !validCounter(finding.ReferenceCount) {
 		return ErrInvalidWire
 	}
 	return nil
@@ -360,6 +422,7 @@ func validStatus(value Status) bool {
 func validFreshness(value string) bool {
 	return oneOf(value, "exact", "commit-fresh-worktree-stale", "incrementally-stale", "structurally-stale", "partial", "unknown", "unusable")
 }
+func validSchemaVersion(value string) bool { return oneOf(value, "1", "2") }
 func validBudget(value int) bool {
 	return value == 2000 || value == 4000 || value == 8000 || value == 12000
 }

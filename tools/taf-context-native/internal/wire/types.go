@@ -21,9 +21,10 @@ const (
 	SearchSymbols   Operation = "search-symbols"
 	SearchDocs      Operation = "search-docs"
 	SourceSnippets  Operation = "source-snippets"
+	RelatedSymbols  Operation = "related-symbols"
 )
 
-var operations = [...]Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets}
+var operations = [...]Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets, RelatedSymbols}
 
 // Operations returns a copy of the frozen operation vocabulary.
 func Operations() []Operation { return append([]Operation(nil), operations[:]...) }
@@ -53,6 +54,9 @@ type Filters struct {
 	SourceTypes  []string `json:"source_types"`
 }
 
+// Request carries the frozen schema-1 keys plus the schema-2 direction. The
+// direction tag is omitempty so a marshaled schema-1 request keeps its frozen
+// key set exactly; schema-2 producers spell the key out, null included.
 type Request struct {
 	SchemaVersion                string    `json:"schema_version"`
 	RequestIdentity              string    `json:"request_identity"`
@@ -68,6 +72,7 @@ type Request struct {
 	MinimumFreshness             string    `json:"minimum_freshness"`
 	Query                        *string   `json:"query"`
 	ResultIdentities             []string  `json:"result_identities"`
+	Direction                    *string   `json:"direction,omitempty"`
 	Filters                      Filters   `json:"filters"`
 	MaximumResults               int       `json:"maximum_results"`
 	MaximumModelOutputCharacters int       `json:"maximum_model_output_characters"`
@@ -121,4 +126,10 @@ type Finding struct {
 	ExtractionMethod string `json:"extraction_method"`
 	EvidenceClass    string `json:"evidence_class"`
 	Preview          string `json:"preview"`
+	// The four edge fields below exist only in schema 2; a schema-1 result is
+	// marshaled through findingV1, which drops them entirely.
+	Relation       string `json:"relation"`
+	EdgeEvidence   string `json:"edge_evidence"`
+	ReferenceLine  int    `json:"reference_line"`
+	ReferenceCount int    `json:"reference_count"`
 }
