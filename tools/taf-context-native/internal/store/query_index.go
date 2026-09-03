@@ -92,7 +92,16 @@ func BuildQueryIndex(records []model.Record) QueryIndex {
 }
 
 func buildQueryIndexContext(ctx context.Context, records []model.Record, observed func()) (QueryIndex, error) {
-	index := QueryIndex{postings: make(map[string][]uint32)}
+	return buildQueryIndexHintedContext(ctx, records, 0, observed)
+}
+
+// buildQueryIndexHintedContext accepts the persisted query posting count as a
+// map sizing hint. The hint only reserves buckets: every key, ordinal, and
+// count is still derived from the decoded records and compared against the
+// persisted section by the caller.
+func buildQueryIndexHintedContext(ctx context.Context, records []model.Record, postingHint int, observed func()) (QueryIndex, error) {
+	index := QueryIndex{postings: make(map[string][]uint32, postingHint)}
+	var visitor queryKeyVisitor
 	for ordinal, record := range records {
 		if ordinal%contextCheckInterval == 0 {
 			if observed != nil {
@@ -102,7 +111,7 @@ func buildQueryIndexContext(ctx context.Context, records []model.Record, observe
 				return QueryIndex{}, err
 			}
 		}
-		visitCanonicalQueryKeys(record, func(key string) bool {
+		visitor.visit(record, func(key string) bool {
 			index.postings[key] = append(index.postings[key], uint32(ordinal))
 			return true
 		})
@@ -176,8 +185,13 @@ func NormalizeQueryText(value string) string { return strings.ToLower(strings.Tr
 // Unicode validity. The complete normalized qualified name is indexed
 // separately, so acronym runs intentionally remain one token.
 func QueryTokens(value string) []string {
+	return appendQueryTokens(make([]string, 0, 8), value)
+}
+
+// appendQueryTokens is QueryTokens with a caller-owned destination so a hot
+// loop can reuse one buffer. The appended tokens are identical.
+func appendQueryTokens(output []string, value string) []string {
 	value = strings.TrimSpace(value)
-	output := make([]string, 0, 8)
 	start := -1
 	previousLower := false
 	flush := func(end int) {
@@ -227,6 +241,20 @@ func canonicalQueryKeys(record model.Record) []string {
 }
 
 func visitCanonicalQueryKeys(record model.Record, visit func(string) bool) bool {
+	// One-shot callers size the buffer for the common case so a single visit
+	// costs one allocation, as it did before the buffer became reusable.
+	visitor := queryKeyVisitor{tokens: make([]string, 0, len(record.SearchTerms)+9)}
+	return visitor.visit(record, visit)
+}
+
+// queryKeyVisitor emits exactly the keys visitCanonicalQueryKeys emits, in the
+// same order, while reusing one token buffer across records so materializing a
+// large index does not allocate per record.
+type queryKeyVisitor struct {
+	tokens []string
+}
+
+func (visitor *queryKeyVisitor) visit(record model.Record, visit func(string) bool) bool {
 	if visit == nil {
 		return false
 	}
@@ -237,11 +265,10 @@ func visitCanonicalQueryKeys(record model.Record, visit func(string) bool) bool 
 	if short := QueryShortName(record.QualifiedName); short != "" && !visit(queryShortPrefix+short) {
 		return false
 	}
-	nameTokens := QueryTokens(record.QualifiedName)
-	tokens := make([]string, 0, len(record.SearchTerms)+len(nameTokens)+1)
-	tokens = append(tokens, qualified)
-	tokens = append(tokens, nameTokens...)
+	tokens := append(visitor.tokens[:0], qualified)
+	tokens = appendQueryTokens(tokens, record.QualifiedName)
 	tokens = append(tokens, record.SearchTerms...)
+	visitor.tokens = tokens
 	seen := tokens[:0]
 	for _, token := range tokens {
 		token = NormalizeQueryText(token)

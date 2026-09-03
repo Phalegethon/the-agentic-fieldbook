@@ -846,7 +846,7 @@ func decodeIndexContextWithCatalogLiveBytesObserved(ctx context.Context, encoded
 	if err != nil || !decoder.canContain(queryPostingCount, 8) || budget.reserve(int64(queryPostingCount)*conservativePostingGroupMemoryBytes) != nil {
 		return invalid(err)
 	}
-	queryIndex, queryErr := buildQueryIndexContext(ctx, records, observed)
+	queryIndex, queryErr := buildQueryIndexHintedContext(ctx, records, queryPostingCount, observed)
 	if queryErr != nil {
 		return invalid(queryErr)
 	}
