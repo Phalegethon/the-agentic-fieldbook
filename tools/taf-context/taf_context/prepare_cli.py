@@ -7,18 +7,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import platform
 import re
 import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from typing import Mapping
-from urllib import error as url_error
-from urllib import parse as url_parse
-from urllib import request as url_request
 
 from .git_snapshot import collect_snapshot
 from .level1_models import Level1Result, parse_level1_result
@@ -327,6 +322,8 @@ def _resolve_native_binary(
 
 
 def _platform_asset() -> tuple[str, str, str]:
+    import platform  # activate-only dependency; kept off the query path
+
     if sys.platform == "darwin":
         system = "darwin"
     elif sys.platform.startswith("linux"):
@@ -370,6 +367,9 @@ def _managed_binary_path(state_home: Path) -> Path:
 def _install_native_engine(
     environment: Mapping[str, str], state_home: Path
 ) -> Path:
+    import tempfile  # activate-only dependency; kept off the query path
+    from urllib import parse as url_parse
+
     _system, _machine, asset = _platform_asset()
     del environment
     base = _NATIVE_RELEASE_BASE_URL.rstrip("/")
@@ -426,6 +426,10 @@ def _install_native_engine(
 
 
 def _download(url: str, maximum_bytes: int) -> bytes:
+    from urllib import error as url_error  # activate-only dependency
+    from urllib import parse as url_parse
+    from urllib import request as url_request
+
     try:
         with url_request.urlopen(url, timeout=60) as response:
             final_scheme = url_parse.urlparse(response.geturl()).scheme
@@ -706,6 +710,8 @@ def _read_binding(binding_path: Path, snapshot: object) -> str | None:
 
 
 def _write_binding(binding_path: Path, snapshot: object, index_identity: str) -> None:
+    import tempfile  # build/activate-only dependency; kept off the query path
+
     if not _SHA256.fullmatch(index_identity):
         raise PrepareCLIError("native engine returned invalid index identity")
     binding_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

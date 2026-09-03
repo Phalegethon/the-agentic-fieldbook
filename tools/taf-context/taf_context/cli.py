@@ -12,7 +12,6 @@ import re
 import selectors
 import subprocess
 import sys
-import tempfile
 import time
 from typing import Callable, Mapping, Sequence, TextIO
 
@@ -260,6 +259,8 @@ def _validate_output_dir(output_dir: Path, repository_root: Path) -> Path:
 def _install_artifacts(
     output: Path, artifacts: tuple[tuple[str, bytes], ...]
 ) -> None:
+    import tempfile  # Level 0 artifact installation only
+
     if not artifacts:
         raise CLIError("no artifacts to install")
     output.mkdir(parents=True, exist_ok=True)

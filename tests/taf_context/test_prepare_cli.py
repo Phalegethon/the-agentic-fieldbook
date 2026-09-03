@@ -156,8 +156,10 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
         self.assertEqual(paths.root, Path(directory))
 
     def test_unpublished_windows_arm_runtime_is_reported_as_unsupported(self) -> None:
+        # platform is imported locally inside _platform_asset (kept off the query
+        # path), so patch the real module rather than a prepare_cli attribute.
         with mock.patch("taf_context.prepare_cli.sys.platform", "win32"), mock.patch(
-            "taf_context.prepare_cli.platform.machine", return_value="ARM64"
+            "platform.machine", return_value="ARM64"
         ):
             with self.assertRaisesRegex(PrepareCLIError, "unsupported"):
                 _platform_asset()
@@ -855,6 +857,27 @@ class QueryArgumentTests(unittest.TestCase):
             )
             self.assertNotEqual(code, 0)
             self.assertIn("valid values", stderr)
+
+
+class QueryPathImportTests(unittest.TestCase):
+    def test_importing_the_cli_does_not_load_installer_modules(self) -> None:
+        # Network, temp-file, and platform modules are only needed by activate
+        # and by build's binding write; loading them on every query costs about
+        # 20 ms of a 55 ms import. Measured in a fresh interpreter so the test
+        # process's own imports cannot mask a regression.
+        probe = (
+            "import sys, taf_context.cli; "
+            "print(sorted(name for name in ('platform', 'tempfile', 'urllib.error', 'urllib.request') if name in sys.modules))"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=str(ROOT / "tools" / "taf-context"),
+            env={"PATH": os.environ.get("PATH", ""), "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(completed.stdout.strip(), "[]")
 
 
 if __name__ == "__main__":
