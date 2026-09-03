@@ -202,8 +202,8 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
 
     def test_unpublished_windows_arm_runtime_is_reported_as_unsupported(self) -> None:
         # platform is imported locally inside _platform_asset (kept off the query
-        # path), so patch the real module rather than a prepare_cli attribute.
-        with mock.patch("taf_context.prepare_cli.sys.platform", "win32"), mock.patch(
+        # path), so patch the real module rather than a module attribute.
+        with mock.patch("taf_context.context_operations.sys.platform", "win32"), mock.patch(
             "platform.machine", return_value="ARM64"
         ):
             with self.assertRaisesRegex(PrepareCLIError, "unsupported"):
@@ -1138,14 +1138,14 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
 
             real_invoke = prepare_cli._invoke_native
 
-            def rotate_current_after_update(binary, operation, *args, **kwargs):
-                result = real_invoke(binary, operation, *args, **kwargs)
+            def rotate_current_after_update(transport, operation, *args, **kwargs):
+                result = real_invoke(transport, operation, *args, **kwargs)
                 if operation == "update":
                     (state_root / "CURRENT").write_text(("e" * 64) + "\n", encoding="utf-8")
                 return result
 
             with mock.patch(
-                "taf_context.prepare_cli._invoke_native", side_effect=rotate_current_after_update
+                "taf_context.context_operations._invoke_native", side_effect=rotate_current_after_update
             ):
                 code, stdout, stderr = invoke(
                     environment, "prepare", "query", "--repo", str(repo),

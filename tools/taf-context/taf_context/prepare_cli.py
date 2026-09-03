@@ -4,51 +4,40 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 from pathlib import Path
 import re
-import shutil
-import stat
-import subprocess
-import sys
 import time
 from typing import Mapping
 
-from . import refresh
+from .context_operations import (  # noqa: F401 - re-exported for callers and tests
+    FILTER_LANGUAGES,
+    FILTER_SYMBOL_KINDS,
+    PrepareCLIError,
+    QueryArguments,
+    _NATIVE_ENGINE_VERSION,
+    _invoke_native,
+    _managed_binary_path,
+    _platform_asset,
+    _read_binding,
+    _repository_state_paths,
+    _resolve_native_binary,
+    _set_descriptor_mode,
+    _state_paths,
+    _validate_binary,
+    normalize_filter_values,
+    run_build,
+    run_inspect,
+    run_query,
+    validate_query_request,
+)
 from .git_snapshot import collect_snapshot
-from .level1_models import Level1Result, parse_level1_result
-from .refresh import (
-    Binding,
-    CHANGE_DOCUMENT_NAME,
-    MAXIMUM_BINDING_DIRTY_PATHS,
-    RefreshLock,
-    build_change_document,
-    changed_paths_between,
-    dirty_paths_of,
-    remove_change_document,
-    write_change_document,
-)
-from .state_lifecycle import (
-    CURRENT_RUNTIME_VERSION,
-    Candidate,
-    apply_plan,
-    current_generation_token,
-    plan_gc,
-    plan_prune_generations,
-    plan_remove,
-    summarize_state,
-    touch_binding,
-)
-from .state_paths import StateError, resolve_state_paths
+from .native_transport import OneShotTransport
+from .state_lifecycle import Candidate, apply_plan, plan_gc, plan_remove
+from .state_paths import StateError
 
 
-_NATIVE_TIMEOUT_SECONDS = 120
-_BINDING_LIMIT = 1024 * 1024
-_SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _CHECKSUM = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)\n\Z")
-_NATIVE_ENGINE_VERSION = CURRENT_RUNTIME_VERSION
 _TAF_RELEASE_VERSION = "2.1.2"
 _NATIVE_RELEASE_BASE_URL = (
     "https://github.com/Phalegethon/the-agentic-fieldbook/releases/download/"
@@ -56,29 +45,6 @@ _NATIVE_RELEASE_BASE_URL = (
 )
 _MAX_NATIVE_BINARY_BYTES = 64 * 1024 * 1024
 _MAX_CHECKSUM_BYTES = 1024
-FILTER_LANGUAGES = frozenset(
-    {"go", "javascript", "json", "markdown", "python", "rust", "toml", "typescript"}
-)
-FILTER_SYMBOL_KINDS = frozenset(
-    {"configuration", "definition", "document-chunk", "entry-point", "heading", "import", "module"}
-)
-
-
-class PrepareCLIError(ValueError):
-    """A concise user-facing preparation error."""
-
-
-def normalize_filter_values(values: list[str], flag: str, valid: frozenset[str]) -> list[str]:
-    """Lower-case, validate, and canonicalize repeatable filter values."""
-    normalized: set[str] = set()
-    for value in values:
-        candidate = value.strip().lower()
-        if candidate not in valid:
-            raise PrepareCLIError(
-                f"invalid {flag} value {value!r}; valid values: {', '.join(sorted(valid))}"
-            )
-        normalized.add(candidate)
-    return sorted(normalized)
 
 
 def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
@@ -163,247 +129,40 @@ def run_prepare_command(
             raise PrepareCLIError(exc.code) from exc
         return _lifecycle_summary("gc", paths.root, candidates, confirmed=args.confirm_state_write)
 
-    repository = Path(args.repo).resolve()
-    snapshot = collect_snapshot(repository)
-    if snapshot.head_sha is None:
-        raise PrepareCLIError("repository must have at least one commit")
-
-    paths = _state_paths(environment)
-    state_root, binding_path = _repository_state_paths(
-        paths.root, snapshot.repository_identity, snapshot.worktree_identity
-    )
-
+    repository = Path(args.repo)
     if args.prepare_command == "remove":
+        snapshot = collect_snapshot(repository.resolve())
+        if snapshot.head_sha is None:
+            raise PrepareCLIError("repository must have at least one commit")
+        paths = _state_paths(environment)
         repository_key = snapshot.repository_identity.removeprefix("sha256:")
         worktree_key = snapshot.worktree_identity.removeprefix("sha256:")
         candidates = plan_remove(paths.root, repository_key, worktree_key)
         return _lifecycle_summary("remove", paths.root, candidates, confirmed=args.confirm_state_write)
-
-    binary, binary_source = _resolve_native_binary(environment, paths.root)
-
     if args.prepare_command == "query":
-        if binary is None:
-            raise PrepareCLIError("ready context is required; run prepare inspect")
-        binding = _read_binding(binding_path, snapshot)
-        if binding is None:
-            raise PrepareCLIError("ready context is required; run prepare inspect")
         query_text, result_identities = _validate_query_arguments(args)
-        binding, refresh_summary = _refresh_if_stale(
-            binary, repository, state_root, binding_path, binding, snapshot, paths.root
-        )
-        # The engine evaluates the binding's freshness on every query, so the
-        # query result carries exactly what a separate status call would have
-        # reported. One native process per query instead of two, plus the one
-        # `update` call the refresh above already made when the binding was stale.
-        result = _invoke_native(
-            binary,
-            args.operation,
-            repository,
-            state_root,
-            snapshot,
-            index_identity=binding.index_identity,
+        arguments = QueryArguments(
+            operation=args.operation,
             query=query_text,
             result_identities=result_identities,
-            filters={
-                "path_prefixes": sorted(set(args.path_prefix)),
-                "languages": normalize_filter_values(args.language, "--language", FILTER_LANGUAGES),
-                "symbol_kinds": normalize_filter_values(args.symbol_kind, "--symbol-kind", FILTER_SYMBOL_KINDS),
-                "source_types": sorted(set(args.source_type)),
-            },
+            path_prefixes=sorted(set(args.path_prefix)),
+            languages=normalize_filter_values(args.language, "--language", FILTER_LANGUAGES),
+            symbol_kinds=normalize_filter_values(args.symbol_kind, "--symbol-kind", FILTER_SYMBOL_KINDS),
+            source_types=sorted(set(args.source_type)),
             maximum_results=args.maximum_results,
             maximum_output_characters=args.maximum_output_characters,
             allow_inferred=args.allow_inferred,
         )
-        if result.status.value not in {"ready", "partial"}:
-            # The engine reports the same status/freshness/next_safe_action
-            # triple both when the index is genuinely stale and when
-            # source-snippets cannot verify the requested result identities
-            # against an otherwise exact index (unknown id, or a record whose
-            # evidence class is not Verified). The wire result carries no
-            # field that tells these apart, so name the snippet case honestly
-            # instead of misdirecting the agent to `prepare inspect`; a
-            # re-run search still produces the correct refusal when the
-            # index really is stale.
-            if args.operation == "source-snippets" and result.status.value == "stale":
-                raise PrepareCLIError(
-                    "result identities could not be verified against the current index; re-run the search query"
-                )
-            raise PrepareCLIError("ready context is required; run prepare inspect")
-        touch_binding(binding_path)
-        return _query_summary(result, refresh_summary)
-
+        return run_query(repository, arguments, environment=environment, transport_for=OneShotTransport)
     if args.prepare_command in {"activate", "build"}:
-        if binary is None and args.prepare_command == "activate":
-            binary = _install_native_engine(environment, paths.root)
-            binary_source = "managed"
-        if binary is None:
-            raise PrepareCLIError("native engine is unavailable")
-        result = _invoke_native(
-            binary,
-            "build",
+        return run_build(
             repository,
-            state_root,
-            snapshot,
-            index_identity=None,
-        )
-        if (
-            result.status.value not in {"ready", "partial"}
-            or result.index_identity is None
-            or result.next_safe_action != "use-index"
-        ):
-            raise PrepareCLIError("native context build did not become ready")
-        _write_binding(binding_path, snapshot, result.index_identity)
-        return _summary(
+            environment=environment,
+            transport_for=OneShotTransport,
             mode=args.prepare_command,
-            snapshot=snapshot,
-            binary=binary,
-            binary_source=binary_source,
-            result=result,
-            estimate=result,
-            authorizations=(),
-            state=summarize_state(paths.root),
+            installer=_install_native_engine if args.prepare_command == "activate" else None,
         )
-
-    binding = _read_binding(binding_path, snapshot)
-    status_result: Level1Result | None = None
-    estimate_result: Level1Result | None = None
-    refresh_summary: dict[str, object] | None = None
-    if binary is not None:
-        if binding is not None:
-            try:
-                binding, refresh_summary = _refresh_if_stale(
-                    binary, repository, state_root, binding_path, binding, snapshot, paths.root
-                )
-            except PrepareCLIError:
-                # Inspect never fails because of a refresh refusal; it falls
-                # back to today's status/estimate reporting (rebuild-index).
-                refresh_summary = None
-            status_result = _invoke_native(
-                binary,
-                "status",
-                repository,
-                state_root,
-                snapshot,
-                index_identity=binding.index_identity,
-            )
-            if status_result.next_safe_action == "use-index":
-                touch_binding(binding_path)
-        if status_result is None or status_result.next_safe_action != "use-index":
-            estimate_result = _invoke_native(
-                binary,
-                "estimate",
-                repository,
-                state_root,
-                snapshot,
-                index_identity=None,
-            )
-
-    result = status_result or estimate_result
-    if binary is None:
-        authorizations = ("network", "state-write")
-    elif result is not None and result.next_safe_action == "use-index":
-        authorizations = ()
-    else:
-        authorizations = ("state-write",)
-    return _summary(
-        mode="inspect",
-        snapshot=snapshot,
-        binary=binary,
-        binary_source=binary_source,
-        result=result,
-        estimate=estimate_result or status_result,
-        authorizations=authorizations,
-        state=summarize_state(paths.root),
-        refresh=refresh_summary,
-    )
-
-
-def _state_paths(environment: Mapping[str, str]):
-    home = environment.get("HOME") or environment.get("USERPROFILE")
-    state_root_is_explicit = bool(environment.get("TAF_STATE_HOME"))
-    windows_state_root_is_available = bool(
-        sys.platform == "win32" and environment.get("LOCALAPPDATA")
-    )
-    if not home and not state_root_is_explicit and not windows_state_root_is_available:
-        raise PrepareCLIError("home directory is unavailable")
-    try:
-        return resolve_state_paths(environment, sys.platform, Path(home or "."))
-    except StateError as exc:
-        raise PrepareCLIError(exc.code) from exc
-
-
-def _repository_state_paths(
-    root: Path, repository_identity: str, worktree_identity: str
-) -> tuple[Path, Path]:
-    repository_key = repository_identity.removeprefix("sha256:")
-    worktree_key = worktree_identity.removeprefix("sha256:")
-    controller_root = root.resolve(strict=False) / "repositories" / repository_key / worktree_key
-    return controller_root / "native", controller_root / "binding.json"
-
-
-def _resolve_native_binary(
-    environment: Mapping[str, str], state_home: Path,
-) -> tuple[Path | None, str | None]:
-    configured = environment.get("TAF_LEVEL1_BINARY")
-    if configured:
-        candidate = Path(configured)
-        _validate_binary(candidate)
-        return candidate.resolve(), "environment"
-
-    managed = _managed_binary_path(state_home)
-    if managed.exists():
-        _validate_binary(managed)
-        return managed.resolve(), "managed"
-
-    found = shutil.which("taf-level1", path=environment.get("PATH", ""))
-    if found:
-        candidate = Path(found)
-        _validate_binary(candidate)
-        return candidate.resolve(), "path"
-    return None, None
-
-
-def _platform_asset() -> tuple[str, str, str]:
-    import platform  # activate-only dependency; kept off the query path
-
-    if sys.platform == "darwin":
-        system = "darwin"
-    elif sys.platform.startswith("linux"):
-        system = "linux"
-    elif sys.platform == "win32":
-        system = "windows"
-    else:
-        raise PrepareCLIError("native engine is unsupported on this platform")
-    raw_machine = platform.machine().lower()
-    if raw_machine in {"amd64", "x86_64"}:
-        machine = "amd64"
-    elif raw_machine in {"aarch64", "arm64"}:
-        machine = "arm64"
-    else:
-        raise PrepareCLIError("native engine is unsupported on this architecture")
-    if (system, machine) not in {
-        ("darwin", "amd64"),
-        ("darwin", "arm64"),
-        ("linux", "amd64"),
-        ("linux", "arm64"),
-        ("windows", "amd64"),
-    }:
-        raise PrepareCLIError("native engine is unsupported on this platform")
-    suffix = ".exe" if system == "windows" else ""
-    asset = f"taf-level1_{_NATIVE_ENGINE_VERSION}_{system}_{machine}{suffix}"
-    return system, machine, asset
-
-
-def _managed_binary_path(state_home: Path) -> Path:
-    system, machine, _asset = _platform_asset()
-    filename = "taf-level1.exe" if system == "windows" else "taf-level1"
-    return (
-        state_home.resolve(strict=False)
-        / "runtime"
-        / _NATIVE_ENGINE_VERSION
-        / f"{system}-{machine}"
-        / filename
-    )
+    return run_inspect(repository, environment=environment, transport_for=OneShotTransport)
 
 
 def _install_native_engine(
@@ -485,265 +244,8 @@ def _download(url: str, maximum_bytes: int) -> bytes:
     return value
 
 
-def _validate_binary(path: Path) -> None:
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise PrepareCLIError("configured native engine is unavailable") from exc
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or not os.access(path, os.X_OK)
-    ):
-        raise PrepareCLIError("configured native engine is unsafe")
-
-
-def _invoke_native(
-    binary: Path,
-    operation: str,
-    repository: Path,
-    state_root: Path,
-    snapshot: object,
-    *,
-    index_identity: str | None,
-    query: str | None = None,
-    result_identities: tuple[str, ...] = (),
-    filters: dict[str, list[str]] | None = None,
-    maximum_results: int = 8,
-    maximum_output_characters: int = 4000,
-    allow_inferred: bool = False,
-    changed_paths_document: str | None = None,
-) -> Level1Result:
-    request_filters = filters or {
-        "path_prefixes": [],
-        "languages": [],
-        "symbol_kinds": [],
-        "source_types": [],
-    }
-    request_material = "\0".join(
-        (
-            operation,
-            snapshot.repository_identity,
-            snapshot.worktree_identity,
-            snapshot.head_sha,
-            snapshot.dirty_fingerprint,
-            index_identity or "none",
-            query or "none",
-            json.dumps(result_identities, separators=(",", ":")),
-            json.dumps(request_filters, sort_keys=True, separators=(",", ":")),
-            str(maximum_results),
-            str(maximum_output_characters),
-            str(allow_inferred),
-        )
-    ).encode("utf-8")
-    request_identity = "taf.prepare." + hashlib.sha256(request_material).hexdigest()[:24]
-    envelope = {
-        "phase": {
-            "build": "build",
-            "estimate": "estimate",
-            "status": "inspect",
-            "update": "update",
-        }.get(operation, "query"),
-        "repository_root": str(repository),
-        "state_root": str(state_root),
-        "changed_paths_document": changed_paths_document,
-        "request": {
-            "schema_version": "1",
-            "request_identity": request_identity,
-            "consumer_identity": "taf.prepare-repo-context",
-            "operation": operation,
-            "repository_identity": snapshot.repository_identity,
-            "worktree_identity": snapshot.worktree_identity,
-            "committed_head": snapshot.head_sha,
-            "dirty_overlay_fingerprint": snapshot.dirty_fingerprint,
-            "provider_identity": "taf-context",
-            "index_identity": index_identity,
-            "required_capability": operation,
-            "minimum_freshness": "exact",
-            "query": query,
-            "result_identities": list(result_identities),
-            "filters": request_filters,
-            "maximum_results": maximum_results,
-            "maximum_model_output_characters": maximum_output_characters,
-            "allow_inferred": allow_inferred,
-        },
-    }
-    wire = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
-    try:
-        completed = subprocess.run(
-            [str(binary)],
-            input=wire,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=_NATIVE_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise PrepareCLIError("native engine invocation failed") from exc
-    if completed.returncode != 0:
-        raise PrepareCLIError("native engine rejected the request")
-    try:
-        result = parse_level1_result(completed.stdout)
-    except (UnicodeError, ValueError) as exc:
-        raise PrepareCLIError("native engine returned invalid output") from exc
-    if (
-        result.request_identity != request_identity
-        or result.operation.value != operation
-        or result.repository_identity != snapshot.repository_identity
-        or result.worktree_identity != snapshot.worktree_identity
-        or result.committed_head != snapshot.head_sha
-        or result.dirty_overlay_fingerprint != snapshot.dirty_fingerprint
-    ):
-        raise PrepareCLIError("native engine returned mismatched output")
-    return result
-
-
-def _refresh_if_stale(
-    binary: Path,
-    repository: Path,
-    state_root: Path,
-    binding_path: Path,
-    binding: Binding,
-    snapshot: object,
-    state_home: Path,
-) -> tuple[Binding, dict[str, object]]:
-    """Bring the bound index to the current snapshot with one `update` when possible.
-
-    Returns the binding to query with and the summary `refresh` block. The
-    binding is standing consent for incremental refresh; a full rebuild stays
-    explicit, so an uncomputable delta or a structurally stale index falls
-    back to the existing refusal.
-    """
-    idle = {"performed": False, "changed_path_count": 0, "duration_ms": 0}
-    if not binding.has_delta_inputs:
-        return binding, idle
-    if binding.head_sha == snapshot.head_sha and binding.dirty_fingerprint == snapshot.dirty_fingerprint:
-        return binding, idle
-    changed = changed_paths_between(binding, snapshot)
-    if changed is None:
-        return binding, idle  # the operation call reports stale; today's refusal follows
-    for attempt in range(2):
-        started = time.perf_counter()
-        with RefreshLock(state_root):
-            # The generation CURRENT names right now, before this attempt's
-            # update, is a generation a reader may already be using. The store
-            # can reuse an existing generation directory for identical content,
-            # so its mtime alone is not a reliable signal once it is superseded;
-            # name it explicitly so pruning below never removes it. Read inside
-            # the lock so a concurrent refresh cannot publish between the read
-            # and this attempt's acquisition.
-            protected_generation = current_generation_token(state_root) or None
-            try:
-                write_change_document(state_root, build_change_document(binding, snapshot, changed))
-            except OSError as exc:
-                raise PrepareCLIError("context state is unavailable") from exc
-            try:
-                result = _invoke_native(
-                    binary, "update", repository, state_root, snapshot,
-                    index_identity=binding.index_identity, changed_paths_document=CHANGE_DOCUMENT_NAME,
-                )
-            finally:
-                remove_change_document(state_root)
-            if result.status.value in {"ready", "partial"} and result.index_identity is not None:
-                _write_binding(binding_path, snapshot, result.index_identity)
-                prune_warnings = _prune_generations(state_home, binding_path.parent, protected_generation)
-                duration = int((time.perf_counter() - started) * 1000)
-                dirty_paths = dirty_paths_of(snapshot)
-                refreshed = Binding(
-                    result.index_identity,
-                    snapshot.head_sha,
-                    snapshot.dirty_fingerprint,
-                    None if len(dirty_paths) > MAXIMUM_BINDING_DIRTY_PATHS else dirty_paths,
-                )
-                block: dict[str, object] = {
-                    "performed": True,
-                    "changed_path_count": len(changed),
-                    "duration_ms": duration,
-                }
-                if prune_warnings:
-                    block["warnings"] = prune_warnings
-                return refreshed, block
-        if result.status.value == "stale":
-            raise PrepareCLIError("ready context is required; run prepare inspect")
-        if attempt == 0:
-            # Another process may have published a newer generation and rewritten
-            # the binding; re-read once and retry with the same snapshot.
-            reread = _read_binding(binding_path, snapshot)
-            if reread is None:
-                break
-            binding = reread
-            if binding.head_sha == snapshot.head_sha and binding.dirty_fingerprint == snapshot.dirty_fingerprint:
-                return binding, idle
-            changed = changed_paths_between(binding, snapshot)
-            if changed is None:
-                break
-    raise PrepareCLIError("incremental refresh failed; run prepare build --confirm-state-write")
-
-
-def _prune_generations(state_home: Path, entry: Path, protected: str | None = None) -> list[str]:
-    """Delete generations no reader can still be using; never raise.
-
-    `protected` names the generation CURRENT pointed at immediately before
-    this refresh's `update` call; it is excluded from the plan even if its
-    mtime alone would otherwise look aged and unreferenced.
-    """
-    try:
-        # `entry` (binding_path.parent) is built from a symlink-resolved root
-        # (see _repository_state_paths); resolve state_home the same way so
-        # candidate relative paths stay consistent with it (macOS commonly
-        # maps a temp/state path through /var -> /private/var).
-        root = state_home.resolve(strict=False)
-        plan = plan_prune_generations(root, entry, now=time.time())
-        if protected:
-            plan = [candidate for candidate in plan if not candidate.relative_path.endswith(protected)]
-        apply_plan(root, plan)
-    except (StateError, OSError, ValueError):
-        return ["retention-prune-incomplete"]
-    return []
-
-
 def _validate_query_arguments(args: argparse.Namespace) -> tuple[str | None, tuple[str, ...]]:
-    query_operations = {"search-symbols", "search-docs"}
-    query_text = args.query.strip() if isinstance(args.query, str) else None
-    if args.operation in query_operations and not query_text:
-        raise PrepareCLIError("selected query operation requires --query")
-    if args.operation not in query_operations and query_text is not None:
-        raise PrepareCLIError("selected query operation does not accept --query")
-    result_identities = tuple(sorted(set(args.result_id)))
-    if args.operation == "source-snippets" and not result_identities:
-        raise PrepareCLIError("source-snippets requires at least one --result-id")
-    if args.operation != "source-snippets" and result_identities:
-        raise PrepareCLIError("selected query operation does not accept --result-id")
-    if any(_SHA256.fullmatch(item) is None for item in result_identities):
-        raise PrepareCLIError("query result identity is invalid")
-    return query_text, result_identities
-
-
-def _query_summary(
-    result: Level1Result, refresh: dict[str, object] | None = None
-) -> dict[str, object]:
-    refresh = dict(refresh) if refresh else {"performed": False, "changed_path_count": 0, "duration_ms": 0}
-    prune_warnings = refresh.pop("warnings", [])
-    warnings = list(result.warnings)
-    if prune_warnings:
-        warnings = sorted(set(warnings) | set(prune_warnings))
-    return {
-        "schema_version": "1",
-        "mode": "query",
-        "operation": result.operation.value,
-        "status": result.status.value,
-        "freshness": result.freshness.value,
-        "index_identity": result.index_identity,
-        "findings": [item.to_dict() for item in result.findings],
-        "returned_count": result.returned_count,
-        "omitted_count": result.omitted_count,
-        "truncated": result.truncated,
-        "output_characters": result.output_characters,
-        "warnings": warnings,
-        "required_authorizations": [],
-        "next_safe_action": result.next_safe_action,
-        "refresh": refresh,
-    }
+    return validate_query_request(args.operation, args.query, tuple(args.result_id))
 
 
 def _lifecycle_summary(
@@ -770,189 +272,3 @@ def _lifecycle_summary(
 
 def _candidate_dict(item: Candidate) -> dict[str, object]:
     return {"category": item.category, "relative_path": item.relative_path, "bytes": item.bytes}
-
-
-def _summary(
-    *,
-    mode: str,
-    snapshot: object,
-    binary: Path | None,
-    binary_source: str | None,
-    result: Level1Result | None,
-    estimate: Level1Result | None,
-    authorizations: tuple[str, ...],
-    state: dict[str, int],
-    refresh: dict[str, object] | None = None,
-) -> dict[str, object]:
-    if binary is None:
-        next_action = "install-native-engine"
-    elif result is None:
-        next_action = "build-index"
-    else:
-        next_action = result.next_safe_action
-    context_status = "unavailable" if result is None else result.status.value
-    freshness = "unknown" if result is None else result.freshness.value
-    refresh = dict(refresh) if refresh else {"performed": False, "changed_path_count": 0, "duration_ms": 0}
-    prune_warnings = refresh.pop("warnings", [])
-    return {
-        "schema_version": "1",
-        "mode": mode,
-        "repository": {
-            "branch": snapshot.branch,
-            "committed_head": snapshot.head_sha,
-            "dirty": bool(
-                snapshot.staged_paths
-                or snapshot.unstaged_paths
-                or snapshot.untracked_paths
-            ),
-            "tracked_file_count": len(snapshot.tracked_paths),
-            "language_counts": dict(snapshot.language_counts),
-        },
-        "engine": {
-            "availability": "available" if binary is not None else "unavailable",
-            "source": binary_source,
-        },
-        "context": {
-            "status": context_status,
-            "freshness": freshness,
-            "index_identity": None if result is None else result.index_identity,
-            "coverage": None if result is None else result.coverage.to_dict(),
-        },
-        "estimate": {
-            "eligible_path_count": (
-                len(snapshot.tracked_paths)
-                if estimate is None
-                else estimate.coverage.indexed_path_count
-            ),
-            "excluded_path_count": (
-                snapshot.ignored_entry_count
-                if estimate is None
-                else estimate.coverage.excluded_path_count
-            ),
-        },
-        "state": state,
-        "required_authorizations": list(authorizations),
-        "next_safe_action": next_action,
-        "warnings": sorted(set(() if result is None else result.warnings) | set(prune_warnings)),
-        "refresh": refresh,
-    }
-
-
-def _read_binding(binding_path: Path, snapshot: object) -> Binding | None:
-    try:
-        metadata = binding_path.lstat()
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise PrepareCLIError("context binding is unavailable") from exc
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_size > _BINDING_LIMIT
-        or metadata.st_nlink != 1
-    ):
-        raise PrepareCLIError("context binding is unsafe")
-    try:
-        value = json.loads(binding_path.read_bytes().decode("utf-8", "surrogateescape"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise PrepareCLIError("context binding is invalid") from exc
-    expected = {
-        "repository_identity": snapshot.repository_identity,
-        "worktree_identity": snapshot.worktree_identity,
-    }
-    if (
-        type(value) is not dict
-        or value.get("schema_version") not in {"1", "2"}
-        or any(value.get(key) != item for key, item in expected.items())
-    ):
-        return None
-    index_identity = value.get("index_identity")
-    if not isinstance(index_identity, str) or not _SHA256.fullmatch(index_identity):
-        raise PrepareCLIError("context binding is invalid")
-    if value["schema_version"] == "1":
-        return Binding(index_identity, None, None, None)
-    head_sha = value.get("head_sha")
-    dirty_fingerprint = value.get("dirty_fingerprint")
-    dirty_paths = value.get("dirty_paths")
-    if (
-        not isinstance(head_sha, str)
-        or not _OBJECT_ID.fullmatch(head_sha)
-        or not isinstance(dirty_fingerprint, str)
-        or not _SHA256.fullmatch(dirty_fingerprint)
-        or not (
-            dirty_paths is None
-            or (isinstance(dirty_paths, list) and all(isinstance(item, str) for item in dirty_paths))
-        )
-    ):
-        raise PrepareCLIError("context binding is invalid")
-    return Binding(
-        index_identity, head_sha, dirty_fingerprint, None if dirty_paths is None else tuple(dirty_paths)
-    )
-
-
-def _write_binding(binding_path: Path, snapshot: object, index_identity: str) -> None:
-    import tempfile  # deferred so importing the CLI stays free of tempfile (Phase 2 import-path test)
-
-    if not _SHA256.fullmatch(index_identity):
-        raise PrepareCLIError("native engine returned invalid index identity")
-    binding_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for parent in (
-        binding_path.parents[2],
-        binding_path.parents[1],
-        binding_path.parent,
-    ):
-        try:
-            parent.chmod(0o700)
-        except OSError as exc:
-            raise PrepareCLIError("context state is unavailable") from exc
-    dirty_paths = dirty_paths_of(snapshot)
-    payload = json.dumps(
-        {
-            "schema_version": "2",
-            "repository_identity": snapshot.repository_identity,
-            "worktree_identity": snapshot.worktree_identity,
-            "index_identity": index_identity,
-            "head_sha": snapshot.head_sha,
-            "dirty_fingerprint": snapshot.dirty_fingerprint,
-            "dirty_paths": None if len(dirty_paths) > refresh.MAXIMUM_BINDING_DIRTY_PATHS else list(dirty_paths),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8", "surrogateescape") + b"\n"
-    descriptor, temporary = tempfile.mkstemp(prefix=".binding-", dir=binding_path.parent)
-    temporary_path = Path(temporary)
-    try:
-        _set_descriptor_mode(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, binding_path)
-        _fsync_directory(binding_path.parent)
-    except OSError as exc:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        raise PrepareCLIError("context binding could not be saved") from exc
-    finally:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def _set_descriptor_mode(descriptor: int, mode: int) -> None:
-    if os.name == "posix":
-        os.fchmod(descriptor, mode)
-
-
-def _fsync_directory(path: Path) -> None:
-    if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
-        return
-    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)

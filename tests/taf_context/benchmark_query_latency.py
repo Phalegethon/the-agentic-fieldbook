@@ -112,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         binding = prepare_cli._read_binding(binding_path, snapshot)
         if binary is None or binding is None:
             raise SystemExit("bound native context is unavailable")
+        transport = prepare_cli.OneShotTransport(binary)
         query_text = args.query if args.operation in {"search-symbols", "search-docs"} else None
 
         stages = {
@@ -125,13 +126,13 @@ def main(argv: list[str] | None = None) -> int:
             "collect-snapshot": _timed(lambda: collect_snapshot(repository), args.repetitions),
             "native-status": _timed(
                 lambda: prepare_cli._invoke_native(
-                    binary, "status", repository, state_root, snapshot, index_identity=binding.index_identity
+                    transport, "status", repository, state_root, snapshot, index_identity=binding.index_identity
                 ),
                 args.repetitions,
             ),
             f"native-{args.operation}": _timed(
                 lambda: prepare_cli._invoke_native(
-                    binary, args.operation, repository, state_root, snapshot,
+                    transport, args.operation, repository, state_root, snapshot,
                     index_identity=binding.index_identity, query=query_text,
                 ),
                 args.repetitions,
