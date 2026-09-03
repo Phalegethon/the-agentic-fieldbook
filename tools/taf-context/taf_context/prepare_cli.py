@@ -770,7 +770,7 @@ def _write_binding(binding_path: Path, snapshot: object, index_identity: str) ->
             "index_identity": index_identity,
             "head_sha": snapshot.head_sha,
             "dirty_fingerprint": snapshot.dirty_fingerprint,
-            "dirty_paths": None if len(dirty_paths) >= refresh.MAXIMUM_BINDING_DIRTY_PATHS else list(dirty_paths),
+            "dirty_paths": None if len(dirty_paths) > refresh.MAXIMUM_BINDING_DIRTY_PATHS else list(dirty_paths),
         },
         sort_keys=True,
         separators=(",", ":"),

@@ -881,9 +881,11 @@ class QueryArgumentTests(unittest.TestCase):
 
 
 class BindingSchemaTests(unittest.TestCase):
-    def _built(self, root: Path) -> tuple[Path, Path, dict[str, str]]:
+    def _built(self, root: Path, extra_untracked: tuple[str, ...] = ()) -> tuple[Path, Path, dict[str, str]]:
         repo = init_committed_repo(root / "repo")
         write(repo / "notes.txt", "untracked\n")
+        for name in extra_untracked:
+            write(repo / name, "also untracked\n")
         binary = root / "taf-level1"
         write_fake_native_engine(binary)
         environment = {"HOME": str(root / "home"), "PATH": "", "TAF_LEVEL1_BINARY": str(binary), "TAF_STATE_HOME": str(root / "state")}
@@ -917,8 +919,14 @@ class BindingSchemaTests(unittest.TestCase):
     def test_too_many_dirty_paths_writes_null(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch("taf_context.refresh.MAXIMUM_BINDING_DIRTY_PATHS", 1):
-                _repo, binding, _environment = self._built(Path(directory))
+                _repo, binding, _environment = self._built(Path(directory), extra_untracked=("second.txt",))
             self.assertIsNone(json.loads(binding.read_text(encoding="utf-8"))["dirty_paths"])
+
+    def test_dirty_paths_at_the_cap_are_not_nulled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("taf_context.refresh.MAXIMUM_BINDING_DIRTY_PATHS", 2):
+                _repo, binding, _environment = self._built(Path(directory), extra_untracked=("second.txt",))
+            self.assertEqual(json.loads(binding.read_text(encoding="utf-8"))["dirty_paths"], ["notes.txt", "second.txt"])
 
     def test_malformed_schema_2_fields_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
