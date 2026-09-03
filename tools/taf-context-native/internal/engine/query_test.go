@@ -3,6 +3,9 @@ package engine
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/boundary"
@@ -342,4 +345,62 @@ func TestQueryLoadsUsablePartialStateButRejectsCorruptState(t *testing.T) {
 			t.Fatalf("corrupt state = %#v", result)
 		}
 	})
+}
+
+func TestCachedEngineServesTwoStateRootsAndTheUpdatedGeneration(t *testing.T) {
+	repositoryA, stateA := controlRoots(t)
+	repositoryB, stateB := controlRoots(t)
+	if err := os.WriteFile(filepath.Join(repositoryB, "other.go"), []byte("package sample\nfunc Other() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cached := NewCached(ProductionDependencies())
+	builtA := mustBuildForUpdate(t, cached, repositoryA, stateA)
+	builtB := mustBuildForUpdate(t, cached, repositoryB, stateB)
+	if *builtA.IndexIdentity == *builtB.IndexIdentity {
+		t.Fatal("the two repositories must produce distinct index identities")
+	}
+	search := func(envelope wire.Envelope, term string) wire.Result {
+		t.Helper()
+		envelope.Request.Query = &term
+		result, err := cached.Execute(context.Background(), envelope)
+		if err != nil {
+			t.Fatalf("%s: %v", term, err)
+		}
+		return result
+	}
+	// A, then B, then A again: each answer comes from its own generation.
+	for _, step := range []struct {
+		repository, state, want string
+		index                   *string
+	}{
+		{repositoryA, stateA, "Main", builtA.IndexIdentity},
+		{repositoryB, stateB, "Other", builtB.IndexIdentity},
+		{repositoryA, stateA, "Main", builtA.IndexIdentity},
+	} {
+		result := search(controlEnvelope(wire.SearchSymbols, step.repository, step.state, step.index), step.want)
+		if result.Freshness != "exact" || len(result.Findings) == 0 || !strings.HasSuffix(result.Findings[0].QualifiedName, step.want) {
+			t.Fatalf("%s: result = %#v", step.want, result)
+		}
+	}
+	// Update A; the cache must serve the new generation and refuse the superseded identity.
+	if err := os.WriteFile(filepath.Join(repositoryA, "main.go"), []byte("package sample\nfunc Renamed() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeUpdateDocument(t, stateA, updateDocument(t, builtA.IndexIdentity, "main.go"))
+	updated, err := cached.Execute(context.Background(), validUpdateEnvelope(repositoryA, stateA, builtA.IndexIdentity))
+	if err != nil || updated.Status != wire.Ready || updated.IndexIdentity == nil {
+		t.Fatalf("update = %#v, %v", updated, err)
+	}
+	after := validUpdateEnvelope(repositoryA, stateA, updated.IndexIdentity).Request
+	fresh := controlEnvelope(wire.SearchSymbols, repositoryA, stateA, updated.IndexIdentity)
+	fresh.Request.RepositoryIdentity, fresh.Request.WorktreeIdentity = after.RepositoryIdentity, after.WorktreeIdentity
+	fresh.Request.CommittedHead, fresh.Request.DirtyOverlayFingerprint = after.CommittedHead, after.DirtyOverlayFingerprint
+	if result := search(fresh, "Renamed"); result.Freshness != "exact" || len(result.Findings) == 0 {
+		t.Fatalf("updated generation not served: %#v", result)
+	}
+	stale := fresh
+	stale.Request.IndexIdentity = builtA.IndexIdentity
+	if result := search(stale, "Main"); result.Status != wire.Stale || len(result.Findings) != 0 {
+		t.Fatalf("superseded identity must be refused as stale without findings: %#v", result)
+	}
 }
