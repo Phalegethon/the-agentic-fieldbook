@@ -212,7 +212,10 @@ def tool_definitions() -> list[dict[str, Any]]:
             "title": "Source snippets",
             "description": (
                 "Fetch the verified source lines for result identities returned by an earlier "
-                "query; the only tool whose output may be quoted as evidence."
+                "query; the only tool whose output may be quoted as evidence. If the result is "
+                "`partial` with `returned_count` 0 and `omitted_count` 1, the snippet did not fit "
+                "the output budget: call again with a larger `maximum_output_characters` (8000 or "
+                "12000)."
                 + query_description_suffix
             ),
             "inputSchema": _schema(
@@ -386,8 +389,11 @@ class _Server:
         self._send({"jsonrpc": "2.0", "id": identifier, "result": result})
 
     def _send(self, message: dict[str, Any]) -> None:
+        # Every byte on stdout stays ASCII, so no client's line reader can
+        # mis-frame a message on a separator it happens to honour (U+2028 and
+        # U+2029 split Python's own ``str.splitlines``).
         self._stdout.write(
-            json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+            json.dumps(message, ensure_ascii=True, separators=(",", ":")).encode("utf-8") + b"\n"
         )
         self._stdout.flush()
 
@@ -425,6 +431,18 @@ class _Server:
         raise _MethodNotFound(method)
 
     def _call(self, params: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            return self._invoke(params, started)
+        except InvalidArguments:
+            # Spec §3 promises one diagnostic line per tool call, and an
+            # argument rejection — a refused `confirm_state_write` above all —
+            # is the one a host most needs to see. An unknown tool is named by
+            # what the client asked for.
+            self._log(f"{params.get('name')} {self._elapsed(started)}ms invalid-arguments")
+            raise
+
+    def _invoke(self, params: dict[str, Any], started: float) -> dict[str, Any]:
         name = params.get("name")
         tool = self._tools.get(name) if isinstance(name, str) else None
         if tool is None:
@@ -434,7 +452,6 @@ class _Server:
         if not os.path.isabs(arguments["repo"]):
             raise InvalidArguments("repo must be an absolute path")
         repository = Path(arguments["repo"])
-        started = time.perf_counter()
         try:
             if name == "inspect":
                 result = self._operations.inspect(repository)
@@ -446,6 +463,10 @@ class _Server:
                 result = self._operations.query(
                     repository, _query_arguments(_QUERY_TOOLS[name], arguments)
                 )
+            # Serialized inside the guard: a result the wire cannot carry is a
+            # tool error like any other, never an uncaught exception that would
+            # leave the request unanswered and end the session.
+            text = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         except InvalidArguments:
             raise
         except (PrepareCLIError, SnapshotError, ValueError) as exc:
@@ -464,7 +485,6 @@ class _Server:
                 "isError": True,
             }
         self._log(f"{name} {self._elapsed(started)}ms ok")
-        text = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return {"content": [{"type": "text", "text": text}], "structuredContent": result}
 
     @staticmethod
@@ -522,7 +542,11 @@ class NativeOperations:
 
     def close(self) -> None:
         for session in self._sessions.values():
-            session.close()
+            # One session that refuses to go away must not strand the others.
+            try:
+                session.close()
+            except Exception as exc:  # noqa: BLE001 - shutdown closes everything it can
+                self._log(f"engine-close failed {type(exc).__name__}")
         self._sessions.clear()
 
 

@@ -20,6 +20,7 @@ Each finding has `rank`, `result_identity`, `path`, `start_line`, `end_line`, `l
 
 - `evidence_class` is `verified` when the extractor proved the record from a literal token in the current source, `inferred` otherwise (hidden unless `--allow-inferred`). Never upgrade it in prose.
 - `preview` is one sanitized line: the first line of the record's range for functions, classes, and methods (for a decorated Python definition that is the decorator line); the first body line under a heading. It is a display hint for choosing the right result. It is not evidence; quote source only from `source-snippets`. A heading directly followed by another heading has an empty preview.
+- A `source-snippets` result that is `partial` with `returned_count` 0 and `omitted_count` 1 means the snippet did not fit the output budget: ask again with a larger budget (`--maximum-output-characters 8000` or `12000` for the script, `maximum_output_characters` for the tool).
 - `record_kind` tells you what matched: `definition`, `import`, `module`, `entry-point`, `configuration` (a key name), `heading`, `document-chunk`. Within a match tier, findings are ordered: definitions, modules, entry points and headings first; configuration keys and document chunks next; imports last; then by path.
 
 ## Presenting results

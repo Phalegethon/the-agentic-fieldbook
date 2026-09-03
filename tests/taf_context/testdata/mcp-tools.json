@@ -353,7 +353,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Fetch the verified source lines for result identities returned by an earlier query; the only tool whose output may be quoted as evidence. A query on a bound index behind the working tree refreshes it incrementally first.",
+    "description": "Fetch the verified source lines for result identities returned by an earlier query; the only tool whose output may be quoted as evidence. If the result is `partial` with `returned_count` 0 and `omitted_count` 1, the snippet did not fit the output budget: call again with a larger `maximum_output_characters` (8000 or 12000). A query on a bound index behind the working tree refreshes it incrementally first.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

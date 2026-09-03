@@ -8,22 +8,30 @@ from pathlib import Path
 import unittest
 
 from taf_context.context_operations import PrepareCLIError, QueryArguments
-from taf_context.mcp_server import SERVER_NAME, SERVER_VERSION, serve, tool_definitions
+from taf_context.mcp_server import (
+    SERVER_NAME,
+    SERVER_VERSION,
+    NativeOperations,
+    serve,
+    tool_definitions,
+)
 
-ROOT = Path(__file__).parents[2]
 FIXTURE = Path(__file__).parent / "testdata" / "mcp-tools.json"
 REPO = "/tmp/example-repository"
 
 
 class FakeOperations:
-    def __init__(self, *, fail_with: Exception | None = None) -> None:
+    def __init__(self, *, fail_with: Exception | None = None, answer: object = None) -> None:
         self.calls: list[tuple] = []
         self.closed = False
         self.fail_with = fail_with
+        self.answer = answer
 
     def _answer(self, mode: str) -> dict:
         if self.fail_with is not None:
             raise self.fail_with
+        if self.answer is not None:
+            return self.answer
         return {"schema_version": "1", "mode": mode, "next_safe_action": "use-index"}
 
     def inspect(self, repository: Path) -> dict:
@@ -298,6 +306,61 @@ class ToolCallTests(unittest.TestCase):
         )
         self.assertIn("RuntimeError", stderr)
 
+    def test_an_unserializable_result_is_a_tool_error_not_an_uncaught_exception(self) -> None:
+        responses, stderr, code, operations = run_server(
+            [call(1, "inspect", {"repo": REPO}), call(2, "inspect", {"repo": REPO})],
+            FakeOperations(answer={"unrepresentable": {1, 2}}),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(responses), 2)  # the session survives and answers again
+        for response in responses:
+            self.assertTrue(response["result"]["isError"])
+            self.assertEqual(
+                response["result"]["content"][0]["text"], "repository context operation failed"
+            )
+            self.assertNotIn("structuredContent", response["result"])
+        self.assertIn("TypeError", stderr)
+        self.assertTrue(operations.closed)
+
+    def test_argument_rejections_leave_a_stderr_diagnostic(self) -> None:
+        responses, stderr, _, _ = run_server(
+            [
+                call(1, "build", {"repo": REPO, "confirm_state_write": False}),
+                call(2, "unknown_tool", {"repo": REPO}),
+            ]
+        )
+        self.assertEqual([response["error"]["code"] for response in responses], [-32602, -32602])
+        self.assertEqual(len(stderr.splitlines()), 2)
+        self.assertRegex(stderr.splitlines()[0], r"^build \d+ms invalid-arguments$")
+        self.assertRegex(stderr.splitlines()[1], r"^unknown_tool \d+ms invalid-arguments$")
+
+
+class NativeOperationsTests(unittest.TestCase):
+    def test_close_closes_every_session_even_when_one_raises(self) -> None:
+        closed: list[str] = []
+        logged: list[str] = []
+
+        class Session:
+            def __init__(self, name: str, *, failing: bool = False) -> None:
+                self.name = name
+                self.failing = failing
+
+            def close(self) -> None:
+                closed.append(self.name)
+                if self.failing:
+                    raise OSError("the child would not go away")
+
+        operations = NativeOperations({}, log=logged.append)
+        operations._sessions = {
+            Path("/bin/first"): Session("first", failing=True),
+            Path("/bin/second"): Session("second"),
+        }
+        operations.close()
+        self.assertEqual(closed, ["first", "second"])
+        self.assertEqual(operations._sessions, {})
+        self.assertEqual(len(logged), 1)
+        self.assertIn("OSError", logged[0])
+
 
 class FramingTests(unittest.TestCase):
     def test_protocol_errors(self) -> None:
@@ -322,6 +385,23 @@ class FramingTests(unittest.TestCase):
         responses, stderr, _, _ = run_server([call(1, "inspect", {"repo": REPO})], operations)
         self.assertEqual(len(responses), 1)
         self.assertRegex(stderr, r"inspect \d+ms ok")
+
+    def test_every_stdout_byte_is_ascii(self) -> None:
+        # A line reader that splits on U+2028 (Python's str.splitlines does)
+        # cannot mis-frame a message that carries no non-ASCII byte at all.
+        note = "one two ünï"
+        stdin = io.BytesIO(json.dumps(call(1, "inspect", {"repo": REPO})).encode("utf-8") + b"\n")
+        stdout, stderr = io.BytesIO(), io.StringIO()
+        serve(stdin, stdout, stderr, FakeOperations(answer={"mode": "inspect", "note": note}))
+        raw = stdout.getvalue()
+        try:
+            text = raw.decode("ascii")
+        except UnicodeDecodeError as exc:  # pragma: no cover - the assertion message
+            self.fail(f"stdout carried a non-ASCII byte: {exc}")
+        self.assertEqual(len(text.splitlines()), 1)
+        message = json.loads(text)
+        self.assertEqual(message["result"]["structuredContent"]["note"], note)
+        self.assertEqual(json.loads(message["result"]["content"][0]["text"])["note"], note)
 
 
 if __name__ == "__main__":
