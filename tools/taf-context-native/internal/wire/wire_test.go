@@ -654,18 +654,48 @@ func TestRequestBoundsRelatedSymbolsAnchors(t *testing.T) {
 	if err := ValidateRequest(withQuery); err == nil {
 		t.Fatal("accepted related-symbols carrying a query")
 	}
+	// The bound is part of the contract, so the two cases spell 16 and 17 out
+	// instead of deriving them from the constant they are meant to pin.
 	tooMany := relatedRequest()
-	tooMany.ResultIdentities = make([]string, 0, maximumRelatedAnchors+1)
-	for index := 0; index <= maximumRelatedAnchors; index++ {
+	tooMany.ResultIdentities = make([]string, 0, 17)
+	for index := 0; index < 17; index++ {
 		tooMany.ResultIdentities = append(tooMany.ResultIdentities, fmt.Sprintf("sha256:%064x", index))
 	}
 	if err := ValidateRequest(tooMany); err == nil {
 		t.Fatalf("accepted %d related-symbols anchors", len(tooMany.ResultIdentities))
 	}
 	bounded := relatedRequest()
-	bounded.ResultIdentities = tooMany.ResultIdentities[:maximumRelatedAnchors]
+	bounded.ResultIdentities = tooMany.ResultIdentities[:16]
 	if err := ValidateRequest(bounded); err != nil {
-		t.Fatalf("rejected %d related-symbols anchors: %v", maximumRelatedAnchors, err)
+		t.Fatalf("rejected 16 related-symbols anchors: %v", err)
+	}
+}
+
+// TestValidateResultBindsEdgeFieldsToRelatedSymbols keeps the edge data where
+// it was resolved: a schema-2 result of any other operation carries no
+// relation, no edge evidence, and no reference numbers.
+func TestValidateResultBindsEdgeFieldsToRelatedSymbols(t *testing.T) {
+	cases := map[string]func(*Result){
+		"relation": func(result *Result) { result.Findings[0].Relation = "call" },
+		"evidence": func(result *Result) { result.Findings[0].EdgeEvidence = "verified" },
+		"line":     func(result *Result) { result.Findings[0].ReferenceLine = 7 },
+		"count":    func(result *Result) { result.Findings[0].ReferenceCount = 2 },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			result := validResult()
+			result.SchemaVersion = "2"
+			mutate(&result)
+			result.OutputCharacters = renderedOutputCharacters(result)
+			if err := EncodeResult(ioDiscard{}, result); err == nil {
+				t.Fatalf("accepted %s on a %s result", name, result.Operation)
+			}
+			related := relatedResult()
+			related.OutputCharacters = renderedOutputCharacters(related)
+			if err := EncodeResult(ioDiscard{}, related); err != nil {
+				t.Fatalf("rejected the same field on a related-symbols result: %v", err)
+			}
+		})
 	}
 }
 

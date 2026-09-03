@@ -329,7 +329,7 @@ func validateResultWithoutBudgets(result Result) error {
 		}
 	}
 	for index, finding := range result.Findings {
-		if err := validateFinding(finding, index+1, result.Freshness, result.SchemaVersion); err != nil {
+		if err := validateFinding(finding, index+1, result.Freshness, result.SchemaVersion, result.Operation); err != nil {
 			return err
 		}
 		if _, exists := identities[finding.ResultIdentity]; exists {
@@ -365,21 +365,23 @@ func renderedOutputCharacters(result Result) int {
 	return utf8.RuneCountInString(text.String())
 }
 
-func validateFinding(finding Finding, rank int, freshness string, schemaVersion string) error {
+func validateFinding(finding Finding, rank int, freshness string, schemaVersion string, operation Operation) error {
 	if finding.Rank != rank || !validSHA(finding.ResultIdentity) || !validPath(finding.Path) || finding.StartLine < 1 || finding.EndLine < finding.StartLine || !validCounter(finding.StartLine) || !validCounter(finding.EndLine) || !validText(finding.Language, false) || !oneOf(finding.RecordKind, "module", "definition", "import", "entry-point", "configuration", "heading", "document-chunk") || !oneOf(finding.SourceType, "source", "document", "configuration") || !validText(finding.QualifiedName, true) || !validText(finding.ExtractionMethod, false) || !validPreview(finding.Preview) || !oneOf(finding.EvidenceClass, "verified", "inferred", "uncertain") {
 		return ErrInvalidWire
 	}
 	if freshness != "exact" && finding.EvidenceClass == "verified" {
 		return ErrInvalidWire
 	}
-	return validateEdgeFields(finding, schemaVersion)
+	return validateEdgeFields(finding, schemaVersion, operation)
 }
 
 // validateEdgeFields keeps the two schemas honest in both directions: schema 1
 // carries no edge data at all (it would be silently dropped by the encoder),
-// and schema 2 admits only the frozen relation and evidence vocabularies.
-func validateEdgeFields(finding Finding, schemaVersion string) error {
-	if schemaVersion != "2" {
+// and schema 2 admits only the frozen relation and evidence vocabularies, and
+// only on the one operation that resolves edges. Every other schema-2 result
+// leaves the four fields empty.
+func validateEdgeFields(finding Finding, schemaVersion string, operation Operation) error {
+	if schemaVersion != "2" || operation != RelatedSymbols {
 		if finding.Relation != "" || finding.EdgeEvidence != "" || finding.ReferenceLine != 0 || finding.ReferenceCount != 0 {
 			return ErrInvalidWire
 		}
