@@ -248,14 +248,18 @@ operations as `prepare-repo-context` as tools: `inspect`, `build`,
 Every tool takes the absolute `repo` path; `build` requires
 `confirm_state_write: true` and is marked so the host asks before running it.
 The server never installs the native engine, never contacts the network, and
-never deletes state; `activate`, `gc`, and `remove` stay skill commands. One
+never runs `gc` or `remove`; those and `activate` stay skill commands. A query
+on a bound index may refresh it incrementally and prune superseded index
+generations, under the standing consent given at the first `build`. One
 native engine process serves the whole session and starts on the first tool
 call, so repeated questions do not pay for a process start and index load.
 
 Claude Code starts the server when the plugin is enabled; the tools appear as
 `mcp__plugin_taf_repo-context__<tool>` (permission matcher
-`mcp__plugin_taf_repo-context__*`), reading its manifest from `.mcp.json`
-(`${CLAUDE_PLUGIN_ROOT}`). Codex reads its own `.codex-plugin/mcp.json`
+`mcp__plugin_taf_repo-context__*`), reading its manifest from
+`.claude-plugin/mcp.json` (`${CLAUDE_PLUGIN_ROOT}`; the file lives inside the
+plugin directory so that a checkout of this repository does not register a
+project-level server). Codex reads its own `.codex-plugin/mcp.json`
 (`${PLUGIN_ROOT}`), since its Agent Plugins MCP loader does not substitute
 `${CLAUDE_PLUGIN_ROOT}`. If a host does not substitute either variable in the
 command path, register the server manually with an absolute path, for
@@ -265,6 +269,10 @@ example in Codex's `config.toml`:
     command = "python3"
     args = ["/absolute/path/to/the-agentic-fieldbook/tools/taf-context/taf_context_mcp.py"]
     default_tools_approval_mode = "writes"
+
+In that mode Codex prompts only for `build`; the query tools are marked
+read-only even though a query may refresh and prune the bound index as
+described above.
 
 The manifest names the interpreter `python3`; on Windows installations where
 only `python` exists, register the server manually with that name.
@@ -288,8 +296,11 @@ the-agentic-fieldbook/
 ├── .agents/plugins/marketplace.json
 ├── .claude-plugin/
 │   ├── marketplace.json
+│   ├── mcp.json
 │   └── plugin.json
-├── .codex-plugin/plugin.json
+├── .codex-plugin/
+│   ├── mcp.json
+│   └── plugin.json
 ├── skills/
 │   ├── branch-handoff/
 │   │   ├── SKILL.md

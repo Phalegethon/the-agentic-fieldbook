@@ -24,8 +24,8 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
   prunes superseded generations older than 60 seconds after a refresh,
   tolerates parse failures in updated files like `build`, and reports a
   `refresh` block.
-- The plugin bundles the `repo-context` MCP stdio server (`.mcp.json` for
-  Claude Code, `.codex-plugin/mcp.json` for Codex): `inspect`, `build` (with
+- The plugin bundles the `repo-context` MCP stdio server (`.claude-plugin/mcp.json`
+  for Claude Code, `.codex-plugin/mcp.json` for Codex): `inspect`, `build` (with
   an explicit `confirm_state_write` argument), and the four read-only query
   operations as tools, served by one session-scoped native engine process
   that starts on the first call, restarts after a crash or time-out, and

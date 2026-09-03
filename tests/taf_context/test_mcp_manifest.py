@@ -15,7 +15,7 @@ ENTRY = ROOT / "tools" / "taf-context" / "taf_context_mcp.py"
 
 class McpManifestTests(unittest.TestCase):
     def test_mcp_json_points_at_the_entry_script_through_the_plugin_root_variable(self) -> None:
-        manifest = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
+        manifest = json.loads((ROOT / ".claude-plugin" / "mcp.json").read_text(encoding="utf-8"))
         server = manifest["mcpServers"]["repo-context"]
         self.assertEqual(server["command"], "python3")
         self.assertEqual(len(server["args"]), 1)
@@ -35,7 +35,7 @@ class McpManifestTests(unittest.TestCase):
 
     def test_claude_plugin_manifest_references_the_claude_mcp_file(self) -> None:
         value = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(value["mcpServers"], "./.mcp.json")
+        self.assertEqual(value["mcpServers"], "./.claude-plugin/mcp.json")
 
     def test_codex_plugin_manifest_references_its_own_mcp_file(self) -> None:
         value = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))

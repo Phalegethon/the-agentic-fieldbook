@@ -195,7 +195,11 @@ def main(argv: list[str] | None = None) -> int:
 
                 def close(self) -> None:
                     self.process.stdin.close()
-                    self.process.wait(timeout=30)
+                    try:
+                        self.process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait()
 
             initialize = {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "benchmark", "version": "0"}}
             startup_samples: list[float] = []
