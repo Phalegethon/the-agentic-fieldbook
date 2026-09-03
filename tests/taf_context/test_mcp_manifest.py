@@ -24,10 +24,22 @@ class McpManifestTests(unittest.TestCase):
         self.assertEqual((ROOT / relative).resolve(), ENTRY.resolve())
         self.assertTrue(ENTRY.is_file())
 
-    def test_both_plugin_manifests_reference_the_same_mcp_configuration(self) -> None:
-        for manifest in (".claude-plugin/plugin.json", ".codex-plugin/plugin.json"):
-            value = json.loads((ROOT / manifest).read_text(encoding="utf-8"))
-            self.assertEqual(value["mcpServers"], "./.mcp.json", manifest)
+    def test_codex_mcp_json_points_at_the_same_entry_script_through_plugin_root(self) -> None:
+        manifest = json.loads((ROOT / ".codex-plugin" / "mcp.json").read_text(encoding="utf-8"))
+        server = manifest["mcpServers"]["repo-context"]
+        self.assertEqual(server["command"], "python3")
+        self.assertEqual(len(server["args"]), 1)
+        self.assertTrue(server["args"][0].startswith("${PLUGIN_ROOT}/"))
+        relative = server["args"][0].removeprefix("${PLUGIN_ROOT}/")
+        self.assertEqual((ROOT / relative).resolve(), ENTRY.resolve())
+
+    def test_claude_plugin_manifest_references_the_claude_mcp_file(self) -> None:
+        value = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual(value["mcpServers"], "./.mcp.json")
+
+    def test_codex_plugin_manifest_references_its_own_mcp_file(self) -> None:
+        value = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual(value["mcpServers"], "./.codex-plugin/mcp.json")
 
     def test_entry_script_answers_initialize_quickly_and_exits_on_eof(self) -> None:
         request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}}
