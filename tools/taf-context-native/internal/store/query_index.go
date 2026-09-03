@@ -402,16 +402,6 @@ func compareCanonicalPathOrdinal(records canonicalRecords, left, right uint32) i
 	return cmp.Compare(l.Identity, r.Identity)
 }
 
-func buildMapGroups(records []model.Record, pathOrdinals []uint32, maximum int) ([]QueryMapGroup, bool) {
-	groups, partial, _ := buildCanonicalMapGroupsContext(context.Background(), newDirectRecords(records), pathOrdinals, maximum, nil)
-	return groups, partial
-}
-
-func buildIndexedMapGroups(records []model.Record, recordOrder, pathOrdinals []uint32, maximum int) ([]QueryMapGroup, bool) {
-	groups, partial, _ := buildCanonicalMapGroupsContext(context.Background(), newRecordsByCanonicalOrder(records, recordOrder), pathOrdinals, maximum, nil)
-	return groups, partial
-}
-
 func buildCanonicalMapGroupsContext(ctx context.Context, records canonicalRecords, pathOrdinals []uint32, maximum int, observed func()) ([]QueryMapGroup, bool, error) {
 	if maximum < 1 {
 		return nil, len(pathOrdinals) != 0, nil

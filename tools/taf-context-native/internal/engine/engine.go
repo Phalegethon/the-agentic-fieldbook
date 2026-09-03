@@ -25,14 +25,13 @@ type Dependencies struct {
 	OpenControl            func(*boundary.Roots, string, int64) (boundary.StableFile, error)
 	Extract                func(context.Context, boundary.StableFile) ([]model.Record, extract.Report)
 	Build                  func(context.Context, *boundary.Roots, model.Manifest, []model.Record) (store.Snapshot, error)
-	BuildWithBarrier       func(context.Context, *boundary.Roots, model.Manifest, []model.Record, func() error) (store.Snapshot, error)
 	BuildCachedWithBarrier func(context.Context, *boundary.Roots, store.Snapshot, model.Manifest, []model.Record, func() error) (store.Snapshot, error)
 	Load                   func(context.Context, *boundary.Roots, string) (store.Snapshot, error)
 	Inspect                func(context.Context, *boundary.Roots) (store.Status, error)
 	// Peek verifies CURRENT, the manifest, the READY marker, the payload
 	// digest, and the generation identity without the raw structural
-	// validator. Query, snippet, and status paths use it; metrics and update
-	// keep Inspect.
+	// validator. Query, snippet, status, and update paths use it; metrics
+	// keeps Inspect.
 	Peek              func(context.Context, *boundary.Roots) (store.Status, error)
 	CurrentGeneration func(context.Context, *boundary.Roots) (string, error)
 	ParserIDs         func() map[string]string
@@ -66,7 +65,6 @@ func ProductionDependencies() Dependencies {
 		},
 		Extract:                registry.ExtractContext,
 		Build:                  store.BuildContext,
-		BuildWithBarrier:       store.BuildContextWithBarrier,
 		BuildCachedWithBarrier: store.BuildCachedContextWithBarrier,
 		Load:                   store.LoadContext,
 		Inspect:                store.InspectContext,
@@ -215,7 +213,7 @@ func (engine *Engine) observeUpdateCounters(counters model.WorkCounters) {
 
 func (engine *Engine) ready() bool {
 	d := engine.dependencies
-	return d.ValidateRoots != nil && d.Collect != nil && d.OpenFile != nil && d.OpenControl != nil && d.Extract != nil && d.Build != nil && d.BuildWithBarrier != nil && d.BuildCachedWithBarrier != nil && d.Load != nil && d.Inspect != nil && d.Peek != nil && d.CurrentGeneration != nil && d.ParserIDs != nil && d.Fit != nil
+	return d.ValidateRoots != nil && d.Collect != nil && d.OpenFile != nil && d.OpenControl != nil && d.Extract != nil && d.Build != nil && d.BuildCachedWithBarrier != nil && d.Load != nil && d.Inspect != nil && d.Peek != nil && d.CurrentGeneration != nil && d.ParserIDs != nil && d.Fit != nil
 }
 
 func productionLimits() policy.Limits { return policy.ProductionLimits() }

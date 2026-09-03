@@ -983,6 +983,13 @@ func TestUpdateRefusesWhenCurrentMovedBetweenLoadAndPublish(t *testing.T) {
 		interloper = published.Manifest.GenerationIdentity
 		return snapshot, nil
 	}
+	publish := dependencies.BuildCachedWithBarrier
+	var publishErr error
+	dependencies.BuildCachedWithBarrier = func(ctx context.Context, roots *boundary.Roots, previous store.Snapshot, manifest model.Manifest, records []model.Record, barrier func() error) (store.Snapshot, error) {
+		snapshot, err := publish(ctx, roots, previous, manifest, records, barrier)
+		publishErr = err
+		return snapshot, err
+	}
 	engine := New(dependencies)
 	result, err := engine.Execute(context.Background(), validUpdateEnvelope(repository, state, built.IndexIdentity))
 	if err != nil {
@@ -990,6 +997,9 @@ func TestUpdateRefusesWhenCurrentMovedBetweenLoadAndPublish(t *testing.T) {
 	}
 	if result.Status != wire.Error || result.NextSafeAction != "rebuild-index" {
 		t.Fatalf("racing update = %#v, want error/rebuild-index", result)
+	}
+	if !errors.Is(publishErr, store.ErrIndexMismatch) {
+		t.Fatalf("publish error = %v, want store.ErrIndexMismatch (the CAS rejection)", publishErr)
 	}
 	current, err := store.CurrentGenerationContext(context.Background(), mustRoots(t, validUpdateEnvelope(repository, state, built.IndexIdentity)))
 	if err != nil || current != interloper {

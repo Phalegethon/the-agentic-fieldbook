@@ -136,6 +136,9 @@ func TestBenchSearchAtScale(t *testing.T) {
 	snapshot := syntheticSnapshot(syntheticRecords(modules, 25, 25))
 	t.Logf("records=%d index_build=%s", len(snapshot.Records), time.Since(started))
 	limits := policy.ProductionLimits()
+	// Any well-formed identity; Fit never dereferences the index. The oracle
+	// requests below carry none, so the wire.Result literal needs a fixed,
+	// correctly shaped value to satisfy wire.validateResult.
 	index := "sha256:" + hexRepeat("d")
 	for _, item := range oracleQueries() {
 		request := item.request()

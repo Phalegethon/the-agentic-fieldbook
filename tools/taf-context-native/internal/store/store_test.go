@@ -155,7 +155,7 @@ func TestVerifyGenerationArtifactsRejectsBytesThatDifferFromTheArtifacts(t *test
 	data := mustRead(t, path)
 	data[len(data)-1] ^= 0xff
 	writeExisting(t, path, data)
-	stateDir, generations := openGenerations(t, roots) // helper: open state + generations directories through boundaryFilesystem
+	stateDir, generations := openGenerations(t, roots)
 	defer closeDirectories(stateDir, generations)
 	if err := verifyGenerationArtifacts(boundaryFilesystem{}, generations, artifacts); !errors.Is(err, ErrStoreCorrupt) {
 		t.Fatalf("verify error = %v, want ErrStoreCorrupt", err)
