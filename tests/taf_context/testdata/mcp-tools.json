@@ -1,0 +1,403 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Report native engine availability, index freshness, eligible and excluded path counts, state usage, required authorizations, and next_safe_action for a repository. Read-only apart from an incremental refresh of an already bound index.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "repo": {
+          "description": "Absolute path of the Git repository or worktree.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo"
+      ],
+      "type": "object"
+    },
+    "name": "inspect",
+    "title": "Inspect repository context"
+  },
+  {
+    "_meta": {
+      "anthropic/requiresUserInteraction": true
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Build a fresh bounded index for the repository in user-local TAF state (never inside the repository). Requires confirm_state_write: true, which you may only pass after the user explicitly approved writing state in this conversation. Query only when the result's next_safe_action is use-index.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "confirm_state_write": {
+          "description": "Must be true; the user's explicit state-write authorization.",
+          "type": "boolean"
+        },
+        "repo": {
+          "description": "Absolute path of the Git repository or worktree.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo",
+        "confirm_state_write"
+      ],
+      "type": "object"
+    },
+    "name": "build",
+    "title": "Build repository index"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "One representative record per file, in path order; narrow with path_prefixes to answer 'what is in directory D'. A query on a bound index behind the working tree refreshes it incrementally first.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_inferred": {
+          "default": false,
+          "description": "Include findings whose evidence class is inferred.",
+          "type": "boolean"
+        },
+        "languages": {
+          "items": {
+            "enum": [
+              "go",
+              "javascript",
+              "json",
+              "markdown",
+              "python",
+              "rust",
+              "toml",
+              "typescript"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "maximum_output_characters": {
+          "default": 4000,
+          "enum": [
+            2000,
+            4000,
+            8000,
+            12000
+          ],
+          "type": "integer"
+        },
+        "maximum_results": {
+          "default": 8,
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path_prefixes": {
+          "description": "Repository-relative path prefixes (case-sensitive).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repo": {
+          "description": "Absolute path of the Git repository or worktree.",
+          "type": "string"
+        },
+        "source_types": {
+          "items": {
+            "enum": [
+              "source",
+              "document",
+              "configuration"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "symbol_kinds": {
+          "items": {
+            "enum": [
+              "configuration",
+              "definition",
+              "document-chunk",
+              "entry-point",
+              "heading",
+              "import",
+              "module"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "repo"
+      ],
+      "type": "object"
+    },
+    "name": "repository_map",
+    "title": "Repository map"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Find definitions, imports, modules, entry points, and configuration keys by name; every query word must match (camelCase and snake_case split). Use symbol_kinds: [\"definition\"] for 'where is X defined' and [\"import\"] for 'who imports X'. A query on a bound index behind the working tree refreshes it incrementally first.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_inferred": {
+          "default": false,
+          "description": "Include findings whose evidence class is inferred.",
+          "type": "boolean"
+        },
+        "languages": {
+          "items": {
+            "enum": [
+              "go",
+              "javascript",
+              "json",
+              "markdown",
+              "python",
+              "rust",
+              "toml",
+              "typescript"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "maximum_output_characters": {
+          "default": 4000,
+          "enum": [
+            2000,
+            4000,
+            8000,
+            12000
+          ],
+          "type": "integer"
+        },
+        "maximum_results": {
+          "default": 8,
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path_prefixes": {
+          "description": "Repository-relative path prefixes (case-sensitive).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "query": {
+          "description": "Exact name or a few words; prefixes match.",
+          "type": "string"
+        },
+        "repo": {
+          "description": "Absolute path of the Git repository or worktree.",
+          "type": "string"
+        },
+        "source_types": {
+          "items": {
+            "enum": [
+              "source",
+              "document",
+              "configuration"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "symbol_kinds": {
+          "items": {
+            "enum": [
+              "configuration",
+              "definition",
+              "document-chunk",
+              "entry-point",
+              "heading",
+              "import",
+              "module"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "repo",
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "search_symbols",
+    "title": "Search symbols"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Find Markdown headings and document chunks; headings rank above body chunks. Use two or three words from the expected heading. A query on a bound index behind the working tree refreshes it incrementally first.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_inferred": {
+          "default": false,
+          "description": "Include findings whose evidence class is inferred.",
+          "type": "boolean"
+        },
+        "languages": {
+          "items": {
+            "enum": [
+              "go",
+              "javascript",
+              "json",
+              "markdown",
+              "python",
+              "rust",
+              "toml",
+              "typescript"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "maximum_output_characters": {
+          "default": 4000,
+          "enum": [
+            2000,
+            4000,
+            8000,
+            12000
+          ],
+          "type": "integer"
+        },
+        "maximum_results": {
+          "default": 8,
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path_prefixes": {
+          "description": "Repository-relative path prefixes (case-sensitive).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "query": {
+          "type": "string"
+        },
+        "repo": {
+          "description": "Absolute path of the Git repository or worktree.",
+          "type": "string"
+        },
+        "source_types": {
+          "items": {
+            "enum": [
+              "source",
+              "document",
+              "configuration"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "symbol_kinds": {
+          "items": {
+            "enum": [
+              "configuration",
+              "definition",
+              "document-chunk",
+              "entry-point",
+              "heading",
+              "import",
+              "module"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "repo",
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "search_docs",
+    "title": "Search documentation"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Fetch the verified source lines for result identities returned by an earlier query; the only tool whose output may be quoted as evidence. A query on a bound index behind the working tree refreshes it incrementally first.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_inferred": {
+          "default": false,
+          "description": "Include findings whose evidence class is inferred.",
+          "type": "boolean"
+        },
+        "maximum_output_characters": {
+          "default": 4000,
+          "enum": [
+            2000,
+            4000,
+            8000,
+            12000
+          ],
+          "type": "integer"
+        },
+        "maximum_results": {
+          "default": 8,
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "repo": {
+          "description": "Absolute path of the Git repository or worktree.",
+          "type": "string"
+        },
+        "result_ids": {
+          "description": "result_identity values from a previous query.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "repo",
+        "result_ids"
+      ],
+      "type": "object"
+    },
+    "name": "source_snippets",
+    "title": "Source snippets"
+  }
+]

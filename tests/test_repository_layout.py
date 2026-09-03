@@ -24,6 +24,7 @@ EXPECTED_TAF_CONTEXT_FILES = {
     "git_snapshot.py",
     "level1_models.py",
     "level1_render.py",
+    "mcp_server.py",
     "models.py",
     "native_transport.py",
     "prepare_cli.py",
