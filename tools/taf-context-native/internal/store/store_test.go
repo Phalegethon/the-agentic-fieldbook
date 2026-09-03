@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1375,6 +1376,133 @@ func TestBuildRejectsUnknownManifestFormatAndControlCharacters(t *testing.T) {
 	}
 }
 
+func TestPeekMatchesInspectForAValidGeneration(t *testing.T) {
+	roots, _ := storeRoots(t)
+	built := mustBuild(t, roots, testManifest(), buildCancellationRecords(64))
+	inspected, err := InspectContext(context.Background(), roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peeked, err := PeekContext(context.Background(), roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(peeked, inspected) {
+		t.Fatalf("peek differs from inspect:\npeek    %#v\ninspect %#v", peeked, inspected)
+	}
+	if !peeked.Ready || peeked.IndexIdentity != built.IndexIdentity || peeked.GenerationIdentity != built.Manifest.GenerationIdentity || peeked.InstalledBytes != built.InstalledBytes {
+		t.Fatalf("peek = %#v", peeked)
+	}
+}
+
+func TestPeekPropagatesCancellationAndNilRoots(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	roots, _ := storeRoots(t)
+	mustBuild(t, roots, testManifest(), []model.Record{testRecord(testRecordA, "a.go", "A", []string{"a"})})
+	if _, err := PeekContext(ctx, roots); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled peek error = %v, want context.Canceled", err)
+	}
+	if _, err := PeekContext(context.Background(), nil); !errors.Is(err, ErrStoreCorrupt) {
+		t.Fatalf("nil roots peek error = %v, want ErrStoreCorrupt", err)
+	}
+}
+
+// resignGenerationWithPayload replaces the installed payload and re-signs the
+// manifest, READY marker, generation directory, and CURRENT so every digest and
+// identity agrees with the new bytes. It models a writer that can rewrite the
+// whole generation, which no digest check can detect; only structural
+// validation or decoding can.
+func resignGenerationWithPayload(t *testing.T, state string, snapshot Snapshot, payload []byte) string {
+	t.Helper()
+	manifest := cloneManifest(snapshot.Manifest)
+	manifest.PayloadDigest = digestIdentity(payload)
+	manifest.IndexIdentity = manifest.PayloadDigest
+	identity, err := computeGenerationIdentity(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.GenerationIdentity = identity
+	encoded, err := encodeManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPath := generationPath(state, snapshot.Manifest.GenerationIdentity)
+	newPath := generationPath(state, identity)
+	if err := os.Rename(oldPath, newPath); err != nil {
+		t.Fatal(err)
+	}
+	writeExisting(t, filepath.Join(newPath, indexFilename), payload)
+	writeExisting(t, filepath.Join(newPath, manifestFilename), encoded)
+	writeExisting(t, filepath.Join(newPath, readyFilename), []byte(identity+"\n"))
+	writeExisting(t, filepath.Join(state, currentFilename), []byte(generationToken(identity)+"\n"))
+	return manifest.IndexIdentity
+}
+
+func TestPeekAcceptsDigestConsistentStructuralCorruptionThatInspectAndLoadReject(t *testing.T) {
+	// This documents the amended invariant: Peek trusts the digest and the
+	// generation identity; a structurally corrupt payload that was re-signed is
+	// caught by Inspect (metrics) and by Load's decoder (every query), never
+	// surfaced as records.
+	roots, state := storeRoots(t)
+	snapshot := mustBuild(t, roots, testManifest(), buildCancellationRecords(8))
+	corrupt := mutateFirstQueryOrdinal(t, installedFile(t, state, snapshot.Manifest.GenerationIdentity, indexFilename), 99)
+	resigned := resignGenerationWithPayload(t, state, snapshot, corrupt)
+
+	peeked, err := PeekContext(context.Background(), roots)
+	if err != nil || !peeked.Ready || peeked.IndexIdentity != resigned {
+		t.Fatalf("peek = %#v, %v; want ready with the re-signed identity", peeked, err)
+	}
+	if _, err := InspectContext(context.Background(), roots); !errors.Is(err, ErrStoreCorrupt) {
+		t.Fatalf("Inspect error = %v, want ErrStoreCorrupt", err)
+	}
+	if _, err := LoadContext(context.Background(), roots, resigned); !errors.Is(err, ErrStoreCorrupt) {
+		t.Fatalf("Load error = %v, want ErrStoreCorrupt", err)
+	}
+}
+
+// TestBenchPeekInspectLoad prints the read-path timings the Phase 2 spec
+// reasons about. It is opt-in: TAF_STORE_BENCH=1 go test -run Bench -v ./internal/store
+// TAF_STORE_BENCH_RECORDS overrides the record count (default 6000).
+func TestBenchPeekInspectLoad(t *testing.T) {
+	if os.Getenv("TAF_STORE_BENCH") != "1" {
+		t.Skip("set TAF_STORE_BENCH=1 to print Peek, Inspect, and Load timings")
+	}
+	count := 6000
+	if raw := os.Getenv("TAF_STORE_BENCH_RECORDS"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			t.Fatalf("TAF_STORE_BENCH_RECORDS=%q is not a positive integer", raw)
+		}
+		count = parsed
+	}
+	roots, _ := storeRoots(t)
+	start := time.Now()
+	snapshot := mustBuild(t, roots, testManifest(), buildCancellationRecords(count))
+	t.Logf("records=%d build=%s installed_bytes=%d", count, time.Since(start), snapshot.InstalledBytes)
+	ctx := context.Background()
+	stages := []struct {
+		name string
+		run  func() error
+	}{
+		{"peek", func() error { _, err := PeekContext(ctx, roots); return err }},
+		{"inspect", func() error { _, err := InspectContext(ctx, roots); return err }},
+		{"load", func() error { _, err := LoadContext(ctx, roots, snapshot.IndexIdentity); return err }},
+	}
+	for _, stage := range stages {
+		durations := make([]time.Duration, 0, 10)
+		for range 10 {
+			began := time.Now()
+			if err := stage.run(); err != nil {
+				t.Fatal(err)
+			}
+			durations = append(durations, time.Since(began))
+		}
+		slices.Sort(durations)
+		t.Logf("%-7s median=%s min=%s max=%s", stage.name, durations[5], durations[0], durations[9])
+	}
+}
+
 func TestLoadAndInspectFailClosedOnCorruptionAndUnsafeState(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1481,6 +1609,9 @@ func TestLoadAndInspectFailClosedOnCorruptionAndUnsafeState(t *testing.T) {
 			if _, err := Inspect(roots); !errors.Is(err, ErrStoreCorrupt) {
 				t.Fatalf("Inspect error = %v, want ErrStoreCorrupt", err)
 			}
+			if _, err := PeekContext(context.Background(), roots); !errors.Is(err, ErrStoreCorrupt) {
+				t.Fatalf("Peek error = %v, want ErrStoreCorrupt", err)
+			}
 		})
 	}
 }
@@ -1511,6 +1642,9 @@ func TestLoadRejectsWrongExpectedIdentityAndMissingCurrent(t *testing.T) {
 	}
 	if _, err := Inspect(roots); !errors.Is(err, ErrNoCurrent) {
 		t.Fatalf("Inspect missing CURRENT error = %v, want ErrNoCurrent", err)
+	}
+	if _, err := PeekContext(context.Background(), roots); !errors.Is(err, ErrNoCurrent) {
+		t.Fatalf("Peek missing CURRENT error = %v, want ErrNoCurrent", err)
 	}
 
 	freshRoots, _ := storeRoots(t)

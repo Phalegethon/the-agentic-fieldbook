@@ -399,6 +399,20 @@ func Inspect(roots *boundary.Roots) (Status, error) {
 }
 
 func InspectContext(ctx context.Context, roots *boundary.Roots) (Status, error) {
+	return currentGenerationStatus(ctx, roots, true)
+}
+
+// PeekContext verifies the same state directory, CURRENT pointer, generation
+// name, manifest, READY marker, payload digest, and generation identity as
+// InspectContext, but does not run the raw structural validator over the
+// payload. Query paths use it before Load, whose decoder performs the bounded
+// structural checks on every materialization; metrics and the build
+// self-check keep InspectContext.
+func PeekContext(ctx context.Context, roots *boundary.Roots) (Status, error) {
+	return currentGenerationStatus(ctx, roots, false)
+}
+
+func currentGenerationStatus(ctx context.Context, roots *boundary.Roots, validatePayload bool) (Status, error) {
 	if err := ctx.Err(); err != nil {
 		return Status{}, err
 	}
@@ -429,7 +443,7 @@ func InspectContext(ctx context.Context, roots *boundary.Roots) (Status, error) 
 	if !exists {
 		return Status{}, ErrNoCurrent
 	}
-	return inspectGenerationContext(ctx, filesystem, generations, token)
+	return describeGenerationContext(ctx, filesystem, generations, token, validatePayload)
 }
 
 // CurrentGenerationContext reads only the atomically selected immutable
@@ -672,7 +686,13 @@ func validateGenerationMetadataContext(ctx context.Context, filesystem storeFile
 	return nil
 }
 
-func inspectGenerationContext(ctx context.Context, filesystem storeFilesystem, generations *boundary.StateDirectory, token string) (Status, error) {
+// describeGenerationContext reads one installed generation and returns its
+// Status. With validatePayload the raw structural validator runs over the
+// payload and its counts are compared with the manifest (Inspect). Without it
+// the digest, READY marker, manifest bounds, and generation identity are still
+// verified (Peek); the manifest's record and posting counts are trusted because
+// the generation identity authenticates the manifest.
+func describeGenerationContext(ctx context.Context, filesystem storeFilesystem, generations *boundary.StateDirectory, token string, validatePayload bool) (Status, error) {
 	if err := ctx.Err(); err != nil {
 		return Status{}, err
 	}
@@ -705,15 +725,17 @@ func inspectGenerationContext(ctx context.Context, filesystem storeFilesystem, g
 	if err != nil || sha256ID(payload) != manifest.PayloadDigest || manifest.IndexIdentity != manifest.PayloadDigest {
 		return Status{}, ErrStoreCorrupt
 	}
-	recordCount, postingCount, err := validateIndexContext(ctx, payload)
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return Status{}, err
+	if validatePayload {
+		recordCount, postingCount, err := validateIndexContext(ctx, payload)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return Status{}, err
+			}
+			return Status{}, ErrStoreCorrupt
 		}
-		return Status{}, ErrStoreCorrupt
-	}
-	if recordCount != manifest.RecordCount || postingCount != manifest.PostingCount {
-		return Status{}, ErrStoreCorrupt
+		if recordCount != manifest.RecordCount || postingCount != manifest.PostingCount {
+			return Status{}, ErrStoreCorrupt
+		}
 	}
 	identity, err := computeGenerationIdentity(manifest)
 	if err != nil || identity != manifest.GenerationIdentity {
@@ -728,6 +750,10 @@ func inspectGenerationContext(ctx context.Context, filesystem storeFilesystem, g
 	}
 	installedBytes := int64(len(payload)) + int64(len(manifestBytes)) + int64(len(ready))
 	return Status{Ready: true, Manifest: manifest, IndexIdentity: manifest.IndexIdentity, GenerationIdentity: manifest.GenerationIdentity, InstalledBytes: installedBytes}, nil
+}
+
+func inspectGenerationContext(ctx context.Context, filesystem storeFilesystem, generations *boundary.StateDirectory, token string) (Status, error) {
+	return describeGenerationContext(ctx, filesystem, generations, token, true)
 }
 
 func computeGenerationIdentity(manifest model.Manifest) (string, error) {
