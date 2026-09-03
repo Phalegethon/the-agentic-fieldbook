@@ -209,12 +209,13 @@ func encodeIndexCatalogObservedStatsContext(ctx context.Context, input []model.R
 			}
 		}
 	}
+	canonical := newRecordsByCanonicalOrder(input, recordOrder)
 	if err := sortOrdinalsBuildContext(ctx, pathOrder, func(left, right uint32) int {
-		return compareIndexedPathOrdinal(input, recordOrder, left, right)
+		return compareCanonicalPathOrdinal(canonical, left, right)
 	}, observed); err != nil {
 		return nil, err
 	}
-	mapGroups, mapPartial, err := buildCanonicalMapGroupsContext(ctx, recordsByCanonicalOrder{records: input, order: recordOrder}, pathOrder, policy.ProductionLimits().MaximumLexicalCandidates, func() {
+	mapGroups, mapPartial, err := buildCanonicalMapGroupsContext(ctx, canonical, pathOrder, policy.ProductionLimits().MaximumLexicalCandidates, func() {
 		_ = observeBuildContext(ctx, observed, buildPhaseSort)
 	})
 	if err != nil {

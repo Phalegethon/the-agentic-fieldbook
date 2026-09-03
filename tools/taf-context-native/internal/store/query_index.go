@@ -120,6 +120,7 @@ func buildQueryIndexContext(ctx context.Context, records []model.Record, observe
 	for ordinal := range records {
 		index.byPath[ordinal] = uint32(ordinal)
 	}
+	canonical := newDirectRecords(records)
 	comparisons := 0
 	canceled := false
 	slices.SortFunc(index.byPath, func(left, right uint32) int {
@@ -133,13 +134,13 @@ func buildQueryIndexContext(ctx context.Context, records []model.Record, observe
 				return 0
 			}
 		}
-		return comparePathOrdinal(records, left, right)
+		return compareCanonicalPathOrdinal(canonical, left, right)
 	})
 	if canceled || ctx.Err() != nil {
 		return QueryIndex{}, ctx.Err()
 	}
 	var err error
-	index.mapGroups, index.mapPartial, err = buildCanonicalMapGroupsContext(ctx, directRecords(records), index.byPath, policy.ProductionLimits().MaximumLexicalCandidates, observed)
+	index.mapGroups, index.mapPartial, err = buildCanonicalMapGroupsContext(ctx, canonical, index.byPath, policy.ProductionLimits().MaximumLexicalCandidates, observed)
 	if err != nil {
 		return QueryIndex{}, err
 	}
@@ -287,55 +288,105 @@ func queryDocumentRecord(record model.Record) bool {
 	return record.RecordKind == model.Heading || record.RecordKind == model.DocumentChunk || record.SourceType == "document"
 }
 
-func comparePathOrdinal(records []model.Record, left, right uint32) int {
-	return compareCanonicalPathOrdinal(directRecords(records), left, right)
-}
-
-func compareIndexedPathOrdinal(records []model.Record, recordOrder []uint32, left, right uint32) int {
-	return compareCanonicalPathOrdinal(recordsByCanonicalOrder{records: records, order: recordOrder}, left, right)
-}
-
+// canonicalRecords exposes the records the canonical path order sorts, in the
+// ordinal space of that order, together with the normalized path and
+// qualified-name keys the comparator needs. The keys are computed once per
+// record instead of once per comparison; the comparison values, and therefore
+// the total order, are unchanged.
 type canonicalRecords interface {
 	At(uint32) model.Record
+	NormalizedPath(uint32) string
+	NormalizedName(uint32) string
+	Len() int
 }
 
-type directRecords []model.Record
+type directRecords struct {
+	records         []model.Record
+	normalizedPaths []string
+	normalizedNames []string
+}
 
-func (records directRecords) At(ordinal uint32) model.Record { return records[ordinal] }
+func newDirectRecords(records []model.Record) directRecords {
+	paths, names := normalizedCanonicalKeys(len(records), func(ordinal int) model.Record { return records[ordinal] })
+	return directRecords{records: records, normalizedPaths: paths, normalizedNames: names}
+}
+
+func (records directRecords) At(ordinal uint32) model.Record { return records.records[ordinal] }
+
+func (records directRecords) NormalizedPath(ordinal uint32) string {
+	return records.normalizedPaths[ordinal]
+}
+
+func (records directRecords) NormalizedName(ordinal uint32) string {
+	return records.normalizedNames[ordinal]
+}
+
+func (records directRecords) Len() int { return len(records.records) }
 
 type recordsByCanonicalOrder struct {
-	records []model.Record
-	order   []uint32
+	records         []model.Record
+	order           []uint32
+	normalizedPaths []string
+	normalizedNames []string
+}
+
+func newRecordsByCanonicalOrder(records []model.Record, order []uint32) recordsByCanonicalOrder {
+	paths, names := normalizedCanonicalKeys(len(order), func(ordinal int) model.Record { return records[order[ordinal]] })
+	return recordsByCanonicalOrder{records: records, order: order, normalizedPaths: paths, normalizedNames: names}
 }
 
 func (records recordsByCanonicalOrder) At(ordinal uint32) model.Record {
 	return records.records[records.order[ordinal]]
 }
 
-func compareCanonicalPathOrdinal(records canonicalRecords, left, right uint32) int {
-	l, r := records.At(left), records.At(right)
-	for _, comparison := range []int{
-		cmp.Compare(NormalizeQueryText(l.Path), NormalizeQueryText(r.Path)),
-		cmp.Compare(l.Path, r.Path),
-		cmp.Compare(l.StartLine, r.StartLine),
-		cmp.Compare(string(l.RecordKind), string(r.RecordKind)),
-		cmp.Compare(NormalizeQueryText(l.QualifiedName), NormalizeQueryText(r.QualifiedName)),
-		cmp.Compare(l.Identity, r.Identity),
-	} {
-		if comparison != 0 {
-			return comparison
-		}
+func (records recordsByCanonicalOrder) NormalizedPath(ordinal uint32) string {
+	return records.normalizedPaths[ordinal]
+}
+
+func (records recordsByCanonicalOrder) NormalizedName(ordinal uint32) string {
+	return records.normalizedNames[ordinal]
+}
+
+func (records recordsByCanonicalOrder) Len() int { return len(records.order) }
+
+func normalizedCanonicalKeys(count int, at func(int) model.Record) ([]string, []string) {
+	paths := make([]string, count)
+	names := make([]string, count)
+	for ordinal := range count {
+		record := at(ordinal)
+		paths[ordinal] = NormalizeQueryText(record.Path)
+		names[ordinal] = NormalizeQueryText(record.QualifiedName)
 	}
-	return 0
+	return paths, names
+}
+
+func compareCanonicalPathOrdinal(records canonicalRecords, left, right uint32) int {
+	if comparison := cmp.Compare(records.NormalizedPath(left), records.NormalizedPath(right)); comparison != 0 {
+		return comparison
+	}
+	l, r := records.At(left), records.At(right)
+	if comparison := cmp.Compare(l.Path, r.Path); comparison != 0 {
+		return comparison
+	}
+	if comparison := cmp.Compare(l.StartLine, r.StartLine); comparison != 0 {
+		return comparison
+	}
+	if comparison := cmp.Compare(string(l.RecordKind), string(r.RecordKind)); comparison != 0 {
+		return comparison
+	}
+	if comparison := cmp.Compare(records.NormalizedName(left), records.NormalizedName(right)); comparison != 0 {
+		return comparison
+	}
+	return cmp.Compare(l.Identity, r.Identity)
 }
 
 func buildMapGroups(records []model.Record, pathOrdinals []uint32, maximum int) ([]QueryMapGroup, bool) {
-	groups, partial, _ := buildCanonicalMapGroupsContext(context.Background(), directRecords(records), pathOrdinals, maximum, nil)
+	groups, partial, _ := buildCanonicalMapGroupsContext(context.Background(), newDirectRecords(records), pathOrdinals, maximum, nil)
 	return groups, partial
 }
 
 func buildIndexedMapGroups(records []model.Record, recordOrder, pathOrdinals []uint32, maximum int) ([]QueryMapGroup, bool) {
-	groups, partial, _ := buildCanonicalMapGroupsContext(context.Background(), recordsByCanonicalOrder{records: records, order: recordOrder}, pathOrdinals, maximum, nil)
+	groups, partial, _ := buildCanonicalMapGroupsContext(context.Background(), newRecordsByCanonicalOrder(records, recordOrder), pathOrdinals, maximum, nil)
 	return groups, partial
 }
 
@@ -369,7 +420,7 @@ func buildCanonicalMapGroupsContext(ctx context.Context, records canonicalRecord
 					return nil, false, err
 				}
 			}
-			if compareMapRepresentative(records.At(pathOrdinals[end]), records.At(best)) < 0 {
+			if compareCanonicalMapRepresentative(records, pathOrdinals[end], best) < 0 {
 				best = pathOrdinals[end]
 			}
 			end++
@@ -387,20 +438,24 @@ func buildCanonicalMapGroupsContext(ctx context.Context, records canonicalRecord
 	return groups, partial, nil
 }
 
-func compareMapRepresentative(left, right model.Record) int {
-	for _, comparison := range []int{
-		cmp.Compare(queryEvidenceTier(left), queryEvidenceTier(right)),
-		cmp.Compare(querySourceTier(left), querySourceTier(right)),
-		cmp.Compare(MapKindTier(left.RecordKind), MapKindTier(right.RecordKind)),
-		cmp.Compare(left.StartLine, right.StartLine),
-		cmp.Compare(NormalizeQueryText(left.QualifiedName), NormalizeQueryText(right.QualifiedName)),
-		cmp.Compare(left.Identity, right.Identity),
-	} {
-		if comparison != 0 {
-			return comparison
-		}
+func compareCanonicalMapRepresentative(records canonicalRecords, leftOrdinal, rightOrdinal uint32) int {
+	left, right := records.At(leftOrdinal), records.At(rightOrdinal)
+	if comparison := cmp.Compare(queryEvidenceTier(left), queryEvidenceTier(right)); comparison != 0 {
+		return comparison
 	}
-	return 0
+	if comparison := cmp.Compare(querySourceTier(left), querySourceTier(right)); comparison != 0 {
+		return comparison
+	}
+	if comparison := cmp.Compare(MapKindTier(left.RecordKind), MapKindTier(right.RecordKind)); comparison != 0 {
+		return comparison
+	}
+	if comparison := cmp.Compare(left.StartLine, right.StartLine); comparison != 0 {
+		return comparison
+	}
+	if comparison := cmp.Compare(records.NormalizedName(leftOrdinal), records.NormalizedName(rightOrdinal)); comparison != 0 {
+		return comparison
+	}
+	return cmp.Compare(left.Identity, right.Identity)
 }
 
 func queryEvidenceTier(record model.Record) int {
