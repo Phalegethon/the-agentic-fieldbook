@@ -71,19 +71,20 @@ def changed_paths_between(binding: Binding, snapshot) -> list[str] | None:
         return None
     changed = set(binding.dirty_paths) | set(dirty_paths_of(snapshot))
     if binding.head_sha != snapshot.head_sha:
-        raw = _git(
-            Path(snapshot.canonical_root), "diff", "--name-only", "--no-renames", "-z",
-            binding.head_sha, snapshot.head_sha, allow_failure=True,
-        )
-        if raw is None:
-            return None
         try:
+            raw = _git(
+                Path(snapshot.canonical_root), "diff", "--name-only", "--no-renames", "-z",
+                binding.head_sha, snapshot.head_sha, allow_failure=True,
+            )
+            if raw is None:
+                return None
             changed |= set(_z_paths(raw, "changed paths"))
         except SnapshotError:
             return None
     if len(changed) > MAXIMUM_CHANGED_PATHS:
         return None
-    ordered = sorted(changed)  # code-point order equals UTF-8 byte order, which the engine requires
+    # valid UTF-8 only (surrogates rejected below); code-point order then equals the engine's byte order
+    ordered = sorted(changed)
     if not all(_safe_update_path(path) for path in ordered):
         return None
     return ordered
@@ -124,14 +125,19 @@ def write_change_document(state_root: Path, document: dict) -> str:
 
     payload = _canonical_json(document)
     descriptor, temporary = tempfile.mkstemp(prefix=".taf-update-", dir=state_root)
+    handed_off = False  # tracks whether os.fdopen took ownership of the descriptor
     try:
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+        stream = os.fdopen(descriptor, "wb", closefd=True)
+        handed_off = True
+        with stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, state_root / CHANGE_DOCUMENT_NAME)
     except OSError:
+        if not handed_off:
+            os.close(descriptor)
         try:
             os.unlink(temporary)
         except OSError:

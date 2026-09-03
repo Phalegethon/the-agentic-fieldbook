@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from taf_context.git_snapshot import collect_snapshot
 from taf_context.refresh import (
@@ -126,6 +128,23 @@ class ChangedPathsTests(unittest.TestCase):
             for unsafe in ("../x", "/abs", "a//b", "a/./b", "back\\slash", "nul\x00"):
                 weird = Binding(SHA_A, snapshot.head_sha, snapshot.dirty_fingerprint, (unsafe,))
                 self.assertIsNone(changed_paths_between(weird, snapshot), unsafe)
+
+    def test_git_timeout_or_os_error_yields_no_delta_instead_of_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = init_committed_repo(Path(directory) / "repo")
+            binding = _bind(collect_snapshot(repo))
+            write(repo / "tracked.txt", "edited\n")
+            commit_all(repo, "second")
+            snapshot = collect_snapshot(repo)
+            real_run = subprocess.run
+
+            def timing_out(argv: list[str], **kwargs: object):
+                if "diff" in argv:
+                    raise subprocess.TimeoutExpired(argv, 20)
+                return real_run(argv, **kwargs)
+
+            with mock.patch("taf_context.git_snapshot.subprocess.run", side_effect=timing_out):
+                self.assertIsNone(changed_paths_between(binding, snapshot))
 
 
 class ChangeDocumentTests(unittest.TestCase):
