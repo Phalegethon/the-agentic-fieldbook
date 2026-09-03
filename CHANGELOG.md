@@ -35,6 +35,13 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 - JavaScript and TypeScript module-scope `const`, `let`, and `var`
   declarations are indexed as definitions, and repository maps represent a
   file by its definitions before its imports.
+- `prepare query` makes one native call per query, the engine verifies the
+  payload digest and generation identity instead of running the raw
+  structural validator on `status` and query paths (the validator still runs
+  at build time and in `metrics`), the broker collects the Git snapshot with
+  concurrent read-only commands, and installer modules load only for
+  `activate`. End-to-end query latency on this repository drops from about
+  1.0 s to about 0.3 s.
 
 ## [2.1.2] - 2026-08-31
 
