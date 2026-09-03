@@ -345,7 +345,7 @@ func TestUpdateRejectsWrongBindingBeforeDeclaredSourceOpen(t *testing.T) {
 func TestUpdatePreservesCurrentOnCancellationAndPublicationFailure(t *testing.T) {
 	for name, arrange := range map[string]func(*Engine){
 		"publication-failure": func(engine *Engine) {
-			engine.dependencies.BuildWithBarrier = func(_ context.Context, roots *boundary.Roots, manifest model.Manifest, records []model.Record, _ func() error) (store.Snapshot, error) {
+			engine.dependencies.BuildCachedWithBarrier = func(_ context.Context, roots *boundary.Roots, _ store.Snapshot, manifest model.Manifest, records []model.Record, _ func() error) (store.Snapshot, error) {
 				return store.BuildWithFaults(roots, manifest, records, store.Faults{BeforeCurrentRename: errors.New("injected publication failure")})
 			}
 		},
@@ -728,9 +728,9 @@ func TestUpdateFinalStoreBarrierRejectsMutationAfterPreparation(t *testing.T) {
 	before := inspectForUpdate(t, base, repository, state)
 	writeUpdateDocument(t, state, updateDocument(t, built.IndexIdentity, "main.go"))
 	candidate := New(base.dependencies)
-	original := candidate.dependencies.BuildWithBarrier
-	candidate.dependencies.BuildWithBarrier = func(ctx context.Context, roots *boundary.Roots, manifest model.Manifest, records []model.Record, barrier func() error) (store.Snapshot, error) {
-		return original(ctx, roots, manifest, records, func() error {
+	original := candidate.dependencies.BuildCachedWithBarrier
+	candidate.dependencies.BuildCachedWithBarrier = func(ctx context.Context, roots *boundary.Roots, previous store.Snapshot, manifest model.Manifest, records []model.Record, barrier func() error) (store.Snapshot, error) {
+		return original(ctx, roots, previous, manifest, records, func() error {
 			if err := os.WriteFile(filepath.Join(repository, "main.go"), []byte("package sample\nfunc ChangedAfterPreparation() {}\n"), 0o600); err != nil {
 				return err
 			}
@@ -772,10 +772,10 @@ func TestUpdateSameGenerationFinalBarrierRejectsSourceMutation(t *testing.T) {
 	}
 	writeUpdateDocument(t, state, contents)
 	candidate := New(base.dependencies)
-	original := candidate.dependencies.BuildWithBarrier
+	original := candidate.dependencies.BuildCachedWithBarrier
 	barrierCalls := 0
-	candidate.dependencies.BuildWithBarrier = func(ctx context.Context, roots *boundary.Roots, manifest model.Manifest, records []model.Record, barrier func() error) (store.Snapshot, error) {
-		return original(ctx, roots, manifest, records, func() error {
+	candidate.dependencies.BuildCachedWithBarrier = func(ctx context.Context, roots *boundary.Roots, previous store.Snapshot, manifest model.Manifest, records []model.Record, barrier func() error) (store.Snapshot, error) {
+		return original(ctx, roots, previous, manifest, records, func() error {
 			barrierCalls++
 			if err := os.WriteFile(filepath.Join(repository, "main.go"), []byte("package sample\nfunc MutatedAtSameGenerationBarrier() {}\n"), 0o600); err != nil {
 				return err
@@ -803,9 +803,9 @@ func TestUpdateFinalStoreBarrierRejectsSameByteReplacement(t *testing.T) {
 	before := inspectForUpdate(t, base, repository, state)
 	writeUpdateDocument(t, state, updateDocument(t, built.IndexIdentity, "main.go"))
 	candidate := New(base.dependencies)
-	original := candidate.dependencies.BuildWithBarrier
-	candidate.dependencies.BuildWithBarrier = func(ctx context.Context, roots *boundary.Roots, manifest model.Manifest, records []model.Record, barrier func() error) (store.Snapshot, error) {
-		return original(ctx, roots, manifest, records, func() error {
+	original := candidate.dependencies.BuildCachedWithBarrier
+	candidate.dependencies.BuildCachedWithBarrier = func(ctx context.Context, roots *boundary.Roots, previous store.Snapshot, manifest model.Manifest, records []model.Record, barrier func() error) (store.Snapshot, error) {
+		return original(ctx, roots, previous, manifest, records, func() error {
 			originalInfo, err := os.Stat(filepath.Join(repository, "main.go"))
 			if err != nil {
 				return err
@@ -853,9 +853,9 @@ func TestUpdateOversizedWitnessUsesMaximumPlusOneAndRejectsReplacement(t *testin
 	candidate := New(base.dependencies)
 	var counters model.WorkCounters
 	candidate.dependencies.ObserveUpdateCounters = func(got model.WorkCounters) { counters = got }
-	original := candidate.dependencies.BuildWithBarrier
-	candidate.dependencies.BuildWithBarrier = func(ctx context.Context, roots *boundary.Roots, manifest model.Manifest, records []model.Record, barrier func() error) (store.Snapshot, error) {
-		return original(ctx, roots, manifest, records, func() error {
+	original := candidate.dependencies.BuildCachedWithBarrier
+	candidate.dependencies.BuildCachedWithBarrier = func(ctx context.Context, roots *boundary.Roots, previous store.Snapshot, manifest model.Manifest, records []model.Record, barrier func() error) (store.Snapshot, error) {
+		return original(ctx, roots, previous, manifest, records, func() error {
 			originalInfo, err := os.Stat(filepath.Join(repository, "main.go"))
 			if err != nil {
 				return err
@@ -900,9 +900,9 @@ func TestUpdateFinalStoreBarrierRejectsIgnoredControlReplacement(t *testing.T) {
 	before := inspectForUpdate(t, base, repository, state)
 	writeUpdateDocument(t, state, updateDocument(t, built.IndexIdentity, "main.go"))
 	candidate := New(base.dependencies)
-	original := candidate.dependencies.BuildWithBarrier
-	candidate.dependencies.BuildWithBarrier = func(ctx context.Context, roots *boundary.Roots, manifest model.Manifest, records []model.Record, barrier func() error) (store.Snapshot, error) {
-		return original(ctx, roots, manifest, records, func() error {
+	original := candidate.dependencies.BuildCachedWithBarrier
+	candidate.dependencies.BuildCachedWithBarrier = func(ctx context.Context, roots *boundary.Roots, previous store.Snapshot, manifest model.Manifest, records []model.Record, barrier func() error) (store.Snapshot, error) {
+		return original(ctx, roots, previous, manifest, records, func() error {
 			if err := os.WriteFile(filepath.Join(repository, ".gitignore"), []byte("# replaced control witness\n"), 0o600); err != nil {
 				return err
 			}
@@ -922,6 +922,85 @@ func TestUpdateFinalStoreBarrierRejectsIgnoredControlReplacement(t *testing.T) {
 	after := inspectForUpdate(t, base, repository, state)
 	if after.GenerationIdentity != before.GenerationIdentity {
 		t.Fatalf("CURRENT changed after ignored-control replacement: %s != %s", after.GenerationIdentity, before.GenerationIdentity)
+	}
+}
+
+func TestUpdatePeeksOnceAndNeverInspectsOnTheUncachedPath(t *testing.T) {
+	repository, state := controlRoots(t)
+	built := mustBuildForUpdate(t, New(ProductionDependencies()), repository, state)
+	if err := os.WriteFile(filepath.Join(repository, "main.go"), []byte("package sample\nfunc Changed() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeUpdateDocument(t, state, updateDocumentWithPaths(t, built.IndexIdentity, []string{"main.go"}))
+	dependencies := ProductionDependencies()
+	peek, inspect := dependencies.Peek, dependencies.Inspect
+	peeks, inspects := 0, 0
+	dependencies.Peek = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+		peeks++
+		return peek(ctx, roots)
+	}
+	dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+		inspects++
+		return inspect(ctx, roots)
+	}
+	result, err := New(dependencies).Execute(context.Background(), validUpdateEnvelope(repository, state, built.IndexIdentity))
+	if err != nil || result.Status != wire.Ready {
+		t.Fatalf("update = %#v, %v", result, err)
+	}
+	if peeks != 1 || inspects != 0 {
+		t.Fatalf("peeks=%d inspects=%d, want 1 and 0", peeks, inspects)
+	}
+}
+
+func TestUpdateRefusesWhenCurrentMovedBetweenLoadAndPublish(t *testing.T) {
+	// Two refreshes from the same prior generation: the loser must not
+	// overwrite the winner. The interloper is published from inside the Load
+	// seam, which is exactly the window a concurrent process would use.
+	repository, state := controlRoots(t)
+	base := New(ProductionDependencies())
+	built := mustBuildForUpdate(t, base, repository, state)
+	if err := os.WriteFile(filepath.Join(repository, "main.go"), []byte("package sample\nfunc Changed() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeUpdateDocument(t, state, updateDocumentWithPaths(t, built.IndexIdentity, []string{"main.go"}))
+	dependencies := ProductionDependencies()
+	load := dependencies.Load
+	var interloper string
+	dependencies.Load = func(ctx context.Context, roots *boundary.Roots, identity string) (store.Snapshot, error) {
+		snapshot, err := load(ctx, roots, identity)
+		if err != nil {
+			return snapshot, err
+		}
+		// Publish a different generation (same records, different binding) after
+		// this update has loaded its prior snapshot.
+		manifest := snapshot.Manifest
+		manifest.Binding.DirtyOverlayFingerprint = testSHA2
+		manifest.GenerationIdentity = ""
+		published, publishErr := store.BuildContext(ctx, roots, manifest, snapshot.Records)
+		if publishErr != nil {
+			t.Fatal(publishErr)
+		}
+		interloper = published.Manifest.GenerationIdentity
+		return snapshot, nil
+	}
+	engine := New(dependencies)
+	result, err := engine.Execute(context.Background(), validUpdateEnvelope(repository, state, built.IndexIdentity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != wire.Error || result.NextSafeAction != "rebuild-index" {
+		t.Fatalf("racing update = %#v, want error/rebuild-index", result)
+	}
+	current, err := store.CurrentGenerationContext(context.Background(), mustRoots(t, validUpdateEnvelope(repository, state, built.IndexIdentity)))
+	if err != nil || current != interloper {
+		t.Fatalf("CURRENT = %q, %v; want the interloper %q", current, err, interloper)
+	}
+	entries, err := os.ReadDir(filepath.Join(state, "generations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("generations = %d, want exactly the original and the interloper", len(entries))
 	}
 }
 

@@ -23,6 +23,9 @@ import (
 // update is deliberately a replacement operation: it first proves the exact
 // prior generation and the requested after-binding, then opens only paths the
 // Level 0 document names. It never turns an uncertain delta into a full build.
+// The loaded snapshot is always published as a trusted previous generation,
+// so the store performs a compare-and-swap against CURRENT and skips
+// re-validating a generation this operation already validated.
 func (engine *Engine) update(ctx context.Context, roots *boundary.Roots, request wire.Request, documentPath *string) (wire.Result, error) {
 	if err := ctx.Err(); err != nil {
 		return wire.Result{}, err
@@ -61,12 +64,12 @@ func (engine *Engine) update(ctx context.Context, roots *boundary.Roots, request
 		}
 		status = store.Status{Ready: true, Manifest: snapshot.Manifest, IndexIdentity: snapshot.IndexIdentity, GenerationIdentity: snapshot.Manifest.GenerationIdentity, InstalledBytes: snapshot.InstalledBytes}
 	} else {
-		var inspectErr error
-		status, inspectErr = engine.dependencies.Inspect(ctx, roots)
+		var peekErr error
+		status, peekErr = engine.dependencies.Peek(ctx, roots)
 		if err := ctx.Err(); err != nil {
 			return wire.Result{}, err
 		}
-		if inspectErr != nil {
+		if peekErr != nil {
 			return engine.staleUpdate(request, emptyCoverage()), nil
 		}
 		var loadErr error
@@ -239,13 +242,10 @@ func (engine *Engine) update(ctx context.Context, roots *boundary.Roots, request
 		}
 		return nil
 	}
-	var published store.Snapshot
-	var buildErr error
-	if cached {
-		published, buildErr = engine.dependencies.BuildCachedWithBarrier(ctx, roots, snapshot, manifest, records, publicationBarrier)
-	} else {
-		published, buildErr = engine.dependencies.BuildWithBarrier(ctx, roots, manifest, records, publicationBarrier)
-	}
+	// The loaded snapshot is the trusted previous generation in both branches:
+	// the store then refuses to publish unless CURRENT still names it
+	// (compare-and-swap) and does not re-validate the previous generation.
+	published, buildErr := engine.dependencies.BuildCachedWithBarrier(ctx, roots, snapshot, manifest, records, publicationBarrier)
 	if buildErr != nil {
 		return engine.updateFailure(request, coverage), nil
 	}
