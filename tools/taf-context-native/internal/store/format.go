@@ -34,16 +34,21 @@ var (
 )
 
 const (
-	indexFormatVersion            uint16 = 3
+	indexFormatVersion            uint16 = 4
 	maximumDecompressedIndexBytes        = 96 << 20
 	maximumEncodedIndexBytes             = 64 << 20
 	maximumManifestBytes                 = 256 << 10
 	maximumIndexStringBytes              = 4096
-	maximumIndexRecords                  = 1_000_000
-	maximumPostingTerms                  = 1_000_000
-	maximumPostingOrdinals               = 8_000_000
-	maximumTermsPerRecord                = 64
-	maximumIndexPeakBytes                = 512 << 20
+	maximumTargetNameBytes               = 512
+	// rawRecordMetadataBytes is the in-memory size of one rawRecordMetadata:
+	// eight rawField locators, the term section, the start line, and the
+	// reference count.
+	rawRecordMetadataBytes = 80
+	maximumIndexRecords    = 1_000_000
+	maximumPostingTerms    = 1_000_000
+	maximumPostingOrdinals = 8_000_000
+	maximumTermsPerRecord  = 64
+	maximumIndexPeakBytes  = 512 << 20
 	// Source catalogs are authenticated index input, not an unbounded sidecar.
 	// The inventory walker has the same total entry ceiling; keep the catalog
 	// considerably below the plain-index ceiling so its JSON and the complete
@@ -511,8 +516,11 @@ func preflightEncodeIndexCatalogContext(ctx context.Context, input []model.Recor
 		values := [...]string{
 			record.Identity, record.Path, record.Language, string(record.RecordKind), record.SourceType,
 			record.QualifiedName, record.ExtractionMethod, string(record.EvidenceClass), record.SourceDigest, record.Preview,
+			record.TargetName,
 		}
-		if !addEncodeSize(&serialized, 12+4*int64(termCount), maximumDecompressedIndexBytes) {
+		// 12 fixed bytes for the two line numbers and the term count, 4 more for
+		// the reference count, and 4 per term ordinal.
+		if !addEncodeSize(&serialized, 16+4*int64(termCount), maximumDecompressedIndexBytes) {
 			return encodeIndexPreflight{}, ErrInvalidIndex
 		}
 		for _, value := range values {
@@ -1126,9 +1134,10 @@ type rawField struct {
 }
 
 type rawRecordMetadata struct {
-	identity, path, language, kind, source, qualified, evidence rawField
-	terms                                                       rawRecordTerms
-	start                                                       uint32
+	identity, path, language, kind, source, qualified, evidence, target rawField
+	terms                                                               rawRecordTerms
+	start                                                               uint32
+	referenceCount                                                      uint32
 }
 
 func (field rawField) bytes(plain []byte) []byte {
@@ -1174,7 +1183,7 @@ func validateIndexContextWithLiveBytes(ctx context.Context, encoded []byte, addi
 	}
 	budget := decodeMemoryBudget{}
 	if budget.reserve(int64(cap(encoded))+int64(cap(plain))+conservativeZlibWorkspaceBytes) != nil ||
-		budget.reserve(additionalLiveBytes) != nil || budget.reserve(int64(recordCount)*72) != nil {
+		budget.reserve(additionalLiveBytes) != nil || budget.reserve(int64(recordCount)*rawRecordMetadataBytes) != nil {
 		return 0, 0, ErrInvalidIndex
 	}
 	records := make([]rawRecordMetadata, recordCount)
@@ -1254,6 +1263,16 @@ func validateIndexContextWithLiveBytes(ctx context.Context, encoded []byte, addi
 		if err != nil || !validTextBytes(preview, maximumIndexStringBytes, true) {
 			return 0, 0, ErrInvalidIndex
 		}
+		target, err := decoder.readString(maximumTargetNameBytes)
+		if err != nil || !validTextBytes(target, maximumTargetNameBytes, true) {
+			return 0, 0, ErrInvalidIndex
+		}
+		metadata.target = rawFieldAt(&decoder, target)
+		referenceCount, err := decoder.readUint32()
+		if err != nil || uint64(referenceCount) > uint64(math.MaxInt) || !validReferenceFieldBytes(kind, target, referenceCount) {
+			return 0, 0, ErrInvalidIndex
+		}
+		metadata.referenceCount = referenceCount
 		count, err := rawQueryKeyCount(plain, metadata)
 		if err != nil || expectedQueryOrdinals > maximumQueryPostingOrdinals-count {
 			return 0, 0, ErrInvalidIndex
@@ -1515,6 +1534,7 @@ func rawModelRecord(plain []byte, metadata rawRecordMetadata) (model.Record, err
 		Language: string(metadata.language.bytes(plain)), RecordKind: model.RecordKind(metadata.kind.bytes(plain)),
 		SourceType: string(metadata.source.bytes(plain)), QualifiedName: string(metadata.qualified.bytes(plain)),
 		EvidenceClass: model.EvidenceClass(metadata.evidence.bytes(plain)),
+		TargetName:    string(metadata.target.bytes(plain)), ReferenceCount: int(metadata.referenceCount),
 	}
 	decoder := rawBinaryDecoder{value: plain, offset: int(metadata.terms.offset)}
 	record.SearchTerms = make([]string, int(metadata.terms.count))
@@ -1650,6 +1670,8 @@ func rawKindTier(value []byte) int {
 		return 4
 	case bytes.Equal(value, []byte(model.Import)):
 		return 5
+	case bytes.Equal(value, []byte(model.Reference)):
+		return 6
 	default:
 		return 6
 	}
@@ -1684,10 +1706,13 @@ func skipRawRecord(decoder *rawBinaryDecoder) error {
 			return err
 		}
 	}
-	for _, maximum := range []int{71, maximumIndexStringBytes} {
+	for _, maximum := range []int{71, maximumIndexStringBytes, maximumTargetNameBytes} {
 		if _, err := decoder.readString(maximum); err != nil {
 			return err
 		}
+	}
+	if _, err := decoder.readUint32(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1708,7 +1733,21 @@ func validRecordKindBytes(value []byte) bool {
 	return bytes.Equal(value, []byte(model.Module)) || bytes.Equal(value, []byte(model.Definition)) ||
 		bytes.Equal(value, []byte(model.Import)) || bytes.Equal(value, []byte(model.EntryPoint)) ||
 		bytes.Equal(value, []byte(model.Configuration)) || bytes.Equal(value, []byte(model.Heading)) ||
-		bytes.Equal(value, []byte(model.DocumentChunk))
+		bytes.Equal(value, []byte(model.DocumentChunk)) || bytes.Equal(value, []byte(model.Reference))
+}
+
+// validReferenceFieldBytes mirrors validReferenceFields on the raw bytes: only
+// reference records count occurrences, and only reference and import records
+// may name a target.
+func validReferenceFieldBytes(kind, target []byte, referenceCount uint32) bool {
+	isReference := bytes.Equal(kind, []byte(model.Reference))
+	if isReference != (referenceCount >= 1) {
+		return false
+	}
+	if isReference {
+		return len(target) != 0
+	}
+	return len(target) == 0 || bytes.Equal(kind, []byte(model.Import))
 }
 
 func validEvidenceClassBytes(value []byte) bool {
@@ -1790,13 +1829,31 @@ func validRecordContext(ctx context.Context, record model.Record, observed func(
 		{value: record.QualifiedName, maximum: 512},
 		{value: record.ExtractionMethod, maximum: 512},
 		{value: record.Preview, maximum: maximumIndexStringBytes, empty: true},
+		{value: record.TargetName, maximum: maximumTargetNameBytes, empty: true},
 	} {
 		valid, err = validTextContext(ctx, field.value, field.maximum, field.empty, observed)
 		if err != nil || !valid {
 			return valid, err
 		}
 	}
-	return true, ctx.Err()
+	return validReferenceFields(record), ctx.Err()
+}
+
+// validReferenceFields ties the two format-4 fields to the record kind: a
+// reference record merges at least one occurrence and names the target it
+// refers to, only an import record may otherwise name a target (the module
+// specifier it binds), and no other kind carries either field. Import records
+// are still allowed to omit the target while the extractors do not populate
+// it yet.
+func validReferenceFields(record model.Record) bool {
+	isReference := record.RecordKind == model.Reference
+	if record.ReferenceCount < 0 || isReference != (record.ReferenceCount >= 1) {
+		return false
+	}
+	if isReference {
+		return record.TargetName != ""
+	}
+	return record.TargetName == "" || record.RecordKind == model.Import
 }
 
 func validSHA256IdentityString(value string) bool {
@@ -1814,7 +1871,7 @@ func validSHA256IdentityString(value string) bool {
 
 func validRecordKind(kind model.RecordKind) bool {
 	switch kind {
-	case model.Module, model.Definition, model.Import, model.EntryPoint, model.Configuration, model.Heading, model.DocumentChunk:
+	case model.Module, model.Definition, model.Import, model.EntryPoint, model.Configuration, model.Heading, model.DocumentChunk, model.Reference:
 		return true
 	default:
 		return false
@@ -1910,7 +1967,10 @@ func validTextContext(ctx context.Context, value string, maximum int, empty bool
 	return true, ctx.Err()
 }
 
-func minimumEncodedRecordBytes() int { return 10*4 + 3*4 }
+// minimumEncodedRecordBytes is the smallest record tuple: eleven empty
+// strings (four length bytes each) plus the start line, end line, term count,
+// and reference count.
+func minimumEncodedRecordBytes() int { return 11*4 + 4*4 }
 
 func writeRecord(writer *bytes.Buffer, record model.Record) {
 	writeString(writer, record.Identity)
@@ -1929,6 +1989,8 @@ func writeRecord(writer *bytes.Buffer, record model.Record) {
 	}
 	writeString(writer, record.SourceDigest)
 	writeString(writer, record.Preview)
+	writeString(writer, record.TargetName)
+	writeUint32(writer, uint32(record.ReferenceCount))
 }
 
 func writeCanonicalRecord(writer *bytes.Buffer, record model.Record) {
@@ -1949,6 +2011,8 @@ func writeCanonicalRecord(writer *bytes.Buffer, record model.Record) {
 	}
 	writeString(writer, record.SourceDigest)
 	writeString(writer, record.Preview)
+	writeString(writer, record.TargetName)
+	writeUint32(writer, uint32(record.ReferenceCount))
 }
 
 func canonicalTermOrder(terms []string) [maximumTermsPerRecord]uint8 {
@@ -2109,6 +2173,14 @@ func (decoder *binaryDecoder) readRecord() (model.Record, error) {
 	if record.Preview, err = decoder.readString(maximumIndexStringBytes); err != nil {
 		return model.Record{}, err
 	}
+	if record.TargetName, err = decoder.readString(maximumTargetNameBytes); err != nil {
+		return model.Record{}, err
+	}
+	referenceCount, err := decoder.readUint32()
+	if err != nil || uint64(referenceCount) > uint64(math.MaxInt) {
+		return model.Record{}, ErrInvalidIndex
+	}
+	record.ReferenceCount = int(referenceCount)
 	if !validRecord(record) {
 		return model.Record{}, ErrInvalidIndex
 	}
@@ -2847,7 +2919,7 @@ func validateManifestContext(ctx context.Context, manifest model.Manifest, obser
 	if err != nil {
 		return err
 	}
-	if manifest.FormatVersion != "2" || !validEngine || pathLike(manifest.EngineVersion) ||
+	if manifest.FormatVersion != "3" || !validEngine || pathLike(manifest.EngineVersion) ||
 		!validSHA256IdentityString(manifest.Binding.RepositoryIdentity) || !validSHA256IdentityString(manifest.Binding.WorktreeIdentity) ||
 		!validObjectIdentityString(manifest.Binding.CommittedHead) || !validSHA256IdentityString(manifest.Binding.DirtyOverlayFingerprint) ||
 		!validSHA256IdentityString(manifest.InclusionPolicyIdentity) || !validSHA256IdentityString(manifest.ExclusionPolicyIdentity) ||

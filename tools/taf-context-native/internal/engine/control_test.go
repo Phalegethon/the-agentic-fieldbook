@@ -104,6 +104,33 @@ func TestBuildThenStatusAndMetricsAreExactAndDoNotLeakFindings(t *testing.T) {
 	}
 }
 
+// TestBuildPublishesFormat3ManifestAtEngineVersion pins the versions a store
+// format v4 index is published under: manifest format "3", engine 0.3.0, and
+// the same engine version reported back as the provider version.
+func TestBuildPublishesFormat3ManifestAtEngineVersion(t *testing.T) {
+	repository, state := controlRoots(t)
+	dependencies := ProductionDependencies()
+	build := dependencies.Build
+	var published model.Manifest
+	dependencies.Build = func(ctx context.Context, roots *boundary.Roots, manifest model.Manifest, records []model.Record) (store.Snapshot, error) {
+		published = manifest
+		return build(ctx, roots, manifest, records)
+	}
+	built, err := New(dependencies).Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built.Status != wire.Ready {
+		t.Fatalf("build = %#v", built)
+	}
+	if published.FormatVersion != "3" || published.EngineVersion != "0.3.0" {
+		t.Fatalf("manifest format = %q engine = %q, want \"3\" and \"0.3.0\"", published.FormatVersion, published.EngineVersion)
+	}
+	if built.ProviderVersion != "0.3.0" {
+		t.Fatalf("provider version = %q, want 0.3.0", built.ProviderVersion)
+	}
+}
+
 func TestBoundedExtractionPublishesQueryablePartialIndex(t *testing.T) {
 	// This catches deterministic extractor limits being treated as parse
 	// failures that make an otherwise valid persisted index unusable forever.

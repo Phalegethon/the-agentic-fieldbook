@@ -511,6 +511,8 @@ func MapKindTier(kind model.RecordKind) int {
 		return 4
 	case model.Import:
 		return 5
+	case model.Reference:
+		return 6
 	default:
 		return 6
 	}

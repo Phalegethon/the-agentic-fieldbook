@@ -223,7 +223,7 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             for system in ("darwin", "linux", "windows"):
                 for machine in ("amd64", "arm64"):
                     suffix = ".exe" if system == "windows" else ""
-                    name = f"taf-level1_0.2.0_{system}_{machine}{suffix}"
+                    name = f"taf-level1_0.3.0_{system}_{machine}{suffix}"
                     (release / name).write_bytes(payload)
                     (release / f"{name}.sha256").write_text(
                         f"{hashlib.sha256(payload).hexdigest()}  {name}\n",
@@ -505,7 +505,7 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             for system in ("darwin", "linux", "windows"):
                 for machine in ("amd64", "arm64"):
                     suffix = ".exe" if system == "windows" else ""
-                    name = f"taf-level1_0.2.0_{system}_{machine}{suffix}"
+                    name = f"taf-level1_0.3.0_{system}_{machine}{suffix}"
                     (release / name).write_bytes(b"corrupt")
                     (release / f"{name}.sha256").write_text(
                         f"{'0' * 64}  {name}\n", encoding="ascii"

@@ -365,6 +365,7 @@ func buildCancellationRecords(count int) []model.Record {
 const (
 	testRecordA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	testRecordB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	testRecordD = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 )
 
 func TestEncodeIndexIsDeterministicAndDoesNotMutateInputs(t *testing.T) {
@@ -431,8 +432,8 @@ func TestIndexV3PersistsCanonicalQueryStructuresAndAuthenticatedSourceCatalog(t 
 		t.Fatal(err)
 	}
 	plain := mustDecompress(t, encoded)
-	if indexFormatVersion != 3 {
-		t.Fatalf("format constant = %d, want authenticated catalog format 3", indexFormatVersion)
+	if indexFormatVersion != 4 {
+		t.Fatalf("format constant = %d, want reference-field format 4", indexFormatVersion)
 	}
 	if version := binary.BigEndian.Uint16(plain[len(indexMagic):]); version != indexFormatVersion {
 		t.Fatalf("index version = %d, want authenticated catalog format %d", version, indexFormatVersion)
@@ -769,6 +770,122 @@ func TestIndexV3RejectsPreCatalogV2Payload(t *testing.T) {
 	}
 	if _, _, err := validateIndex(legacy); !errors.Is(err, ErrInvalidIndex) {
 		t.Fatalf("pre-catalog v2 validation error = %v, want ErrInvalidIndex", err)
+	}
+}
+
+// TestFormatRoundTripsReferenceFields freezes the two record fields the
+// format-4 tuple adds after the preview: a reference record carries the
+// referenced name and the number of merged occurrences, an import record
+// carries only the imported module specifier, and every other kind carries
+// neither. The raw validator must accept the same bytes the decoder returns.
+func TestFormatRoundTripsReferenceFields(t *testing.T) {
+	definition := testRecord(testRecordA, "pkg/a.py", "a.run", []string{"run"})
+	reference := testRecord(testRecordB, "pkg/a.py", "a.run", []string{"helpers", "helpers.load", "load"})
+	reference.RecordKind = model.Reference
+	reference.TargetName, reference.ReferenceCount = "helpers.load", 3
+	imported := testRecord(testRecordD, "pkg/a.py", "helpers", []string{"helpers"})
+	imported.RecordKind = model.Import
+	imported.TargetName = "pkg.helpers"
+	// An import record may still omit the target: the extractors start writing
+	// the module specifier in the follow-up task, and indexes built before that
+	// must stay encodable.
+	untargetedImport := testRecord(testRecordB[:len(testRecordB)-1]+"a", "pkg/a.py", "os", []string{"os"})
+	untargetedImport.RecordKind = model.Import
+	encoded, err := encodeIndex([]model.Record{definition, reference, imported, untargetedImport})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recordCount, _, err := validateIndex(encoded); err != nil || recordCount != 4 {
+		t.Fatalf("validateIndex = %d, %v", recordCount, err)
+	}
+	decoded, _, err := decodeIndex(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byIdentity := map[string]model.Record{}
+	for _, record := range decoded {
+		byIdentity[record.Identity] = record
+	}
+	if got := byIdentity[testRecordB]; got.RecordKind != model.Reference || got.TargetName != "helpers.load" || got.ReferenceCount != 3 {
+		t.Fatalf("reference round trip = %#v", got)
+	}
+	if got := byIdentity[testRecordD]; got.TargetName != "pkg.helpers" || got.ReferenceCount != 0 {
+		t.Fatalf("import round trip = %#v", got)
+	}
+	if got := byIdentity[testRecordA]; got.TargetName != "" || got.ReferenceCount != 0 {
+		t.Fatalf("definition round trip = %#v", got)
+	}
+}
+
+// TestFormatRejectsInconsistentReferenceFields keeps the two new fields tied
+// to the record kind: only reference records count occurrences, and only
+// reference and import records name a target.
+func TestFormatRejectsInconsistentReferenceFields(t *testing.T) {
+	cases := map[string]func(*model.Record){
+		"reference without count":  func(record *model.Record) { record.RecordKind = model.Reference; record.TargetName = "x" },
+		"reference without target": func(record *model.Record) { record.RecordKind = model.Reference; record.ReferenceCount = 1 },
+		"definition with count":    func(record *model.Record) { record.ReferenceCount = 1 },
+		"definition with target":   func(record *model.Record) { record.TargetName = "x" },
+		"negative count": func(record *model.Record) {
+			record.RecordKind = model.Reference
+			record.TargetName = "x"
+			record.ReferenceCount = -1
+		},
+		"target too long": func(record *model.Record) {
+			record.RecordKind = model.Reference
+			record.ReferenceCount = 1
+			record.TargetName = strings.Repeat("x", 513)
+		},
+		"target with control character": func(record *model.Record) {
+			record.RecordKind = model.Reference
+			record.ReferenceCount = 1
+			record.TargetName = "load\n"
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			record := testRecord(testRecordA, "pkg/a.py", "a.run", []string{"run"})
+			mutate(&record)
+			if _, err := encodeIndex([]model.Record{record}); !errors.Is(err, ErrInvalidIndex) {
+				t.Fatalf("err = %v, want ErrInvalidIndex", err)
+			}
+		})
+	}
+}
+
+// TestValidateIndexRejectsCorruptedReferenceCount exercises the raw validator
+// on the encoded bytes: zeroing the occurrence count of a reference record
+// leaves every length intact, so only the kind/count consistency rule can
+// catch it.
+func TestValidateIndexRejectsCorruptedReferenceCount(t *testing.T) {
+	reference := testRecord(testRecordA, "pkg/a.py", "a.run", []string{"load"})
+	reference.RecordKind = model.Reference
+	reference.TargetName, reference.ReferenceCount = "helpers.load", 2
+	encoded, err := encodeIndex([]model.Record{reference})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := mustDecompress(t, encoded)
+	decoder := rawBinaryDecoder{value: plain}
+	if _, err := decoder.readBytes(len(indexMagic)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decoder.readUint16(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decoder.readCount(maximumIndexRecords); err != nil {
+		t.Fatal(err)
+	}
+	if err := skipRawRecord(&decoder); err != nil {
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint32(plain[decoder.offset-4:decoder.offset], 0)
+	corrupt := mustCompress(plain)
+	if _, _, err := validateIndex(corrupt); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("raw validation error = %v, want ErrInvalidIndex", err)
+	}
+	if _, _, err := decodeIndex(corrupt); !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("decode error = %v, want ErrInvalidIndex", err)
 	}
 }
 
@@ -1123,6 +1240,15 @@ func TestDecodeMemoryBudgetCoversRecordSliceGrowth(t *testing.T) {
 	}
 }
 
+// TestRawRecordMetadataBudgetMatchesTheStructure keeps the raw validator's
+// per-record reservation honest: it charges exactly what one metadata entry
+// costs, so a record tuple that grows cannot silently exceed the peak budget.
+func TestRawRecordMetadataBudgetMatchesTheStructure(t *testing.T) {
+	if got := int(unsafe.Sizeof(rawRecordMetadata{})); got != rawRecordMetadataBytes {
+		t.Fatalf("rawRecordMetadata = %d bytes, budget charges %d", got, rawRecordMetadataBytes)
+	}
+}
+
 func TestDecodeMemoryBudgetChargesStringAllocationOverhead(t *testing.T) {
 	budget := decodeMemoryBudget{}
 	decoder := binaryDecoder{value: []byte{0, 0, 0, 1, 'a'}, budget: &budget}
@@ -1353,8 +1479,10 @@ func TestBuildReviewerShapePeakMemoryStaysBelowBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if preflight.plainSize != 85_800_322 {
-		t.Fatalf("reviewer-shape v3 preflight bytes = %d, want 85800322", preflight.plainSize)
+	// Format 4 adds an empty target name (four length bytes) and the four-byte
+	// reference count to every record tuple: 300000 * 8 bytes over format 3.
+	if preflight.plainSize != 88_200_322 {
+		t.Fatalf("reviewer-shape v4 preflight bytes = %d, want 88200322", preflight.plainSize)
 	}
 
 	for _, test := range []struct {
@@ -2640,7 +2768,7 @@ func testRecord(identity, path, qualified string, terms []string) model.Record {
 
 func testManifest() model.Manifest {
 	return model.Manifest{
-		FormatVersion: "2", EngineVersion: "engine-v1",
+		FormatVersion: "3", EngineVersion: "engine-v1",
 		Binding: model.Binding{
 			RepositoryIdentity:      "sha256:1111111111111111111111111111111111111111111111111111111111111111",
 			WorktreeIdentity:        "sha256:2222222222222222222222222222222222222222222222222222222222222222",

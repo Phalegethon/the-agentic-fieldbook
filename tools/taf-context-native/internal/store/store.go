@@ -516,7 +516,7 @@ func prepareGenerationContext(ctx context.Context, input model.Manifest, inputRe
 	// Bound all caller-controlled manifest collections and strings before
 	// cloneManifest can traverse or allocate for them. Once bounded, manifest
 	// cloning and JSON map ordering are fixed-size operations.
-	if input.FormatVersion != "2" || !manifestVariableBounds(input) {
+	if input.FormatVersion != "3" || !manifestVariableBounds(input) {
 		return generationArtifacts{}, ErrInvalidManifest
 	}
 	normalizedCatalog, _, catalogErr := preflightSourceCatalog(input.SourceCatalog)
@@ -533,7 +533,7 @@ func prepareGenerationContext(ctx context.Context, input model.Manifest, inputRe
 		return generationArtifacts{}, err
 	}
 	manifest := cloneManifest(input)
-	manifest.FormatVersion = "2"
+	manifest.FormatVersion = "3"
 	manifest.RecordCount = len(inputRecords)
 	manifest.PostingCount = postingCount
 	payloadDigest, err := sha256IDContext(ctx, payload, observed, buildPhasePayloadDigest)

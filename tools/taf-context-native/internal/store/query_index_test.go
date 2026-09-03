@@ -16,7 +16,7 @@ import (
 )
 
 func TestMapKindTierPrefersDefinitionsOverImports(t *testing.T) {
-	order := []model.RecordKind{model.Module, model.Definition, model.EntryPoint, model.Heading, model.Configuration, model.DocumentChunk, model.Import}
+	order := []model.RecordKind{model.Module, model.Definition, model.EntryPoint, model.Heading, model.Configuration, model.DocumentChunk, model.Import, model.Reference}
 	previous := -1
 	for _, kind := range order {
 		tier := MapKindTier(kind)
@@ -41,7 +41,7 @@ func TestMapGroupsRepresentDefinitionsNotEarlierImports(t *testing.T) {
 }
 
 func TestRawKindTierMirrorsMapKindTier(t *testing.T) {
-	kinds := []model.RecordKind{model.Module, model.Definition, model.Import, model.EntryPoint, model.Configuration, model.Heading, model.DocumentChunk, model.RecordKind("unknown-kind")}
+	kinds := []model.RecordKind{model.Module, model.Definition, model.Import, model.EntryPoint, model.Configuration, model.Heading, model.DocumentChunk, model.Reference, model.RecordKind("unknown-kind")}
 	for _, kind := range kinds {
 		if got, want := rawKindTier([]byte(kind)), MapKindTier(kind); got != want {
 			t.Fatalf("rawKindTier(%q) = %d, want MapKindTier = %d", kind, got, want)

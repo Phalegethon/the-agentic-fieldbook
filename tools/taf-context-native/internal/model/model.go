@@ -18,6 +18,7 @@ const (
 	Configuration RecordKind = "configuration"
 	Heading       RecordKind = "heading"
 	DocumentChunk RecordKind = "document-chunk"
+	Reference     RecordKind = "reference"
 )
 
 type Record struct {
@@ -34,6 +35,12 @@ type Record struct {
 	SearchTerms      []string
 	SourceDigest     string
 	Preview          string
+	// TargetName is the referenced name as written for `reference` records and
+	// the imported module specifier for `import` records; empty otherwise.
+	TargetName string
+	// ReferenceCount is the number of occurrences merged into one `reference`
+	// record (>= 1); zero for every other kind.
+	ReferenceCount int
 }
 
 type Coverage struct {

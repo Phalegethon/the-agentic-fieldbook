@@ -19,7 +19,7 @@ import (
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
 
-const engineVersion = "0.2.0"
+const engineVersion = "0.3.0"
 
 const maximumAggregateRecordBytes = 64 << 20
 
@@ -103,7 +103,7 @@ func (engine *Engine) build(ctx context.Context, roots *boundary.Roots, request 
 		}
 	}
 	manifest := model.Manifest{
-		FormatVersion: "2", EngineVersion: engineVersion,
+		FormatVersion: "3", EngineVersion: engineVersion,
 		Binding:                 model.Binding{RepositoryIdentity: request.RepositoryIdentity, WorktreeIdentity: request.WorktreeIdentity, CommittedHead: request.CommittedHead, DirtyOverlayFingerprint: request.DirtyOverlayFingerprint},
 		InclusionPolicyIdentity: currentInclusionPolicyIdentity(), ExclusionPolicyIdentity: currentExclusionPolicyIdentity(),
 		ParserIdentities: cloneStrings(parserIDs), Coverage: coverage,
