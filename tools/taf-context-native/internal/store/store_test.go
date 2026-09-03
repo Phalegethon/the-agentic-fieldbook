@@ -1462,8 +1462,12 @@ func TestPeekAcceptsDigestConsistentStructuralCorruptionThatInspectAndLoadReject
 }
 
 // TestBenchPeekInspectLoad prints the read-path timings the Phase 2 spec
-// reasons about. It is opt-in: TAF_STORE_BENCH=1 go test -run Bench -v ./internal/store
-// TAF_STORE_BENCH_RECORDS overrides the record count (default 6000).
+// reasons about, plus prepareGenerationContext ("prepare": deterministic
+// in-memory preparation) and BuildContext ("publish": prepare plus state
+// I/O), so the fixed cost of preparation can be told apart from publication.
+// It is opt-in: TAF_STORE_BENCH=1 go test -run Bench -v ./internal/store
+// TAF_STORE_BENCH_RECORDS overrides the record count (default 6000, ignored
+// when TAF_BENCH_STATE names a real state root to measure instead).
 func TestBenchPeekInspectLoad(t *testing.T) {
 	if os.Getenv("TAF_STORE_BENCH") != "1" {
 		t.Skip("set TAF_STORE_BENCH=1 to print Peek, Inspect, and Load timings")
@@ -1476,11 +1480,39 @@ func TestBenchPeekInspectLoad(t *testing.T) {
 		}
 		count = parsed
 	}
-	roots, _ := storeRoots(t)
-	start := time.Now()
-	snapshot := mustBuild(t, roots, testManifest(), buildCancellationRecords(count))
-	t.Logf("records=%d build=%s installed_bytes=%d", count, time.Since(start), snapshot.InstalledBytes)
 	ctx := context.Background()
+	var roots *boundary.Roots
+	var snapshot Snapshot
+	if benchState := os.Getenv("TAF_BENCH_STATE"); benchState != "" {
+		// Measure a real, already-built state root instead of a synthetic one.
+		// The repository root only needs to satisfy boundary validation; Build
+		// and the read paths never inspect its contents.
+		repository := filepath.Join(t.TempDir(), "repository")
+		if err := os.MkdirAll(filepath.Join(repository, ".git"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		validated, err := boundary.ValidateRoots(wire.Envelope{RepositoryRoot: repository, StateRoot: benchState})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = validated.Close() })
+		roots = &validated
+		status, err := PeekContext(ctx, roots)
+		if err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := LoadContext(ctx, roots, status.IndexIdentity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot = loaded
+		t.Logf("records=%d installed_bytes=%d", len(snapshot.Records), snapshot.InstalledBytes)
+	} else {
+		roots, _ = storeRoots(t)
+		start := time.Now()
+		snapshot = mustBuild(t, roots, testManifest(), buildCancellationRecords(count))
+		t.Logf("records=%d build=%s installed_bytes=%d", count, time.Since(start), snapshot.InstalledBytes)
+	}
 	stages := []struct {
 		name string
 		run  func() error
@@ -1488,6 +1520,15 @@ func TestBenchPeekInspectLoad(t *testing.T) {
 		{"peek", func() error { _, err := PeekContext(ctx, roots); return err }},
 		{"inspect", func() error { _, err := InspectContext(ctx, roots); return err }},
 		{"load", func() error { _, err := LoadContext(ctx, roots, snapshot.IndexIdentity); return err }},
+		{"prepare", func() error {
+			_, err := prepareGenerationContext(ctx, snapshot.Manifest, snapshot.Records, nil)
+			return err
+		}},
+		{"publish", func() error {
+			publishRoots, _ := storeRoots(t)
+			_, err := BuildContext(ctx, publishRoots, snapshot.Manifest, snapshot.Records)
+			return err
+		}},
 	}
 	for _, stage := range stages {
 		durations := make([]time.Duration, 0, 10)
