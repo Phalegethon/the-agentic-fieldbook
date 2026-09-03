@@ -129,7 +129,13 @@ def write_fake_native_engine(
                 "warnings": ["json-collection-limit"] if ready and __PARTIAL__ else [],
                 "next_safe_action": "use-index" if ready else "build-index",
             }
-            if operation == "status" and __STALE__:
+            if __STALE__ and operation in {
+                "status",
+                "repository-map",
+                "search-symbols",
+                "search-docs",
+                "source-snippets",
+            }:
                 payload["status"] = "stale"
                 payload["freshness"] = "incrementally-stale"
                 payload["next_safe_action"] = "rebuild-index"
@@ -278,7 +284,7 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             self.assertLessEqual(len(stdout), 4000)
             self.assertEqual(
                 invocation_log.read_text(encoding="utf-8").splitlines(),
-                ["build", "status", "search-symbols"],
+                ["build", "search-symbols"],
             )
 
     def test_partial_context_is_bound_inspectable_and_queryable(self) -> None:
@@ -338,8 +344,72 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             self.assertIn("json-collection-limit", queried["warnings"])
             self.assertEqual(
                 invocation_log.read_text(encoding="utf-8").splitlines(),
-                ["build", "status", "status", "repository-map"],
+                ["build", "status", "repository-map"],
             )
+
+    def test_stale_query_result_is_an_error_and_does_not_touch_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            fresh_binary = root / "taf-level1"
+            write_fake_native_engine(fresh_binary)
+            stale_binary = root / "taf-level1-stale"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(stale_binary, invocation_log, stale=True)
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_LEVEL1_BINARY": str(fresh_binary),
+                "TAF_STATE_HOME": str(state_home),
+            }
+            code, _stdout, stderr = invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+            self.assertEqual((code, stderr), (0, ""))
+            binding = next(state_home.glob("repositories/*/*/binding.json"))
+            old = 1_600_000_000
+            os.utime(binding, (old, old))
+
+            environment["TAF_LEVEL1_BINARY"] = str(stale_binary)
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo),
+                "--operation", "search-symbols", "--query", "Widget",
+            )
+
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn("ready context is required", stderr)
+            self.assertEqual(binding.stat().st_mtime, old)
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["search-symbols"],
+            )
+
+    def test_successful_query_touches_binding_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            binary = root / "taf-level1"
+            write_fake_native_engine(binary)
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_LEVEL1_BINARY": str(binary),
+                "TAF_STATE_HOME": str(state_home),
+            }
+            code, _stdout, stderr = invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+            self.assertEqual((code, stderr), (0, ""))
+            binding = next(state_home.glob("repositories/*/*/binding.json"))
+            old = 1_600_000_000
+            os.utime(binding, (old, old))
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo),
+                "--operation", "repository-map",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(decoded(stdout)["status"], "ready")
+            self.assertGreater(binding.stat().st_mtime, old)
 
     def test_query_requires_an_existing_exact_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

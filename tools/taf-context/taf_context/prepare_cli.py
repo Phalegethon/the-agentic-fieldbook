@@ -177,18 +177,10 @@ def run_prepare_command(
         binding = _read_binding(binding_path, snapshot)
         if binding is None:
             raise PrepareCLIError("ready context is required; run prepare inspect")
-        status_result = _invoke_native(
-            binary,
-            "status",
-            repository,
-            state_root,
-            snapshot,
-            index_identity=binding,
-        )
-        if status_result.next_safe_action != "use-index":
-            raise PrepareCLIError("ready context is required; run prepare inspect")
-        touch_binding(binding_path)
         query_text, result_identities = _validate_query_arguments(args)
+        # The engine evaluates the binding's freshness on every query, so the
+        # query result carries exactly what a separate status call would have
+        # reported. One native process per query instead of two.
         result = _invoke_native(
             binary,
             args.operation,
@@ -208,6 +200,9 @@ def run_prepare_command(
             maximum_output_characters=args.maximum_output_characters,
             allow_inferred=args.allow_inferred,
         )
+        if result.status.value not in {"ready", "partial"}:
+            raise PrepareCLIError("ready context is required; run prepare inspect")
+        touch_binding(binding_path)
         return _query_summary(result)
 
     if args.prepare_command in {"activate", "build"}:
