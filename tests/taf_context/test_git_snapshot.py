@@ -6,7 +6,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from unittest import mock
 
 from taf_context import git_snapshot as gs
@@ -17,7 +17,7 @@ from taf_context.git_snapshot import (
     collect_snapshot,
     manifest_from_snapshot,
 )
-from taf_context.models import BackgroundState, RepositorySnapshot
+from taf_context.models import BackgroundState
 from tests.taf_context.repo_factory import (
     commit_all,
     init_committed_repo,
@@ -910,197 +910,8 @@ class DeferredEdgeCaseTests(unittest.TestCase):
             self.assertIn("dirty-diff-statistics-incomplete", snapshot.warnings)
 
 
-def _reference_collect_snapshot(repo: Path, max_dirty_file_bytes: int = 8 * 1024 * 1024):
-    """Frozen copy of collect_snapshot before Phase 2 (sequential Git calls).
-
-    It exists only to prove the concurrent implementation returns identical
-    values; delete it together with its test once the branch is merged.
-    """
-    if (
-        isinstance(max_dirty_file_bytes, bool)
-        or not isinstance(max_dirty_file_bytes, int)
-        or max_dirty_file_bytes < 0
-    ):
-        raise SnapshotError("invalid dirty file byte ceiling")
-    repo = Path(repo)
-    canonical_root = Path(
-        gs._text(gs._git(repo, "rev-parse", "--show-toplevel"), "repository root")
-    ).resolve()
-    repo = canonical_root
-    configured_filters = gs._git(
-        repo, "config", "--local", "--includes", "--name-only", "--get-regexp",
-        r"^filter\..*\.(clean|smudge|process)$", allow_failure=True,
-    )
-    if configured_filters is not None:
-        raise SnapshotError("executable Git filters are not allowed")
-    git_dir = Path(
-        gs._text(gs._git(repo, "rev-parse", "--absolute-git-dir"), "Git directory")
-    ).resolve()
-    common_value = gs._text(
-        gs._git(repo, "rev-parse", "--git-common-dir"), "Git common directory"
-    )
-    git_common_dir = gs._resolve_common_dir(git_dir, canonical_root, common_value)
-
-    raw_head = gs._git(repo, "rev-parse", "--verify", "HEAD", allow_failure=True)
-    if raw_head is None:
-        head_sha = None
-        root_commits: tuple[str, ...] = ()
-    else:
-        head_values = gs._object_ids(raw_head, "HEAD")
-        if len(head_values) != 1:
-            raise SnapshotError("malformed Git output: HEAD")
-        head_sha = head_values[0]
-        root_commits = gs._object_ids(
-            gs._git(repo, "rev-list", "--max-parents=0", "HEAD"), "root commits"
-        )
-
-    raw_branch = gs._git(repo, "symbolic-ref", "--short", "-q", "HEAD", allow_failure=True)
-    branch = None if raw_branch is None else gs._text(raw_branch, "branch")
-
-    tracked_paths = gs._z_paths(gs._git(repo, "ls-files", "-z"), "tracked paths")
-    index_gitlinks = gs._index_gitlinks(gs._git(repo, "ls-files", "--stage", "-z"))
-    staged_paths = gs._z_paths(
-        gs._git(repo, "diff", "--no-renames", "--ignore-submodules=dirty", "--cached", "--name-only", "-z"),
-        "staged paths",
-    )
-    unstaged_paths = gs._z_paths(
-        gs._git(repo, "diff", "--no-renames", "--ignore-submodules=all", "--name-only", "-z"),
-        "unstaged paths",
-    )
-    untracked_paths = gs._z_paths(
-        gs._git(repo, "ls-files", "--others", "--exclude-standard", "-z"),
-        "untracked paths",
-    )
-    statuses, ignored_entry_count = gs._status_paths(
-        gs._git(
-            repo, "status", "--no-renames", "--ignore-submodules=all", "--porcelain=v1",
-            "-z", "--ignored=matching", "--untracked-files=normal",
-        )
-    )
-
-    dirty_paths = tuple(sorted(set(staged_paths + unstaged_paths + untracked_paths)))
-    dirty_values: list[str] = []
-    dirty_bytes_hashed = 0
-    binary_file_count = 0
-    oversized_file_count = 0
-    dirty_complete = not bool(index_gitlinks)
-    tracked_dirty_paths = set(staged_paths + unstaged_paths)
-    warnings: set[str] = set()
-    if index_gitlinks:
-        warnings.add("submodule-worktree-state-uninspected")
-    for path in dirty_paths:
-        flags = statuses.get(path)
-        if flags is None:
-            flags = "??" if path in untracked_paths else "  "
-        if path in index_gitlinks and path in staged_paths:
-            descriptor = "gitlink:" + ",".join(index_gitlinks[path])
-            bytes_hashed, binary, complete, warning = 0, False, True, None
-        else:
-            descriptor, bytes_hashed, binary, complete, warning = gs._content_descriptor(
-                canonical_root, path, max_dirty_file_bytes
-            )
-        dirty_values.extend((path, flags, descriptor))
-        dirty_bytes_hashed += bytes_hashed
-        binary_file_count += int(binary)
-        oversized_file_count += int(descriptor.startswith("oversized:"))
-        dirty_complete = dirty_complete and complete
-        if warning is not None:
-            warnings.add(warning)
-            if warning.startswith("dirty-") and warning.endswith("-content-excluded"):
-                warnings.add("dirty-content-excluded")
-
-    inventory_paths = tuple(sorted(set(tracked_paths + untracked_paths)))
-    generated_or_vendored_count = sum(
-        bool(set(PurePosixPath(path).parts) & gs._GENERATED_OR_VENDORED_SEGMENTS)
-        for path in inventory_paths
-    )
-    candidate_artifacts = tuple(path for path in inventory_paths if gs._is_candidate_artifact(path))
-    provider_markers = tuple(
-        path for path in inventory_paths
-        if path in {".taf/context/registration.json", ".taf/context/manifest.json"}
-    )
-    insertions = deletions = 0
-    if tracked_dirty_paths:
-        warnings.add("dirty-diff-statistics-incomplete")
-
-    return RepositorySnapshot(
-        schema_version="1",
-        repository_identity=gs._fingerprint(list(root_commits)),
-        canonical_root=str(canonical_root),
-        canonical_root_fingerprint=gs._fingerprint([str(canonical_root)]),
-        git_dir=str(git_dir),
-        git_common_dir=str(git_common_dir),
-        git_common_dir_fingerprint=gs._fingerprint([str(git_common_dir)]),
-        worktree_identity=gs._fingerprint([str(canonical_root), str(git_dir)]),
-        head_sha=head_sha,
-        branch=branch,
-        dirty_fingerprint=gs._fingerprint(dirty_values),
-        dirty_fingerprint_complete=dirty_complete,
-        tracked_paths=tracked_paths,
-        staged_paths=staged_paths,
-        unstaged_paths=unstaged_paths,
-        untracked_paths=untracked_paths,
-        ignored_entry_count=ignored_entry_count,
-        generated_or_vendored_count=generated_or_vendored_count,
-        binary_file_count=binary_file_count,
-        oversized_file_count=oversized_file_count,
-        language_counts=gs._language_counts(inventory_paths),
-        candidate_artifacts=candidate_artifacts,
-        provider_markers=provider_markers,
-        insertions=insertions,
-        deletions=deletions,
-        dirty_bytes_hashed=dirty_bytes_hashed,
-        warnings=tuple(sorted(warnings)),
-    )
-
-
-class ConcurrentSnapshotEquivalenceTests(unittest.TestCase):
-    """The concurrent collector must return exactly what the sequential one did."""
-
-    def _mixed_fixture(self, root: Path) -> Path:
-        repo = init_committed_repo(root / "repo")
-        write(repo / ".gitignore", "ignored/**\n")
-        write(repo / "docs/README.md", "# Title\n")
-        write(repo / "src/app.py", "print('app')\n")
-        write(repo / "src/ünïcode name.txt", "unicode\n")
-        commit_all(repo, "fixture baseline")
-        head = run(repo, "git", "rev-parse", "HEAD")
-        # Staged, unstaged, untracked, ignored, deleted, symlink, and a gitlink
-        # entry that only exists in the index.
-        write(repo / "src/app.py", "print('staged')\n")
-        run(repo, "git", "add", "src/app.py")
-        write(repo / "docs/README.md", "# Title\n\nunstaged\n")
-        write(repo / "notes/todo.txt", "untracked\n")
-        write(repo / "ignored/private.txt", "ignored\n")
-        (repo / "tracked.txt").unlink()
-        os.symlink("docs/README.md", repo / "link.md")
-        run(repo, "git", "update-index", "--add", "--cacheinfo", f"160000,{head},vendor/linked")
-        return repo
-
-    def test_concurrent_collector_equals_frozen_sequential_reference(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = self._mixed_fixture(Path(directory))
-            for start in (repo, repo / "src"):
-                with self.subTest(start=start.name):
-                    reference = _reference_collect_snapshot(start)
-                    actual = collect_snapshot(start)
-                    self.assertEqual(actual, reference)
-                    self.assertEqual(actual.dirty_fingerprint, reference.dirty_fingerprint)
-            self.assertIn("vendor/linked", collect_snapshot(repo).staged_paths)
-            self.assertIn("submodule-worktree-state-uninspected", collect_snapshot(repo).warnings)
-            self.assertFalse(collect_snapshot(repo).dirty_fingerprint_complete)
-
-    def test_concurrent_collector_equals_reference_on_unborn_repository(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = init_repo(Path(directory) / "unborn")
-            write(repo / "staged.txt", "staged\n")
-            run(repo, "git", "add", "staged.txt")
-            write(repo / "untracked.txt", "untracked\n")
-            reference = _reference_collect_snapshot(repo)
-            actual = collect_snapshot(repo)
-            self.assertEqual(actual, reference)
-            self.assertIsNone(actual.head_sha)
-            self.assertEqual(actual.repository_identity, gs._fingerprint([]))
+class ConcurrentSchedulingTests(unittest.TestCase):
+    """The concurrent collector keeps the sequential error contract."""
 
     def test_first_failing_git_command_still_raises_snapshot_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1119,7 +930,7 @@ class ConcurrentSnapshotEquivalenceTests(unittest.TestCase):
     def test_thread_start_failure_falls_back_to_sequential_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = init_committed_repo(Path(directory) / "repo")
-            reference = _reference_collect_snapshot(repo)
+            expected = collect_snapshot(repo)
 
             with mock.patch(
                 "taf_context.git_snapshot.threading.Thread.start",
@@ -1127,22 +938,7 @@ class ConcurrentSnapshotEquivalenceTests(unittest.TestCase):
             ):
                 actual = collect_snapshot(repo)
 
-            self.assertEqual(actual, reference)
-
-    def test_concurrent_collector_equals_reference_on_linked_worktree(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            primary = init_committed_repo(root / "primary")
-            linked = root / "linked"
-            run(primary, "git", "worktree", "add", "-b", "linked", str(linked), "HEAD")
-            write(linked / "src" / "module.py", "print('linked')\n")
-            write(linked / "tracked.txt", "unstaged change\n")
-
-            for start in (linked, linked / "src"):
-                with self.subTest(start=start.name):
-                    reference = _reference_collect_snapshot(start)
-                    actual = collect_snapshot(start)
-                    self.assertEqual(actual, reference)
+            self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":
