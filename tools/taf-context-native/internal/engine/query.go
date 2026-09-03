@@ -24,7 +24,7 @@ func (engine *Engine) query(ctx context.Context, roots *boundary.Roots, request 
 	if snapshot, cached := engine.cachedSnapshot(request); cached {
 		return engine.querySnapshot(ctx, request, snapshot)
 	}
-	status, err := engine.dependencies.Inspect(ctx, roots)
+	status, err := engine.dependencies.Peek(ctx, roots)
 	if err != nil {
 		action := "rebuild-index"
 		if errors.Is(err, store.ErrNoCurrent) {
@@ -56,7 +56,7 @@ func (engine *Engine) query(ctx context.Context, roots *boundary.Roots, request 
 	}
 	// Load rechecks CURRENT after materialization. Re-evaluate the returned
 	// immutable manifest as well, so an injected or future alternate loader
-	// cannot turn an Inspect/Load race into exact evidence.
+	// cannot turn a Peek/Load race into exact evidence.
 	loadedFreshness, loadedAction := freshnessFor(request, snapshot.Manifest, snapshot.IndexIdentity, engine.dependencies.ParserIDs())
 	if loadedFreshness != "exact" || snapshot.IndexIdentity != status.IndexIdentity {
 		resultStatus := wire.Stale

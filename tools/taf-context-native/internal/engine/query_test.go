@@ -45,9 +45,9 @@ func TestCachedEngineValidatesAndLoadsAnUnchangedGenerationOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	dependencies := ProductionDependencies()
-	inspect, load := dependencies.Inspect, dependencies.Load
+	inspect, load := dependencies.Peek, dependencies.Load
 	inspectCalls, loadCalls := 0, 0
-	dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+	dependencies.Peek = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
 		inspectCalls++
 		return inspect(ctx, roots)
 	}
@@ -306,10 +306,10 @@ func TestQueryLoadsUsablePartialStateButRejectsCorruptState(t *testing.T) {
 
 	t.Run("partial", func(t *testing.T) {
 		dependencies := ProductionDependencies()
-		inspect := dependencies.Inspect
+		inspect := dependencies.Peek
 		load := dependencies.Load
 		loaded := false
-		dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+		dependencies.Peek = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
 			status, inspectErr := inspect(ctx, roots)
 			status.Manifest.Coverage.ParseFailureCount = 1
 			return status, inspectErr
@@ -331,7 +331,7 @@ func TestQueryLoadsUsablePartialStateButRejectsCorruptState(t *testing.T) {
 
 	t.Run("corrupt", func(t *testing.T) {
 		dependencies := ProductionDependencies()
-		dependencies.Inspect = func(context.Context, *boundary.Roots) (store.Status, error) {
+		dependencies.Peek = func(context.Context, *boundary.Roots) (store.Status, error) {
 			return store.Status{}, store.ErrStoreCorrupt
 		}
 		result, executeErr := New(dependencies).Execute(context.Background(), envelope)

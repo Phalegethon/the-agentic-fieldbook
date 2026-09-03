@@ -49,7 +49,7 @@ func TestSourceSnippetsPropagatesCancellationFromInitialInspection(t *testing.T)
 		t.Fatal(err)
 	}
 	dependencies := ProductionDependencies()
-	dependencies.Inspect = func(context.Context, *boundary.Roots) (store.Status, error) {
+	dependencies.Peek = func(context.Context, *boundary.Roots) (store.Status, error) {
 		return store.Status{}, context.Canceled
 	}
 	result, executeErr := New(dependencies).Execute(context.Background(), snippetEnvelope(repository, state, built.IndexIdentity, engineSHA))
@@ -61,9 +61,9 @@ func TestSourceSnippetsPropagatesCancellationFromInitialInspection(t *testing.T)
 func TestCachedSourceSnippetsRevalidateThePointerWithoutReloadingTheGeneration(t *testing.T) {
 	repository, state := controlRoots(t)
 	dependencies := ProductionDependencies()
-	inspect, load := dependencies.Inspect, dependencies.Load
+	inspect, load := dependencies.Peek, dependencies.Load
 	inspectCalls, loadCalls := 0, 0
-	dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+	dependencies.Peek = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
 		inspectCalls++
 		return inspect(ctx, roots)
 	}
@@ -280,9 +280,9 @@ func TestSourceSnippetsRejectsCurrentReplacementAfterSourceRead(t *testing.T) {
 	}
 	record := snippetRecord(t, repository, state, *built.IndexIdentity)
 	dependencies := ProductionDependencies()
-	inspect := dependencies.Inspect
+	inspect := dependencies.Peek
 	inspections, opens := 0, 0
-	dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+	dependencies.Peek = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
 		status, inspectErr := inspect(ctx, roots)
 		inspections++
 		if inspections == 2 && inspectErr == nil {
@@ -310,9 +310,9 @@ func TestSourceSnippetsRejectsSameIndexDifferentGenerationAfterSourceRead(t *tes
 	}
 	record := snippetRecord(t, repository, state, *built.IndexIdentity)
 	dependencies := ProductionDependencies()
-	inspect := dependencies.Inspect
+	inspect := dependencies.Peek
 	inspections, opens := 0, 0
-	dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+	dependencies.Peek = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
 		status, inspectErr := inspect(ctx, roots)
 		inspections++
 		if inspections == 2 && inspectErr == nil {
@@ -462,7 +462,7 @@ func TestSourceSnippetsContextErrorsDominateEveryDependencySeam(t *testing.T) {
 				nonContextErr := errors.New("seam failure")
 				switch seam {
 				case "initial-inspect":
-					dependencies.Inspect = func(context.Context, *boundary.Roots) (store.Status, error) {
+					dependencies.Peek = func(context.Context, *boundary.Roots) (store.Status, error) {
 						ctx.cancel()
 						return store.Status{}, nonContextErr
 					}
@@ -477,9 +477,9 @@ func TestSourceSnippetsContextErrorsDominateEveryDependencySeam(t *testing.T) {
 						return boundary.StableFile{}, nonContextErr
 					}
 				case "final-inspect":
-					inspect := dependencies.Inspect
+					inspect := dependencies.Peek
 					calls := 0
-					dependencies.Inspect = func(callCtx context.Context, roots *boundary.Roots) (store.Status, error) {
+					dependencies.Peek = func(callCtx context.Context, roots *boundary.Roots) (store.Status, error) {
 						status, inspectErr := inspect(callCtx, roots)
 						calls++
 						if calls == 2 {
@@ -660,8 +660,8 @@ func TestSourceSnippetsRejectsWrongIndexBindingParserAndPolicyBeforeOpen(t *test
 			}
 			record := snippetRecord(t, repository, state, *built.IndexIdentity)
 			dependencies := ProductionDependencies()
-			inspect := dependencies.Inspect
-			dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+			inspect := dependencies.Peek
+			dependencies.Peek = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
 				status, inspectErr := inspect(ctx, roots)
 				if inspectErr == nil {
 					mutation.apply(&status)
@@ -780,6 +780,33 @@ func TestSourceSnippetsRejectsUnknownOrMixedIdentityBeforeSourceOpen(t *testing.
 				t.Fatalf("result = %#v opens=%d", result, opens)
 			}
 		})
+	}
+}
+
+func TestSourceSnippetsPeekTwiceAndNeverInspect(t *testing.T) {
+	repository, state := controlRoots(t)
+	built, err := New(ProductionDependencies()).Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := snippetRecord(t, repository, state, *built.IndexIdentity)
+	dependencies := ProductionDependencies()
+	peek, inspect := dependencies.Peek, dependencies.Inspect
+	peeks, inspects := 0, 0
+	dependencies.Peek = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+		peeks++
+		return peek(ctx, roots)
+	}
+	dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+		inspects++
+		return inspect(ctx, roots)
+	}
+	result, executeErr := New(dependencies).Execute(context.Background(), snippetEnvelope(repository, state, built.IndexIdentity, record.Identity))
+	if executeErr != nil || result.Status != wire.Ready || len(result.Findings) != 1 {
+		t.Fatalf("result = %#v, %v", result, executeErr)
+	}
+	if peeks != 2 || inspects != 0 {
+		t.Fatalf("peeks=%d inspects=%d, want 2 and 0", peeks, inspects)
 	}
 }
 

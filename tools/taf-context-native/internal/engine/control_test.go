@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/extract"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/inventory"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/store"
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
 
@@ -239,6 +241,64 @@ func TestUpdateWithoutChangeDocumentReturnsBoundedStaleResult(t *testing.T) {
 	}
 	if result.Status != wire.Stale || result.Freshness != "structurally-stale" || result.NextSafeAction != "rebuild-index" || len(result.Findings) != 0 {
 		t.Fatalf("missing document = %#v", result)
+	}
+}
+
+func TestStatusAndQueriesPeekWhileMetricsInspects(t *testing.T) {
+	// This catches the query path or status regressing to the raw structural
+	// validator, and metrics silently losing it.
+	repository, state := controlRoots(t)
+	built, err := New(ProductionDependencies()).Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		operation    wire.Operation
+		query        bool
+		wantPeeks    int
+		wantInspects int
+	}{
+		{wire.StatusOperation, false, 1, 0},
+		{wire.Metrics, false, 0, 1},
+		{wire.RepositoryMap, false, 1, 0},
+		{wire.SearchSymbols, true, 1, 0},
+		{wire.SearchDocs, true, 1, 0},
+	}
+	for _, test := range tests {
+		t.Run(string(test.operation), func(t *testing.T) {
+			dependencies := ProductionDependencies()
+			peek, inspect := dependencies.Peek, dependencies.Inspect
+			peeks, inspects := 0, 0
+			dependencies.Peek = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+				peeks++
+				return peek(ctx, roots)
+			}
+			dependencies.Inspect = func(ctx context.Context, roots *boundary.Roots) (store.Status, error) {
+				inspects++
+				return inspect(ctx, roots)
+			}
+			envelope := controlEnvelope(test.operation, repository, state, built.IndexIdentity)
+			if test.query {
+				query := "main"
+				envelope.Request.Query = &query
+			}
+			result, executeErr := New(dependencies).Execute(context.Background(), envelope)
+			if executeErr != nil || result.Status != wire.Ready || result.Freshness != "exact" {
+				t.Fatalf("result = %#v, %v", result, executeErr)
+			}
+			if peeks != test.wantPeeks || inspects != test.wantInspects {
+				t.Fatalf("peeks=%d inspects=%d, want %d and %d", peeks, inspects, test.wantPeeks, test.wantInspects)
+			}
+		})
+	}
+}
+
+func TestEngineWithoutPeekIsNotReady(t *testing.T) {
+	dependencies := ProductionDependencies()
+	dependencies.Peek = nil
+	_, err := New(dependencies).Execute(context.Background(), wire.Envelope{})
+	if !errors.Is(err, ErrDependencies) {
+		t.Fatalf("error = %v, want ErrDependencies", err)
 	}
 }
 

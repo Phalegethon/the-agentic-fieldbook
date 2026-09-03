@@ -57,7 +57,7 @@ func (engine *Engine) sourceSnippets(ctx context.Context, roots *boundary.Roots,
 		}
 	} else {
 		var err error
-		status, err = engine.dependencies.Inspect(ctx, roots)
+		status, err = engine.dependencies.Peek(ctx, roots)
 		if contextErr := ctx.Err(); contextErr != nil {
 			return wire.Result{}, contextErr
 		}
@@ -126,7 +126,7 @@ func (engine *Engine) sourceSnippets(ctx context.Context, roots *boundary.Roots,
 			return engine.snippetStale(request, snapshot.Manifest.Coverage), nil
 		}
 	} else {
-		after, err := engine.dependencies.Inspect(ctx, roots)
+		after, err := engine.dependencies.Peek(ctx, roots)
 		if contextErr := ctx.Err(); contextErr != nil {
 			return wire.Result{}, contextErr
 		}

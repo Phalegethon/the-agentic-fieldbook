@@ -752,10 +752,6 @@ func describeGenerationContext(ctx context.Context, filesystem storeFilesystem, 
 	return Status{Ready: true, Manifest: manifest, IndexIdentity: manifest.IndexIdentity, GenerationIdentity: manifest.GenerationIdentity, InstalledBytes: installedBytes}, nil
 }
 
-func inspectGenerationContext(ctx context.Context, filesystem storeFilesystem, generations *boundary.StateDirectory, token string) (Status, error) {
-	return describeGenerationContext(ctx, filesystem, generations, token, true)
-}
-
 func computeGenerationIdentity(manifest model.Manifest) (string, error) {
 	return computeGenerationIdentityContext(context.Background(), manifest, nil)
 }

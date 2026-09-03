@@ -194,7 +194,11 @@ func (engine *Engine) state(ctx context.Context, roots *boundary.Roots, request 
 	if err := ctx.Err(); err != nil {
 		return wire.Result{}, err
 	}
-	status, err := engine.dependencies.Inspect(ctx, roots)
+	describe := engine.dependencies.Peek
+	if metrics {
+		describe = engine.dependencies.Inspect
+	}
+	status, err := describe(ctx, roots)
 	if err != nil {
 		action := "rebuild-index"
 		if errors.Is(err, store.ErrNoCurrent) {
