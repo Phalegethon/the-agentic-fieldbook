@@ -1,10 +1,18 @@
 package store
 
 import (
+	"bytes"
+	"cmp"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/model"
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/policy"
 )
 
 func TestMapKindTierPrefersDefinitionsOverImports(t *testing.T) {
@@ -56,5 +64,231 @@ func TestQueryShortNameIsTheLastDottedSegment(t *testing.T) {
 		if got := QueryShortName(input); got != want {
 			t.Fatalf("QueryShortName(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+// TestCanonicalPathOrderIsUnchangedByPrecomputedKeys freezes the canonical
+// path order against the pre-optimisation comparator, which normalized both
+// operands on every comparison. byPath, the map groups, the token terms, and
+// the encoded payload must stay identical when the comparator changes.
+func TestCanonicalPathOrderIsUnchangedByPrecomputedKeys(t *testing.T) {
+	records := mixedCaseRecords(2000)
+	got := BuildQueryIndex(records)
+	want := referenceQueryIndex(records)
+	if !slices.Equal(got.PathOrdinals(), want.PathOrdinals()) {
+		t.Fatalf("byPath differs from the frozen reference order")
+	}
+	if !slices.Equal(got.TokenTerms(), want.TokenTerms()) {
+		t.Fatalf("token terms differ from the frozen reference")
+	}
+	gotGroups, gotPartial := got.MapGroups()
+	wantGroups, wantPartial := want.MapGroups()
+	if gotPartial != wantPartial || !reflect.DeepEqual(gotGroups, wantGroups) {
+		t.Fatalf("map groups differ from the frozen reference (partial got=%v want=%v)", gotPartial, wantPartial)
+	}
+	if !reflect.DeepEqual(got.postings, want.postings) {
+		t.Fatalf("query postings differ from the frozen reference")
+	}
+	encodedGot, err := encodeIndex(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join("testdata", "mixed-case-2000.bin")
+	if os.Getenv("TAF_UPDATE_FIXTURE") == "1" {
+		if err := os.MkdirAll("testdata", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fixture, encodedGot, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatalf("wrote %s from the current encoder; unset TAF_UPDATE_FIXTURE and rerun", fixture)
+	}
+	encodedWant, err := os.ReadFile(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(encodedGot, encodedWant) {
+		t.Fatalf("encoded payload changed: got %d bytes, want %d bytes", len(encodedGot), len(encodedWant))
+	}
+}
+
+// mixedCaseRecords is deterministic and exercises every level of the canonical
+// path comparator: differing normalized paths, equal normalized paths that
+// differ in case, equal paths differing in start line and in record kind, and
+// equal normalized qualified names that differ only in surrounding space and
+// case so the identity tie-break decides.
+func mixedCaseRecords(count int) []model.Record {
+	records := make([]model.Record, 0, count)
+	for index := 0; len(records) < count; index++ {
+		family := index / 8
+		slot := index % 8
+		path := fmt.Sprintf("src/Module%03d/Handler.go", family)
+		if slot >= 4 {
+			path = strings.ToLower(path)
+		}
+		record := model.Record{
+			Identity:         fmt.Sprintf("sha256:%064x", index),
+			Path:             path,
+			StartLine:        1,
+			EndLine:          9,
+			Language:         "go",
+			RecordKind:       model.Definition,
+			SourceType:       "source",
+			QualifiedName:    fmt.Sprintf("Module%03d.Handler", family),
+			ExtractionMethod: "go/parser@go1.27",
+			EvidenceClass:    model.Verified,
+			SearchTerms:      []string{"handler", fmt.Sprintf("module%03d", family)},
+			SourceDigest:     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		}
+		switch slot % 4 {
+		case 0:
+			record.QualifiedName = "  " + record.QualifiedName + "  "
+		case 1:
+			record.QualifiedName = strings.ToLower(record.QualifiedName)
+			record.EvidenceClass = model.Inferred
+		case 2:
+			record.RecordKind = model.Import
+			record.QualifiedName = "Fmt"
+			record.SearchTerms = []string{"fmt", "import"}
+		case 3:
+			record.StartLine = 42
+			record.EndLine = 44
+			record.QualifiedName = fmt.Sprintf("Module%03d.Other", family)
+			record.SearchTerms = []string{"other", fmt.Sprintf("module%03d", family)}
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+// referenceQueryIndex reproduces the pre-optimisation ordering: the byPath
+// sort and the map grouping as they were before normalized keys were
+// precomputed. It intentionally duplicates the production logic so a change
+// there cannot silently move the reference too.
+func referenceQueryIndex(records []model.Record) QueryIndex {
+	index := QueryIndex{postings: make(map[string][]uint32)}
+	for ordinal, record := range records {
+		visitCanonicalQueryKeys(record, func(key string) bool {
+			index.postings[key] = append(index.postings[key], uint32(ordinal))
+			return true
+		})
+	}
+	index.tokenTerms = make([]string, 0, len(index.postings))
+	for key := range index.postings {
+		if strings.HasPrefix(key, queryTokenPrefix) {
+			index.tokenTerms = append(index.tokenTerms, strings.TrimPrefix(key, queryTokenPrefix))
+		}
+	}
+	slices.Sort(index.tokenTerms)
+	index.byPath = make([]uint32, len(records))
+	for ordinal := range records {
+		index.byPath[ordinal] = uint32(ordinal)
+	}
+	slices.SortFunc(index.byPath, func(left, right uint32) int {
+		return referenceComparePathOrdinal(records, left, right)
+	})
+	index.mapGroups, index.mapPartial = referenceMapGroups(records, index.byPath, policy.ProductionLimits().MaximumLexicalCandidates)
+	return index
+}
+
+func referenceComparePathOrdinal(records []model.Record, left, right uint32) int {
+	l, r := records[left], records[right]
+	for _, comparison := range []int{
+		cmp.Compare(referenceNormalize(l.Path), referenceNormalize(r.Path)),
+		cmp.Compare(l.Path, r.Path),
+		cmp.Compare(l.StartLine, r.StartLine),
+		cmp.Compare(string(l.RecordKind), string(r.RecordKind)),
+		cmp.Compare(referenceNormalize(l.QualifiedName), referenceNormalize(r.QualifiedName)),
+		cmp.Compare(l.Identity, r.Identity),
+	} {
+		if comparison != 0 {
+			return comparison
+		}
+	}
+	return 0
+}
+
+func referenceMapGroups(records []model.Record, pathOrdinals []uint32, maximum int) ([]QueryMapGroup, bool) {
+	if maximum < 1 {
+		return nil, len(pathOrdinals) != 0
+	}
+	groups := make([]QueryMapGroup, 0, min(len(pathOrdinals), maximum))
+	partial := false
+	for start := 0; start < len(pathOrdinals); {
+		end := start + 1
+		path := records[pathOrdinals[start]].Path
+		best := pathOrdinals[start]
+		for end < len(pathOrdinals) && records[pathOrdinals[end]].Path == path {
+			if referenceCompareMapRepresentative(records[pathOrdinals[end]], records[best]) < 0 {
+				best = pathOrdinals[end]
+			}
+			end++
+		}
+		if len(groups) == maximum {
+			partial = true
+			break
+		}
+		groups = append(groups, QueryMapGroup{Path: path, Ordinals: []uint32{best}})
+		start = end
+	}
+	return groups, partial
+}
+
+func referenceCompareMapRepresentative(left, right model.Record) int {
+	for _, comparison := range []int{
+		cmp.Compare(referenceEvidenceTier(left), referenceEvidenceTier(right)),
+		cmp.Compare(referenceSourceTier(left), referenceSourceTier(right)),
+		cmp.Compare(referenceKindTier(left.RecordKind), referenceKindTier(right.RecordKind)),
+		cmp.Compare(left.StartLine, right.StartLine),
+		cmp.Compare(referenceNormalize(left.QualifiedName), referenceNormalize(right.QualifiedName)),
+		cmp.Compare(left.Identity, right.Identity),
+	} {
+		if comparison != 0 {
+			return comparison
+		}
+	}
+	return 0
+}
+
+func referenceNormalize(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
+
+func referenceEvidenceTier(record model.Record) int {
+	switch record.EvidenceClass {
+	case model.Verified:
+		return 0
+	case model.Inferred:
+		return 1
+	default:
+		return 2
+	}
+}
+
+func referenceSourceTier(record model.Record) int {
+	switch record.SourceType {
+	case "source":
+		return 0
+	case "document":
+		return 1
+	default:
+		return 2
+	}
+}
+
+func referenceKindTier(kind model.RecordKind) int {
+	switch kind {
+	case model.Module:
+		return 0
+	case model.Definition, model.EntryPoint:
+		return 1
+	case model.Heading:
+		return 2
+	case model.Configuration:
+		return 3
+	case model.DocumentChunk:
+		return 4
+	case model.Import:
+		return 5
+	default:
+		return 6
 	}
 }
