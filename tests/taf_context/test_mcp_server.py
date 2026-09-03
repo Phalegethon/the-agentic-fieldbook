@@ -389,7 +389,7 @@ class FramingTests(unittest.TestCase):
     def test_every_stdout_byte_is_ascii(self) -> None:
         # A line reader that splits on U+2028 (Python's str.splitlines does)
         # cannot mis-frame a message that carries no non-ASCII byte at all.
-        note = "one two ünï"
+        note = "one\u2028two ünï"
         stdin = io.BytesIO(json.dumps(call(1, "inspect", {"repo": REPO})).encode("utf-8") + b"\n")
         stdout, stderr = io.BytesIO(), io.StringIO()
         serve(stdin, stdout, stderr, FakeOperations(answer={"mode": "inspect", "note": note}))
