@@ -11,7 +11,7 @@ from taf_context.prepare_cli import _NATIVE_RELEASE_BASE_URL
 ROOT = Path(__file__).parents[1]
 SKILL = ROOT / "skills" / "branch-handoff"
 WORK_RECOVERY = ROOT / "skills" / "work-recovery"
-TAF_VERSION = "2.2.0"
+TAF_VERSION = "2.3.0"
 SKILL_VERSIONS = {
     "branch-handoff": "1.2.1",
     "prepare-repo-context": "1.5.0",
@@ -126,6 +126,7 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertIn("## [2.1.1] - 2026-08-31", changelog)
         self.assertIn("## [2.1.2] - 2026-08-31", changelog)
         self.assertIn("## [2.2.0] - 2026-09-03", changelog)
+        self.assertIn("## [2.3.0] - 2026-09-04", changelog)
         for required in (
             "Install TAF once",
             "## Install TAF",

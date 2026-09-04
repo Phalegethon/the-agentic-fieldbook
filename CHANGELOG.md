@@ -5,6 +5,13 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-09-04
+
+Native runtime `0.3.0` (index format 4; existing indexes report `rebuild-index`
+once and the next `inspect` reports `install-native-engine` until `activate`
+downloads the new runtime). Bundled skills: `branch-handoff` 1.2.1,
+`prepare-repo-context` 1.5.0, `work-recovery` 1.0.1.
+
 ### Added
 
 - The native engine indexes call and import references as file-local

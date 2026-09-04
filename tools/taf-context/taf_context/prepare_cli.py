@@ -38,7 +38,7 @@ from .state_paths import StateError
 
 
 _CHECKSUM = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)\n\Z")
-_TAF_RELEASE_VERSION = "2.2.0"
+_TAF_RELEASE_VERSION = "2.3.0"
 _NATIVE_RELEASE_BASE_URL = (
     "https://github.com/Phalegethon/the-agentic-fieldbook/releases/download/"
     f"v{_TAF_RELEASE_VERSION}"
