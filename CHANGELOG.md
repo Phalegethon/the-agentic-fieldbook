@@ -5,6 +5,62 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Native runtime `0.5.0` (no index format change, so existing indexes are kept;
+the next `inspect` reports `install-native-engine` until `activate` downloads
+the new runtime). Bundled skills: `branch-handoff` 1.2.1,
+`prepare-repo-context` 1.7.0, `work-recovery` 1.1.0.
+
+### Added
+
+- The native engine answers a read-only `repository-overview` operation over
+  the additive wire schema `4`: how a repository is organized, in one call.
+  `groups` is a bounded directory table, one row per prefix with its file,
+  definition, entry-point, document, and configuration counts, its languages,
+  and the identity of a representative file; `overview` names the described
+  root, the counted files, and how many directories the row `*` folds
+  together. Prefixes stay relative to the repository root. A group holding
+  more than 40 % of the counted files is replaced by its children while it
+  stays within four segments of depth and the table has fewer than twelve
+  groups; the rows are ordered by definition count, then file count, then
+  prefix, and the surplus beyond sixteen is folded into `*`. Nothing is
+  resolved and no file is reopened.
+- The same answer carries a ranked file layer in `findings`: each group's
+  files are ordered by entry points and well-known entry file names
+  (`main.go` under a `cmd/` directory, `main.py`, `__main__.py`, `app.py`,
+  `manage.py`, `cli.py`, `index.js`, `index.ts`, `index.tsx`, `page.tsx`,
+  `layout.tsx`, `server.ts`, `main.rs`, `lib.rs`), then the files that define
+  something, then documents with a README first, then configuration, and one
+  file is taken from each group per round so a dominant directory cannot fill
+  the answer alone. The name list is a ranking hint only: a file it names
+  keeps the record kinds it really has. `omitted_count` is the counted files
+  the answer does not list.
+- `prepare-repo-context` 1.7.0 exposes it as
+  `query --operation repository-overview`, which needs neither a query nor a
+  result identity and accepts only `--path-prefix` and `--language`;
+  `--query`, `--result-id`, `--direction`, `--base`, `--symbol-kind`, and
+  `--source-type` are rejected. For this operation `--path-prefix` names whole
+  directory segments, and naming several prefixes describes the first in
+  sorted order with the warning `overview-root-first-prefix`. The group table
+  is never trimmed, so the output budget takes the file layer from the tail
+  and `output-budget-exceeded` is reported only when even an empty file layer
+  does not fit; `output_characters` is the canonical length of the answer, as
+  it already is for `impact-candidates`.
+- The `repo-context` MCP server, now 1.3.0, gains a tenth tool,
+  `repository_overview` (`path_prefixes`, `languages`, `allow_inferred`, and
+  the two budgets), read-only like the other query tools. Its
+  `maximum_output_characters` defaults to 8000 rather than 4000, because the
+  group table alone leaves little of the smaller budget for the file layer.
+
+### Changed
+
+- The callers dogfood now measures a fixed-range clone at the pinned commit
+  instead of the working tree, so its precision and recall figures no longer
+  move with uncommitted work; the truth set is the one that matches that
+  commit again.
+- `changed-symbols` and `impact-candidates` reuse the repository root the
+  snapshot already resolved, so one change query runs
+  `git rev-parse --show-toplevel` once instead of three times.
+
 ## [2.4.0] - 2026-09-04
 
 Native runtime `0.4.0` (no index format change, so existing indexes are kept;

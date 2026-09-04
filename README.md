@@ -15,7 +15,7 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.6.0 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, symbol relationships, and change-impact questions, and reclaim unused index state without loading the full repository into model context. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.7.0 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, and reclaim unused index state without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.1.0 | Recover interrupted work and the single best next step from bounded, read-only Git evidence, optionally naming the symbols the work touched. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
@@ -223,8 +223,8 @@ bounded query results rather than the full index.
 After commits or edits the next query refreshes the bound index incrementally;
 a full rebuild is only asked for after a runtime upgrade.
 
-Once ready, the same skill can answer repository-map, symbol, documentation,
-and relationship questions with bounded results. Findings carry paths, line
+Once ready, the same skill can answer repository-overview, repository-map,
+symbol, documentation, and relationship questions with bounded results. Findings carry paths, line
 ranges, evidence class, and a one-line preview; multi-word queries intersect
 their words, and `--language`, `--symbol-kind`, and `--path-prefix` filters
 narrow them. A relationship question ("who calls X", "what does X depend
@@ -236,6 +236,17 @@ skill's `references/query-routing.md` maps questions to queries and
 `references/result-contract.md` explains `status`, `truncated`,
 `omitted_count`, and the relationship fields. It retrieves source snippets
 only for selected result identities.
+
+An unfamiliar repository starts with one `query --operation repository-overview`
+call, which needs neither a query nor an identity: it returns a directory table
+in `groups` with, per prefix, the file, definition, entry-point, document, and
+configuration counts and the languages; an `overview` block naming the
+described root and the counted files; and a ranked file layer that leads with
+entry points and well-known entry file names such as `main.go` under `cmd/` or
+`index.ts`. `--path-prefix D/` describes one subtree, and `--language` counts
+one language's files. The table is never trimmed, so the output budget takes
+the file layer first: ask for `--maximum-output-characters 8000` or `12000`
+when the answer should carry files as well as the table.
 
 A change question is answered in one step and needs no identity.
 `query --operation changed-symbols` reports the definitions, entry points,
@@ -269,8 +280,8 @@ Windows on amd64.
 TAF bundles an MCP stdio server, `repo-context`, that exposes the same
 operations as `prepare-repo-context` as tools: `inspect`, `build`,
 `repository_map`, `search_symbols`, `search_docs`, `source_snippets`,
-`related_symbols`, `changed_symbols`, and `impact_candidates`. Every tool
-takes the absolute `repo` path; `build` requires `confirm_state_write: true`
+`related_symbols`, `changed_symbols`, `impact_candidates`, and
+`repository_overview`. Every tool takes the absolute `repo` path; `build` requires `confirm_state_write: true`
 and is marked so the host asks before running it.
 The server never installs the native engine, never contacts the network, and
 never runs `gc` or `remove`; those and `activate` stay skill commands. A query
@@ -301,6 +312,14 @@ direction over the same engine process. Its candidates are attributed in
 `anchors` to the changed symbols they depend on; a candidate is a symbol
 that references changed work, not a defect.
 
+`repository_overview` answers how a repository is organized in one call: the
+directory table in `groups`, the `overview` block, and a ranked file layer in
+`findings`. It takes only `path_prefixes`, `languages`, `allow_inferred`, and
+the two budgets; `path_prefixes` names whole directory segments and describes
+the first of them in sorted order. Because the group table is never trimmed,
+this tool's `maximum_output_characters` defaults to 8000 rather than the 4000
+the other query tools use.
+
 Claude Code starts the server when the plugin is enabled; the tools appear as
 `mcp__plugin_taf_repo-context__<tool>` (permission matcher
 `mcp__plugin_taf_repo-context__*`), reading its manifest from
@@ -330,7 +349,7 @@ TAF and its skills have separate versions:
 
 - TAF `2.4.0` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.6.0` versions its behavior contract.
+- `prepare-repo-context` `1.7.0` versions its behavior contract.
 - `work-recovery` `1.1.0` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with

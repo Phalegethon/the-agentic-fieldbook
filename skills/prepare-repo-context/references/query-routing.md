@@ -4,6 +4,7 @@ Turn the user's question into exactly one bounded query. Prefer the smallest ope
 
 | The user asks | Run | Notes |
 |---|---|---|
+| How is this repository organized? Where is the code? Where do I start? | `repository-overview` | One call, no query text and no identity: a directory table in `groups` with per-prefix counts and languages, plus a ranked file layer in `findings` that leads with entry points and well-known entry file names. Start here in an unfamiliar repository. |
 | Where is `X` defined? What is `X`? | `search-symbols --query X` | Add `--symbol-kind definition` when the name is heavily imported. Definitions rank above imports by default. |
 | Who imports `X`? (import statements naming `X`) | `search-symbols --query X --symbol-kind import` | Import records only. For call sites, use the `callers` direction below; call sites are not `search-symbols` results in this version. |
 | Who calls `X`? | `search-symbols --query X` to get its `result_identity`, then `related-symbols --result-id <identity> --direction callers` | Two-step: `related-symbols` follows the relationships of a result you already have, it does not search by name. Verified edges only unless `--allow-inferred` is set. |
@@ -14,7 +15,7 @@ Turn the user's question into exactly one bounded query. Prefer the smallest ope
 | What could my change break? What depends on what I changed? | `impact-candidates` | One step as well: the callers of the changed definitions and entry points and the importers of the changed modules and definitions, each candidate attributed in `anchors` to the changed symbols it depends on. Verified edges only unless `--allow-inferred` is set. |
 | Something about "snapshot" / "state paths" (a concept, not an exact name) | `search-symbols --query <words>` | Every word must match. Words split camelCase and snake_case, so `snapshot` finds `collect_snapshot` and `RepositorySnapshot`. |
 | What do the docs say about `Y`? Where is the section on `Y`? | `search-docs --query <words>` | Headings rank above body chunks. Use two or three words from the expected heading. |
-| What is in directory `D`? Which modules exist there? | `repository-map --path-prefix D/` | One representative record per file, in path order. |
+| What is in directory `D`? Which modules exist there? | `repository-overview --path-prefix D/`, then `repository-map --path-prefix D/` | The overview answers with that subtree's own directory table and its ranked files; `repository-map` is the flat listing, one representative record per file in path order. |
 | Only Go / only Python / only this folder | add `--language <l>` / `--path-prefix <p>` | Language values are case-insensitive. |
 
 ## Filter values
@@ -22,8 +23,9 @@ Turn the user's question into exactly one bounded query. Prefer the smallest ope
 - `--language`: `go`, `javascript`, `json`, `markdown`, `python`, `rust`, `toml`, `typescript`.
 - `--symbol-kind`: `configuration`, `definition`, `document-chunk`, `entry-point`, `heading`, `import`, `module`.
 - `--source-type`: `source`, `document`, `configuration`.
-- `--path-prefix`: a repository-relative prefix such as `tools/taf-context/`.
+- `--path-prefix`: a repository-relative prefix such as `tools/taf-context/`. `repository-overview` reads it as whole directory segments, so a file path or a partial segment answers with an empty table there, and it describes only one subtree: several prefixes are not composed, the first in sorted order becomes the root and the warning `overview-root-first-prefix` says so.
 - `--direction`: `callers`, `callees`, `importers`, `imports`. Required by `related-symbols` and rejected by every other operation. `related-symbols` also requires one or more `--result-id` values (anchor identities from an earlier query, at most 16) and accepts no `--query`.
+- `repository-overview` accepts only `--path-prefix` and `--language`; it rejects `--query`, `--result-id`, `--direction`, `--base`, `--symbol-kind`, and `--source-type`, each with a message naming the flag to drop.
 - `--base`: a Git ref or commit the change set is measured against. Accepted only by `changed-symbols` and `impact-candidates`, and rejected by every other operation; both of them reject `--query`, `--result-id`, and `--direction`.
 
 All three filter flags (`--language`, `--symbol-kind`, `--source-type`) are case-insensitive. `--path-prefix` is case-sensitive and matches the repository-relative path exactly as stored.
@@ -43,6 +45,12 @@ An unknown value fails fast and the error lists the valid values.
 - A changed symbol is a definition, entry point, or module record whose line span meets a changed hunk of the same path. A deleted file leaves no record, so it appears only as the warning `changed-path-not-indexed`; the same warning covers any changed path the index carries no record for.
 - `impact-candidates` follows at most 64 changed symbols and asks one relationship question per changed symbol and direction (`callers` for a changed definition or entry point, `importers` for a changed module or definition), so its cost grows with the change set. Narrow a large change set with `--path-prefix` (or `--language`) before raising `--maximum-results`: the filters apply to the changed set of both operations. The `impact_candidates` MCP tool accepts no filters, so use the script when a change set needs narrowing.
 - Neither operation reopens a file: the change set only selects records the index already carries, and the incremental refresh the query performs first is what brings edited, new, and untracked files into it. A path the index excludes stays outside the answer and is reported as `changed-path-not-indexed`.
+
+## Overview questions
+
+- The group table is never trimmed, so the output budget takes the file layer first. At the default 4000 characters the table usually fills the answer on its own and `findings` comes back empty; ask for `--maximum-output-characters 8000` (the `repository_overview` tool's own default) or `12000` when the answer should carry files as well. Only a budget that not even the table fits in is reported as `output-budget-exceeded`.
+- Read the table first and query second: a group's `representative_identity` and every file-layer finding is an ordinary record identity, never a `reference`, so `source-snippets` can fetch one without another search; `related-symbols` still needs an identity that names a `definition`, `module`, or `entry-point` record.
+- Narrow with `--path-prefix D/` to describe one subtree, or with `--language` to count only that language's files. Neither changes what a row means: prefixes stay relative to the repository root.
 
 ## When `grep` or `rg` is the better tool
 
