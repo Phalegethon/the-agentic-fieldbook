@@ -61,7 +61,7 @@ func (extractor goExtractor) Extract(file boundary.StableFile) ([]model.Record, 
 		start, end = astLines(fileSet, imported.Pos(), imported.End())
 		record := structuralRecord(name, model.Import, "source", start, end)
 		if specifier, unquoteErr := strconv.Unquote(imported.Path.Value); unquoteErr == nil {
-			record.TargetName = specifier
+			record.TargetName = boundedImportSpecifier(specifier)
 		}
 		if !appendRecord(record) {
 			break

@@ -696,9 +696,10 @@ func helper() {}
 	}
 	assertImportTarget(t, records, "fmt", "fmt")
 	assertImportTarget(t, records, "yaml", "gopkg.in/yaml.v3")
-	// A package-level initializer belongs to the package record, which spans
-	// the package clause exactly as the module record does.
-	assertReference(t, records, referenceExpectation{"tool", 1, 1, "go", goParserVersion, []model.ReferenceEntry{
+	// A package-level initializer belongs to the package record, whose own
+	// range is the package clause alone; the reference record covers the lines
+	// its entries name instead, so a use always sits inside its record.
+	assertReference(t, records, referenceExpectation{"tool", 6, 6, "go", goParserVersion, []model.ReferenceEntry{
 		{Name: "compute", Line: 6, Count: 1},
 	}})
 	// Every call inside Main is one record covering Main's own range, with the
@@ -804,5 +805,71 @@ func TestRecordIdentityDistinguishesReferenceTables(t *testing.T) {
 	}
 	if output[0].Identity == output[1].Identity {
 		t.Fatalf("two tables share identity %q", output[0].Identity)
+	}
+}
+
+// A Go import specifier is bounded exactly as the tree-sitter path bounds it:
+// an unusable specifier only empties the target, and the bound local name
+// stays indexed.
+func TestGoExtractorBoundsTheImportSpecifierWithoutDroppingTheBinding(t *testing.T) {
+	specifier := "example.com/" + strings.Repeat("p", maximumTargetSpecifierBytes)
+	source := "package tool\n\nimport wide \"" + specifier + "\"\n"
+	records, report := NewRegistry().Extract(stableFile("cmd/tool/wide.go", source))
+	if report.ParseFailures != 0 || len(report.WarningCodes) != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	assertImportTarget(t, records, "wide", "")
+}
+
+// A Go module-scope reference record hosts uses the package clause does not
+// span, so its range covers the lines its own entries name.
+func TestGoModuleReferenceRangeCoversItsEntries(t *testing.T) {
+	source := "package tool\n" +
+		"\n" +
+		"var first = compute()\n" +
+		"\n" +
+		"var second = build()\n" +
+		"\n" +
+		"func compute() int { return 1 }\n" +
+		"func build() int { return 2 }\n"
+	records, report := NewRegistry().Extract(stableFile("cmd/tool/values.go", source))
+	if report.ParseFailures != 0 || len(report.WarningCodes) != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	assertReference(t, records, referenceExpectation{"tool", 3, 5, "go", goParserVersion, []model.ReferenceEntry{
+		{Name: "compute", Line: 3, Count: 1},
+		{Name: "build", Line: 5, Count: 1},
+	}})
+	module := findRecord(t, records, "tool")
+	if module.RecordKind != model.Module || module.StartLine != 1 || module.EndLine != 1 {
+		t.Fatalf("module record = %#v, want the package clause range", module)
+	}
+}
+
+// The entry cap keeps the entries the table would order first, so it drops the
+// same entries the byte bound would drop rather than the ones the parser
+// happened to visit last.
+func TestReferenceCollectorAppliesTheEntryCapAfterOrderingByLine(t *testing.T) {
+	collector := referenceCollector{}
+	scope := referenceScope{name: "pkg.Wide", start: 1, end: 1000}
+	for index := 0; index < model.MaximumReferenceTableEntries; index++ {
+		collector.add(scope, fmt.Sprintf("late%02d", index), 100+index)
+	}
+	collector.add(scope, "early", 2)
+	records, warnings := collector.flush()
+	if !contains(warnings, "reference-limit") {
+		t.Fatalf("warnings = %#v, want reference-limit", warnings)
+	}
+	entries, ok := model.ParseReferenceTable(records[0].TargetName)
+	if !ok || len(entries) != model.MaximumReferenceTableEntries {
+		t.Fatalf("entries = %#v, want %d", entries, model.MaximumReferenceTableEntries)
+	}
+	if entries[0].Name != "early" || entries[0].Line != 2 {
+		t.Fatalf("first entry = %#v, want the lowest line", entries[0])
+	}
+	for _, entry := range entries {
+		if entry.Name == fmt.Sprintf("late%02d", model.MaximumReferenceTableEntries-1) {
+			t.Fatalf("entries kept the last line %#v, want it dropped for %q", entry, "early")
+		}
 	}
 }

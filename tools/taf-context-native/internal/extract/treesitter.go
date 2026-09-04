@@ -308,9 +308,7 @@ func (analysis *treeSitterAnalysis) appendNodeRecord(node *sitter.Node, qualifie
 // together with the module specifier it was imported from. An unusable
 // specifier only leaves the target empty; the binding itself stays indexed.
 func (analysis *treeSitterAnalysis) appendImportRecord(node *sitter.Node, binding, target string) {
-	if target != "" && (len(target) > maximumTargetSpecifierBytes || strings.ContainsAny(target, "\x00\n\r")) {
-		target = ""
-	}
+	target = boundedImportSpecifier(target)
 	before := len(analysis.records)
 	analysis.appendNodeRecord(node, binding, model.Import, model.Verified)
 	if len(analysis.records) > before {
@@ -532,4 +530,14 @@ func unquotedString(text string) (string, bool) {
 		return "", false
 	}
 	return text[1 : len(text)-1], true
+}
+
+// boundedImportSpecifier keeps an import binding indexed when the module
+// specifier it names is unusable: an over-long or control-carrying specifier
+// is dropped on its own, never together with the record that carries it.
+func boundedImportSpecifier(target string) string {
+	if target != "" && (len(target) > maximumTargetSpecifierBytes || strings.ContainsAny(target, "\x00\n\r")) {
+		return ""
+	}
+	return target
 }

@@ -1101,3 +1101,35 @@ func TestPythonReferenceRangeMatchesTheDecoratedDefinitionRecord(t *testing.T) {
 		{Name: "helper", Line: 5, Count: 1},
 	}})
 }
+
+// Two definitions written with the same qualified name in one file are two
+// hosts, so each keeps its own reference record over its own range instead of
+// merging its uses into the first one.
+func TestPythonExtractorKeepsSameNamedDefinitionsApart(t *testing.T) {
+	source := "def twin():\n" +
+		"    first()\n" +
+		"\n" +
+		"def twin():\n" +
+		"    second()\n"
+	records, report := NewRegistry().Extract(stableFile("pkg/duplicate.py", source))
+	if report.ParseFailures != 0 || len(report.WarningCodes) != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	selected := referencesOf(records, "duplicate.twin")
+	if len(selected) != 2 {
+		t.Fatalf("references of duplicate.twin = %#v, want one per definition", selected)
+	}
+	for index, want := range []struct {
+		startLine int
+		endLine   int
+		table     string
+	}{
+		{1, 2, "first:2:1"},
+		{4, 5, "second:5:1"},
+	} {
+		record := selected[index]
+		if record.StartLine != want.startLine || record.EndLine != want.endLine || record.TargetName != want.table {
+			t.Fatalf("reference %d = %d-%d %q, want %d-%d %q", index, record.StartLine, record.EndLine, record.TargetName, want.startLine, want.endLine, want.table)
+		}
+	}
+}

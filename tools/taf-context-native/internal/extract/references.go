@@ -23,7 +23,7 @@ type referenceScope struct {
 // merged targets become that record's target table.
 type referenceCollector struct {
 	groups  []referenceGroup
-	index   map[string]int
+	index   map[referenceScope]int
 	limited bool
 	skipped int
 }
@@ -45,12 +45,15 @@ func (collector *referenceCollector) add(scope referenceScope, target string, li
 		return
 	}
 	if collector.index == nil {
-		collector.index = make(map[string]int)
+		collector.index = make(map[referenceScope]int)
 	}
-	position, known := collector.index[scope.name]
+	// Two definitions may be written with the same qualified name in one file,
+	// so the group is keyed by the definition's name and its range together:
+	// each one keeps its own record instead of merging into the first.
+	position, known := collector.index[scope]
 	if !known {
 		position = len(collector.groups)
-		collector.index[scope.name] = position
+		collector.index[scope] = position
 		collector.groups = append(collector.groups, referenceGroup{scope: scope, targets: make(map[string]int)})
 	}
 	group := &collector.groups[position]
@@ -61,10 +64,10 @@ func (collector *referenceCollector) add(scope referenceScope, target string, li
 		group.entries[entry].Count++
 		return
 	}
-	if len(group.entries) >= model.MaximumReferenceTableEntries {
-		collector.limited = true
-		return
-	}
+	// Every distinct target is collected here and both bounds are applied in
+	// flush, after the entries are ordered, so a table drops the entries it
+	// orders last rather than the ones the parser visited last. The number of
+	// distinct targets is bounded by the source file the extractor accepted.
 	group.targets[target] = len(group.entries)
 	group.entries = append(group.entries, model.ReferenceEntry{Name: target, Line: line, Count: 1})
 }
@@ -72,7 +75,8 @@ func (collector *referenceCollector) add(scope referenceScope, target string, li
 // flush renders one reference record per enclosing definition, in the order
 // the definitions were first seen, together with the warning codes the file
 // earned. Entries are ordered by the line they first appear on, so the table
-// of a definition does not depend on the order the parser visited its calls.
+// of a definition does not depend on the order the parser visited its calls,
+// and both the entry cap and the byte bound cut that order's tail.
 func (collector *referenceCollector) flush() ([]model.Record, []string) {
 	records := make([]model.Record, 0, len(collector.groups))
 	for index := range collector.groups {
@@ -83,13 +87,18 @@ func (collector *referenceCollector) flush() ([]model.Record, []string) {
 			}
 			return group.entries[left].Name < group.entries[right].Name
 		})
+		if len(group.entries) > model.MaximumReferenceTableEntries {
+			group.entries = group.entries[:model.MaximumReferenceTableEntries]
+			collector.limited = true
+		}
 		entries, total := collector.boundedEntries(group.entries)
 		if len(entries) == 0 {
 			continue
 		}
+		start, end := referenceRange(group.scope, entries)
 		records = append(records, model.Record{
-			StartLine:      group.scope.start,
-			EndLine:        group.scope.end,
+			StartLine:      start,
+			EndLine:        end,
 			RecordKind:     model.Reference,
 			SourceType:     "source",
 			QualifiedName:  group.scope.name,
@@ -126,4 +135,17 @@ func (collector *referenceCollector) boundedEntries(entries []model.ReferenceEnt
 		total += entry.Count
 	}
 	return entries, total
+}
+
+// referenceRange is the range the record covers. It is the enclosing
+// definition's own range, except where that range does not contain the uses
+// the record carries: Go's module scope is the package clause alone, so a
+// package-level initializer would sit outside it. There the entries' own
+// first and last line describe the record honestly.
+func referenceRange(scope referenceScope, entries []model.ReferenceEntry) (int, int) {
+	first, last := entries[0].Line, entries[len(entries)-1].Line
+	if first >= scope.start && last <= scope.end {
+		return scope.start, scope.end
+	}
+	return first, last
 }
