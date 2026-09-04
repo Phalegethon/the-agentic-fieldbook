@@ -288,9 +288,14 @@ func ValidateRequest(request Request) error {
 // carry, keeping the query-time edge resolution work predictable.
 const maximumRelatedAnchors = 16
 
-// The overview keeps 16 directory groups and folds the surplus into one "*"
-// row, so a result never carries more than 17 group rows.
-const maximumOverviewGroups = 17
+// The overview returns one row per directory group it found and folds nothing
+// away, so the repository's own shape is what makes the table wide: a group
+// holds at least one indexed path, which makes one row per indexed path the
+// theoretical maximum. 4096 is well above any directory table a repository
+// produces and well below policy.MaximumEligiblePaths, and the transport byte
+// cap ends an honest wide table long before this bound does — so this one is
+// here to reject a payload that is no longer a directory table at all.
+const maximumOverviewGroups = 4096
 
 // The changed selector is bounded independently of the collection limit: a
 // change set names many more paths than a result may return, and the two
@@ -438,7 +443,8 @@ func validateOverview(result Result) error {
 // admitted shapes, counters that cannot be negative, a language list ordered by
 // count descending then name ascending (which also rejects a repeated name),
 // and a representative the caller can cite back — absent exactly for the "*"
-// row, which sums several directories and represents none of them.
+// row, which sums several directories and represents none of them. The engine
+// emits no such row; a consumer folding the table to an output budget does.
 func validateOverviewGroup(group OverviewGroup) error {
 	if !validOverviewPrefix(group.PathPrefix) || !validCounter(group.Depth) || !validCounter(group.FileCount) || !validCounter(group.DefinitionCount) || !validCounter(group.EntryPointCount) || !validCounter(group.DocumentCount) || !validCounter(group.ConfigurationCount) {
 		return ErrInvalidWire
@@ -471,7 +477,7 @@ func validateOverviewGroup(group OverviewGroup) error {
 }
 
 // validOverviewPrefix admits the four group prefix shapes: "." for the files at
-// the repository root, "*" for the folded surplus, "<directory>/" for a
+// the repository root, "*" for a consumer's folded tail, "<directory>/" for a
 // directory subtree, and "<directory>/." for the files directly inside a
 // directory a split replaced by its children.
 func validOverviewPrefix(value string) bool {

@@ -616,8 +616,8 @@ func TestChangedSymbolsAnswersTheSymbolsAHunkTouches(t *testing.T) {
 	if result.SchemaVersion != "3" || result.Status != wire.Ready || result.Freshness != "exact" || result.NextSafeAction != "use-index" {
 		t.Fatalf("changed result = %#v", result)
 	}
-	if result.ProviderVersion != "0.5.0" {
-		t.Fatalf("provider version = %q, want 0.5.0", result.ProviderVersion)
+	if result.ProviderVersion != "0.6.0" {
+		t.Fatalf("provider version = %q, want 0.6.0", result.ProviderVersion)
 	}
 	if len(result.Findings) != 1 {
 		t.Fatalf("findings = %#v, want sample.Main alone", result.Findings)
@@ -720,8 +720,8 @@ func TestRepositoryOverviewDescribesTheControlRepository(t *testing.T) {
 	if result.Status != wire.Ready || result.Freshness != "exact" || result.NextSafeAction != "use-index" {
 		t.Fatalf("overview result = %#v", result)
 	}
-	if result.SchemaVersion != "4" || result.ProviderVersion != "0.5.0" {
-		t.Fatalf("schema = %q provider = %q, want \"4\" and \"0.5.0\"", result.SchemaVersion, result.ProviderVersion)
+	if result.SchemaVersion != "4" || result.ProviderVersion != "0.6.0" {
+		t.Fatalf("schema = %q provider = %q, want \"4\" and \"0.6.0\"", result.SchemaVersion, result.ProviderVersion)
 	}
 	if result.Groups == nil || result.Overview == nil {
 		t.Fatal("a schema-4 result carries both overview keys")

@@ -1187,8 +1187,9 @@ func overviewGroups(entries ...OverviewGroup) *[]OverviewGroup {
 	return &list
 }
 
-// overviewResult carries a full schema-4 payload: two directory groups and the
-// "*" row the group cap folds the rest into.
+// overviewResult carries a full schema-4 payload: two directory groups and a
+// "*" row. The engine never emits that row — a consumer folding a table to an
+// output budget produces it — but the wire has to keep admitting it.
 func overviewResult() Result {
 	result := validResult()
 	result.SchemaVersion = "4"
@@ -1455,30 +1456,48 @@ func TestValidateResultRejectsMalformedOverviewRows(t *testing.T) {
 	}
 }
 
-// The bound is part of the contract, so the cases spell 17 and 18 out instead
-// of deriving them from the constant they are meant to pin: 16 kept groups plus
-// the one "*" row the rest is folded into.
-func TestValidateResultBoundsOverviewGroupRows(t *testing.T) {
-	rows := make([]OverviewGroup, 0, 18)
-	for index := 0; index < 17; index++ {
+// overviewRows builds count plausible directory rows, so a test can say how
+// wide a table it means rather than how it is spelled.
+func overviewRows(count int) []OverviewGroup {
+	rows := make([]OverviewGroup, 0, count)
+	for index := 0; index < count; index++ {
 		rows = append(rows, OverviewGroup{
-			PathPrefix: fmt.Sprintf("directory%02d/", index), Depth: 1, FileCount: 1,
+			PathPrefix: fmt.Sprintf("directory%04d/", index), Depth: 1, FileCount: 1,
 			Languages: []OverviewLanguage{{Language: "Go", FileCount: 1}}, RepresentativeIdentity: ptr(resultIdentity),
 		})
 	}
+	return rows
+}
+
+// A hundred rows is an ordinary wide table and travels the whole encode path.
+func TestEncodeResultAcceptsAWideOverviewTable(t *testing.T) {
+	wide := overviewResult()
+	wide.Groups = overviewGroups(overviewRows(100)...)
+	wide.OutputCharacters = renderedOutputCharacters(wide)
+	if err := EncodeResult(ioDiscard{}, wide); err != nil {
+		t.Fatalf("rejected 100 group rows: %v", err)
+	}
+}
+
+// The bound is part of the contract, so the cases spell 4096 and 4097 out
+// instead of deriving them from the constant they are meant to pin: a table
+// can hold at most one row per indexed path, and nothing beyond that is a
+// directory table at all. Validation is called directly here because a result
+// this wide exceeds the transport byte cap, which would otherwise reject the
+// admitted case for a reason that has nothing to do with the row bound.
+func TestValidateResultBoundsOverviewGroupRows(t *testing.T) {
+	rows := overviewRows(4097)
 	bounded := overviewResult()
-	bounded.Groups = overviewGroups(rows...)
+	bounded.Groups = overviewGroups(rows[:4096]...)
 	bounded.OutputCharacters = renderedOutputCharacters(bounded)
-	if err := EncodeResult(ioDiscard{}, bounded); err != nil {
-		t.Fatalf("rejected 17 group rows: %v", err)
+	if err := validateResult(bounded); err != nil {
+		t.Fatalf("rejected 4096 group rows: %v", err)
 	}
 	tooMany := overviewResult()
-	tooMany.Groups = overviewGroups(append(rows, OverviewGroup{
-		PathPrefix: "*", Depth: 0, FileCount: 1, Languages: []OverviewLanguage{},
-	})...)
+	tooMany.Groups = overviewGroups(rows...)
 	tooMany.OutputCharacters = renderedOutputCharacters(tooMany)
-	if err := EncodeResult(ioDiscard{}, tooMany); !errors.Is(err, ErrInvalidWire) {
-		t.Fatalf("accepted 18 group rows: error = %v", err)
+	if err := validateResult(tooMany); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("accepted 4097 group rows: error = %v", err)
 	}
 }
 

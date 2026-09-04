@@ -230,9 +230,11 @@ func TestOverviewSplitsOnlyStrictlyAboveFortyPercent(t *testing.T) {
 	}
 }
 
-// Ties on the largest splittable group break by path ascending, so the
-// smaller-prefix group always splits first, however many groups tie.
-func TestOverviewBreaksLargestGroupTiesByPath(t *testing.T) {
+// Nothing stops the split loop before the threshold and the depth cap do, so
+// every group above the threshold is replaced by its children however many
+// tie for largest. Which one the loop picks first only orders the work: the
+// table it ends at is the same either way, and it holds no dominant group.
+func TestOverviewSplitsEveryDominantGroup(t *testing.T) {
 	specs := append(overviewDirectory("aa/p/", 10), overviewDirectory("aa/q/", 9)...)
 	specs = append(specs, overviewDirectory("bb/p/", 10)...)
 	specs = append(specs, overviewDirectory("bb/q/", 9)...)
@@ -241,14 +243,16 @@ func TestOverviewBreaksLargestGroupTiesByPath(t *testing.T) {
 	}
 	response := overviewOf(t, specs)
 	prefixes := groupPrefixes(response.Groups)
-	if !slices.Contains(prefixes, "aa/p/") || !slices.Contains(prefixes, "aa/q/") {
-		t.Fatalf("aa/ must split first on the path tie-break: %#v", prefixes)
+	for _, want := range []string{"aa/p/", "aa/q/", "bb/p/", "bb/q/"} {
+		if !slices.Contains(prefixes, want) {
+			t.Fatalf("group %q is missing from %#v", want, prefixes)
+		}
 	}
-	if !slices.Contains(prefixes, "bb/") {
-		t.Fatalf("bb/ must stay whole once the ceiling is reached: %#v", prefixes)
+	if slices.Contains(prefixes, "aa/") || slices.Contains(prefixes, "bb/") {
+		t.Fatalf("a group above the threshold is never left whole: %#v", prefixes)
 	}
-	if slices.Contains(prefixes, "aa/") || slices.Contains(prefixes, "bb/p/") || slices.Contains(prefixes, "bb/q/") {
-		t.Fatalf("exactly one group splits before the ceiling: %#v", prefixes)
+	if len(prefixes) != 13 {
+		t.Fatalf("groups = %d, want the four children and the nine singletons: %#v", len(prefixes), prefixes)
 	}
 }
 
@@ -325,85 +329,98 @@ func TestOverviewStopsSplittingAtDepthFour(t *testing.T) {
 	}
 }
 
-// Splitting stops once the table reaches twelve groups, so a dominant
-// directory below a wide root stays whole and is still reported as one row.
-func TestOverviewStopsSplittingAtTwelveGroups(t *testing.T) {
-	for _, testCase := range []struct {
-		name       string
-		singletons int
-		split      bool
-	}{
-		{name: "eleven singletons reach the ceiling", singletons: 11, split: false},
-		{name: "ten singletons leave room for one split", singletons: 10, split: true},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
+// How many rows the table already holds is not a reason to leave a dominant
+// directory whole: the split rule is the threshold and the depth cap alone,
+// so the same subtree splits under a narrow root and under a wide one.
+func TestOverviewSplitsADominantDirectoryHoweverWideTheTable(t *testing.T) {
+	for _, singletons := range []int{10, 11, 40} {
+		t.Run(fmt.Sprintf("%d singletons", singletons), func(t *testing.T) {
 			specs := append(overviewDirectory("big/x/", 15), overviewDirectory("big/y/", 15)...)
-			for index := 0; index < testCase.singletons; index++ {
+			for index := 0; index < singletons; index++ {
 				specs = append(specs, overviewDirectory(fmt.Sprintf("d%02d/", index), 1)...)
 			}
 			response := overviewOf(t, specs)
 			prefixes := groupPrefixes(response.Groups)
-			whole := false
-			for _, prefix := range prefixes {
-				if prefix == "big/" {
-					whole = true
-				}
+			if slices.Contains(prefixes, "big/") {
+				t.Fatalf("groups = %#v, want big/ replaced by its children", prefixes)
 			}
-			if whole == testCase.split {
-				t.Fatalf("groups = %#v, want big/ split = %v", prefixes, testCase.split)
+			if child := groupNamed(t, response.Groups, "big/x/"); child.FileCount != 15 {
+				t.Fatalf("big/x/ = %#v", child)
 			}
-			if testCase.split {
-				if child := groupNamed(t, response.Groups, "big/x/"); child.FileCount != 15 {
-					t.Fatalf("big/x/ = %#v", child)
-				}
+			if child := groupNamed(t, response.Groups, "big/y/"); child.FileCount != 15 {
+				t.Fatalf("big/y/ = %#v", child)
+			}
+			if len(prefixes) != singletons+2 {
+				t.Fatalf("groups = %d, want %d: %#v", len(prefixes), singletons+2, prefixes)
 			}
 		})
 	}
 }
 
-// Beyond sixteen groups the surplus is folded into one "*" row whose counters
-// are sums, whose languages are merged and re-sorted, and which represents no
-// single file.
-func TestOverviewFoldsTheSurplusIntoTheOtherRow(t *testing.T) {
+// The engine folds nothing away: twenty directories are twenty rows, no "*"
+// row is invented, and the summary reports no folded group. Trimming the
+// table to a caller's output budget is the broker's job, not the engine's.
+func TestOverviewReturnsEveryGroupWithoutAnOtherRow(t *testing.T) {
 	specs := make([]overviewSpec, 0, 210)
 	for directory := 1; directory <= 20; directory++ {
-		language := "go"
-		if directory == 1 {
-			language = "python"
-		}
 		for index := 0; index < directory; index++ {
 			specs = append(specs, overviewSpec{
 				path:     fmt.Sprintf("d%02d/file%02d.src", directory, index),
-				language: language,
+				language: "go",
 				kinds:    []model.RecordKind{model.Module, model.Definition},
 			})
 		}
 	}
 	response := overviewOf(t, specs)
-	if len(response.Groups) != 17 {
-		t.Fatalf("groups = %#v", groupPrefixes(response.Groups))
+	prefixes := groupPrefixes(response.Groups)
+	want := make([]string, 0, 20)
+	for directory := 20; directory >= 1; directory-- {
+		want = append(want, fmt.Sprintf("d%02d/", directory))
 	}
-	if got, want := groupPrefixes(response.Groups)[0], "d20/"; got != want {
-		t.Fatalf("first group = %q, want %q", got, want)
+	if !reflect.DeepEqual(prefixes, want) {
+		t.Fatalf("group prefixes = %#v, want %#v", prefixes, want)
 	}
-	if got, want := response.Groups[16].PathPrefix, "*"; got != want {
-		t.Fatalf("last group = %q, want %q", got, want)
+	if summary := (wire.OverviewSummary{Root: "", CountedFileCount: 210, OtherGroupCount: 0}); response.Overview != summary {
+		t.Fatalf("summary = %#v, want %#v", response.Overview, summary)
 	}
-	other := response.Groups[16]
-	if other.Depth != 0 || other.FileCount != 10 || other.DefinitionCount != 10 || other.RepresentativeIdentity != nil {
-		t.Fatalf("other row = %#v", other)
-	}
-	if got, want := other.Languages, []wire.OverviewLanguage{{Language: "go", FileCount: 9}, {Language: "python", FileCount: 1}}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("other languages = %#v, want %#v", got, want)
-	}
-	if want := (wire.OverviewSummary{Root: "", CountedFileCount: 210, OtherGroupCount: 4}); response.Overview != want {
-		t.Fatalf("summary = %#v, want %#v", response.Overview, want)
-	}
-	// The folded directories keep their files out of the file layer.
+	// Every group offers its files to the round-robin, including the smallest
+	// ones a fixed row cap used to fold out of the table altogether.
+	smallest := false
 	for _, path := range recordPaths(response.Records) {
-		if strings.HasPrefix(path, "d01/") || strings.HasPrefix(path, "d04/") {
-			t.Fatalf("folded directory reached the file layer: %q", path)
+		if strings.HasPrefix(path, "d01/") {
+			smallest = true
 		}
+	}
+	if !smallest {
+		t.Fatalf("the smallest group never reached the file layer: %#v", recordPaths(response.Records))
+	}
+}
+
+// A repository wide enough to fill sixty rows is returned whole and in the
+// table order — definitions descending, then files, then prefix — so a caller
+// that can afford the whole table gets it.
+func TestOverviewReturnsAWideTableWholeAndOrdered(t *testing.T) {
+	specs := make([]overviewSpec, 0, 120)
+	for directory := 1; directory <= 60; directory++ {
+		specs = append(specs, overviewDirectory(fmt.Sprintf("d%02d/", directory), 2)...)
+	}
+	response := overviewOf(t, specs)
+	if len(response.Groups) != 60 {
+		t.Fatalf("groups = %d, want 60: %#v", len(response.Groups), groupPrefixes(response.Groups))
+	}
+	// Every group holds the same counters here, so the prefix tie-break alone
+	// decides the order and the whole table is one ascending run.
+	prefixes := groupPrefixes(response.Groups)
+	if !sort.StringsAreSorted(prefixes) {
+		t.Fatalf("group prefixes are not ordered: %#v", prefixes)
+	}
+	for _, group := range response.Groups {
+		if group.PathPrefix == "*" || group.RepresentativeIdentity == nil {
+			t.Fatalf("group = %#v, want a real directory with a representative", group)
+		}
+	}
+	if response.Overview.OtherGroupCount != 0 {
+		t.Fatalf("other group count = %d, want 0", response.Overview.OtherGroupCount)
 	}
 }
 
@@ -674,7 +691,7 @@ func TestOverviewSelectsFilesRoundRobinAcrossGroups(t *testing.T) {
 }
 
 // maximum_results bounds the file layer alone; every counted file the layer
-// left out is an omission, including the files of the folded "*" row.
+// left out is an omission, whichever group holds it.
 func TestOverviewBoundsTheFileLayerByMaximumResults(t *testing.T) {
 	specs := make([]overviewSpec, 0, 9)
 	for _, directory := range []string{"a/", "b/", "c/"} {

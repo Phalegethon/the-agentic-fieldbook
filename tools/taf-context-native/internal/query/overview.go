@@ -13,6 +13,9 @@ import (
 
 // The grouping and ranking constants live here alone. The wire only bounds how
 // many rows a result may carry; how the table is shaped is this file's rule.
+// No constant here counts rows: the table is as wide as the repository's own
+// shape makes it, and a caller who cannot afford all of it says so with its
+// output budget, which the consumer applies to the table this file returns.
 const (
 	// A group is replaced by its children while it holds more than 40 % of the
 	// counted files, so one dominant directory cannot stand for a repository.
@@ -21,14 +24,7 @@ const (
 	// A split never reaches deeper than four directory segments below the
 	// overview root: below that a table stops describing and starts listing.
 	maximumOverviewDepth = 4
-	// Splitting stops once the table reaches twelve groups. One split may push
-	// the count past it; the fold below trims whatever is left over.
-	overviewSplitCeiling = 12
-	// The table keeps sixteen groups and folds the surplus into one "*" row,
-	// which is why the wire admits at most seventeen.
-	maximumOverviewGroups = 16
-	overviewOtherPrefix   = "*"
-	overviewRootPrefix    = "."
+	overviewRootPrefix   = "."
 )
 
 // File rank tiers, lower is better. Every counted file has one, so the file
@@ -98,18 +94,22 @@ type overviewCounters struct {
 	configurations int
 }
 
-// Overview answers how a repository is organized: a bounded table of directory
+// Overview answers how a repository is organized: the whole table of directory
 // groups with counts, and a ranked file layer spread across those groups. It
 // walks the path-sorted records once, charging one work-budget unit per record
-// visited, and never resolves anything or reopens a file.
+// visited, and never resolves anything or reopens a file. The engine folds
+// nothing away and reports no folded group, so a consumer that has to fit the
+// answer into an output budget still has every row to choose from.
 func Overview(snapshot store.Snapshot, request wire.Request, limits policy.Limits) Response {
 	budget := newWorkBudget(limits, len(snapshot.Records))
 	root, extraPrefixes := overviewRoot(request.Filters.PathPrefixes)
 	rooted := false
-	finish := func(records []model.Record, omitted int, partial bool, rows []wire.OverviewGroup, counted, folded int) Response {
+	finish := func(records []model.Record, omitted int, partial bool, rows []wire.OverviewGroup, counted int) Response {
 		response := budget.response(records, omitted, partial)
 		response.Groups = rows
-		response.Overview = wire.OverviewSummary{Root: root, CountedFileCount: counted, OtherGroupCount: folded}
+		// The engine never folds a row away, so the count of the groups a "*"
+		// row stands for is zero here and stays the consumer's to raise.
+		response.Overview = wire.OverviewSummary{Root: root, CountedFileCount: counted, OtherGroupCount: 0}
 		response.ExtraPathPrefixes = extraPrefixes
 		// A requested root the walk never reached a path under is named but
 		// not a directory of this repository. A walk a budget cut short
@@ -119,24 +119,17 @@ func Overview(snapshot store.Snapshot, request wire.Request, limits policy.Limit
 	}
 	// An empty snapshot examines nothing and is not exhausted.
 	if budget.maximum < 1 {
-		return finish([]model.Record{}, 0, false, []wire.OverviewGroup{}, 0, 0)
+		return finish([]model.Record{}, 0, false, []wire.OverviewGroup{}, 0)
 	}
 	files, partial, rooted := overviewFiles(snapshot, request, root, budget)
 	groups := overviewDirectoryGroups(files)
-	kept, folded := groups, []overviewDirectoryGroup(nil)
-	if len(groups) > maximumOverviewGroups {
-		kept, folded = groups[:maximumOverviewGroups], groups[maximumOverviewGroups:]
+	rows := make([]wire.OverviewGroup, 0, len(groups))
+	for index := range groups {
+		rankOverviewFiles(groups[index].files, files)
+		rows = append(rows, overviewRow(root, groups[index], files, limits))
 	}
-	rows := make([]wire.OverviewGroup, 0, len(kept)+1)
-	for index := range kept {
-		rankOverviewFiles(kept[index].files, files)
-		rows = append(rows, overviewRow(root, kept[index], files, limits))
-	}
-	if len(folded) != 0 {
-		rows = append(rows, foldedOverviewRow(folded, files, limits))
-	}
-	selected := selectOverviewFiles(kept, files, request.MaximumResults)
-	return finish(selected, len(files)-len(selected), partial, rows, len(files), len(folded))
+	selected := selectOverviewFiles(groups, files, request.MaximumResults)
+	return finish(selected, len(files)-len(selected), partial, rows, len(files))
 }
 
 // overviewRoot normalizes the requested subtree into a directory prefix a
@@ -355,9 +348,15 @@ func directoryOf(path string) string {
 // overviewDirectoryGroups builds the adaptive-depth table: one group per
 // top-level directory under the root, split while a group dominates, then
 // ordered by what a reader is looking for — where the definitions are.
+//
+// The loop ends because every split replaces one group by children that are
+// either a directory one segment deeper — which maximumOverviewDepth stops —
+// or the "<dir>/." group of the files sitting directly inside it, which names
+// no directory to descend into and is never splittable. Nothing else can end
+// it: how many rows the table already holds is not part of the rule.
 func overviewDirectoryGroups(files []fileFacts) []overviewDirectoryGroup {
 	groups := childOverviewGroups("", 0, indexRange(len(files)), files)
-	for len(groups) < overviewSplitCeiling {
+	for {
 		chosen := -1
 		var children []overviewDirectoryGroup
 		for index := range groups {
@@ -445,7 +444,9 @@ func descendableOverviewChild(candidates []overviewDirectoryGroup) bool {
 }
 
 // largerOverviewGroup breaks a tie on "largest" by path, so which group a split
-// picks never depends on the order the groups happened to be built in.
+// picks never depends on the order the groups happened to be built in. Since
+// no ceiling can stop the loop early, every group above the threshold is split
+// before it ends and this only decides the order the work is done in.
 func largerOverviewGroup(candidate, current overviewDirectoryGroup) bool {
 	if len(candidate.files) != len(current.files) {
 		return len(candidate.files) > len(current.files)
@@ -518,23 +519,6 @@ func overviewRow(root string, group overviewDirectoryGroup, files []fileFacts, l
 	}
 }
 
-// foldedOverviewRow sums the groups the table had no room for. It stands for
-// several directories and therefore represents no single file.
-func foldedOverviewRow(folded []overviewDirectoryGroup, files []fileFacts, limits policy.Limits) wire.OverviewGroup {
-	row := wire.OverviewGroup{PathPrefix: overviewOtherPrefix}
-	indexes := make([]int, 0, len(folded))
-	for _, group := range folded {
-		row.FileCount += group.counters.files
-		row.DefinitionCount += group.counters.definitions
-		row.EntryPointCount += group.counters.entryPoints
-		row.DocumentCount += group.counters.documents
-		row.ConfigurationCount += group.counters.configurations
-		indexes = append(indexes, group.files...)
-	}
-	row.Languages = overviewLanguages(indexes, files, limits)
-	return row
-}
-
 // overviewLanguages counts the files of a group by language, most files first
 // and ties by name. The list is bounded by the request's own injected limits,
 // the same bound Overview already applies to its work budget, not by a fixed
@@ -561,14 +545,15 @@ func overviewLanguages(indexes []int, files []fileFacts, limits policy.Limits) [
 	return languages
 }
 
-// selectOverviewFiles spreads the file layer over the kept groups: each round
-// takes every group's next best file, so a dominant directory cannot fill the
-// answer on its own. The folded "*" row has no files to offer.
-func selectOverviewFiles(kept []overviewDirectoryGroup, files []fileFacts, maximum int) []model.Record {
+// selectOverviewFiles spreads the file layer over the table: each round takes
+// every group's next best file, so a dominant directory cannot fill the answer
+// on its own and no group is left out of the rounds. maximum_results is what
+// bounds the layer, however wide the table is.
+func selectOverviewFiles(groups []overviewDirectoryGroup, files []fileFacts, maximum int) []model.Record {
 	selected := make([]model.Record, 0, min(max(0, maximum), len(files)))
 	for round := 0; len(selected) < maximum; round++ {
 		offered := false
-		for _, group := range kept {
+		for _, group := range groups {
 			if round >= len(group.files) {
 				continue
 			}

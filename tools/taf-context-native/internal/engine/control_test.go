@@ -107,7 +107,7 @@ func TestBuildThenStatusAndMetricsAreExactAndDoNotLeakFindings(t *testing.T) {
 }
 
 // TestBuildPublishesFormat3ManifestAtEngineVersion pins the versions a store
-// format v4 index is published under: manifest format "3", engine 0.5.0, and
+// format v4 index is published under: manifest format "3", engine 0.6.0, and
 // the same engine version reported back as the provider version.
 func TestBuildPublishesFormat3ManifestAtEngineVersion(t *testing.T) {
 	repository, state := controlRoots(t)
@@ -125,11 +125,11 @@ func TestBuildPublishesFormat3ManifestAtEngineVersion(t *testing.T) {
 	if built.Status != wire.Ready {
 		t.Fatalf("build = %#v", built)
 	}
-	if published.FormatVersion != "3" || published.EngineVersion != "0.5.0" {
-		t.Fatalf("manifest format = %q engine = %q, want \"3\" and \"0.5.0\"", published.FormatVersion, published.EngineVersion)
+	if published.FormatVersion != "3" || published.EngineVersion != "0.6.0" {
+		t.Fatalf("manifest format = %q engine = %q, want \"3\" and \"0.6.0\"", published.FormatVersion, published.EngineVersion)
 	}
-	if built.ProviderVersion != "0.5.0" {
-		t.Fatalf("provider version = %q, want 0.5.0", built.ProviderVersion)
+	if built.ProviderVersion != "0.6.0" {
+		t.Fatalf("provider version = %q, want 0.6.0", built.ProviderVersion)
 	}
 }
 

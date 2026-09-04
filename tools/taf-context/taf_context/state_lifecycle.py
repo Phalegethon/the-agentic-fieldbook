@@ -13,7 +13,7 @@ from typing import Iterator
 
 from .state_paths import StateError
 
-CURRENT_RUNTIME_VERSION = "0.5.0"
+CURRENT_RUNTIME_VERSION = "0.6.0"
 
 REPOSITORIES_DIRECTORY = "repositories"
 RUNTIME_DIRECTORY = "runtime"
