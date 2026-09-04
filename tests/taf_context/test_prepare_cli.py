@@ -1830,7 +1830,10 @@ class QueryArgumentTests(unittest.TestCase):
         parser = argparse.ArgumentParser()
         register_prepare_command(parser.add_subparsers(dest="command"))
         args = parser.parse_args(["prepare", "query", "--repo", ".", "--operation", "repository-map"])
-        self.assertEqual(args.maximum_output_characters, 4000)
+        # The flag carries no default of its own: the budget an unbudgeted
+        # query answers with belongs to the operation.
+        self.assertIsNone(args.maximum_output_characters)
+        self.assertEqual(_validate_query_arguments(args)[3], 4000)
 
     def test_filter_values_are_lower_cased_deduplicated_and_sorted(self) -> None:
         self.assertEqual(
@@ -2061,7 +2064,7 @@ class QueryArgumentInvariantTests(unittest.TestCase):
 
     def _cli_arguments(self, parser: argparse.ArgumentParser, *argv: str) -> QueryArguments:
         args = parser.parse_args(list(argv))
-        query_text, result_identities, base = _validate_query_arguments(args)
+        query_text, result_identities, base, output_characters = _validate_query_arguments(args)
         return QueryArguments(
             operation=args.operation,
             query=query_text,
@@ -2075,7 +2078,7 @@ class QueryArgumentInvariantTests(unittest.TestCase):
             ),
             source_types=sorted(set(args.source_type)),
             maximum_results=args.maximum_results,
-            maximum_output_characters=args.maximum_output_characters,
+            maximum_output_characters=output_characters,
             allow_inferred=args.allow_inferred,
         )
 
@@ -2116,6 +2119,21 @@ class QueryArgumentInvariantTests(unittest.TestCase):
                 run_query(repo, cli, environment=environment, transport_for=OneShotTransport),
                 run_query(repo, mcp, environment=environment, transport_for=OneShotTransport),
             )
+
+    def test_both_surfaces_default_the_output_budget_by_operation(self) -> None:
+        """The overview's table alone fills 4000 characters, so both default to 8000."""
+        parser = argparse.ArgumentParser()
+        register_prepare_command(parser.add_subparsers(dest="command", required=True))
+        for operation, expected in (("repository-overview", 8000), ("repository-map", 4000)):
+            with self.subTest(operation=operation):
+                cli = self._cli_arguments(
+                    parser,
+                    "prepare", "query", "--repo", "/repo", "--operation", operation,
+                )
+                mcp = _query_arguments(operation, {"repo": "/repo"})
+                self.assertEqual(cli.maximum_output_characters, expected)
+                self.assertEqual(mcp.maximum_output_characters, expected)
+                self.assertEqual(cli, mcp)
 
     def test_both_surfaces_answer_a_change_query_identically(self) -> None:
         parser = argparse.ArgumentParser()

@@ -224,14 +224,14 @@ After commits or edits the next query refreshes the bound index incrementally;
 a full rebuild is only asked for after a runtime upgrade.
 
 Once ready, the same skill can answer repository-overview, repository-map,
-symbol, documentation, and relationship questions with bounded results. Findings carry paths, line
-ranges, evidence class, and a one-line preview; multi-word queries intersect
-their words, and `--language`, `--symbol-kind`, and `--path-prefix` filters
-narrow them. A relationship question ("who calls X", "what does X depend
-on", "who uses module M") is answered in two steps: a query that finds the
-symbol, then `related-symbols --result-id <identity> --direction
-callers|callees|importers|imports`, whose findings additionally carry
-`relation`, `edge_evidence`, `reference_line`, and `reference_count`. The
+symbol, documentation, and relationship questions with bounded results.
+Findings carry paths, line ranges, evidence class, and a one-line preview;
+multi-word queries intersect their words, and `--language`, `--symbol-kind`,
+and `--path-prefix` filters narrow them. A relationship question ("who calls
+X", "what does X depend on", "who uses module M") is answered in two steps: a
+query that finds the symbol, then `related-symbols --result-id <identity>
+--direction callers|callees|importers|imports`, whose findings additionally
+carry `relation`, `edge_evidence`, `reference_line`, and `reference_count`. The
 skill's `references/query-routing.md` maps questions to queries and
 `references/result-contract.md` explains `status`, `truncated`,
 `omitted_count`, and the relationship fields. It retrieves source snippets
@@ -245,8 +245,9 @@ described root and the counted files; and a ranked file layer that leads with
 entry points and well-known entry file names such as `main.go` under `cmd/` or
 `index.ts`. `--path-prefix D/` describes one subtree, and `--language` counts
 one language's files. The table is never trimmed, so the output budget takes
-the file layer first: ask for `--maximum-output-characters 8000` or `12000`
-when the answer should carry files as well as the table.
+the file layer first: this operation defaults to 8000 characters rather than
+the 4000 the other queries use, and `--maximum-output-characters 12000` buys
+more files still.
 
 A change question is answered in one step and needs no identity.
 `query --operation changed-symbols` reports the definitions, entry points,
@@ -281,8 +282,9 @@ TAF bundles an MCP stdio server, `repo-context`, that exposes the same
 operations as `prepare-repo-context` as tools: `inspect`, `build`,
 `repository_map`, `search_symbols`, `search_docs`, `source_snippets`,
 `related_symbols`, `changed_symbols`, `impact_candidates`, and
-`repository_overview`. Every tool takes the absolute `repo` path; `build` requires `confirm_state_write: true`
-and is marked so the host asks before running it.
+`repository_overview`. Every tool takes the absolute `repo` path; `build`
+requires `confirm_state_write: true` and is marked so the host asks before
+running it.
 The server never installs the native engine, never contacts the network, and
 never runs `gc` or `remove`; those and `activate` stay skill commands. A query
 on a bound index may refresh it incrementally and prune superseded index

@@ -19,6 +19,7 @@ from .context_operations import (
     QUERY_DIRECTIONS,
     QueryArguments,
     _SHA256,
+    default_output_characters,
     normalize_change_base,
     normalize_filter_values,
     run_build,
@@ -348,8 +349,10 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "together. Start here in an unfamiliar repository, then narrow with "
                 "path_prefixes to answer 'what is in directory D'; several path_prefixes "
                 "are not composed, so the first in sorted order becomes the root and the "
-                "warning overview-root-first-prefix says so. The group table is never "
-                "trimmed: when the serialized answer is longer than "
+                "warning overview-root-first-prefix says so. A path_prefix names whole "
+                "directory segments, so a file path or a partial segment answers with an "
+                "empty table and the warning overview-root-not-a-directory. The group "
+                "table is never trimmed: when the serialized answer is longer than "
                 "maximum_output_characters the warning output-budget-exceeded says so, and "
                 "a larger budget or fewer maximum_results is the way to fit it. "
                 "maximum_output_characters defaults to 8000 here, not the other tools' "
@@ -423,13 +426,6 @@ def _in_enum(allowed: list[Any], value: Any) -> bool:
     return value in allowed
 
 
-# repository-overview's group table alone is about 3700 characters of
-# canonical JSON, so it gets a tool-specific default output budget of 8000;
-# every other operation keeps the shared default of 4000.
-_DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION: dict[str, int] = {"repository-overview": 8000}
-_DEFAULT_OUTPUT_CHARACTERS = 4000
-
-
 def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArguments:
     query = arguments.get("query")
     if operation in {"search-symbols", "search-docs"} and (
@@ -478,13 +474,10 @@ def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArgument
         symbol_kinds=symbol_kinds,
         source_types=source_types,
         maximum_results=int(arguments.get("maximum_results", 8)),
+        # The operation's own default lives in the broker, so this surface and
+        # the CLI answer an unbudgeted request with the same budget.
         maximum_output_characters=int(
-            arguments.get(
-                "maximum_output_characters",
-                _DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION.get(
-                    operation, _DEFAULT_OUTPUT_CHARACTERS
-                ),
-            )
+            arguments.get("maximum_output_characters", default_output_characters(operation))
         ),
         allow_inferred=bool(arguments.get("allow_inferred", False)),
     )

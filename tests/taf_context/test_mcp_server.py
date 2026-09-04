@@ -217,9 +217,13 @@ class ToolListTests(unittest.TestCase):
                 "repo",
             ],
         )
-        # The two warnings only this operation can raise are named where the
-        # model reads them.
-        for warning in ("overview-root-first-prefix", "output-budget-exceeded"):
+        # The warnings this operation can raise are named where the model
+        # reads them.
+        for warning in (
+            "overview-root-first-prefix",
+            "overview-root-not-a-directory",
+            "output-budget-exceeded",
+        ):
             self.assertIn(warning, tools["repository_overview"]["description"])
 
     def test_the_overview_tool_defaults_to_a_larger_output_budget(self) -> None:

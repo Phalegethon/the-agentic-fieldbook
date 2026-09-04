@@ -81,6 +81,7 @@ func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, s
 		groups        *[]wire.OverviewGroup
 		overview      *wire.OverviewSummary
 		extraPrefixes bool
+		rootUnmatched bool
 	)
 	switch request.Operation {
 	case wire.RepositoryMap:
@@ -114,6 +115,9 @@ func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, s
 		// A request that named more than one path prefix was served from the
 		// first of them, which is reported once, below.
 		extraPrefixes = response.ExtraPathPrefixes
+		// A root no indexed path lies under counts nothing, and only this
+		// warning tells that apart from a directory holding nothing counted.
+		rootUnmatched = response.RootUnmatched
 	default:
 		return engine.unsupported(request), nil
 	}
@@ -146,6 +150,9 @@ func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, s
 	}
 	if extraPrefixes {
 		result.Warnings = appendBoundedWarnings(result.Warnings, "overview-root-first-prefix")
+	}
+	if rootUnmatched {
+		result.Warnings = appendBoundedWarnings(result.Warnings, "overview-root-not-a-directory")
 	}
 	return result, nil
 }

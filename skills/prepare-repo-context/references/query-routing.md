@@ -23,7 +23,7 @@ Turn the user's question into exactly one bounded query. Prefer the smallest ope
 - `--language`: `go`, `javascript`, `json`, `markdown`, `python`, `rust`, `toml`, `typescript`.
 - `--symbol-kind`: `configuration`, `definition`, `document-chunk`, `entry-point`, `heading`, `import`, `module`.
 - `--source-type`: `source`, `document`, `configuration`.
-- `--path-prefix`: a repository-relative prefix such as `tools/taf-context/`. `repository-overview` reads it as whole directory segments, so a file path or a partial segment answers with an empty table there, and it describes only one subtree: several prefixes are not composed, the first in sorted order becomes the root and the warning `overview-root-first-prefix` says so.
+- `--path-prefix`: a repository-relative prefix such as `tools/taf-context/`. `repository-overview` reads it as whole directory segments, so a file path or a partial segment answers with an empty table and the warning `overview-root-not-a-directory` there, and it describes only one subtree: several prefixes are not composed, the first in sorted order becomes the root and the warning `overview-root-first-prefix` says so.
 - `--direction`: `callers`, `callees`, `importers`, `imports`. Required by `related-symbols` and rejected by every other operation. `related-symbols` also requires one or more `--result-id` values (anchor identities from an earlier query, at most 16) and accepts no `--query`.
 - `repository-overview` accepts only `--path-prefix` and `--language`; it rejects `--query`, `--result-id`, `--direction`, `--base`, `--symbol-kind`, and `--source-type`, each with a message naming the flag to drop.
 - `--base`: a Git ref or commit the change set is measured against. Accepted only by `changed-symbols` and `impact-candidates`, and rejected by every other operation; both of them reject `--query`, `--result-id`, and `--direction`.
@@ -48,7 +48,7 @@ An unknown value fails fast and the error lists the valid values.
 
 ## Overview questions
 
-- The group table is never trimmed, so the output budget takes the file layer first. At the default 4000 characters the table usually fills the answer on its own and `findings` comes back empty; ask for `--maximum-output-characters 8000` (the `repository_overview` tool's own default) or `12000` when the answer should carry files as well. Only a budget that not even the table fits in is reported as `output-budget-exceeded`.
+- The group table is never trimmed, so the output budget takes the file layer first. At 4000 characters the table usually fills the answer on its own and `findings` comes back empty, which is why this operation defaults to 8000 on both surfaces; ask for `--maximum-output-characters 12000` when the answer should carry more files. Only a budget that not even the table fits in is reported as `output-budget-exceeded`.
 - Read the table first and query second: a group's `representative_identity` and every file-layer finding is an ordinary record identity, never a `reference`, so `source-snippets` can fetch one without another search; `related-symbols` still needs an identity that names a `definition`, `module`, or `entry-point` record.
 - Narrow with `--path-prefix D/` to describe one subtree, or with `--language` to count only that language's files. Neither changes what a row means: prefixes stay relative to the repository root.
 

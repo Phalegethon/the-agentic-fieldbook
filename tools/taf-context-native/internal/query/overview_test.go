@@ -252,13 +252,54 @@ func TestOverviewBreaksLargestGroupTiesByPath(t *testing.T) {
 	}
 }
 
-// A directory with a single child is never replaced by it: the split rule asks
-// for at least two children, so an overview cannot walk down a chain of
-// single-child directories and still describe one group.
-func TestOverviewKeepsADirectoryWithASingleChild(t *testing.T) {
+// The descent stops at a group whose only child is the files sitting directly
+// inside it: "<dir>/." names no directory to descend into, so replacing the
+// group by it would only lengthen the prefix.
+func TestOverviewStopsAtADirectoryWhoseOnlyChildIsItsOwnFiles(t *testing.T) {
 	response := overviewOf(t, overviewDirectory("a/b/", 4))
-	if got, want := groupPrefixes(response.Groups), []string{"a/"}; !reflect.DeepEqual(got, want) {
+	if got, want := groupPrefixes(response.Groups), []string{"a/b/"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("group prefixes = %#v, want %#v", got, want)
+	}
+}
+
+// A dominant subtree reached through an intervening directory still splits at
+// its own branch point: the group whose only child is one directory is
+// replaced by that child, and the split looks again from there.
+func TestOverviewDescendsThroughASingleDirectoryChild(t *testing.T) {
+	var specs []overviewSpec
+	for _, leaf := range []string{"alpha", "beta", "gamma", "delta", "epsilon"} {
+		specs = append(specs, overviewDirectory("src/all/"+leaf+"/", 12)...)
+	}
+	for index := 0; index < 3; index++ {
+		specs = append(specs, overviewDirectory(fmt.Sprintf("side%d/", index), 1)...)
+	}
+	response := overviewOf(t, specs)
+	prefixes := append([]string(nil), groupPrefixes(response.Groups)...)
+	sort.Strings(prefixes)
+	want := []string{
+		"side0/", "side1/", "side2/",
+		"src/all/alpha/", "src/all/beta/", "src/all/delta/", "src/all/epsilon/", "src/all/gamma/",
+	}
+	if !reflect.DeepEqual(prefixes, want) {
+		t.Fatalf("group prefixes = %#v, want %#v", prefixes, want)
+	}
+	if leaf := groupNamed(t, response.Groups, "src/all/alpha/"); leaf.Depth != 3 || leaf.FileCount != 12 {
+		t.Fatalf("src/all/alpha/ group = %#v", leaf)
+	}
+	if response.Overview.CountedFileCount != 63 {
+		t.Fatalf("counted = %d, want 63", response.Overview.CountedFileCount)
+	}
+}
+
+// A chain with no branch point inside the depth cap is still one row, at the
+// longest prefix the cap allows rather than at the shortest one.
+func TestOverviewDescendsASingleChildChainToTheDepthCap(t *testing.T) {
+	response := overviewOf(t, overviewDirectory("a/b/c/d/e/f/", 6))
+	if got, want := groupPrefixes(response.Groups), []string{"a/b/c/d/"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("group prefixes = %#v, want %#v", got, want)
+	}
+	if deepest := groupNamed(t, response.Groups, "a/b/c/d/"); deepest.Depth != 4 || deepest.FileCount != 6 {
+		t.Fatalf("deepest group = %#v", deepest)
 	}
 }
 
@@ -429,6 +470,34 @@ func TestOverviewRootsAtTheFirstOfSeveralPrefixes(t *testing.T) {
 	single := overviewOf(t, specs, withPathPrefixes("alpha/"))
 	if single.ExtraPathPrefixes {
 		t.Fatal("a single prefix is not an extra prefix")
+	}
+}
+
+// A root no indexed path lies under is reported, so a caller can tell "you
+// named a file, not a directory" from "that subtree holds nothing counted".
+func TestOverviewReportsARootNoIndexedPathLiesUnder(t *testing.T) {
+	specs := []overviewSpec{
+		goFile("pkg/a.go", model.Module, model.Definition),
+		documentFile("README.md"),
+	}
+	response := overviewOf(t, specs, withPathPrefixes("README.md"))
+	if response.Overview.Root != "README.md/" || response.Overview.CountedFileCount != 0 {
+		t.Fatalf("summary = %#v", response.Overview)
+	}
+	if !response.RootUnmatched {
+		t.Fatal("a root no path lies under must be reported to the caller")
+	}
+	if directory := overviewOf(t, specs, withPathPrefixes("pkg")); directory.RootUnmatched {
+		t.Fatal("a directory that counts files is not an unmatched root")
+	}
+	// A filter that admits nothing under a real directory is a different
+	// answer from a root that names no directory at all, and stays silent.
+	filtered := overviewOf(t, specs, withPathPrefixes("pkg"), withLanguages("rust"))
+	if filtered.Overview.CountedFileCount != 0 || filtered.RootUnmatched {
+		t.Fatalf("filtered = %#v, unmatched = %v", filtered.Overview, filtered.RootUnmatched)
+	}
+	if whole := overviewOf(t, specs); whole.RootUnmatched {
+		t.Fatal("the whole repository is never an unmatched root")
 	}
 }
 

@@ -36,6 +36,12 @@ type Response struct {
 	// one path prefix, so the overview was rooted at the first of them in
 	// sorted order, which the caller turns into one warning.
 	ExtraPathPrefixes bool
+	// RootUnmatched is set by Overview alone: the request named a root no
+	// indexed path lies under, so the empty table means "that is not a
+	// directory of this repository" rather than "nothing there was counted".
+	// It stays false for the whole repository and for a walk a budget cut
+	// short, which proves nothing about the paths it never reached.
+	RootUnmatched bool
 }
 
 // Match tiers, lower is better. Fuzzy tiers add the edit distance.

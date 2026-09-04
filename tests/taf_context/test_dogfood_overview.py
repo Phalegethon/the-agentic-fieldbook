@@ -265,5 +265,20 @@ class DogfoodOverviewTests(unittest.TestCase):
         self.assertEqual(result["overview"]["counted_file_count"], counted)
 
 
+    def test_a_root_that_is_not_a_directory_is_answered_with_a_warning(self) -> None:
+        # README.md is a real path at the pinned commit but not a directory, so
+        # the table is empty and the warning is what tells that apart from a
+        # directory the query counted nothing in.
+        _text, result = self._overview("README.md")
+        self.assertEqual(result["status"], "ready")
+        self.assertIn("overview-root-not-a-directory", result["warnings"])
+        self.assertEqual(result["overview"]["root"], "README.md/")
+        self.assertEqual(result["overview"]["counted_file_count"], 0)
+        self.assertEqual(result["groups"], [])
+        # A real directory answers without it.
+        _subtree_text, subtree = self._overview("tools")
+        self.assertNotIn("overview-root-not-a-directory", subtree["warnings"])
+
+
 if __name__ == "__main__":
     unittest.main()

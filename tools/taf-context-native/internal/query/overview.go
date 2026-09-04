@@ -105,18 +105,23 @@ type overviewCounters struct {
 func Overview(snapshot store.Snapshot, request wire.Request, limits policy.Limits) Response {
 	budget := newWorkBudget(limits, len(snapshot.Records))
 	root, extraPrefixes := overviewRoot(request.Filters.PathPrefixes)
+	rooted := false
 	finish := func(records []model.Record, omitted int, partial bool, rows []wire.OverviewGroup, counted, folded int) Response {
 		response := budget.response(records, omitted, partial)
 		response.Groups = rows
 		response.Overview = wire.OverviewSummary{Root: root, CountedFileCount: counted, OtherGroupCount: folded}
 		response.ExtraPathPrefixes = extraPrefixes
+		// A requested root the walk never reached a path under is named but
+		// not a directory of this repository. A walk a budget cut short
+		// reached only part of the paths, so it makes no such claim.
+		response.RootUnmatched = root != "" && !rooted && !partial
 		return response
 	}
 	// An empty snapshot examines nothing and is not exhausted.
 	if budget.maximum < 1 {
 		return finish([]model.Record{}, 0, false, []wire.OverviewGroup{}, 0, 0)
 	}
-	files, partial := overviewFiles(snapshot, request, root, budget)
+	files, partial, rooted := overviewFiles(snapshot, request, root, budget)
 	groups := overviewDirectoryGroups(files)
 	kept, folded := groups, []overviewDirectoryGroup(nil)
 	if len(groups) > maximumOverviewGroups {
@@ -162,8 +167,10 @@ func overviewRoot(prefixes []string) (string, bool) {
 
 // overviewFiles derives one fileFacts per counted path. Paths arrive from the
 // map groups, so a path represented only by references contributes nothing,
-// and a path whose records are all inadmissible is not counted at all.
-func overviewFiles(snapshot store.Snapshot, request wire.Request, root string, budget *workBudget) ([]fileFacts, bool) {
+// and a path whose records are all inadmissible is not counted at all. The
+// last return value reports whether any indexed path lies under the root at
+// all, which is a different question from how many of them were counted.
+func overviewFiles(snapshot store.Snapshot, request wire.Request, root string, budget *workBudget) ([]fileFacts, bool, bool) {
 	// The overview counts files, so the two symbol-shaped filters are dropped
 	// before the shared record predicate is built: the wire already refuses
 	// them for this operation, and honouring them here would drop a file whose
@@ -175,21 +182,23 @@ func overviewFiles(snapshot store.Snapshot, request wire.Request, root string, b
 	groups, partial := snapshot.Query.MapGroups()
 	ordinals := snapshot.Query.PathOrdinals()
 	files := make([]fileFacts, 0, len(groups))
+	rooted := false
 	for _, group := range groups {
 		if !strings.HasPrefix(group.Path, root) {
 			continue
 		}
+		rooted = true
 		facts, counted, stopped := overviewFileFacts(snapshot, ordinals, group.Path, root, predicate, budget)
 		// A walk the budget cut short proves nothing about the paths it never
 		// reached, so the table it could build is reported as partial evidence.
 		if stopped {
-			return files, true
+			return files, true, rooted
 		}
 		if counted {
 			files = append(files, facts)
 		}
 	}
-	return files, partial
+	return files, partial, rooted
 }
 
 // overviewFileFacts scans one path's slice of the canonical path index. Two raw
@@ -358,10 +367,12 @@ func overviewDirectoryGroups(files []fileFacts) []overviewDirectoryGroup {
 			if chosen >= 0 && !largerOverviewGroup(groups[index], groups[chosen]) {
 				continue
 			}
-			// A directory with a single child describes exactly what its child
-			// describes, so replacing it would only make the table deeper.
+			// A group whose only child is one directory describes exactly what
+			// that directory describes, so it is replaced by it and the split
+			// looks again from there; a lone "<dir>/." child names no
+			// directory to descend into and only lengthens the prefix.
 			candidates := childOverviewGroups(groups[index].prefix, groups[index].depth, groups[index].files, files)
-			if len(candidates) < 2 {
+			if len(candidates) < 2 && !descendableOverviewChild(candidates) {
 				continue
 			}
 			chosen, children = index, candidates
@@ -416,13 +427,21 @@ func childOverviewGroups(parent string, depth int, indexes []int, files []fileFa
 }
 
 // splittableOverviewGroup applies the size and depth halves of the split rule.
-// The "at least two children" half needs the children themselves and is
-// checked by the caller.
+// The half about the children themselves — at least two of them, or the one
+// directory the split descends into — needs the children and is checked by
+// the caller.
 func splittableOverviewGroup(group overviewDirectoryGroup, counted int) bool {
 	if !strings.HasSuffix(group.prefix, "/") || group.depth >= maximumOverviewDepth {
 		return false
 	}
 	return len(group.files)*overviewSplitDenominator > counted*overviewSplitNumerator
+}
+
+// descendableOverviewChild reports whether a group's only child is a directory
+// the split may descend into. Each descent adds a segment of depth, so
+// splittableOverviewGroup ends the chain at maximumOverviewDepth.
+func descendableOverviewChild(candidates []overviewDirectoryGroup) bool {
+	return len(candidates) == 1 && strings.HasSuffix(candidates[0].prefix, "/")
 }
 
 // largerOverviewGroup breaks a tie on "largest" by path, so which group a split

@@ -655,6 +655,12 @@ CHANGE_QUERY_OPERATIONS = ("changed-symbols", "impact-candidates")
 # The operation that answers with a directory table instead of a ranked
 # search: it names no query, no anchor, no direction, and no base.
 OVERVIEW_QUERY_OPERATION = "repository-overview"
+# The output budget an operation answers with when the caller names none.
+# repository-overview's group table alone is about 3700 characters of
+# canonical JSON, so it gets a larger default than the shared 4000 and both
+# surfaces resolve it here, which is what keeps them from drifting apart.
+DEFAULT_OUTPUT_CHARACTERS = 4000
+DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION: dict[str, int] = {OVERVIEW_QUERY_OPERATION: 8000}
 # The composed operation asks the engine for the widest change set and the
 # widest relationship answer it will give, then trims what it composed to the
 # caller's own budget.
@@ -679,6 +685,11 @@ MAXIMUM_REQUEST_BYTES = 256 * 1024
 # worst frame the engine would still accept.
 _SELECTOR_RESERVE_BYTES = 48 * 1024
 MAXIMUM_CHANGED_SELECTOR_BYTES = MAXIMUM_REQUEST_BYTES - _SELECTOR_RESERVE_BYTES
+
+
+def default_output_characters(operation: str) -> int:
+    """The output budget one operation answers with when the caller names none."""
+    return DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION.get(operation, DEFAULT_OUTPUT_CHARACTERS)
 
 
 def normalize_change_base(base: str | None) -> str | None:

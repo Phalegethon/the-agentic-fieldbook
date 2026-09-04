@@ -857,6 +857,44 @@ func TestRepositoryOverviewWarnsWhenSeveralPrefixesAreRequested(t *testing.T) {
 	}
 }
 
+// A path prefix that names no directory answers with an empty table, and the
+// warning is what tells the caller a file path was named rather than a
+// directory that happens to hold nothing.
+func TestRepositoryOverviewWarnsWhenTheRootIsNotADirectory(t *testing.T) {
+	repository, state := overviewRoots(t)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, testCase := range []struct {
+		name    string
+		prefix  string
+		warned  bool
+		counted int
+	}{
+		{name: "a file path", prefix: "config.json", warned: true},
+		{name: "a partial segment", prefix: "doc", warned: true},
+		{name: "a directory", prefix: "docs", counted: 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			envelope := controlEnvelope(wire.RepositoryOverview, repository, state, built.IndexIdentity)
+			envelope.Request.SchemaVersion = "4"
+			envelope.Request.Filters.PathPrefixes = []string{testCase.prefix}
+			result, err := engine.Execute(context.Background(), envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Overview == nil || result.Overview.CountedFileCount != testCase.counted {
+				t.Fatalf("summary = %#v, want %d counted", result.Overview, testCase.counted)
+			}
+			if got := hasWarning(result.Warnings, "overview-root-not-a-directory"); got != testCase.warned {
+				t.Fatalf("warnings = %#v, want the root warning = %v", result.Warnings, testCase.warned)
+			}
+		})
+	}
+}
+
 // Every schema-4 result carries the two keys the schema promises, whatever
 // status it reports and whichever operation asked: the result builder fills an
 // empty table, so a refusal under schema 4 is still encodable.
