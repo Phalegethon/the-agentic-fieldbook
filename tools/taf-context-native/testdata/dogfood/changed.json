@@ -5,7 +5,7 @@
     "base": "9bce09b",
     "head": "f33d96c"
   },
-  "restriction": "The range touches 64 paths and 376 symbols, too many to hand-check, so the fixture covers three subtrees: the Python broker package, the Go wire package and the Go extractors. Every one of those paths fits a single query at the largest request settings the CLI accepts (64 results, 12000 characters), which is why the subtree of the change-heavy query package is not part of it: one file added there in the range carries 63 changed symbols and cannot be returned in one answer.",
+  "restriction": "The range touches 64 paths and 376 symbols, too many to hand-check, so the fixture covers three subtrees: the Python broker package, the Go wire package and the Go extractors. Every one of those paths fits a single query at the largest request settings the CLI accepts (64 results, 12000 characters), which is why the subtree of the change-heavy query package is not part of it: one file added there in the range carries 63 changed symbols and cannot be returned in one answer. The three subtrees change 20 paths, all 20 listed here: 18 carry at least one changed definition, and two (tools/taf-context-native/internal/extract/typescript.go, tools/taf-context/taf_context/state_lifecycle.py) carry an empty changed_symbols list because their only hunk touches no definition (a top-level query-string literal and a module-level constant), so the fixture asserts the engine returns nothing for both.",
   "unindexed_paths": [
     "tools/taf-context-native/internal/store/testdata/mixed-case-2000.bin"
   ],
@@ -434,6 +434,10 @@
       ]
     },
     {
+      "path": "tools/taf-context-native/internal/extract/typescript.go",
+      "changed_symbols": []
+    },
+    {
       "path": "tools/taf-context-native/internal/wire/decode.go",
       "changed_symbols": [
         {
@@ -855,6 +859,10 @@
           "end_line": 253
         }
       ]
+    },
+    {
+      "path": "tools/taf-context/taf_context/state_lifecycle.py",
+      "changed_symbols": []
     }
   ],
   "impact_cross_check": [

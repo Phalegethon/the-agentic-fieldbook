@@ -95,7 +95,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--related needs --mcp: the stage is measured over the warm MCP session")
     if args.impact and not args.mcp:
         parser.error("--impact needs --mcp: the stages are measured over the warm MCP session")
-    if args.base and not args.impact:
+    if args.base is not None and not args.base.strip():
+        # An empty or whitespace-only --base used to be silently ignored
+        # (the two guards below fall through it as falsy, so the stage would
+        # measure the broker-resolved base instead of the requested one); it
+        # is rejected outright instead (M8).
+        parser.error("--base must not be empty or whitespace-only")
+    if args.base is not None and not args.impact:
         parser.error("--base is only used by the --impact stages")
     if os.environ.get("TAF_DOGFOOD") != "1" or not os.environ.get("TAF_LEVEL1_BINARY"):
         print("set TAF_DOGFOOD=1 and TAF_LEVEL1_BINARY to run the latency benchmark", file=sys.stderr)

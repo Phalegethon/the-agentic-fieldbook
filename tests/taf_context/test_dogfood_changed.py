@@ -17,7 +17,11 @@ The second test cross-checks `impact-candidates` against the callers fixture:
 for every anchor of `callers.json` that this range changed, each hand-checked
 call site must come back as a verified candidate with that anchor attributed,
 and every call site that does not must be explained by one of the three
-reasons the fixture records.
+reasons the fixture records. The accounting itself is asserted against
+`callers.json`, not just trusted: the union of this fixture's attributed and
+absent call sites for an anchor must equal that anchor's full expected-caller
+set there, the two must be disjoint, and an "absent" entry must not in fact be
+an attributed candidate.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from taf_context.cli import main
 
 ROOT = Path(__file__).parents[2]
 FIXTURE = ROOT / "tools" / "taf-context-native" / "testdata" / "dogfood" / "changed.json"
+CALLERS_FIXTURE = ROOT / "tools" / "taf-context-native" / "testdata" / "dogfood" / "callers.json"
 MINIMUM_PRECISION = 0.90
 # The acceptance bound only asks for the recall to be reported. The floor
 # below is the guard that keeps the fixture honest: without it a symbol the
@@ -59,6 +64,10 @@ class DogfoodChangedTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        callers_fixture = json.loads(CALLERS_FIXTURE.read_text(encoding="utf-8"))
+        # Keyed by `id` so the cross-check test can look up the full set of
+        # hand-checked call sites for an anchor it did not itself curate (I1).
+        cls.callers_by_id = {entry["id"]: entry for entry in callers_fixture["entries"]}
         cls._directory = tempfile.TemporaryDirectory()
         directory = Path(cls._directory.name)
         cls.repository = directory / "repo"
@@ -104,7 +113,11 @@ class DogfoodChangedTests(unittest.TestCase):
     def _invoke(cls, *argv: str) -> dict[str, object]:
         stdout, stderr = StringIO(), StringIO()
         code = main(list(argv), stdout=stdout, stderr=stderr, environment=cls.environment)
-        assert (code, stderr.getvalue()) == (0, ""), (code, stderr.getvalue())
+        if (code, stderr.getvalue()) != (0, ""):
+            # A bare `assert` is removed under `python -O`, which would let a
+            # non-zero exit code slip through and surface later as an opaque
+            # JSONDecodeError instead of this clear message (M6).
+            raise AssertionError(f"CLI call {argv!r} exited {code}: {stderr.getvalue()!r}")
         return json.loads(stdout.getvalue())
 
     @classmethod
@@ -132,6 +145,29 @@ class DogfoodChangedTests(unittest.TestCase):
             )
         return cls._cache[key]
 
+    @classmethod
+    def _repository_map(cls, path_prefix: str) -> dict[str, object]:
+        # `repository-map` takes no `--base`, so this cannot share `_query`'s
+        # argument shape, but it shares its cache dict: the key namespace
+        # ("repository-map", path) never collides with the change operations'.
+        key = ("repository-map", path_prefix)
+        if key not in cls._cache:
+            cls._cache[key] = cls._invoke(
+                "prepare",
+                "query",
+                "--repo",
+                str(cls.repository),
+                "--operation",
+                "repository-map",
+                "--path-prefix",
+                path_prefix,
+                "--maximum-results",
+                MAXIMUM_RESULTS,
+                "--maximum-output-characters",
+                MAXIMUM_OUTPUT_CHARACTERS,
+            )
+        return cls._cache[key]
+
     def _assert_base_is_the_fixed_range(self, result: dict[str, object]) -> None:
         base = result["base"]
         self.assertEqual(base["requested"], self.fixture["range"]["base"])
@@ -151,9 +187,10 @@ class DogfoodChangedTests(unittest.TestCase):
             # change set, and this range does contain such a path.
             self.assertIn("changed-path-not-indexed", result["warnings"])
             self.assertFalse(result["truncated"], path)
-            self.assertEqual(
-                sorted({finding["path"] for finding in result["findings"]}), [path]
-            )
+            # Two fixture paths carry no changed definition (M1) and legitimately
+            # return zero findings, so this only constrains findings that exist.
+            for finding in result["findings"]:
+                self.assertEqual(finding["path"], path)
             spans = {
                 (finding["qualified_name"], finding["record_kind"]): (
                     finding["start_line"],
@@ -174,7 +211,12 @@ class DogfoodChangedTests(unittest.TestCase):
             returned = {key for key in spans if key[1] in MEASURED_KINDS}
             expected = {key for key in expected_spans if key[1] in MEASURED_KINDS}
             hits = returned & expected
-            for key in sorted(hits):
+            # The span check runs over every matched identity, module records
+            # included, not only the measured kinds counted below (M2): a
+            # module's span must line up with the fixture just as much as a
+            # definition's does.
+            matched_identities = spans.keys() & expected_spans.keys()
+            for key in sorted(matched_identities):
                 # The fixture carries the span the language's own parser
                 # reports, so a matched symbol must also match line for line.
                 self.assertEqual(spans[key], expected_spans[key], (path, key))
@@ -209,6 +251,23 @@ class DogfoodChangedTests(unittest.TestCase):
         self.assertGreaterEqual(summary["precision"], MINIMUM_PRECISION, summary)
         self.assertGreaterEqual(summary["recall"], MINIMUM_RECALL, summary)
 
+    def test_unindexed_paths_are_confirmed_absent_from_the_index(self) -> None:
+        # `unindexed_paths` was dead fixture data (M3): nothing read it. A
+        # per-path `repository-map` probe is cheap and confirms the claim
+        # directly instead of leaving it as unverified documentation.
+        for path in self.fixture["unindexed_paths"]:
+            result = self._repository_map(path)
+            self.assertEqual(result["status"], "ready", path)
+            self.assertEqual(result["returned_count"], 0, path)
+        # A control path that the fixture does list changed symbols for
+        # proves the probe can see records at all, so the zero above means
+        # "unindexed", not "the probe is broken".
+        control_path = next(
+            entry["path"] for entry in self.fixture["paths"] if entry["changed_symbols"]
+        )
+        control = self._repository_map(control_path)
+        self.assertGreater(control["returned_count"], 0, control_path)
+
     def test_impact_candidates_confirm_the_callers_fixture_for_changed_anchors(self) -> None:
         entries = self.fixture["impact_cross_check"]
         self.assertTrue(entries)
@@ -223,37 +282,70 @@ class DogfoodChangedTests(unittest.TestCase):
                 for finding in impact["findings"]
             }
             returned = set(candidates)
+
+            # I1: the accounting itself is asserted, not just each side's
+            # internal shape. Every hand-checked caller of this anchor in
+            # callers.json must land in exactly one of the fixture's two
+            # lists here, with nothing invented and nothing left out.
+            callers_entry = self.callers_by_id[entry["id"]]
+            expected_callers = {
+                (caller["path"], caller["qualified_name"])
+                for caller in callers_entry["expected_callers"]
+            }
+            expected_keys = {
+                (expected["path"], expected["qualified_name"])
+                for expected in entry["expected_candidates"]
+            }
+            absent_keys = {
+                (absent["path"], absent["qualified_name"])
+                for absent in entry["absent_callers"]
+            }
+            self.assertTrue(
+                expected_keys.isdisjoint(absent_keys), (entry["id"], expected_keys & absent_keys)
+            )
+            self.assertEqual(expected_keys | absent_keys, expected_callers, entry["id"])
+
             for expected in entry["expected_candidates"]:
                 key = (expected["path"], expected["qualified_name"])
                 # Compared against the key set rather than the candidates, so a
                 # failure names what came back instead of printing every field.
                 self.assertIn(key, returned, entry["id"])
                 self.assertTrue(
-                    any(
-                        attribution["path"] == anchor[0]
-                        and attribution["qualified_name"] == anchor[1]
-                        and attribution["edge_evidence"] == "verified"
-                        for attribution in candidates[key]["anchors"]
-                    ),
+                    self._attributed(candidates, key, anchor),
                     (entry["id"], key, candidates[key]["anchors"]),
                 )
             for absent in entry["absent_callers"]:
                 key = (absent["path"], absent["qualified_name"])
                 self.assertIn(absent["reason"], ABSENCE_REASONS, (entry["id"], key))
+                # Whatever the reason, an "absent" call site must not actually
+                # be an attributed candidate of this anchor; otherwise the
+                # fixture is excusing a call site the composition did produce
+                # (this is what closes I1's second mutation: relabelling a
+                # real candidate as absent no longer passes silently).
+                self.assertFalse(self._attributed(candidates, key, anchor), (entry["id"], key))
                 if absent["reason"] == "self-changed":
                     # The composition never offers a changed symbol as its own
-                    # candidate, so this call site is in the changed set.
-                    self.assertIn(
-                        self._changed_identity(key),
-                        {item["result_identity"] for item in impact["changed"]},
-                        (entry["id"], key),
-                    )
+                    # candidate. This checks against a direct changed-symbols
+                    # query rather than `impact["changed"]`: the output-budget
+                    # trimming this same call is subject to can legitimately
+                    # empty that list before candidates are dropped (Task 4's
+                    # fix wave), which would make the display list an
+                    # unreliable witness for a fact the exclusion itself does
+                    # not lose. `_changed_identity` already fails the case
+                    # where the call site is not a changed symbol of its path
+                    # (`assertEqual(len(identities), 1, key)`), so finding it
+                    # is itself the assertion.
+                    self._changed_identity(key)
                 elif absent["reason"] == "related-symbols-miss":
                     # The relationship query itself does not reach this call
                     # site, so the composition cannot either.
                     self.assertNotIn(key, self._related_callers(entry), (entry["id"], key))
                 else:
+                    # "budget" cannot excuse a call site the relationship query
+                    # itself does not reach: it must be a real, reachable
+                    # caller that the output-character budget then dropped.
                     self.assertTrue(impact["truncated"], (entry["id"], key))
+                    self.assertIn(key, self._related_callers(entry), (entry["id"], key))
             per_anchor.append(
                 {
                     "id": entry["id"],
@@ -278,6 +370,26 @@ class DogfoodChangedTests(unittest.TestCase):
             "per_anchor": per_anchor,
         }
         print(json.dumps(summary, indent=2, sort_keys=True))
+
+    def _attributed(
+        self,
+        candidates: dict[tuple[str, str], dict[str, object]],
+        key: tuple[str, str],
+        anchor: tuple[str, str],
+    ) -> bool:
+        # True only when `key` is a candidate the composition returned AND
+        # that candidate carries a verified attribution to this exact anchor
+        # (a call site can appear as a candidate of a different anchor in the
+        # same answer without that counting here).
+        finding = candidates.get(key)
+        if finding is None:
+            return False
+        return any(
+            attribution["path"] == anchor[0]
+            and attribution["qualified_name"] == anchor[1]
+            and attribution["edge_evidence"] == "verified"
+            for attribution in finding["anchors"]
+        )
 
     def _changed_identity(self, key: tuple[str, str]) -> str:
         result = self._query("changed-symbols", key[0])
