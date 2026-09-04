@@ -15,8 +15,8 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.5.0 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries and symbol relationships, and reclaim unused index state without loading the full repository into model context. |
-| [`work-recovery`](skills/work-recovery) | 1.0.1 | Recover interrupted work and the single best next step from bounded, read-only Git evidence. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.6.0 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, symbol relationships, and change-impact questions, and reclaim unused index state without loading the full repository into model context. |
+| [`work-recovery`](skills/work-recovery) | 1.1.0 | Recover interrupted work and the single best next step from bounded, read-only Git evidence, optionally naming the symbols the work touched. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
 `/taf:prepare-repo-context`, and `/taf:work-recovery`. Codex uses the
@@ -191,6 +191,11 @@ Default boundaries:
 - Does not build or update an index, query a provider, or access the network.
 - Uses an existing provider/index only after separate explicit authorization;
   native recovery remains complete when none is available.
+- On an explicit request for indexed context, adds at most a readiness check
+  and one read-only `prepare-repo-context` change-impact query against an
+  index that is already ready, and reports the symbols the work touched with
+  their one-hop dependents. It never builds, installs, or downloads an index,
+  and it never delays or replaces the native report.
 - Writes no recovery artifact and reports exact evidence omissions within the
   selected context budget.
 
@@ -232,6 +237,20 @@ skill's `references/query-routing.md` maps questions to queries and
 `omitted_count`, and the relationship fields. It retrieves source snippets
 only for selected result identities.
 
+A change question is answered in one step and needs no identity.
+`query --operation changed-symbols` reports the definitions, entry points,
+and modules whose lines a changed hunk touches, and
+`query --operation impact-candidates` reports their one-hop callers and
+importers, each candidate attributed in `anchors` to the changed symbols it
+depends on. Both compare the working tree, including staged, unstaged, and
+untracked changes, with a base resolved as the branch's upstream main, then
+`origin/HEAD`, then a local `main`/`master`, and `--base <ref>` selects
+another one. Neither reopens a source file: the change set only selects
+records the index already carries. `impact-candidates` asks the engine one
+relationship question per changed symbol and direction, so its cost grows
+with the change set; narrow a large one with `--path-prefix` before raising
+`--maximum-results`.
+
 Index state lives in the user-local TAF state directory, never in the
 repository. `prepare_repo_context.py remove --repo <repo>` deletes the entry
 for one repository worktree and `prepare_repo_context.py gc` reclaims orphaned
@@ -249,9 +268,10 @@ Windows on amd64.
 
 TAF bundles an MCP stdio server, `repo-context`, that exposes the same
 operations as `prepare-repo-context` as tools: `inspect`, `build`,
-`repository_map`, `search_symbols`, `search_docs`, `source_snippets`, and
-`related_symbols`. Every tool takes the absolute `repo` path; `build` requires
-`confirm_state_write: true` and is marked so the host asks before running it.
+`repository_map`, `search_symbols`, `search_docs`, `source_snippets`,
+`related_symbols`, `changed_symbols`, and `impact_candidates`. Every tool
+takes the absolute `repo` path; `build` requires `confirm_state_write: true`
+and is marked so the host asks before running it.
 The server never installs the native engine, never contacts the network, and
 never runs `gc` or `remove`; those and `activate` stay skill commands. A query
 on a bound index may refresh it incrementally and prune superseded index
@@ -268,6 +288,18 @@ inferred` is a name match, never proof, and stays hidden unless
 `allow_inferred` is set. Reference records that back these edges are never
 returned by the other query tools and cannot be fetched with
 `source_snippets`.
+
+`changed_symbols` and `impact_candidates` answer from a Git difference
+instead of a query string or a result identity, so neither takes `query` or
+`result_ids`. Both accept an optional `base`; without it the base is the
+branch's upstream main, then `origin/HEAD`, then a local `main`/`master`,
+and uncommitted changes are always included. `changed_symbols` accepts the
+same filters as the other query tools; `impact_candidates` accepts only
+`base`, `allow_inferred`, and the two budgets, and composes its answer from
+one `changed_symbols` call plus one relationship call per changed symbol and
+direction over the same engine process. Its candidates are attributed in
+`anchors` to the changed symbols they depend on; a candidate is a symbol
+that references changed work, not a defect.
 
 Claude Code starts the server when the plugin is enabled; the tools appear as
 `mcp__plugin_taf_repo-context__<tool>` (permission matcher
@@ -298,8 +330,8 @@ TAF and its skills have separate versions:
 
 - TAF `2.3.0` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.5.0` versions its behavior contract.
-- `work-recovery` `1.0.1` versions its behavior contract.
+- `prepare-repo-context` `1.6.0` versions its behavior contract.
+- `work-recovery` `1.1.0` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with
 `v2.0.0`. Historical per-skill releases remain as legacy records.

@@ -13,6 +13,7 @@ Every `query` invocation returns one JSON object. Read these fields before summa
 | `warnings` | Codes such as `python-dynamic-lookup` (a file uses `getattr`/`eval`/dynamic imports; its literal definitions are still verified) or `query-frontier-exhausted` (a budget stopped the search). | Mention warnings that affect the answer; do not list them all. |
 | `next_safe_action` | `use-index`, `refine-query`, `rebuild-index`, `update-index` (a `query` result never returns `build-index` or `install-native-engine`; the broker refuses to query without a ready context, so those two come from `inspect`, `build`, and `activate`). | Follow it; never invent another action. |
 | `refresh` | `{performed, changed_path_count, duration_ms}`. `performed: true` means the index was brought to the current commit and dirty state before the search. | Do not report it unless it affects the answer's timing; `performed: false` needs no mention. |
+| `base` | Present only on `changed-symbols` and `impact-candidates`: `{requested, ref, sha, source, warning}` for the base the change set was measured against. `source` is `explicit`, `upstream-main`, `origin-head`, `local-main`, `local-master`, or `unknown`. | Name the base you actually compared against. When `warning` is `base-unresolved`, say the answer covers uncommitted changes only. |
 
 ## Findings
 
@@ -25,13 +26,40 @@ Each finding has `rank`, `result_identity`, `path`, `start_line`, `end_line`, `l
 
 ## Relationship findings (`related-symbols`)
 
-A `related-symbols` finding carries four extra fields beyond the ones above: `relation` (`call` or `import`), `edge_evidence` (`verified` or `inferred`), `reference_line`, and `reference_count`. These four fields are present only on `related-symbols` findings; every other operation's findings do not carry these keys at all, so do not look for them there.
+A `related-symbols` finding carries four extra fields beyond the ones above: `relation` (`call` or `import`), `edge_evidence` (`verified` or `inferred`), `reference_line`, and `reference_count`. `repository-map`, `search-symbols`, `search-docs`, and `source-snippets` findings do not carry these keys at all, so do not look for them there. `changed-symbols` findings carry the keys but describe no edge: `relation` and `edge_evidence` are `null` and the two counters are `0`. An `impact-candidates` candidate carries them filled from its strongest anchor (see below).
 
 - `edge_evidence: verified` means the resolution from the reference to this specific record was unambiguous (same module scope, or through a single matching import). `edge_evidence: inferred` is a **name match, never proof** — the engine found a definition with the right name somewhere in the index but could not prove it is the one actually called. `related-symbols` hides `inferred` edges by default; only `--allow-inferred` (`allow_inferred` over MCP) returns them, and you must still present them as unconfirmed, not as fact.
 - `reference_line` is the source line of the call or import that produced this edge. `reference_count` is how many times that same target name is referenced from the same enclosing symbol (merged occurrences, not a count of distinct call sites elsewhere).
 - A `callers` finding for a bare module-level call (outside any function, class, or method) is synthesized with `record_kind: module`; its `result_identity` belongs to the underlying `reference` record, and `source-snippets` refuses it by design (a `reference` identity is never snippet-able). Report the finding's `path` and `start_line` directly instead of fetching a snippet for it.
 - The summary object's own `schema_version` field stays `"1"` for every operation, including `related-symbols` — it names the broker's envelope shape, not the four relationship fields, which are carried on the findings regardless of that value.
 
+## Change findings (`changed-symbols`)
+
+A `changed-symbols` finding is an ordinary finding of `record_kind` `definition`, `entry-point`, or `module` whose line span meets a changed hunk of its path. Findings are ordered by `evidence_class` (verified before inferred), then by path, then by start line. `output_characters` is the rendered character count the engine reports, exactly as for the other engine operations.
+
+- Only Go files carry a `module` record (it spans the package clause); a Python file has none, so a changed Python module shows up through its changed definitions.
+- These change-set warnings mean the answer covers less than the change set, or was compared against something other than what was asked: `base-unresolved` (no base could be resolved, so only uncommitted changes are covered), `changed-diff-unavailable` (the difference could not be read, so the answer is empty), `changed-path-not-indexed` (the change set reached a path the index carries no record for — a deleted file, or a file outside the indexed set), `changed-path-unsafe` (a path the index could not accept was dropped), `changed-paths-limit` (more than 200 changed paths, so the tail was dropped), and `changed-selector-limit` (the request frame was too large, so paths were dropped from the tail). Say which of them applied.
+- These two only cost precision, never coverage: `changed-ranges-collapsed` (a path with more than 64 hunks is treated as changed as a whole) and `changed-selector-collapsed` (the request frame was too large, so the path with the most hunks is treated the same way). They can add symbols of that path that a hunk did not touch.
+- A deletion is attributed to the surviving adjacent line, so the enclosing definition counts as changed. A whole deleted file has no record left and appears only as `changed-path-not-indexed`.
+
+## Impact candidates (`impact-candidates`)
+
+`impact-candidates` is composed by the script from one `changed-symbols` answer plus one `related-symbols` call per changed symbol and direction (`callers` for a changed definition or entry point, `importers` for a changed module or definition), so its result adds fields the engine operations do not have:
+
+| Field | Meaning |
+|---|---|
+| `changed` | The change set itself, compactly: `result_identity`, `path`, `start_line`, `end_line`, `record_kind`, `qualified_name` per changed symbol. |
+| `changed_count` | How many changed symbols the composition followed (at most 64). |
+| `changed_omitted_count` | Changed symbols the engine left out of that set, counted separately from `omitted_count`, which adds them to the omissions of the relationship calls and to the candidates dropped for the budget. |
+| `findings` | The candidates: one entry per related record, never a changed symbol itself. |
+| `anchors` | On each candidate, the changed symbols it depends on: `result_identity`, `path`, `qualified_name`, `relation`, `edge_evidence`, `reference_line`, `reference_count`, strongest evidence first. The candidate's own four edge fields are copied from the first anchor. |
+
+- Candidates are ordered by `edge_evidence` (verified before inferred), then by number of anchors, then by path and start line, so a truncated list is the strongest prefix, not a sample. `inferred` edges appear only with `--allow-inferred`/`allow_inferred`, and the composition never upgrades an edge.
+- `status` is `ready` only when every underlying call was ready; otherwise it is `partial` with that call's `next_safe_action`. `warnings` is the union of every underlying answer's warnings plus the change-set warnings above.
+- `output_characters` is the serialized length of this object, which is a different measure from the engine's rendered-text count on the other operations.
+- Over the output budget the result sheds context before answers, in this order: the `changed` entries shrink to identities, then drop from the tail with the warning `changed-list-trimmed`, then candidates drop from the tail (`truncated`, `omitted_count`), and only if nothing is left to lose does the warning `output-budget-exceeded` appear. The anchors of a kept candidate are never trimmed, so every reported candidate keeps its full attribution.
+- A candidate is a symbol that references something you changed, not a defect. Report it with its anchors and the edge's evidence, and never state that it breaks.
+
 ## Presenting results
 
-Report `path:start_line-end_line`, the qualified name, the evidence class, and the preview for each finding you use. State `truncated` plainly, and state `partial` according to its cause (see the `status` row: `use-index` is partial coverage, `refine-query` is an exhausted search) in one sentence. Do not paste raw JSON. Do not describe what a symbol does beyond its preview unless you fetched the snippet. For a `related-symbols` finding, also state the `relation` and, when `edge_evidence` is `inferred`, say plainly that the edge is a name match rather than a confirmed call or import.
+Report `path:start_line-end_line`, the qualified name, the evidence class, and the preview for each finding you use. State `truncated` plainly, and state `partial` according to its cause (see the `status` row: `use-index` is partial coverage, `refine-query` is an exhausted search) in one sentence. Do not paste raw JSON. Do not describe what a symbol does beyond its preview unless you fetched the snippet. For a `related-symbols` finding, also state the `relation` and, when `edge_evidence` is `inferred`, say plainly that the edge is a name match rather than a confirmed call or import. For a change answer, name the base you compared against first, then the changed symbols as `path:start_line-end_line` with their qualified names; for a candidate, name the changed symbols it is attributed to and call it a candidate, not a break.

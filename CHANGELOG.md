@@ -5,6 +5,70 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Native runtime `0.4.0` (no index format change, so existing indexes are kept;
+the next `inspect` reports `install-native-engine` until `activate` downloads
+the new runtime). Bundled skills: `branch-handoff` 1.2.1,
+`prepare-repo-context` 1.6.0, `work-recovery` 1.1.0.
+
+### Added
+
+- The native engine answers a read-only `changed-symbols` operation: given the
+  changed line ranges of a Git difference, it returns the `definition`,
+  `entry-point`, and `module` records whose line span meets a changed hunk of
+  the same path. Nothing is resolved and no file is reopened; the change set
+  only selects records the index already carries. A changed path the index has
+  no record for is reported once as the warning `changed-path-not-indexed`.
+- The broker derives those ranges from one `git diff -U0` between a resolved
+  base and the working tree, so committed, staged, and unstaged changes are
+  covered together and untracked files count as changed as a whole. The base is
+  the one work recovery resolves: an explicit request, then the branch's
+  upstream main, then `origin/HEAD`, then a local `main`/`master`; the result
+  carries it as `base`, and an unresolved base is reported as `base-unresolved`
+  with uncommitted changes only. The change set is bounded to 200 paths and 64
+  hunks per path, and the warnings `changed-paths-limit`,
+  `changed-ranges-collapsed`, `changed-path-unsafe`, `changed-diff-unavailable`,
+  `changed-selector-collapsed`, and `changed-selector-limit` each say what a
+  bound cost the answer.
+- The broker composes a second operation, `impact-candidates`, from one
+  `changed-symbols` answer plus one `related-symbols` call per changed symbol
+  and direction (`callers` for a changed definition or entry point, `importers`
+  for a changed module or definition). Each candidate is one related record
+  that is not itself changed, and carries in `anchors` every changed symbol it
+  depends on with the edge that reached it, strongest evidence first; the
+  candidate's own `relation`, `edge_evidence`, `reference_line`, and
+  `reference_count` come from that first anchor. Candidates rank verified
+  before inferred, then by number of anchors, then by path and start line, so a
+  truncated list is the strongest prefix. `inferred` edges are returned only
+  with `--allow-inferred`/`allow_inferred` and are never upgraded. Over the
+  output budget the result sheds the `changed` list before candidates
+  (`changed-list-trimmed`, then `truncated`, then `output-budget-exceeded`).
+- `prepare-repo-context` 1.6.0 exposes both as
+  `query --operation changed-symbols|impact-candidates [--base <ref>]`, which
+  need no result identity and reject `--query`, `--result-id`, and
+  `--direction`; `--base` is rejected by every other operation. The
+  `repo-context` MCP server, now 1.2.0, gains the eighth and ninth tools,
+  `changed_symbols` (with the usual filters) and `impact_candidates` (`base`,
+  `allow_inferred`, and the two budgets), both read-only. A warm
+  `impact_candidates` call on this repository answers a change set of 126
+  changed symbols across 18 paths in about 0.3 s, and `changed_symbols` alone
+  in about 0.2 s; a single-symbol change set answers in about 0.15 s each.
+- `work-recovery` 1.1.0 may, only on an explicit request for indexed context,
+  add one readiness check and exactly one `impact-candidates` query against an
+  index that is already ready, and append a "Symbols touched and one-hop
+  dependents" section to the recovery report. It never builds, installs, or
+  downloads an index, never repeats the query, and never delays or replaces the
+  native report; the recovery collector itself is unchanged.
+
+### Changed
+
+- Wire schema gains an additive version `3`, which carries the request key
+  `changed_ranges` and the `changed-symbols` operation and reuses the schema-2
+  finding field set. Schema `1` and schema `2` requests and results are
+  unchanged, and a schema-3 `changed-symbols` finding leaves `relation` and
+  `edge_evidence` null with both reference counters `0`.
+- The native engine version becomes `0.4.0`. The index format, the record
+  tuple, and the manifest format are untouched, so no index rebuilds.
+
 ## [2.3.0] - 2026-09-04
 
 Native runtime `0.3.0` (index format 4; existing indexes report `rebuild-index`
