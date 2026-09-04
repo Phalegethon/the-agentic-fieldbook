@@ -112,6 +112,29 @@ class DogfoodMcpTests(unittest.TestCase):
                     # with "refine-query" (internal/engine/engine.go and
                     # internal/engine/snippets.go); nothing else may produce it.
                     self.assertEqual(snippet["next_safe_action"], "refine-query")
+                # The search returns the broker copy of collect_snapshot next to
+                # the vendored Level 0 one; only the broker copy is called from
+                # this repository, so the anchor is picked by path rather than
+                # by rank.
+                anchor = next(
+                    finding
+                    for finding in found["findings"]
+                    if finding["path"] == "tools/taf-context/taf_context/git_snapshot.py"
+                )
+                related = client.call(
+                    "related_symbols",
+                    repo=str(work),
+                    result_ids=[anchor["result_identity"]],
+                    direction="callers",
+                )
+                self.assertIn(related["status"], {"ready", "partial"})
+                self.assertTrue(
+                    any(
+                        finding["relation"] == "call" and finding["edge_evidence"] == "verified"
+                        for finding in related["findings"]
+                    ),
+                    related["findings"],
+                )
                 target = work / "tools" / "taf-context" / "taf_context" / "state_paths.py"
                 target.write_text(target.read_text(encoding="utf-8") + "\n\ndef mcp_dogfood_marker():\n    return 1\n", encoding="utf-8")
                 refreshed = client.call("search_symbols", repo=str(work), query="mcp_dogfood_marker")

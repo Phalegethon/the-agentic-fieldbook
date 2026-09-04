@@ -26,6 +26,12 @@ spawns the underlying engine session and loads the prepared index),
 `mcp-warm` (subsequent calls over the already-running session), and, with
 `--edit`, `mcp-after-edit` (a call after each edit, each one forcing an
 incremental refresh inside the same session). Existing stages are unchanged.
+
+With `--related` (which needs `--mcp`), the warm session additionally answers
+`related_symbols` in the `callers` direction for the first finding of the warm
+search, reported as the `mcp-related-callers` stage. It measures the
+relationship query over an already-loaded index, not the anchor search that
+precedes it.
 """
 
 from __future__ import annotations
@@ -67,7 +73,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--edit", action="store_true")
     parser.add_argument("--edit-file", default="tools/taf-context/taf_context/state_paths.py")
     parser.add_argument("--mcp", action="store_true")
+    parser.add_argument("--related", action="store_true")
     args = parser.parse_args(argv)
+    if args.related and not args.mcp:
+        parser.error("--related needs --mcp: the stage is measured over the warm MCP session")
     if os.environ.get("TAF_DOGFOOD") != "1" or not os.environ.get("TAF_LEVEL1_BINARY"):
         print("set TAF_DOGFOOD=1 and TAF_LEVEL1_BINARY to run the latency benchmark", file=sys.stderr)
         return 2
@@ -151,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
         }
 
         edit_changed_path_count: int | None = None
+        related_summary: dict[str, object] | None = None
         if args.edit:
             edit_file = repository / args.edit_file
             samples: list[float] = []
@@ -183,15 +193,24 @@ def main(argv: list[str] | None = None) -> int:
                     self.process.stdin.flush()
                     return json.loads(self.process.stdout.readline())
 
+                def call(self, tool: str, arguments: dict[str, object]) -> dict:
+                    response = self.request("tools/call", {"name": tool, "arguments": arguments})
+                    if response.get("result", {}).get("isError"):
+                        raise SystemExit(f"mcp tool failed: {response['result']['content'][0]['text']}")
+                    return response["result"]["structuredContent"]
+
                 def search(self) -> dict:
                     arguments: dict[str, object] = {"repo": str(repository)}
                     if query_text is not None:
                         arguments["query"] = query_text
                     tool = {"search-symbols": "search_symbols", "search-docs": "search_docs", "repository-map": "repository_map"}[args.operation]
-                    response = self.request("tools/call", {"name": tool, "arguments": arguments})
-                    if response.get("result", {}).get("isError"):
-                        raise SystemExit(f"mcp tool failed: {response['result']['content'][0]['text']}")
-                    return response["result"]["structuredContent"]
+                    return self.call(tool, arguments)
+
+                def related_callers(self, identity: str) -> dict:
+                    return self.call(
+                        "related_symbols",
+                        {"repo": str(repository), "result_ids": [identity], "direction": "callers"},
+                    )
 
                 def close(self) -> None:
                     self.process.stdin.close()
@@ -224,6 +243,39 @@ def main(argv: list[str] | None = None) -> int:
                 stages["mcp-startup-to-initialize"] = {"median_seconds": round(statistics.median(startup_samples), 4), "min_seconds": round(min(startup_samples), 4)}
                 stages["mcp-first-call"] = {"median_seconds": round(statistics.median(first_call_samples), 4), "min_seconds": round(min(first_call_samples), 4)}
                 stages["mcp-warm"] = _timed(client.search, args.repetitions)
+                if args.related:
+                    warm = client.search()
+                    # related-symbols only accepts these anchor kinds; anything
+                    # else is refused, so it never enters the measurement.
+                    usable = [
+                        finding
+                        for finding in warm["findings"]
+                        if finding["record_kind"] in {"definition", "module", "entry-point"}
+                    ]
+                    if not usable:
+                        raise SystemExit("the warm search returned no anchor that related-symbols accepts")
+                    # A symbol nobody calls answers with an empty result, which
+                    # would time the cheapest possible relationship query; the
+                    # first finding that has callers is the honest anchor, and
+                    # the first usable finding is the fallback.
+                    anchor, followed = usable[0], None
+                    for candidate in usable:
+                        result = client.related_callers(candidate["result_identity"])
+                        if result["returned_count"] > 0:
+                            anchor, followed = candidate, result
+                            break
+                        if followed is None:
+                            followed = result
+                    related_summary = {
+                        "anchor_path": anchor["path"],
+                        "anchor_qualified_name": anchor["qualified_name"],
+                        "direction": "callers",
+                        "status": followed["status"],
+                        "returned_count": followed["returned_count"],
+                    }
+                    stages["mcp-related-callers"] = _timed(
+                        lambda: client.related_callers(anchor["result_identity"]), args.repetitions
+                    )
                 if args.edit:
                     edit_file = repository / args.edit_file
                     samples = []
@@ -251,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
         }
         if args.edit:
             report["edit"] = {"edit_file": args.edit_file, "changed_path_count": edit_changed_path_count}
+        if related_summary is not None:
+            report["related"] = related_summary
         print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
