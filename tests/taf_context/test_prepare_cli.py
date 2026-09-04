@@ -179,9 +179,10 @@ def write_fake_native_engine(
             if __SNIPPET_STALE__ and operation in {"source-snippets", "related-symbols"}:
                 # Mirrors the engine's snippetStale helper: an exact index
                 # that cannot verify the requested result identities, or an
-                # anchor no relationship may start from, reports the same
-                # status/freshness/next_safe_action as a genuinely stale
-                # index (structurally-stale, update-index).
+                # anchor no relationship may start from, reports stale with
+                # structurally-stale and update-index. A genuinely stale index
+                # (above) answers rebuild-index instead, which is what tells
+                # the two apart.
                 payload["status"] = "stale"
                 payload["freshness"] = "structurally-stale"
                 payload["next_safe_action"] = "update-index"
@@ -613,6 +614,42 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
                 invocation_log.read_text(encoding="utf-8").splitlines(),
                 ["source-snippets", "related-symbols"],
             )
+
+    def test_a_stale_index_is_reported_as_stale_for_identity_operations(self) -> None:
+        # A genuinely stale index and an index that cannot use the requested
+        # identities are different situations with different next steps, and
+        # the engine tells them apart: only the identity case answers
+        # "update-index". The identity operations must not misreport the first
+        # as the second.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            fresh_binary = root / "taf-level1"
+            write_fake_native_engine(fresh_binary)
+            stale_binary = root / "taf-level1-stale"
+            write_fake_native_engine(stale_binary, stale=True)
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_LEVEL1_BINARY": str(fresh_binary),
+                "TAF_STATE_HOME": str(state_home),
+            }
+            code, _stdout, stderr = invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+            self.assertEqual((code, stderr), (0, ""))
+
+            environment["TAF_LEVEL1_BINARY"] = str(stale_binary)
+            result_id = "sha256:" + ("a" * 64)
+            for argv in (
+                ("--operation", "source-snippets", "--result-id", result_id),
+                ("--operation", "related-symbols", "--result-id", result_id, "--direction", "callers"),
+            ):
+                code, stdout, stderr = invoke(
+                    environment, "prepare", "query", "--repo", str(repo), *argv
+                )
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn("ready context is required; run prepare inspect", stderr)
+                self.assertNotIn("result identities could not be verified", stderr)
 
     def test_query_requires_an_existing_exact_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

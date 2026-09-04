@@ -712,19 +712,19 @@ def run_query(
         allow_inferred=arguments.allow_inferred,
     )
     if result.status.value not in {"ready", "partial"}:
-        # The engine reports the same status/freshness/next_safe_action
-        # triple both when the index is genuinely stale and when an
-        # operation cannot use the requested result identities against an
-        # otherwise exact index: source-snippets cannot verify them
-        # (unknown id, or a record whose evidence class is not Verified),
-        # and related-symbols cannot anchor a relationship on them. The
-        # wire result carries no field that tells these apart, so name the
-        # identity case honestly instead of misdirecting the agent to
-        # `prepare inspect`; a re-run search still produces the correct
-        # refusal when the index really is stale.
+        # Two different refusals arrive as `stale`: the index is genuinely
+        # stale, or an otherwise exact index cannot use the requested result
+        # identities - source-snippets cannot verify them (unknown id, or a
+        # record whose evidence class is not Verified), and related-symbols
+        # cannot anchor a relationship on them. `next_safe_action` tells them
+        # apart: only the identity case answers `update-index`, while every
+        # genuinely stale query path answers `rebuild-index`. Name the
+        # identity case honestly, and leave a stale index pointing at
+        # `prepare inspect`, which is the step that actually helps.
         if (
             arguments.operation in IDENTITY_QUERY_OPERATIONS
             and result.status.value == "stale"
+            and result.next_safe_action == "update-index"
         ):
             raise PrepareCLIError(
                 "result identities could not be verified against the current index; re-run the search query"

@@ -726,6 +726,17 @@ class Level1RelationshipSchemaTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     Level1Result.from_dict(wire)
 
+    def test_a_schema_one_result_may_not_name_the_relationship_operation(self) -> None:
+        # A result echoes the schema its request asked for, and schema 1 has no
+        # relationship operation to ask for. The request side already refuses
+        # the mirror pairing.
+        wire = related_result_wire()
+        wire["schema_version"] = "1"
+        wire["findings"] = [finding_wire()]
+
+        with self.assertRaises(ValueError):
+            Level1Result.from_dict(wire)
+
     def test_edge_vocabulary_and_counters_fail_closed(self) -> None:
         cases: list[dict[str, object]] = []
         for field, value in (

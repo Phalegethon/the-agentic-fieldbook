@@ -446,6 +446,11 @@ class Level1Result:
             item.relation is not None for item in findings
         ):
             raise Level1ModelError("relation")
+        # A result echoes the schema its request asked for, and schema 1 has
+        # no relationship operation to ask for; the request side refuses the
+        # mirror pairing in _direction.
+        if schema == "1" and operation is Level1Operation.RELATED_SYMBOLS:
+            raise Level1ModelError("operation")
         if index_identity is None and not (
             operation is Level1Operation.ESTIMATE
             or (
