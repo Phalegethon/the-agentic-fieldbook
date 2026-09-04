@@ -15,7 +15,7 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.4.0 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, and reclaim unused index state without loading the full repository into model context. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.5.0 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries and symbol relationships, and reclaim unused index state without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.0.1 | Recover interrupted work and the single best next step from bounded, read-only Git evidence. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
@@ -218,14 +218,19 @@ bounded query results rather than the full index.
 After commits or edits the next query refreshes the bound index incrementally;
 a full rebuild is only asked for after a runtime upgrade.
 
-Once ready, the same skill can answer repository-map, symbol, and documentation
-questions with bounded results. Findings carry paths, line ranges, evidence
-class, and a one-line preview; multi-word queries intersect their words, and
-`--language`, `--symbol-kind`, and `--path-prefix` filters narrow them. The
+Once ready, the same skill can answer repository-map, symbol, documentation,
+and relationship questions with bounded results. Findings carry paths, line
+ranges, evidence class, and a one-line preview; multi-word queries intersect
+their words, and `--language`, `--symbol-kind`, and `--path-prefix` filters
+narrow them. A relationship question ("who calls X", "what does X depend
+on", "who uses module M") is answered in two steps: a query that finds the
+symbol, then `related-symbols --result-id <identity> --direction
+callers|callees|importers|imports`, whose findings additionally carry
+`relation`, `edge_evidence`, `reference_line`, and `reference_count`. The
 skill's `references/query-routing.md` maps questions to queries and
-`references/result-contract.md` explains `status`, `truncated`, and
-`omitted_count`. It retrieves source snippets only for selected result
-identities.
+`references/result-contract.md` explains `status`, `truncated`,
+`omitted_count`, and the relationship fields. It retrieves source snippets
+only for selected result identities.
 
 Index state lives in the user-local TAF state directory, never in the
 repository. `prepare_repo_context.py remove --repo <repo>` deletes the entry
@@ -244,8 +249,8 @@ Windows on amd64.
 
 TAF bundles an MCP stdio server, `repo-context`, that exposes the same
 operations as `prepare-repo-context` as tools: `inspect`, `build`,
-`repository_map`, `search_symbols`, `search_docs`, and `source_snippets`.
-Every tool takes the absolute `repo` path; `build` requires
+`repository_map`, `search_symbols`, `search_docs`, `source_snippets`, and
+`related_symbols`. Every tool takes the absolute `repo` path; `build` requires
 `confirm_state_write: true` and is marked so the host asks before running it.
 The server never installs the native engine, never contacts the network, and
 never runs `gc` or `remove`; those and `activate` stay skill commands. A query
@@ -253,6 +258,16 @@ on a bound index may refresh it incrementally and prune superseded index
 generations, under the standing consent given at the first `build`. One
 native engine process serves the whole session and starts on the first tool
 call, so repeated questions do not pay for a process start and index load.
+
+`related_symbols` follows the relationships of one or more `result_ids` from
+an earlier query in one required `direction`: `callers` (who calls this),
+`callees` (what this calls), `importers` (who imports this module), or
+`imports` (what this imports). Every finding carries `relation`,
+`edge_evidence`, `reference_line`, and `reference_count`; `edge_evidence:
+inferred` is a name match, never proof, and stays hidden unless
+`allow_inferred` is set. Reference records that back these edges are never
+returned by the other query tools and cannot be fetched with
+`source_snippets`.
 
 Claude Code starts the server when the plugin is enabled; the tools appear as
 `mcp__plugin_taf_repo-context__<tool>` (permission matcher
@@ -283,7 +298,7 @@ TAF and its skills have separate versions:
 
 - TAF `2.2.0` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.4.0` versions its behavior contract.
+- `prepare-repo-context` `1.5.0` versions its behavior contract.
 - `work-recovery` `1.0.1` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with

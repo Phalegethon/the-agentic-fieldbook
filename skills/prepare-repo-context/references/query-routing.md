@@ -5,7 +5,11 @@ Turn the user's question into exactly one bounded query. Prefer the smallest ope
 | The user asks | Run | Notes |
 |---|---|---|
 | Where is `X` defined? What is `X`? | `search-symbols --query X` | Add `--symbol-kind definition` when the name is heavily imported. Definitions rank above imports by default. |
-| Who imports or uses `X`? | `search-symbols --query X --symbol-kind import` | Import records only; call sites are not indexed in this version. |
+| Who imports `X`? (import statements naming `X`) | `search-symbols --query X --symbol-kind import` | Import records only. For call sites, use the `callers` direction below; call sites are not `search-symbols` results in this version. |
+| Who calls `X`? | `search-symbols --query X` to get its `result_identity`, then `related-symbols --result-id <identity> --direction callers` | Two-step: `related-symbols` follows the relationships of a result you already have, it does not search by name. Verified edges only unless `--allow-inferred` is set. |
+| What does `X` depend on / call? | `search-symbols --query X` then `related-symbols --result-id <identity> --direction callees` | Same two-step shape; findings are the definitions `X` calls. |
+| Who uses module `M`? | `search-symbols --query M` (or `repository-map --path-prefix <M's path>`) then `related-symbols --result-id <identity> --direction importers` | Findings are the importing files' `import` records themselves — real, snippet-able results. |
+| What does `X` import? | `search-symbols --query X` then `related-symbols --result-id <identity> --direction imports` | Findings are `import` records in `X`'s file, resolved to a definition or module record where one exists in the index; imports of packages outside the index produce no finding. |
 | Something about "snapshot" / "state paths" (a concept, not an exact name) | `search-symbols --query <words>` | Every word must match. Words split camelCase and snake_case, so `snapshot` finds `collect_snapshot` and `RepositorySnapshot`. |
 | What do the docs say about `Y`? Where is the section on `Y`? | `search-docs --query <words>` | Headings rank above body chunks. Use two or three words from the expected heading. |
 | What is in directory `D`? Which modules exist there? | `repository-map --path-prefix D/` | One representative record per file, in path order. |
@@ -17,8 +21,9 @@ Turn the user's question into exactly one bounded query. Prefer the smallest ope
 - `--symbol-kind`: `configuration`, `definition`, `document-chunk`, `entry-point`, `heading`, `import`, `module`.
 - `--source-type`: `source`, `document`, `configuration`.
 - `--path-prefix`: a repository-relative prefix such as `tools/taf-context/`.
+- `--direction`: `callers`, `callees`, `importers`, `imports`. Required by `related-symbols` and rejected by every other operation. `related-symbols` also requires one or more `--result-id` values (anchor identities from an earlier query, at most 16) and accepts no `--query`.
 
-All three filter flags are case-insensitive. `--path-prefix` is case-sensitive and matches the repository-relative path exactly as stored.
+All three filter flags (`--language`, `--symbol-kind`, `--source-type`) are case-insensitive. `--path-prefix` is case-sensitive and matches the repository-relative path exactly as stored.
 
 An unknown value fails fast and the error lists the valid values.
 

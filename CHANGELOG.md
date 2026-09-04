@@ -5,6 +5,33 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+### Added
+
+- The native engine indexes call and import references as file-local
+  `reference` records (one per enclosing definition, or per module for
+  module-level calls) and adds a read-only `related-symbols` operation with
+  four directions: `callers`, `callees`, `importers`, `imports`. Anchored on
+  one or more identities from an earlier query, it resolves edges at query
+  time and returns each related definition, module, or import record with
+  four extra fields: `relation` (`call` or `import`), `edge_evidence`
+  (`verified` or `inferred`), `reference_line`, and `reference_count`.
+  `edge_evidence: inferred` is a name match, never proof, and stays hidden
+  unless `allow_inferred`/`--allow-inferred` is set. `reference` records are
+  never returned by `search-symbols`, `search-docs`, `repository-map`, or
+  `source-snippets`; they are reachable only through `related-symbols`.
+- `prepare-repo-context` 1.5.0 exposes `related-symbols` through
+  `query --operation related-symbols --result-id <id> --direction
+  callers|callees|importers|imports`, and the `repo-context` MCP server gains
+  a seventh tool, `related_symbols`, with the same contract.
+
+### Changed
+
+- Wire schema gains an additive version `2`, used only for `related-symbols`
+  requests and results; schema `1` requests and results are unchanged.
+- The record tuple, store format (index format 4, manifest format `"3"`), and
+  native engine version (`0.3.0`) all change to carry the two new reference
+  fields. Existing indexes rebuild once on the next `inspect`.
+
 ## [2.2.0] - 2026-09-03
 
 Native runtime `0.2.0` (every engine change below; `--serve` is required by the
