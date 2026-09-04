@@ -75,6 +75,7 @@ def write_fake_native_engine(
     snippet_stale: bool = False,
     update_outcome: str = "ready",
     wide_overview: bool = False,
+    build_error: bool = False,
 ) -> None:
     source = textwrap.dedent(
             """\
@@ -183,9 +184,13 @@ def write_fake_native_engine(
                     "provider_identity": "taf-context",
                     "provider_version": "0.1.1",
                     "index_identity": (
-                        "sha256:" + hashlib.sha256(b"fake-index").hexdigest()
+                        # The engine answers `build` with the identity it just
+                        # wrote and nothing when the build refused; every other
+                        # operation echoes the identity it was asked about,
+                        # ready or not, exactly as the engine's own result
+                        # helper backfills it.
+                        ("sha256:" + hashlib.sha256(b"fake-index").hexdigest() if ready else None)
                         if operation == "build" else request["index_identity"]
-                        if ready else None
                     ),
                     "repository_identity": request["repository_identity"],
                     "worktree_identity": request["worktree_identity"],
@@ -233,6 +238,14 @@ def write_fake_native_engine(
                 }:
                     payload["status"] = "stale"
                     payload["freshness"] = "incrementally-stale"
+                    payload["next_safe_action"] = "rebuild-index"
+                if __BUILD_ERROR__ and operation == "build":
+                    # The engine's own build refusal: an error with a populated
+                    # coverage, no index identity, and no warning of its own.
+                    payload["status"] = "error"
+                    payload["freshness"] = "unknown"
+                    payload["index_identity"] = None
+                    payload["warnings"] = []
                     payload["next_safe_action"] = "rebuild-index"
                 if __SNIPPET_STALE__ and operation in {"source-snippets", "related-symbols"}:
                     # Mirrors the engine's snippetStale helper: an exact index
@@ -391,9 +404,63 @@ def write_fake_native_engine(
             "__PARTIAL__", repr(partial)
         ).replace("__STALE__", repr(stale)).replace("__SNIPPET_STALE__", repr(snippet_stale)).replace(
             "__UPDATE_OUTCOME__", repr(update_outcome)
-        ).replace("__WIDE_OVERVIEW__", repr(wide_overview))
+        ).replace("__WIDE_OVERVIEW__", repr(wide_overview)).replace(
+            "__BUILD_ERROR__", repr(build_error)
+        )
     path.write_text(source, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def fabricate_incompatible_generation(
+    state_home: Path, repository: Path, *, engine_version: str = "0.1.1"
+) -> Path:
+    """Bind a repository to a generation only an older runtime could read.
+
+    The directory layout is the one `state_lifecycle` defines and the manifest
+    is the store's format "2" shape, the one the 0.1.x runtimes wrote; nothing
+    here is copied from a real state root.
+    """
+    snapshot = collect_snapshot(repository.resolve())
+    entry = (
+        state_home
+        / "repositories"
+        / snapshot.repository_identity.removeprefix("sha256:")
+        / snapshot.worktree_identity.removeprefix("sha256:")
+    )
+    generation = "d" * 64
+    directory = entry / "native" / "generations" / generation
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "index.bin").write_bytes(b"legacy-index" * 100)
+    (directory / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format_version": "2",
+                "engine_version": engine_version,
+                "binding": {
+                    "repository_identity": snapshot.repository_identity,
+                    "worktree_identity": snapshot.worktree_identity,
+                    "committed_head": snapshot.head_sha,
+                    "dirty_overlay_fingerprint": "sha256:" + "0" * 64,
+                },
+                "record_count": 15698,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (directory / "READY").write_text("sha256:" + generation, encoding="utf-8")
+    (entry / "native" / "CURRENT").write_text(generation + "\n", encoding="utf-8")
+    (entry / "binding.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "repository_identity": snapshot.repository_identity,
+                "worktree_identity": snapshot.worktree_identity,
+                "index_identity": "sha256:" + "0" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return entry
 
 
 def change_fixture(root: Path) -> tuple[Path, str]:
@@ -1405,7 +1472,13 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             result = decoded(stdout)
             self.assertEqual(
                 result["state"],
-                {"root_bytes": 0, "entry_count": 0, "orphan_count": 0, "stale_runtime_count": 0},
+                {
+                    "root_bytes": 0,
+                    "entry_count": 0,
+                    "orphan_count": 0,
+                    "stale_runtime_count": 0,
+                    "incompatible_generation_count": 0,
+                },
             )
             self.assertFalse(state_home.exists())
 
@@ -1549,6 +1622,88 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             code, stdout, stderr = invoke(environment, "prepare", "inspect", "--repo", str(repo))
             self.assertEqual((code, stderr), (0, ""))
             self.assertEqual(decoded(stdout)["state"]["orphan_count"], 0)
+
+    def test_inspect_and_gc_report_a_generation_this_runtime_cannot_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            binary = root / "taf-level1"
+            write_fake_native_engine(binary)
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_LEVEL1_BINARY": str(binary),
+                "TAF_STATE_HOME": str(state_home),
+            }
+            entry = fabricate_incompatible_generation(state_home, repo)
+
+            code, stdout, stderr = invoke(environment, "prepare", "inspect", "--repo", str(repo))
+            self.assertEqual((code, stderr), (0, ""))
+            inspected = decoded(stdout)
+            self.assertEqual(inspected["state"]["incompatible_generation_count"], 1)
+            self.assertEqual(inspected["state"]["orphan_count"], 0)
+
+            code, stdout, stderr = invoke(environment, "prepare", "gc")
+            self.assertEqual((code, stderr), (0, ""))
+            planned = decoded(stdout)
+            self.assertTrue(planned["dry_run"])
+            incompatible = [
+                candidate
+                for candidate in planned["candidates"]
+                if candidate["category"] == "incompatible-generation"
+            ]
+            # The candidate names the repository record, which is how the
+            # affected repository is identified; `inspect` only counts them.
+            self.assertEqual(len(incompatible), 1)
+            self.assertTrue(
+                incompatible[0]["relative_path"].startswith("repositories/")
+            )
+            self.assertEqual(planned["required_authorizations"], ["state-write"])
+            self.assertTrue(entry.exists())
+
+            code, stdout, stderr = invoke(environment, "prepare", "gc", "--confirm-state-write")
+            self.assertEqual((code, stderr), (0, ""))
+            reclaimed = decoded(stdout)
+            self.assertIn(
+                "incompatible-generation",
+                [candidate["category"] for candidate in reclaimed["removed"]],
+            )
+            self.assertFalse(entry.exists())
+
+    def test_build_over_an_incompatible_generation_rebuilds_and_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            state_home = root / "state"
+            binary = root / "taf-level1"
+            write_fake_native_engine(binary)
+            environment = {
+                "HOME": str(root / "home"),
+                "PATH": "",
+                "TAF_LEVEL1_BINARY": str(binary),
+                "TAF_STATE_HOME": str(state_home),
+            }
+            entry = fabricate_incompatible_generation(state_home, repo)
+            legacy = entry / "native" / "generations" / ("d" * 64)
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write"
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            built = decoded(stdout)
+            self.assertEqual(built["next_safe_action"], "use-index")
+            self.assertIn("incompatible-generation", built["warnings"])
+            self.assertEqual(built["engine"]["replaced_generation_version"], "0.1.1")
+            self.assertEqual(built["state"]["incompatible_generation_count"], 0)
+            self.assertFalse(legacy.exists())
+
+            code, stdout, stderr = invoke(environment, "prepare", "inspect", "--repo", str(repo))
+            self.assertEqual((code, stderr), (0, ""))
+            inspected = decoded(stdout)
+            self.assertEqual(inspected["next_safe_action"], "use-index")
+            self.assertEqual(inspected["state"]["incompatible_generation_count"], 0)
+            self.assertIsNone(inspected["engine"]["replaced_generation_version"])
 
     def test_gc_rejects_negative_unused_for(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

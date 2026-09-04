@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import stat
@@ -21,11 +22,21 @@ BINDING_FILENAME = "binding.json"
 NATIVE_DIRECTORY = "native"
 GENERATIONS_DIRECTORY = "generations"
 CURRENT_FILENAME = "CURRENT"
+MANIFEST_FILENAME = "manifest.json"
 STAGING_PREFIX = ".stage-"
 TRASH_PREFIX = ".trash-"
 
+# The generation manifest format this runtime reads. A generation written in
+# any other format is unusable: the engine can neither answer from it nor
+# publish over it, and it refuses without a warning of its own, so the broker
+# has to recognize it here.
+CURRENT_MANIFEST_FORMAT_VERSION = "3"
+UNKNOWN_ENGINE_VERSION = "unknown"
+
 _IDENTITY_LENGTH = 64
 _MAX_BINDING_BYTES = 1024 * 1024
+_MAX_MANIFEST_BYTES = 256 * 1024
+_ENGINE_VERSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}\Z")
 
 
 def touch_binding(binding_path: Path) -> None:
@@ -38,7 +49,13 @@ def touch_binding(binding_path: Path) -> None:
 
 def summarize_state(root: Path) -> dict[str, int]:
     """Count entries, orphans, stale runtimes, and bytes without following symlinks."""
-    summary = {"root_bytes": 0, "entry_count": 0, "orphan_count": 0, "stale_runtime_count": 0}
+    summary = {
+        "root_bytes": 0,
+        "entry_count": 0,
+        "orphan_count": 0,
+        "stale_runtime_count": 0,
+        "incompatible_generation_count": 0,
+    }
     if not _is_real_directory(root):
         return summary
     summary["root_bytes"] = _tree_bytes(root)
@@ -46,6 +63,9 @@ def summarize_state(root: Path) -> dict[str, int]:
         summary["entry_count"] += 1
         if not has_valid_binding(entry):
             summary["orphan_count"] += 1
+            continue
+        if incompatible_generation_version(entry / NATIVE_DIRECTORY) is not None:
+            summary["incompatible_generation_count"] += 1
     for runtime in iter_runtime_versions(root):
         if runtime.name != CURRENT_RUNTIME_VERSION:
             summary["stale_runtime_count"] += 1
@@ -197,6 +217,7 @@ def plan_gc(root: Path, *, unused_for_days: int, now: float) -> list[Candidate]:
         return []
     orphans: list[Candidate] = []
     unused: list[Candidate] = []
+    incompatible: list[Candidate] = []
     generations: list[Candidate] = []
     doomed_entries: set[Path] = set()
     cutoff = now - unused_for_days * _SECONDS_PER_DAY
@@ -208,6 +229,14 @@ def plan_gc(root: Path, *, unused_for_days: int, now: float) -> list[Candidate]:
         # An entry whose last use is exactly unused_for_days old counts as unused.
         if (entry / BINDING_FILENAME).lstat().st_mtime <= cutoff:
             unused.append(_candidate("unused-entry", root, entry))
+            doomed_entries.add(entry)
+            continue
+        if incompatible_generation_version(entry / NATIVE_DIRECTORY) is not None:
+            # The whole record goes, not the generation alone: its binding
+            # names an index this runtime cannot read, and removing the
+            # generation by itself would leave CURRENT and the binding
+            # pointing at nothing. Rebuilding writes the record again.
+            incompatible.append(_candidate("incompatible-generation", root, entry))
             doomed_entries.add(entry)
             continue
         generations.extend(_unreferenced_generations(root, entry))
@@ -242,7 +271,7 @@ def plan_gc(root: Path, *, unused_for_days: int, now: float) -> list[Candidate]:
             empty_parents.append(
                 Candidate("empty-parent", repository.relative_to(root).as_posix(), residual_files)
             )
-    ordered = orphans + unused + runtimes + generations + legacy + trash + empty_parents
+    ordered = orphans + unused + incompatible + runtimes + generations + legacy + trash + empty_parents
     return [item for group in _group_by_category(ordered) for item in sorted(group, key=lambda c: c.relative_path)]
 
 
@@ -259,6 +288,46 @@ def _unreferenced_generations(root: Path, entry: Path) -> list[Candidate]:
         for child in _sorted_real_directories(generations)
         if child.name != current
     ]
+
+
+def incompatible_generation_version(state_root: Path) -> str | None:
+    """The engine version of a bound generation this runtime cannot read.
+
+    `state_root` is the entry's ``native`` directory, the one the engine is
+    handed. The answer is ``None`` whenever the generation is readable,
+    absent, or unidentifiable: only a manifest that positively names a format
+    version other than the current one is treated as incompatible, so a
+    corrupt or half-written generation is left to the engine's own refusal
+    instead of being deleted on a guess. An old manifest whose engine version
+    cannot be read safely answers ``"unknown"``, never the raw file content.
+    """
+    token = _read_current(state_root / CURRENT_FILENAME)
+    if not token:
+        return None
+    manifest = _read_manifest(
+        state_root / GENERATIONS_DIRECTORY / token / MANIFEST_FILENAME
+    )
+    if manifest is None:
+        return None
+    format_version = manifest.get("format_version")
+    if type(format_version) is not str or format_version == CURRENT_MANIFEST_FORMAT_VERSION:
+        return None
+    engine_version = manifest.get("engine_version")
+    if type(engine_version) is not str or not _ENGINE_VERSION.match(engine_version):
+        return UNKNOWN_ENGINE_VERSION
+    return engine_version
+
+
+def _read_manifest(path: Path) -> dict | None:
+    """The generation manifest as a plain object, or None when unreadable."""
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_MANIFEST_BYTES:
+            return None
+        value = json.loads(path.read_bytes())
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return value if type(value) is dict else None
 
 
 def current_generation_token(state_root: Path) -> str:
@@ -301,8 +370,8 @@ def plan_prune_generations(root: Path, entry: Path, *, now: float, grace_seconds
 
 
 def _group_by_category(items: list[Candidate]) -> list[list[Candidate]]:
-    order = ["orphan-entry", "unused-entry", "stale-runtime", "unreferenced-generation",
-             "legacy-control-file", "trash-leftover", "empty-parent"]
+    order = ["orphan-entry", "unused-entry", "incompatible-generation", "stale-runtime",
+             "unreferenced-generation", "legacy-control-file", "trash-leftover", "empty-parent"]
     groups: dict[str, list[Candidate]] = {name: [] for name in order}
     for item in items:
         groups[item.category].append(item)

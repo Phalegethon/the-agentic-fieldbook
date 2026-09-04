@@ -35,7 +35,7 @@ from taf_context.level1_models import Level1Result
 from taf_context.native_transport import NativeTransportError, OneShotTransport
 
 from .repo_factory import commit_all, init_committed_repo, run, write
-from .test_prepare_cli import write_fake_native_engine
+from .test_prepare_cli import fabricate_incompatible_generation, write_fake_native_engine
 
 
 def _script(path: Path, body: str) -> Path:
@@ -411,6 +411,46 @@ class OperationTests(unittest.TestCase):
                         overview, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                     )
                 ),
+            )
+
+    def test_a_refused_build_over_an_old_generation_answers_rebuild_index(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = init_committed_repo(Path(directory) / "repo")
+            binary = Path(directory) / "engine"
+            write_fake_native_engine(binary, build_error=True)
+            environment = self._environment(directory, binary)
+            state_home = Path(environment["TAF_STATE_HOME"])
+            entry = fabricate_incompatible_generation(state_home, repository)
+
+            refused = run_build(
+                repository, environment=environment, transport_for=OneShotTransport
+            )
+
+            # A build the engine refused with no warning of its own is never a
+            # bare "did not become ready" once the state explains it: the
+            # answer names the next safe action and the runtime that wrote the
+            # generation this one could not read.
+            self.assertEqual(refused["next_safe_action"], "rebuild-index")
+            self.assertIn("incompatible-generation", refused["warnings"])
+            self.assertEqual(refused["engine"]["replaced_generation_version"], "0.1.1")
+            self.assertEqual(refused["context"]["status"], "error")
+            self.assertEqual(refused["required_authorizations"], ["state-write"])
+            self.assertFalse((entry / "native" / "generations" / ("d" * 64)).exists())
+            self.assertFalse((entry / "binding.json").exists())
+
+    def test_an_unexplained_build_refusal_carries_the_engine_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = init_committed_repo(Path(directory) / "repo")
+            binary = Path(directory) / "engine"
+            write_fake_native_engine(binary, build_error=True)
+            environment = self._environment(directory, binary)
+
+            with self.assertRaises(PrepareCLIError) as caught:
+                run_build(repository, environment=environment, transport_for=OneShotTransport)
+
+            self.assertEqual(
+                str(caught.exception),
+                "native context build did not become ready (engine status: error)",
             )
 
     def test_impact_candidates_composes_one_related_call_per_anchor(self) -> None:

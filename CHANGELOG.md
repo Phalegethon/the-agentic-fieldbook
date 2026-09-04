@@ -56,6 +56,28 @@ skills: `branch-handoff` 1.2.1, `prepare-repo-context` 1.7.1,
   set before the first candidate, which is what made `changed` shrink to
   identities and then empty on an ordinary branch diff.
 
+### Fixed
+
+- `build` and `activate` no longer fail silently over an index an older
+  runtime wrote. Such a generation is removed before the build, under the
+  state-write authorization the command already required, and the summary
+  carries the warning `incompatible-generation` with the runtime that wrote it
+  in `engine.replaced_generation_version`. When the engine refuses a build
+  without a warning of its own and the state explains the refusal, the answer
+  is `next_safe_action: rebuild-index` with that warning instead of a bare
+  "native context build did not become ready"; a refusal nothing explains now
+  names the engine's own status.
+- `inspect` reports `state.incompatible_generation_count` next to
+  `stale_runtime_count`, and `gc` proposes those records under a new category
+  `incompatible-generation`, removed only with `--confirm-state-write` like
+  every other category and named by the repository record they belong to.
+  Before this, a state root holding 0.1.x generations reported them through
+  nothing: they were bound and their repositories still existed, so neither
+  `orphan_count` nor the stale runtime covered them. Only a manifest that
+  positively names a format version other than the current one counts, so a
+  corrupt or half-written generation is still left to the engine's own
+  refusal rather than deleted on a guess.
+
 ## [2.5.0] - 2026-09-05
 
 Native runtime `0.5.0` (no index format change, so existing indexes are kept;

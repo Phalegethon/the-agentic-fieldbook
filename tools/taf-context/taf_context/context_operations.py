@@ -38,7 +38,9 @@ from .state_lifecycle import (
     CURRENT_RUNTIME_VERSION,
     apply_plan,
     current_generation_token,
+    incompatible_generation_version,
     plan_prune_generations,
+    plan_remove,
     summarize_state,
     touch_binding,
 )
@@ -400,6 +402,29 @@ def _prune_generations(state_home: Path, entry: Path, protected: str | None = No
     return []
 
 
+def _remove_state_entry(state_home: Path, snapshot: object) -> None:
+    """Delete this repository's state entry; never raise.
+
+    This is exactly what `remove --confirm-state-write` deletes, and the whole
+    entry goes rather than the generation alone: the binding names an index
+    this runtime cannot read, and CURRENT would otherwise be left pointing at
+    nothing. A removal that fails leaves the build to refuse, and the refusal
+    then carries the warning that explains it.
+    """
+    try:
+        root = state_home.resolve(strict=False)
+        apply_plan(
+            root,
+            plan_remove(
+                root,
+                snapshot.repository_identity.removeprefix("sha256:"),
+                snapshot.worktree_identity.removeprefix("sha256:"),
+            ),
+        )
+    except (StateError, OSError, ValueError):
+        return
+
+
 def _query_summary(
     result: Level1Result, refresh: dict[str, object] | None = None
 ) -> dict[str, object]:
@@ -447,6 +472,8 @@ def _summary(
     authorizations: tuple[str, ...],
     state: dict[str, int],
     refresh: dict[str, object] | None = None,
+    replaced_generation_version: str | None = None,
+    extra_warnings: tuple[str, ...] = (),
 ) -> dict[str, object]:
     if binary is None:
         next_action = "install-native-engine"
@@ -475,6 +502,10 @@ def _summary(
         "engine": {
             "availability": "available" if binary is not None else "unavailable",
             "source": binary_source,
+            # The runtime that wrote the generation this build had to remove
+            # before it could write its own; `null` whenever nothing was
+            # replaced, which is every inspect and every ordinary build.
+            "replaced_generation_version": replaced_generation_version,
         },
         "context": {
             "status": context_status,
@@ -497,7 +528,11 @@ def _summary(
         "state": state,
         "required_authorizations": list(authorizations),
         "next_safe_action": next_action,
-        "warnings": sorted(set(() if result is None else result.warnings) | set(prune_warnings)),
+        "warnings": sorted(
+            set(() if result is None else result.warnings)
+            | set(prune_warnings)
+            | set(extra_warnings)
+        ),
         "refresh": refresh,
     }
 
@@ -1500,6 +1535,17 @@ def run_build(
         binary_source = "managed"
     if binary is None:
         raise PrepareCLIError("native engine is unavailable")
+    # A generation this runtime cannot read is removed before the build, under
+    # the state-write authorization the build itself already required: the
+    # engine can neither answer from such a generation nor publish over it, and
+    # it refuses without a warning of its own. The version it was written by is
+    # kept for the summary, and for the refusal below when the build still
+    # fails.
+    replaced = incompatible_generation_version(state_root)
+    warnings: tuple[str, ...] = ()
+    if replaced is not None:
+        warnings = ("incompatible-generation",)
+        _remove_state_entry(paths.root, snapshot)
     result = _invoke_native(
         transport_for(binary), "build", repository, state_root, snapshot, index_identity=None
     )
@@ -1508,7 +1554,26 @@ def run_build(
         or result.index_identity is None
         or result.next_safe_action != "use-index"
     ):
-        raise PrepareCLIError("native context build did not become ready")
+        if replaced is not None:
+            # The state explains the refusal, so answer it instead of hiding
+            # it behind an error string: the removed generation is named, and
+            # `rebuild-index` is the step that now has a clean state to run in.
+            return _summary(
+                mode=mode,
+                snapshot=snapshot,
+                binary=binary,
+                binary_source=binary_source,
+                result=result,
+                estimate=result,
+                authorizations=("state-write",),
+                state=summarize_state(paths.root),
+                replaced_generation_version=replaced,
+                extra_warnings=warnings,
+            )
+        raise PrepareCLIError(
+            "native context build did not become ready "
+            f"(engine status: {result.status.value})"
+        )
     _write_binding(binding_path, snapshot, result.index_identity)
     return _summary(
         mode=mode,
@@ -1519,6 +1584,8 @@ def run_build(
         estimate=result,
         authorizations=(),
         state=summarize_state(paths.root),
+        replaced_generation_version=replaced,
+        extra_warnings=warnings,
     )
 
 

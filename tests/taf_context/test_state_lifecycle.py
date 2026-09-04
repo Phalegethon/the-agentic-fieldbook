@@ -14,6 +14,7 @@ from taf_context.state_lifecycle import (
     CURRENT_RUNTIME_VERSION,
     Candidate,
     apply_plan,
+    incompatible_generation_version,
     plan_gc,
     plan_prune_generations,
     plan_remove,
@@ -23,13 +24,22 @@ from taf_context.state_paths import StateError
 
 
 def make_entry(
-    root: Path, repo: str, worktree: str, *, bound: bool, generation: str = "e" * 64, schema: str = "1"
+    root: Path,
+    repo: str,
+    worktree: str,
+    *,
+    bound: bool,
+    generation: str = "e" * 64,
+    schema: str = "1",
+    manifest: dict[str, object] | None = None,
 ) -> Path:
     entry = root / "repositories" / repo / worktree
     native = entry / "native" / "generations" / generation
     native.mkdir(parents=True)
     (native / "index.bin").write_bytes(b"x" * 1000)
-    (native / "manifest.json").write_text("{}", encoding="utf-8")
+    (native / "manifest.json").write_text(
+        "{}" if manifest is None else json.dumps(manifest), encoding="utf-8"
+    )
     (native / "READY").write_text("sha256:" + generation, encoding="utf-8")
     (entry / "native" / "CURRENT").write_text(generation + "\n", encoding="utf-8")
     if bound:
@@ -51,6 +61,27 @@ def make_entry(
     return entry
 
 
+def legacy_manifest(engine_version: str = "0.1.1") -> dict[str, object]:
+    """A generation manifest in the store format this runtime cannot read.
+
+    Format "2" is the shape the 0.1.x and 0.2.x runtimes wrote, before the
+    relationship record fields raised the manifest to "3"; only the two
+    version fields matter to the reader under test, and the rest is written
+    so the fixture keeps the shape of a real manifest.
+    """
+    return {
+        "format_version": "2",
+        "engine_version": engine_version,
+        "binding": {
+            "repository_identity": "sha256:" + "a" * 64,
+            "worktree_identity": "sha256:" + "1" * 64,
+            "committed_head": "c" * 40,
+            "dirty_overlay_fingerprint": "sha256:" + "0" * 64,
+        },
+        "record_count": 15698,
+    }
+
+
 def make_runtime(root: Path, version: str) -> Path:
     binary = root / "runtime" / version / "darwin-arm64" / "taf-level1"
     binary.parent.mkdir(parents=True)
@@ -63,7 +94,16 @@ class SummarizeStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "absent"
             summary = summarize_state(root)
-        self.assertEqual(summary, {"root_bytes": 0, "entry_count": 0, "orphan_count": 0, "stale_runtime_count": 0})
+        self.assertEqual(
+            summary,
+            {
+                "root_bytes": 0,
+                "entry_count": 0,
+                "orphan_count": 0,
+                "stale_runtime_count": 0,
+                "incompatible_generation_count": 0,
+            },
+        )
         self.assertFalse(root.exists())
 
     def test_counts_entries_orphans_stale_runtimes_and_bytes(self) -> None:
@@ -101,6 +141,102 @@ class SummarizeStateTests(unittest.TestCase):
             padded["dirty_paths"] = ["p" * 200] * 4000
             (entry / "binding.json").write_text(json.dumps(padded), encoding="utf-8")
             self.assertEqual(summarize_state(root)["orphan_count"], 0)
+
+
+class IncompatibleGenerationTests(unittest.TestCase):
+    """A bound generation whose manifest format this runtime cannot read."""
+
+    def test_the_old_engine_version_is_read_from_a_format_two_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = make_entry(root, "a" * 64, "1" * 64, bound=True, manifest=legacy_manifest())
+            self.assertEqual(incompatible_generation_version(entry / "native"), "0.1.1")
+
+    def test_the_current_format_and_an_unreadable_manifest_are_never_incompatible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = make_entry(
+                root,
+                "a" * 64,
+                "1" * 64,
+                bound=True,
+                manifest={"format_version": "3", "engine_version": "0.6.0"},
+            )
+            # `make_entry` writes an empty object by default: a manifest that
+            # names no format version is corrupt, not old, and is left to the
+            # engine's own refusal rather than deleted on a guess.
+            corrupt = make_entry(root, "b" * 64, "1" * 64, bound=True)
+            self.assertIsNone(incompatible_generation_version(current / "native"))
+            self.assertIsNone(incompatible_generation_version(corrupt / "native"))
+            self.assertEqual(summarize_state(root)["incompatible_generation_count"], 0)
+
+    def test_an_unsafe_engine_version_is_reported_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = make_entry(
+                root,
+                "a" * 64,
+                "1" * 64,
+                bound=True,
+                manifest={"format_version": "2", "engine_version": "../../etc/passwd"},
+            )
+            self.assertEqual(incompatible_generation_version(entry / "native"), "unknown")
+
+    def test_only_a_bound_incompatible_generation_is_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_entry(root, "a" * 64, "1" * 64, bound=True, manifest=legacy_manifest())
+            make_entry(root, "b" * 64, "1" * 64, bound=False, manifest=legacy_manifest())
+            summary = summarize_state(root)
+        # An entry without a valid binding is already an orphan; the new count
+        # names the records `gc` reported through nothing at all.
+        self.assertEqual(summary["incompatible_generation_count"], 1)
+        self.assertEqual(summary["orphan_count"], 1)
+        self.assertEqual(summary["entry_count"], 2)
+
+    def test_gc_plans_the_incompatible_record_and_apply_removes_it(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            incompatible = make_entry(
+                root, "a" * 64, "1" * 64, bound=True, manifest=legacy_manifest()
+            )
+            os.utime(incompatible / "binding.json", (now, now))
+            usable = make_entry(
+                root,
+                "b" * 64,
+                "1" * 64,
+                bound=True,
+                manifest={"format_version": "3", "engine_version": CURRENT_RUNTIME_VERSION},
+            )
+            os.utime(usable / "binding.json", (now, now))
+            plan = plan_gc(root, unused_for_days=30, now=now)
+            # The repository directory follows its only worktree entry, as it
+            # does for an orphan or an unused one.
+            self.assertEqual(
+                [(c.category, c.relative_path) for c in plan],
+                [
+                    ("incompatible-generation", f"repositories/{'a' * 64}/{'1' * 64}"),
+                    ("empty-parent", f"repositories/{'a' * 64}"),
+                ],
+            )
+            self.assertGreater(plan[0].bytes, 1000)
+            apply_plan(root, plan)
+            self.assertFalse(incompatible.exists())
+            self.assertTrue(usable.exists())
+            self.assertEqual(summarize_state(root)["incompatible_generation_count"], 0)
+
+    def test_an_unused_incompatible_entry_stays_in_the_unused_category(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = make_entry(root, "a" * 64, "1" * 64, bound=True, manifest=legacy_manifest())
+            stamp = now - 40 * 86400
+            os.utime(entry / "binding.json", (stamp, stamp))
+            plan = plan_gc(root, unused_for_days=30, now=now)
+        # One record is one candidate: the older reason keeps it, so nothing
+        # is planned twice.
+        self.assertEqual([c.category for c in plan], ["unused-entry", "empty-parent"])
 
 
 class RemovePlanTests(unittest.TestCase):
@@ -210,8 +346,9 @@ class GcPlanTests(unittest.TestCase):
         self.assertNotIn(f"repositories/{'a' * 64}/{'1' * 64}", [c.relative_path for c in plan])
         self.assertEqual(
             [c.category for c in plan],
-            sorted([c.category for c in plan], key=["orphan-entry", "unused-entry", "stale-runtime",
-                   "unreferenced-generation", "legacy-control-file", "trash-leftover", "empty-parent"].index),
+            sorted([c.category for c in plan], key=["orphan-entry", "unused-entry", "incompatible-generation",
+                   "stale-runtime", "unreferenced-generation", "legacy-control-file", "trash-leftover",
+                   "empty-parent"].index),
         )
 
     def test_unused_for_zero_treats_every_bound_entry_as_unused(self) -> None:
