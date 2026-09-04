@@ -19,7 +19,7 @@ import (
 	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/wire"
 )
 
-const engineVersion = "0.4.0"
+const engineVersion = "0.5.0"
 
 const maximumAggregateRecordBytes = 64 << 20
 
@@ -234,7 +234,7 @@ func (engine *Engine) result(request wire.Request, status wire.Status, freshness
 	if index == nil && request.IndexIdentity != nil && request.Operation != wire.Estimate && request.Operation != wire.Build {
 		index = request.IndexIdentity
 	}
-	return wire.Result{
+	result := wire.Result{
 		// A result answers in the schema its request asked for; the validated
 		// request already carries a schema the wire admits.
 		SchemaVersion: request.SchemaVersion, RequestIdentity: request.RequestIdentity, Operation: request.Operation,
@@ -244,6 +244,14 @@ func (engine *Engine) result(request wire.Request, status wire.Status, freshness
 		ParserVersions: cloneStrings(engine.dependencies.ParserIDs()), Coverage: wireCoverage(coverage), Findings: []wire.Finding{},
 		Warnings: []string{}, NextSafeAction: action,
 	}
+	// Schema 4 promises the two overview keys for every result, whatever its
+	// status and whichever operation asked, and struct marshaling drops a nil
+	// pointer. An empty table is therefore the schema-4 default here, and the
+	// overview replaces it with the answer it derived.
+	if result.SchemaVersion == "4" {
+		result.Groups, result.Overview = &[]wire.OverviewGroup{}, &wire.OverviewSummary{}
+	}
+	return result
 }
 
 func freshnessFor(request wire.Request, manifest model.Manifest, index string, parserIDs map[string]string) (string, string) {

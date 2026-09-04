@@ -26,6 +26,16 @@ type Response struct {
 	// path carried no record at all, which the caller turns into one warning
 	// rather than into findings or omissions.
 	Unindexed bool
+	// Groups and Overview are set by Overview alone: the bounded directory
+	// table and the summary a schema-4 result carries next to the ranked file
+	// layer in Records. Groups is never nil, so an empty table travels as an
+	// empty list rather than as a missing key.
+	Groups   []wire.OverviewGroup
+	Overview wire.OverviewSummary
+	// ExtraPathPrefixes is set by Overview alone: the request named more than
+	// one path prefix, so the overview was rooted at the first of them in
+	// sorted order, which the caller turns into one warning.
+	ExtraPathPrefixes bool
 }
 
 // Match tiers, lower is better. Fuzzy tiers add the edit distance.

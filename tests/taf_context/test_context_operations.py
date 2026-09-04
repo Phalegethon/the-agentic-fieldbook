@@ -440,7 +440,7 @@ def engine_result(
             "operation": operation,
             "status": status,
             "provider_identity": "taf-context",
-            "provider_version": "0.4.0",
+            "provider_version": "0.5.0",
             "index_identity": INDEX_IDENTITY,
             "repository_identity": REPOSITORY_IDENTITY,
             "worktree_identity": WORKTREE_IDENTITY,

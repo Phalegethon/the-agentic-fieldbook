@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -615,8 +616,8 @@ func TestChangedSymbolsAnswersTheSymbolsAHunkTouches(t *testing.T) {
 	if result.SchemaVersion != "3" || result.Status != wire.Ready || result.Freshness != "exact" || result.NextSafeAction != "use-index" {
 		t.Fatalf("changed result = %#v", result)
 	}
-	if result.ProviderVersion != "0.4.0" {
-		t.Fatalf("provider version = %q, want 0.4.0", result.ProviderVersion)
+	if result.ProviderVersion != "0.5.0" {
+		t.Fatalf("provider version = %q, want 0.5.0", result.ProviderVersion)
 	}
 	if len(result.Findings) != 1 {
 		t.Fatalf("findings = %#v, want sample.Main alone", result.Findings)
@@ -673,5 +674,171 @@ func TestChangedSymbolsWarnsOnceForPathsTheIndexDoesNotCarry(t *testing.T) {
 	}
 	if len(result.Findings) != 1 || result.Findings[0].QualifiedName != "sample.Main" {
 		t.Fatalf("findings = %#v", result.Findings)
+	}
+}
+
+// overviewRoots builds a control repository with the four shapes an overview
+// has to tell apart: a command, a package, a document, and configuration.
+func overviewRoots(t *testing.T) (string, string) {
+	t.Helper()
+	base := t.TempDir()
+	repository := filepath.Join(base, "repository")
+	for _, directory := range []string{"", ".git", "cmd", filepath.Join("cmd", "tool"), "internal", filepath.Join("internal", "a"), "docs"} {
+		if err := os.Mkdir(filepath.Join(repository, directory), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for relative, body := range map[string]string{
+		filepath.Join("cmd", "tool", "main.go"): "package main\n\nfunc helper() {}\n\nfunc main() {\n\thelper()\n}\n",
+		filepath.Join("internal", "a", "x.go"):  "package a\n\nfunc X() {}\n",
+		filepath.Join("docs", "README.md"):      "# Control\n\nHow this control repository is organized.\n",
+		"config.json":                           "{\n  \"name\": \"control\"\n}\n",
+	} {
+		if err := os.WriteFile(filepath.Join(repository, relative), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return repository, filepath.Join(base, "state")
+}
+
+// The overview answers how a repository is organized in one call: the group
+// table names the directories, and the file layer starts at the command's
+// entry point rather than at the first path in alphabetical order.
+func TestRepositoryOverviewDescribesTheControlRepository(t *testing.T) {
+	repository, state := overviewRoots(t)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := controlEnvelope(wire.RepositoryOverview, repository, state, built.IndexIdentity)
+	envelope.Request.SchemaVersion = "4"
+	result, err := engine.Execute(context.Background(), envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != wire.Ready || result.Freshness != "exact" || result.NextSafeAction != "use-index" {
+		t.Fatalf("overview result = %#v", result)
+	}
+	if result.SchemaVersion != "4" || result.ProviderVersion != "0.5.0" {
+		t.Fatalf("schema = %q provider = %q, want \"4\" and \"0.5.0\"", result.SchemaVersion, result.ProviderVersion)
+	}
+	if result.Groups == nil || result.Overview == nil {
+		t.Fatal("a schema-4 result carries both overview keys")
+	}
+	prefixes := make([]string, 0, len(*result.Groups))
+	for _, group := range *result.Groups {
+		prefixes = append(prefixes, group.PathPrefix)
+	}
+	if want := []string{"cmd/", "internal/", ".", "docs/"}; !reflect.DeepEqual(prefixes, want) {
+		t.Fatalf("group prefixes = %#v, want %#v", prefixes, want)
+	}
+	command := (*result.Groups)[0]
+	if command.Depth != 1 || command.FileCount != 1 || command.DefinitionCount != 1 || command.EntryPointCount != 1 || command.DocumentCount != 0 || command.ConfigurationCount != 0 {
+		t.Fatalf("cmd/ group = %#v", command)
+	}
+	if got, want := command.Languages, []wire.OverviewLanguage{{Language: "go", FileCount: 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cmd/ languages = %#v, want %#v", got, want)
+	}
+	if command.RepresentativeIdentity == nil || *command.RepresentativeIdentity != result.Findings[0].ResultIdentity {
+		t.Fatalf("cmd/ representative = %#v, first finding = %q", command.RepresentativeIdentity, result.Findings[0].ResultIdentity)
+	}
+	if document := (*result.Groups)[3]; document.DocumentCount != 1 || document.FileCount != 1 {
+		t.Fatalf("docs/ group = %#v", document)
+	}
+	if root := (*result.Groups)[2]; root.Depth != 0 || root.ConfigurationCount != 1 {
+		t.Fatalf("root group = %#v", root)
+	}
+	if want := (wire.OverviewSummary{Root: "", CountedFileCount: 4, OtherGroupCount: 0}); *result.Overview != want {
+		t.Fatalf("summary = %#v, want %#v", *result.Overview, want)
+	}
+	paths := make([]string, 0, len(result.Findings))
+	for _, finding := range result.Findings {
+		paths = append(paths, finding.Path)
+	}
+	if want := []string{filepath.ToSlash("cmd/tool/main.go"), "internal/a/x.go", "config.json", "docs/README.md"}; !reflect.DeepEqual(paths, want) {
+		t.Fatalf("file layer = %#v, want %#v", paths, want)
+	}
+	if result.ReturnedCount != 4 || result.OmittedCount != 0 || result.Truncated {
+		t.Fatalf("counts = %d/%d truncated = %v", result.ReturnedCount, result.OmittedCount, result.Truncated)
+	}
+}
+
+// A path prefix narrows the overview to a subtree and the summary names the
+// normalized root, so a consumer can join a group prefix to it.
+func TestRepositoryOverviewNarrowsToARequestedSubtree(t *testing.T) {
+	repository, state := overviewRoots(t)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := controlEnvelope(wire.RepositoryOverview, repository, state, built.IndexIdentity)
+	envelope.Request.SchemaVersion = "4"
+	envelope.Request.Filters.PathPrefixes = []string{"cmd"}
+	result, err := engine.Execute(context.Background(), envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Overview == nil || result.Overview.Root != "cmd/" || result.Overview.CountedFileCount != 1 {
+		t.Fatalf("summary = %#v", result.Overview)
+	}
+	if len(*result.Groups) != 1 || (*result.Groups)[0].PathPrefix != "cmd/tool/" {
+		t.Fatalf("groups = %#v", *result.Groups)
+	}
+}
+
+// Several path prefixes root the overview at the first of them and say so, so
+// the answer stays one honest subtree rather than a union of several.
+func TestRepositoryOverviewWarnsWhenSeveralPrefixesAreRequested(t *testing.T) {
+	repository, state := overviewRoots(t)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := controlEnvelope(wire.RepositoryOverview, repository, state, built.IndexIdentity)
+	envelope.Request.SchemaVersion = "4"
+	envelope.Request.Filters.PathPrefixes = []string{"cmd", "internal"}
+	result, err := engine.Execute(context.Background(), envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Overview == nil || result.Overview.Root != "cmd/" {
+		t.Fatalf("summary = %#v", result.Overview)
+	}
+	if !hasWarning(result.Warnings, "overview-root-first-prefix") {
+		t.Fatalf("warnings = %#v", result.Warnings)
+	}
+}
+
+// Every schema-4 result carries the two keys the schema promises, whatever
+// status it reports and whichever operation asked: the result builder fills an
+// empty table, so a refusal under schema 4 is still encodable.
+func TestSchemaFourResultsAlwaysCarryTheOverviewKeys(t *testing.T) {
+	engine := New(ProductionDependencies())
+	request := controlEnvelope(wire.RepositoryOverview, "", "", testPtr(engineSHA)).Request
+	request.SchemaVersion = "4"
+	for _, testCase := range []struct {
+		name   string
+		result wire.Result
+	}{
+		{name: "unsupported", result: engine.unsupported(request)},
+		{name: "error", result: engine.result(request, wire.Error, "unusable", nil, emptyCoverage(), "build-index")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			result := testCase.result
+			if result.Groups == nil || len(*result.Groups) != 0 || result.Overview == nil {
+				t.Fatalf("result = %#v", result)
+			}
+			result.OutputCharacters = wire.OutputCharacters(result)
+			if err := wire.EncodeResult(io.Discard, result); err != nil {
+				t.Fatalf("schema-4 %s result does not encode: %v", testCase.name, err)
+			}
+		})
+	}
+	frozen := controlEnvelope(wire.RepositoryMap, "", "", testPtr(engineSHA)).Request
+	if result := engine.unsupported(frozen); result.Groups != nil || result.Overview != nil {
+		t.Fatalf("frozen schema result = %#v", result)
 	}
 }

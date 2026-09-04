@@ -74,10 +74,13 @@ func (engine *Engine) query(ctx context.Context, roots *boundary.Roots, request 
 
 func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, snapshot store.Snapshot) (wire.Result, error) {
 	var (
-		selected  []wire.Finding
-		omitted   int
-		partial   bool
-		unindexed bool
+		selected      []wire.Finding
+		omitted       int
+		partial       bool
+		unindexed     bool
+		groups        *[]wire.OverviewGroup
+		overview      *wire.OverviewSummary
+		extraPrefixes bool
 	)
 	switch request.Operation {
 	case wire.RepositoryMap:
@@ -102,6 +105,15 @@ func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, s
 		// nor a counted omission; it is reported once, below, so the caller
 		// learns the change set reached further than the index.
 		unindexed = response.Unindexed
+	case wire.RepositoryOverview:
+		response := query.Overview(snapshot, request, productionLimits())
+		selected, omitted, partial = findings(response.Records), response.Omitted, response.Partial
+		// The group table and the summary are the answer's first layer, so they
+		// travel next to the findings rather than instead of them.
+		groups, overview = &response.Groups, &response.Overview
+		// A request that named more than one path prefix was served from the
+		// first of them, which is reported once, below.
+		extraPrefixes = response.ExtraPathPrefixes
 	default:
 		return engine.unsupported(request), nil
 	}
@@ -122,12 +134,18 @@ func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, s
 	// because the ranking overflowed, the renderer trimmed, or a budget stopped
 	// the search. Omissions the engine could not count are never estimated.
 	result.Truncated = partial || omitted > 0
+	if groups != nil {
+		result.Groups, result.Overview = groups, overview
+	}
 	result.Warnings = sourceCatalogWarnings(snapshot.Manifest.SourceCatalog)
 	if partial {
 		result.Warnings = appendBoundedWarnings(result.Warnings, "query-frontier-exhausted")
 	}
 	if unindexed {
 		result.Warnings = appendBoundedWarnings(result.Warnings, "changed-path-not-indexed")
+	}
+	if extraPrefixes {
+		result.Warnings = appendBoundedWarnings(result.Warnings, "overview-root-first-prefix")
 	}
 	return result, nil
 }
