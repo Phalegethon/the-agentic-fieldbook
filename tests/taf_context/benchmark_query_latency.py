@@ -42,6 +42,15 @@ they carry the per-call cost the acceptance bounds of the change phase name
 to the medians. `impact-candidates` sends one relationship call per changed
 anchor, which is why it is worth measuring on the session transport rather than
 the one-shot CLI.
+
+With `--overview` (which also needs `--mcp`), the warm session answers
+`repository_overview` at the largest request settings the tool accepts,
+reported as the `mcp-repository-overview` stage. Its bound is relative rather
+than absolute: the `overview` block divides the median by the `mcp-warm`
+median and reports the quotient as `ratio_to_warm` next to the tolerance the
+owner named (three to four times a warm search). The tolerance is reported,
+never enforced: the benchmark is evidence for the execution ledger, not a
+gate.
 """
 
 from __future__ import annotations
@@ -62,6 +71,12 @@ ROOT = Path(__file__).resolve().parents[2]
 IMPACT_BOUNDS = {"mcp-changed-symbols": 0.15, "mcp-impact-candidates": 0.50}
 IMPACT_MAXIMUM_RESULTS = 64
 IMPACT_MAXIMUM_OUTPUT_CHARACTERS = 12000
+# The overview's bound is relative to a warm search rather than absolute: the
+# owner tolerates three to four times that median, and the report says whether
+# the measurement stayed inside it without failing when it does not.
+OVERVIEW_TOLERATED_RATIO = 4.0
+OVERVIEW_MAXIMUM_RESULTS = 64
+OVERVIEW_MAXIMUM_OUTPUT_CHARACTERS = 12000
 PACKAGE_ROOT = ROOT / "tools" / "taf-context"
 ENTRYPOINT = ROOT / "skills" / "prepare-repo-context" / "scripts" / "prepare_repo_context.py"
 
@@ -89,12 +104,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mcp", action="store_true")
     parser.add_argument("--related", action="store_true")
     parser.add_argument("--impact", action="store_true")
+    parser.add_argument("--overview", action="store_true")
     parser.add_argument("--base")
     args = parser.parse_args(argv)
     if args.related and not args.mcp:
         parser.error("--related needs --mcp: the stage is measured over the warm MCP session")
     if args.impact and not args.mcp:
         parser.error("--impact needs --mcp: the stages are measured over the warm MCP session")
+    if args.overview and not args.mcp:
+        parser.error("--overview needs --mcp: the stage is measured over the warm MCP session")
     if args.base is not None and not args.base.strip():
         # An empty or whitespace-only --base used to be silently ignored
         # (the two guards below fall through it as falsy, so the stage would
@@ -188,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         edit_changed_path_count: int | None = None
         related_summary: dict[str, object] | None = None
         impact_summary: dict[str, object] | None = None
+        overview_summary: dict[str, object] | None = None
         if args.edit:
             edit_file = repository / args.edit_file
             samples: list[float] = []
@@ -248,6 +267,16 @@ def main(argv: list[str] | None = None) -> int:
                     if args.base:
                         arguments["base"] = args.base
                     return self.call(tool, arguments)
+
+                def overview(self) -> dict:
+                    return self.call(
+                        "repository_overview",
+                        {
+                            "repo": str(repository),
+                            "maximum_results": OVERVIEW_MAXIMUM_RESULTS,
+                            "maximum_output_characters": OVERVIEW_MAXIMUM_OUTPUT_CHARACTERS,
+                        },
+                    )
 
                 def close(self) -> None:
                     self.process.stdin.close()
@@ -339,6 +368,35 @@ def main(argv: list[str] | None = None) -> int:
                             for stage, bound in IMPACT_BOUNDS.items()
                         },
                     }
+                if args.overview:
+                    # Measured on the same warm session as `mcp-warm`, and
+                    # before any edit, so the ratio below compares two calls
+                    # over one loaded index rather than one of them over a
+                    # refreshed one.
+                    described = client.overview()
+                    stages["mcp-repository-overview"] = _timed(client.overview, args.repetitions)
+                    warm_median = stages["mcp-warm"]["median_seconds"]
+                    overview_median = stages["mcp-repository-overview"]["median_seconds"]
+                    ratio = round(overview_median / warm_median, 2) if warm_median else None
+                    overview_summary = {
+                        "status": described["status"],
+                        "root": described["overview"]["root"],
+                        "counted_file_count": described["overview"]["counted_file_count"],
+                        "group_count": len(described["groups"]),
+                        "other_group_count": described["overview"]["other_group_count"],
+                        "returned_count": described["returned_count"],
+                        "omitted_count": described["omitted_count"],
+                        "truncated": described["truncated"],
+                        "output_characters": described["output_characters"],
+                        "warnings": described["warnings"],
+                        "ratio_to_warm": ratio,
+                        "tolerated_ratio_to_warm": OVERVIEW_TOLERATED_RATIO,
+                        # Reported, never enforced: a slower answer is a fact
+                        # for the ledger, not a failed run.
+                        "within_tolerance": (
+                            None if ratio is None else ratio <= OVERVIEW_TOLERATED_RATIO
+                        ),
+                    }
                 if args.edit:
                     edit_file = repository / args.edit_file
                     samples = []
@@ -370,6 +428,8 @@ def main(argv: list[str] | None = None) -> int:
             report["related"] = related_summary
         if impact_summary is not None:
             report["impact"] = impact_summary
+        if overview_summary is not None:
+            report["overview"] = overview_summary
         print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

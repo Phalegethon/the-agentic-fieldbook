@@ -187,6 +187,61 @@ class DogfoodMcpTests(unittest.TestCase):
                     ),
                     [finding["qualified_name"] for finding in impact["findings"]],
                 )
+                overview = client.call(
+                    "repository_overview",
+                    repo=str(work),
+                    maximum_results=64,
+                    maximum_output_characters=12000,
+                )
+                self.assertEqual(overview["status"], "ready")
+                self.assertEqual(overview["overview"]["root"], "")
+                # The clone tracks the working tree, so the exact table is the
+                # pinned dogfood's business (test_dogfood_overview.py); what
+                # this session must show is that the tool answers with a real
+                # table over the same loaded index every other tool used.
+                self.assertGreater(overview["overview"]["counted_file_count"], 0)
+                self.assertTrue(overview["groups"])
+                self.assertLessEqual(len(overview["groups"]), 17)
+                definitions = [group["definition_count"] for group in overview["groups"]]
+                self.assertEqual(definitions, sorted(definitions, reverse=True))
+                self.assertEqual(
+                    overview["omitted_count"],
+                    overview["overview"]["counted_file_count"] - overview["returned_count"],
+                )
+                identities = {finding["result_identity"] for finding in overview["findings"]}
+                # Every kept group is represented by a file the same answer
+                # returned; only the folded row names none.
+                for group in overview["groups"]:
+                    if group["path_prefix"] == "*":
+                        self.assertIsNone(group["representative_identity"])
+                        continue
+                    self.assertIn(group["representative_identity"], identities, group)
+                narrowed = client.call(
+                    "repository_overview",
+                    repo=str(work),
+                    path_prefixes=["skills"],
+                    maximum_results=64,
+                    maximum_output_characters=12000,
+                )
+                self.assertEqual(narrowed["status"], "ready")
+                self.assertEqual(narrowed["overview"]["root"], "skills/")
+                self.assertLess(
+                    narrowed["overview"]["counted_file_count"],
+                    overview["overview"]["counted_file_count"],
+                )
+                for finding in narrowed["findings"]:
+                    self.assertTrue(finding["path"].startswith("skills/"), finding["path"])
+                # The two symbol-shaped filters are not declared on this tool,
+                # so asking for one is a protocol error rather than a filter
+                # the operation would have to refuse later.
+                refused = client.request(
+                    "tools/call",
+                    {
+                        "name": "repository_overview",
+                        "arguments": {"repo": str(work), "symbol_kinds": ["definition"]},
+                    },
+                )
+                self.assertEqual(refused["error"]["code"], -32602)
             finally:
                 code = client.close()
             self.assertEqual(code, 0)

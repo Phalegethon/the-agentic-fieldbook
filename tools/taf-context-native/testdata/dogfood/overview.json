@@ -1,0 +1,75 @@
+{
+  "schema_version": "1",
+  "description": "Hand-checked directory groups of this repository at the pinned commit 3b9e5ae284447d80099e3677ab1e4b55899da0de, used by tests/taf_context/test_dogfood_overview.py to check repository-overview end to end. Every row was re-derived without the engine: the file counts and the language rows from `git ls-files` at that commit restricted to the indexed extensions (.go, .py, .js/.mjs/.cjs/.jsx, .ts/.tsx, .rs, .md/.mdx, .json, .toml) with the excluded directory components removed (vendor, node_modules, third_party, generated, dist, build, coverage, .next, target, .git); the definition counts from the language's own parser (CPython's ast for the class and function definitions of a Python file, go/ast for the top-level type specs and function declarations of a Go file, methods included); the entry-point count from the one main.main with the entry-point signature; the document and configuration counts from the Markdown and JSON files, whose extractors emit nothing but headings, document chunks and configuration records. Two indexed paths carry no record at all and are therefore not counted files; they are listed under uncounted_indexed_paths.",
+  "commit": "3b9e5ae284447d80099e3677ab1e4b55899da0de",
+  "request": {
+    "maximum_results": 64,
+    "maximum_output_characters": 12000
+  },
+  "repository": {
+    "root": "",
+    "counted_file_count": 237,
+    "other_group_count": 0,
+    "uncounted_indexed_paths": [
+      "tests/preparing_branch_handoff/__init__.py",
+      "tests/work_recovery/__init__.py"
+    ],
+    "groups": [
+      {"path_prefix": "tools/taf-context-native/", "depth": 2, "file_count": 91, "definition_count": 1684, "entry_point_count": 1, "document_count": 0, "configuration_count": 10, "languages": [{"file_count": 81, "language": "go"}, {"file_count": 10, "language": "json"}]},
+      {"path_prefix": "tests/", "depth": 1, "file_count": 89, "definition_count": 1144, "entry_point_count": 0, "document_count": 1, "configuration_count": 33, "languages": [{"file_count": 55, "language": "python"}, {"file_count": 33, "language": "json"}, {"file_count": 1, "language": "markdown"}]},
+      {"path_prefix": "tools/taf-context/", "depth": 2, "file_count": 24, "definition_count": 402, "entry_point_count": 0, "document_count": 0, "configuration_count": 2, "languages": [{"file_count": 22, "language": "python"}, {"file_count": 2, "language": "json"}]},
+      {"path_prefix": "skills/", "depth": 1, "file_count": 21, "definition_count": 174, "entry_point_count": 0, "document_count": 12, "configuration_count": 1, "languages": [{"file_count": 12, "language": "markdown"}, {"file_count": 8, "language": "python"}, {"file_count": 1, "language": "json"}]},
+      {"path_prefix": "scripts/", "depth": 1, "file_count": 2, "definition_count": 1, "entry_point_count": 0, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 2, "language": "python"}]},
+      {"path_prefix": ".", "depth": 0, "file_count": 3, "definition_count": 0, "entry_point_count": 0, "document_count": 3, "configuration_count": 0, "languages": [{"file_count": 3, "language": "markdown"}]},
+      {"path_prefix": ".claude-plugin/", "depth": 1, "file_count": 3, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 3, "languages": [{"file_count": 3, "language": "json"}]},
+      {"path_prefix": ".codex-plugin/", "depth": 1, "file_count": 2, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 2, "languages": [{"file_count": 2, "language": "json"}]},
+      {"path_prefix": ".agents/", "depth": 1, "file_count": 1, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 1, "languages": [{"file_count": 1, "language": "json"}]},
+      {"path_prefix": ".github/", "depth": 1, "file_count": 1, "definition_count": 0, "entry_point_count": 0, "document_count": 1, "configuration_count": 0, "languages": [{"file_count": 1, "language": "markdown"}]}
+    ],
+    "first_findings": [
+      "tools/taf-context-native/cmd/taf-level1/main.go",
+      "tests/taf_context/test_prepare_cli.py",
+      "tools/taf-context/taf_context/cli.py",
+      "skills/branch-handoff/scripts/collect_diff.py",
+      "scripts/package-native-release.py",
+      "README.md",
+      ".claude-plugin/marketplace.json",
+      ".codex-plugin/mcp.json",
+      ".agents/plugins/marketplace.json",
+      ".github/PULL_REQUEST_TEMPLATE.md"
+    ],
+    "tier0_paths": [
+      "tools/taf-context-native/cmd/taf-level1/main.go",
+      "tools/taf-context/taf_context/__main__.py",
+      "tools/taf-context/taf_context/cli.py"
+    ]
+  },
+  "subtree": {
+    "path_prefix": "tools",
+    "root": "tools/",
+    "counted_file_count": 115,
+    "other_group_count": 1,
+    "folded_paths": [
+      "tools/taf-context-native/policy/production-v1.json"
+    ],
+    "groups": [
+      {"path_prefix": "tools/taf-context-native/internal/store/", "depth": 3, "file_count": 10, "definition_count": 413, "entry_point_count": 0, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 10, "language": "go"}]},
+      {"path_prefix": "tools/taf-context/", "depth": 1, "file_count": 24, "definition_count": 402, "entry_point_count": 0, "document_count": 0, "configuration_count": 2, "languages": [{"file_count": 22, "language": "python"}, {"file_count": 2, "language": "json"}]},
+      {"path_prefix": "tools/taf-context-native/internal/extract/", "depth": 3, "file_count": 14, "definition_count": 307, "entry_point_count": 0, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 14, "language": "go"}]},
+      {"path_prefix": "tools/taf-context-native/internal/query/", "depth": 3, "file_count": 12, "definition_count": 241, "entry_point_count": 0, "document_count": 0, "configuration_count": 2, "languages": [{"file_count": 10, "language": "go"}, {"file_count": 2, "language": "json"}]},
+      {"path_prefix": "tools/taf-context-native/internal/engine/", "depth": 3, "file_count": 11, "definition_count": 206, "entry_point_count": 0, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 11, "language": "go"}]},
+      {"path_prefix": "tools/taf-context-native/internal/boundary/", "depth": 3, "file_count": 11, "definition_count": 201, "entry_point_count": 0, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 11, "language": "go"}]},
+      {"path_prefix": "tools/taf-context-native/internal/wire/", "depth": 3, "file_count": 7, "definition_count": 116, "entry_point_count": 0, "document_count": 0, "configuration_count": 2, "languages": [{"file_count": 5, "language": "go"}, {"file_count": 2, "language": "json"}]},
+      {"path_prefix": "tools/taf-context-native/internal/inventory/", "depth": 3, "file_count": 5, "definition_count": 111, "entry_point_count": 0, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 5, "language": "go"}]},
+      {"path_prefix": "tools/taf-context-native/internal/model/", "depth": 3, "file_count": 4, "definition_count": 30, "entry_point_count": 0, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 4, "language": "go"}]},
+      {"path_prefix": "tools/taf-context-native/cmd/", "depth": 2, "file_count": 4, "definition_count": 25, "entry_point_count": 1, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 4, "language": "go"}]},
+      {"path_prefix": "tools/taf-context-native/internal/render/", "depth": 3, "file_count": 3, "definition_count": 14, "entry_point_count": 0, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 3, "language": "go"}]},
+      {"path_prefix": "tools/taf-context-native/integration/", "depth": 2, "file_count": 2, "definition_count": 13, "entry_point_count": 0, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 2, "language": "go"}]},
+      {"path_prefix": "tools/taf-context-native/internal/policy/", "depth": 3, "file_count": 2, "definition_count": 7, "entry_point_count": 0, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 2, "language": "go"}]},
+      {"path_prefix": "tools/taf-context-native/testdata/", "depth": 2, "file_count": 3, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 3, "languages": [{"file_count": 3, "language": "json"}]},
+      {"path_prefix": "tools/taf-context-native/.", "depth": 1, "file_count": 1, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 1, "languages": [{"file_count": 1, "language": "json"}]},
+      {"path_prefix": "tools/taf-context-native/adapter/", "depth": 2, "file_count": 1, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 1, "languages": [{"file_count": 1, "language": "json"}]},
+      {"path_prefix": "*", "depth": 0, "file_count": 1, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 1, "languages": [{"file_count": 1, "language": "json"}]}
+    ]
+  }
+}
