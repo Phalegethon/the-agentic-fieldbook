@@ -23,9 +23,12 @@ const (
 	SourceSnippets  Operation = "source-snippets"
 	RelatedSymbols  Operation = "related-symbols"
 	ChangedSymbols  Operation = "changed-symbols"
+	// RepositoryOverview answers how a repository is organized: directory
+	// groups with counts plus a ranked file layer, under schema 4.
+	RepositoryOverview Operation = "repository-overview"
 )
 
-var operations = [...]Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets, RelatedSymbols, ChangedSymbols}
+var operations = [...]Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets, RelatedSymbols, ChangedSymbols, RepositoryOverview}
 
 // Operations returns a copy of the frozen operation vocabulary.
 func Operations() []Operation { return append([]Operation(nil), operations[:]...) }
@@ -112,6 +115,48 @@ type Result struct {
 	OutputCharacters        int               `json:"output_characters"`
 	Warnings                []string          `json:"warnings"`
 	NextSafeAction          string            `json:"next_safe_action"`
+	// Groups and Overview exist only in schema 4. Both tags are omitempty so a
+	// marshaled schema-1, -2, or -3 result keeps its frozen key set exactly,
+	// which also means marshaling drops them when they are nil: a schema-4
+	// result must set both, and the validator refuses one that does not.
+	Groups   *[]OverviewGroup `json:"groups,omitempty"`
+	Overview *OverviewSummary `json:"overview,omitempty"`
+}
+
+// OverviewLanguage names one language inside a group and how many of the
+// group's files carry it. A group's list is ordered by FileCount descending,
+// then Language ascending, so equal counts still order deterministically.
+type OverviewLanguage struct {
+	Language  string `json:"language"`
+	FileCount int    `json:"file_count"`
+}
+
+// OverviewGroup is one directory group of the repository overview. PathPrefix
+// is relative to the repository root and is either "." (the files at the root),
+// "*" (the row the surplus groups are folded into), a directory prefix ending
+// in "/", or "<directory>/." (the files directly inside a split directory).
+// Depth counts the segments below the overview root, so "." and "*" are 0.
+// RepresentativeIdentity cites the group's top-ranked file and is null for "*",
+// which sums several directories and therefore represents none of them.
+type OverviewGroup struct {
+	PathPrefix             string             `json:"path_prefix"`
+	Depth                  int                `json:"depth"`
+	FileCount              int                `json:"file_count"`
+	DefinitionCount        int                `json:"definition_count"`
+	EntryPointCount        int                `json:"entry_point_count"`
+	DocumentCount          int                `json:"document_count"`
+	ConfigurationCount     int                `json:"configuration_count"`
+	Languages              []OverviewLanguage `json:"languages"`
+	RepresentativeIdentity *string            `json:"representative_identity"`
+}
+
+// OverviewSummary states what the group table was derived from: the overview
+// root ("" for the repository root, otherwise a directory prefix ending in
+// "/"), how many files were counted, and how many groups the "*" row folded.
+type OverviewSummary struct {
+	Root             string `json:"root"`
+	CountedFileCount int    `json:"counted_file_count"`
+	OtherGroupCount  int    `json:"other_group_count"`
 }
 
 type Coverage struct {

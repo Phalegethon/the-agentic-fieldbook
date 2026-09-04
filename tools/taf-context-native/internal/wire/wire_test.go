@@ -17,6 +17,7 @@ const (
 	dirtyIdentity      = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
 	indexIdentity      = "sha256:4444444444444444444444444444444444444444444444444444444444444444"
 	resultIdentity     = "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+	overviewIdentity   = "sha256:6666666666666666666666666666666666666666666666666666666666666666"
 	head               = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 )
 
@@ -154,6 +155,7 @@ func TestDecodeEnvelopeEnforcesAdvertisedPhaseOperationMapping(t *testing.T) {
 		{"query", SourceSnippets},
 		{"query", RelatedSymbols},
 		{"query", ChangedSymbols},
+		{"query", RepositoryOverview},
 	}
 	for _, item := range cases {
 		t.Run(item.phase+"-"+string(item.operation), func(t *testing.T) {
@@ -197,6 +199,10 @@ func envelopeForOperation(phase string, operation Operation) Envelope {
 		envelope.Request.Direction = ptr("callers")
 		envelope.Request.Filters = validRequest().Filters
 	}
+	if operation == RepositoryOverview {
+		envelope.Request.SchemaVersion = "4"
+		envelope.Request.Filters = overviewFilters()
+	}
 	if operation == ChangedSymbols {
 		envelope.Request.SchemaVersion = "3"
 		envelope.Request.ChangedRanges = changedRanges(ChangedRange{Path: "internal/query/changed.go", Ranges: [][2]int{{1, 4}}})
@@ -221,7 +227,7 @@ func TestRequestRequiresOperationCapabilityParity(t *testing.T) {
 }
 
 func TestRequestAcceptsEveryFrozenOperation(t *testing.T) {
-	expected := []Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets, RelatedSymbols, ChangedSymbols}
+	expected := []Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets, RelatedSymbols, ChangedSymbols, RepositoryOverview}
 	if got := Operations(); !equalOperations(got, expected) {
 		t.Fatalf("operations = %v", got)
 	}
@@ -261,6 +267,10 @@ func TestRequestAcceptsEveryFrozenOperation(t *testing.T) {
 			request.SchemaVersion = "3"
 			request.ChangedRanges = changedRanges(ChangedRange{Path: "internal/query/changed.go", Ranges: [][2]int{{1, 4}}})
 			request.Filters = validRequest().Filters
+		}
+		if operation == RepositoryOverview {
+			request.SchemaVersion = "4"
+			request.Filters = overviewFilters()
 		}
 		if err := ValidateRequest(request); err != nil {
 			t.Fatalf("operation %s: %v", operation, err)
@@ -637,7 +647,7 @@ func TestDecodeEnvelopeRejectsInvalidSchemaTwoDirections(t *testing.T) {
 }
 
 func TestRequestRejectsUnknownSchemaVersions(t *testing.T) {
-	for _, version := range []string{"", "0", "4", "2.0"} {
+	for _, version := range []string{"", "0", "5", "2.0"} {
 		request := validRequest()
 		request.SchemaVersion = version
 		if err := ValidateRequest(request); err == nil {
@@ -796,7 +806,7 @@ func TestValidateResultRejectsInconsistentEdgeFields(t *testing.T) {
 		"unknown edge evidence":    func(result *Result) { result.SchemaVersion, result.Findings[0].EdgeEvidence = "2", "guessed" },
 		"negative reference line":  func(result *Result) { result.SchemaVersion, result.Findings[0].ReferenceLine = "2", -1 },
 		"negative reference count": func(result *Result) { result.SchemaVersion, result.Findings[0].ReferenceCount = "2", -1 },
-		"unknown result schema":    func(result *Result) { result.SchemaVersion = "4" },
+		"unknown result schema":    func(result *Result) { result.SchemaVersion = "5" },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -873,11 +883,12 @@ func changedRequest() Request {
 
 // framedEnvelope marshals an envelope for the decoder and spells out the
 // schema-3 keys that struct marshaling omits: the null direction and, for the
-// operations that carry no selector, the null changed_ranges.
+// operations that carry no selector, the null changed_ranges. Schema 4 carries
+// the same key set with both selectors null.
 func framedEnvelope(t *testing.T, envelope Envelope) []byte {
 	t.Helper()
 	overrides := map[string]json.RawMessage{}
-	if envelope.Request.SchemaVersion == "3" {
+	if envelope.Request.SchemaVersion == "3" || envelope.Request.SchemaVersion == "4" {
 		overrides["direction"] = json.RawMessage("null")
 		if envelope.Request.ChangedRanges == nil {
 			overrides["changed_ranges"] = json.RawMessage("null")
@@ -1147,5 +1158,399 @@ func TestMarshalRequestKeepsChangedRangesOutOfFrozenSchemas(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"changed_ranges":[{"path":"internal/query/changed.go","ranges":[[10,20],[40,40]]}`) {
 		t.Fatalf("schema-3 request selector = %s", raw)
+	}
+}
+
+// --- schema 4: repository-overview groups -----------------------------------
+
+// overviewFilters is the filter set the overview accepts: it counts files, so
+// it takes path prefixes and languages and refuses the two symbol-shaped lists.
+func overviewFilters() Filters {
+	return Filters{PathPrefixes: []string{"tools/taf-context"}, Languages: []string{"Python"}, SymbolKinds: []string{}, SourceTypes: []string{}}
+}
+
+func overviewRequest() Request {
+	request := validRequest()
+	request.SchemaVersion = "4"
+	request.Operation, request.RequiredCapability = RepositoryOverview, "repository-overview"
+	request.Query = nil
+	request.ResultIdentities = []string{}
+	request.Filters = overviewFilters()
+	return request
+}
+
+// overviewGroups builds the result-side group list; the pointed-to slice is
+// never nil so an empty overview still marshals as [] rather than null.
+func overviewGroups(entries ...OverviewGroup) *[]OverviewGroup {
+	list := make([]OverviewGroup, 0, len(entries))
+	list = append(list, entries...)
+	return &list
+}
+
+// overviewResult carries a full schema-4 payload: two directory groups and the
+// "*" row the group cap folds the rest into.
+func overviewResult() Result {
+	result := validResult()
+	result.SchemaVersion = "4"
+	result.Operation = RepositoryOverview
+	result.Groups = overviewGroups(
+		OverviewGroup{
+			PathPrefix: "internal/", Depth: 1, FileCount: 12, DefinitionCount: 40, EntryPointCount: 0,
+			DocumentCount: 0, ConfigurationCount: 0,
+			Languages:              []OverviewLanguage{{Language: "Go", FileCount: 12}},
+			RepresentativeIdentity: ptr(resultIdentity),
+		},
+		OverviewGroup{
+			PathPrefix: "cmd/taf-level1/.", Depth: 2, FileCount: 2, DefinitionCount: 3, EntryPointCount: 1,
+			DocumentCount: 0, ConfigurationCount: 0,
+			Languages:              []OverviewLanguage{{Language: "Go", FileCount: 2}},
+			RepresentativeIdentity: ptr(overviewIdentity),
+		},
+		OverviewGroup{
+			PathPrefix: "*", Depth: 0, FileCount: 5, DefinitionCount: 0, EntryPointCount: 0,
+			DocumentCount: 3, ConfigurationCount: 2,
+			Languages:              []OverviewLanguage{{Language: "Markdown", FileCount: 3}, {Language: "JSON", FileCount: 2}},
+			RepresentativeIdentity: nil,
+		},
+	)
+	result.Overview = &OverviewSummary{Root: "", CountedFileCount: 19, OtherGroupCount: 4}
+	result.OutputCharacters = renderedOutputCharacters(result)
+	return result
+}
+
+func TestDecodeEnvelopeAcceptsSchemaFourRepositoryOverview(t *testing.T) {
+	envelope := validEnvelope()
+	envelope.Request = overviewRequest()
+	decoded, err := DecodeEnvelope(bytes.NewReader(framedEnvelope(t, envelope)))
+	if err != nil {
+		t.Fatalf("rejected schema-4 repository-overview: %v", err)
+	}
+	if decoded.Request.Operation != RepositoryOverview || decoded.Request.SchemaVersion != "4" {
+		t.Fatalf("request = %s/%s", decoded.Request.SchemaVersion, decoded.Request.Operation)
+	}
+	if decoded.Request.Direction != nil || decoded.Request.ChangedRanges != nil {
+		t.Fatalf("schema-4 request carries a selector: %v/%v", decoded.Request.Direction, decoded.Request.ChangedRanges)
+	}
+}
+
+// The schema-4 request key set is the schema-3 one, so a request that omits
+// either null selector is malformed even though the typed value would be nil.
+func TestDecodeEnvelopeRequiresBothNullSelectorsUnderSchemaFour(t *testing.T) {
+	for _, field := range []string{"direction", "changed_ranges"} {
+		envelope := validEnvelope()
+		envelope.Request = overviewRequest()
+		overrides := map[string]json.RawMessage{"direction": json.RawMessage("null"), "changed_ranges": json.RawMessage("null")}
+		overrides[field] = nil
+		raw := envelopeWithRequestKeys(t, envelope, overrides)
+		if _, err := DecodeEnvelope(bytes.NewReader(raw)); !errors.Is(err, ErrInvalidWire) {
+			t.Fatalf("schema-4 request without %s: error = %v", field, err)
+		}
+	}
+}
+
+func TestRequestBindsRepositoryOverviewToSchemaFour(t *testing.T) {
+	for _, schemaVersion := range []string{"1", "2", "3"} {
+		request := overviewRequest()
+		request.SchemaVersion = schemaVersion
+		if err := ValidateRequest(request); !errors.Is(err, ErrInvalidWire) {
+			t.Fatalf("schema-%s repository-overview: error = %v", schemaVersion, err)
+		}
+	}
+	related := relatedRequest()
+	related.SchemaVersion = "4"
+	related.Direction = nil
+	if err := ValidateRequest(related); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("schema-4 related-symbols: error = %v", err)
+	}
+	changed := changedRequest()
+	changed.SchemaVersion = "4"
+	changed.ChangedRanges = nil
+	if err := ValidateRequest(changed); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("schema-4 changed-symbols: error = %v", err)
+	}
+	// A schema-agnostic operation may travel under schema 4.
+	search := validRequest()
+	search.SchemaVersion = "4"
+	if err := ValidateRequest(search); err != nil {
+		t.Fatalf("rejected schema-4 search-symbols: %v", err)
+	}
+}
+
+// The overview counts files, so the two symbol-shaped filters would promise a
+// narrowing it cannot perform; path prefixes and languages are accepted.
+func TestRequestRejectsSymbolShapedFiltersForRepositoryOverview(t *testing.T) {
+	kinds := overviewRequest()
+	kinds.Filters.SymbolKinds = []string{"class"}
+	if err := ValidateRequest(kinds); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("symbol kinds: error = %v", err)
+	}
+	sources := overviewRequest()
+	sources.Filters.SourceTypes = []string{"source"}
+	if err := ValidateRequest(sources); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("source types: error = %v", err)
+	}
+	if err := ValidateRequest(overviewRequest()); err != nil {
+		t.Fatalf("rejected path prefix and language filters: %v", err)
+	}
+}
+
+func TestRequestRejectsRepositoryOverviewExtras(t *testing.T) {
+	cases := map[string]func(*Request){
+		"query":     func(request *Request) { request.Query = ptr("anchor") },
+		"anchors":   func(request *Request) { request.ResultIdentities = []string{resultIdentity} },
+		"direction": func(request *Request) { request.Direction = ptr("callers") },
+		"changed ranges": func(request *Request) {
+			request.ChangedRanges = changedRanges(ChangedRange{Path: "a.go", Ranges: [][2]int{{1, 2}}})
+		},
+		"no index": func(request *Request) { request.IndexIdentity = nil },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			request := overviewRequest()
+			mutate(&request)
+			if err := ValidateRequest(request); err == nil {
+				t.Fatalf("accepted repository-overview carrying %s", name)
+			}
+		})
+	}
+}
+
+func TestEncodeResultAcceptsSchemaFourRepositoryOverview(t *testing.T) {
+	var encoded bytes.Buffer
+	if err := EncodeResult(&encoded, overviewResult()); err != nil {
+		t.Fatalf("rejected a schema-4 repository-overview result: %v", err)
+	}
+	for _, fragment := range []string{`"groups":[`, `"path_prefix":"internal/"`, `"overview":{`, `"counted_file_count":19`, `"other_group_count":4`, `"representative_identity":null`} {
+		if !strings.Contains(encoded.String(), fragment) {
+			t.Fatalf("schema-4 result missing %s: %s", fragment, encoded.String())
+		}
+	}
+	// Schema-4 findings carry the schema-2 edge keys, zeroed.
+	var schemaTwo bytes.Buffer
+	two := validResult()
+	two.SchemaVersion = "2"
+	if err := EncodeResult(&schemaTwo, two); err != nil {
+		t.Fatal(err)
+	}
+	got, want := findingKeys(t, encoded.Bytes()), findingKeys(t, schemaTwo.Bytes())
+	if len(got) != len(want) {
+		t.Fatalf("schema-4 finding keys = %v, want %v", got, want)
+	}
+	for key := range want {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("schema-4 finding dropped %q", key)
+		}
+	}
+}
+
+// An empty group list is a legitimate schema-4 payload, and a schema-agnostic
+// operation may carry one: the two keys belong to the schema, not to the
+// operation that introduced them.
+func TestValidateResultAcceptsEmptyGroupsUnderSchemaFour(t *testing.T) {
+	result := validResult()
+	result.SchemaVersion = "4"
+	result.Groups = overviewGroups()
+	result.Overview = &OverviewSummary{Root: "tools/", CountedFileCount: 0, OtherGroupCount: 0}
+	result.OutputCharacters = renderedOutputCharacters(result)
+	var encoded bytes.Buffer
+	if err := EncodeResult(&encoded, result); err != nil {
+		t.Fatalf("rejected an empty schema-4 group list: %v", err)
+	}
+	if !strings.Contains(encoded.String(), `"groups":[]`) {
+		t.Fatalf("empty group list did not marshal as []: %s", encoded.String())
+	}
+}
+
+func TestValidateResultRejectsOverviewKeysOutsideSchemaFour(t *testing.T) {
+	for _, schemaVersion := range []string{"1", "2", "3"} {
+		for name, mutate := range map[string]func(*Result){
+			"groups":   func(result *Result) { result.Groups = overviewGroups() },
+			"overview": func(result *Result) { result.Overview = &OverviewSummary{} },
+		} {
+			result := validResult()
+			result.SchemaVersion = schemaVersion
+			if schemaVersion == "3" {
+				result.Operation = ChangedSymbols
+			}
+			mutate(&result)
+			result.OutputCharacters = renderedOutputCharacters(result)
+			if err := EncodeResult(ioDiscard{}, result); !errors.Is(err, ErrInvalidWire) {
+				t.Fatalf("schema-%s result carrying %s: error = %v", schemaVersion, name, err)
+			}
+		}
+	}
+}
+
+// Struct marshaling omits a nil group list and a nil summary, so a schema-4
+// result that left either unset would travel without a key the schema promises.
+func TestValidateResultRequiresBothOverviewKeysUnderSchemaFour(t *testing.T) {
+	for name, mutate := range map[string]func(*Result){
+		"missing groups":   func(result *Result) { result.Groups = nil },
+		"missing overview": func(result *Result) { result.Overview = nil },
+		"missing both":     func(result *Result) { result.Groups, result.Overview = nil, nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := overviewResult()
+			mutate(&result)
+			result.OutputCharacters = renderedOutputCharacters(result)
+			if err := EncodeResult(ioDiscard{}, result); !errors.Is(err, ErrInvalidWire) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+	// repository-overview itself exists only under schema 4.
+	for _, schemaVersion := range []string{"1", "2", "3"} {
+		result := validResult()
+		result.SchemaVersion = schemaVersion
+		result.Operation = RepositoryOverview
+		result.OutputCharacters = renderedOutputCharacters(result)
+		if err := EncodeResult(ioDiscard{}, result); !errors.Is(err, ErrInvalidWire) {
+			t.Fatalf("schema-%s repository-overview result: error = %v", schemaVersion, err)
+		}
+	}
+}
+
+func TestValidateResultRejectsMalformedOverviewRows(t *testing.T) {
+	cases := map[string]func(*Result){
+		"empty prefix":          func(result *Result) { (*result.Groups)[0].PathPrefix = "" },
+		"absolute prefix":       func(result *Result) { (*result.Groups)[0].PathPrefix = "/internal/" },
+		"parent prefix":         func(result *Result) { (*result.Groups)[0].PathPrefix = "../internal/" },
+		"empty segment":         func(result *Result) { (*result.Groups)[0].PathPrefix = "internal//" },
+		"bare directory":        func(result *Result) { (*result.Groups)[0].PathPrefix = "internal" },
+		"negative depth":        func(result *Result) { (*result.Groups)[0].Depth = -1 },
+		"negative files":        func(result *Result) { (*result.Groups)[0].FileCount = -1 },
+		"negative definitions":  func(result *Result) { (*result.Groups)[0].DefinitionCount = -1 },
+		"negative entry points": func(result *Result) { (*result.Groups)[0].EntryPointCount = -1 },
+		"negative documents":    func(result *Result) { (*result.Groups)[0].DocumentCount = -1 },
+		"negative configs":      func(result *Result) { (*result.Groups)[0].ConfigurationCount = -1 },
+		"nil languages":         func(result *Result) { (*result.Groups)[0].Languages = nil },
+		"empty language name":   func(result *Result) { (*result.Groups)[0].Languages[0].Language = "" },
+		"negative language":     func(result *Result) { (*result.Groups)[0].Languages[0].FileCount = -1 },
+		"ascending languages": func(result *Result) {
+			(*result.Groups)[2].Languages = []OverviewLanguage{{Language: "JSON", FileCount: 2}, {Language: "Markdown", FileCount: 3}}
+		},
+		"duplicate languages": func(result *Result) {
+			(*result.Groups)[2].Languages = []OverviewLanguage{{Language: "JSON", FileCount: 2}, {Language: "JSON", FileCount: 2}}
+		},
+		"unsorted equal counts": func(result *Result) {
+			(*result.Groups)[2].Languages = []OverviewLanguage{{Language: "Markdown", FileCount: 2}, {Language: "JSON", FileCount: 2}}
+		},
+		"bad representative":   func(result *Result) { (*result.Groups)[0].RepresentativeIdentity = ptr("not-a-digest") },
+		"fold representative":  func(result *Result) { (*result.Groups)[2].RepresentativeIdentity = ptr(resultIdentity) },
+		"bad summary root":     func(result *Result) { result.Overview.Root = "/tools/" },
+		"bare summary root":    func(result *Result) { result.Overview.Root = "tools" },
+		"fold summary root":    func(result *Result) { result.Overview.Root = "*" },
+		"negative counted":     func(result *Result) { result.Overview.CountedFileCount = -1 },
+		"negative other count": func(result *Result) { result.Overview.OtherGroupCount = -1 },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			result := overviewResult()
+			mutate(&result)
+			result.OutputCharacters = renderedOutputCharacters(result)
+			if err := EncodeResult(ioDiscard{}, result); !errors.Is(err, ErrInvalidWire) {
+				t.Fatalf("accepted %s: error = %v", name, err)
+			}
+		})
+	}
+}
+
+// The bound is part of the contract, so the cases spell 17 and 18 out instead
+// of deriving them from the constant they are meant to pin: 16 kept groups plus
+// the one "*" row the rest is folded into.
+func TestValidateResultBoundsOverviewGroupRows(t *testing.T) {
+	rows := make([]OverviewGroup, 0, 18)
+	for index := 0; index < 17; index++ {
+		rows = append(rows, OverviewGroup{
+			PathPrefix: fmt.Sprintf("directory%02d/", index), Depth: 1, FileCount: 1,
+			Languages: []OverviewLanguage{{Language: "Go", FileCount: 1}}, RepresentativeIdentity: ptr(resultIdentity),
+		})
+	}
+	bounded := overviewResult()
+	bounded.Groups = overviewGroups(rows...)
+	bounded.OutputCharacters = renderedOutputCharacters(bounded)
+	if err := EncodeResult(ioDiscard{}, bounded); err != nil {
+		t.Fatalf("rejected 17 group rows: %v", err)
+	}
+	tooMany := overviewResult()
+	tooMany.Groups = overviewGroups(append(rows, OverviewGroup{
+		PathPrefix: "*", Depth: 0, FileCount: 1, Languages: []OverviewLanguage{},
+	})...)
+	tooMany.OutputCharacters = renderedOutputCharacters(tooMany)
+	if err := EncodeResult(ioDiscard{}, tooMany); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("accepted 18 group rows: error = %v", err)
+	}
+}
+
+func TestValidateResultAcceptsEveryGroupPrefixShape(t *testing.T) {
+	for _, prefix := range []string{".", "*", "internal/", "internal/query/", "cmd/taf-level1/."} {
+		result := overviewResult()
+		(*result.Groups)[0].PathPrefix = prefix
+		if prefix == "*" {
+			(*result.Groups)[0].RepresentativeIdentity = nil
+		}
+		result.OutputCharacters = renderedOutputCharacters(result)
+		if err := EncodeResult(ioDiscard{}, result); err != nil {
+			t.Fatalf("rejected group prefix %q: %v", prefix, err)
+		}
+	}
+}
+
+// The group row and the summary are exact key sets: a consumer that reads them
+// positionally must never meet a renamed, added, or dropped key.
+func TestEncodeResultKeepsOverviewKeySetsExact(t *testing.T) {
+	var encoded bytes.Buffer
+	if err := EncodeResult(&encoded, overviewResult()); err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Groups   []map[string]json.RawMessage `json:"groups"`
+		Overview map[string]json.RawMessage   `json:"overview"`
+	}
+	if err := json.Unmarshal(encoded.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Groups) != 3 {
+		t.Fatalf("groups = %d", len(decoded.Groups))
+	}
+	wantGroup := []string{"path_prefix", "depth", "file_count", "definition_count", "entry_point_count", "document_count", "configuration_count", "languages", "representative_identity"}
+	for index, group := range decoded.Groups {
+		assertExactKeys(t, fmt.Sprintf("group %d", index), group, wantGroup)
+		var languages []map[string]json.RawMessage
+		if err := json.Unmarshal(group["languages"], &languages); err != nil {
+			t.Fatal(err)
+		}
+		for _, language := range languages {
+			assertExactKeys(t, "language", language, []string{"language", "file_count"})
+		}
+	}
+	assertExactKeys(t, "overview", decoded.Overview, []string{"root", "counted_file_count", "other_group_count"})
+}
+
+func assertExactKeys(t *testing.T, name string, value map[string]json.RawMessage, want []string) {
+	t.Helper()
+	if len(value) != len(want) {
+		t.Fatalf("%s keys = %v, want %v", name, value, want)
+	}
+	for _, key := range want {
+		if _, ok := value[key]; !ok {
+			t.Fatalf("%s is missing %q", name, key)
+		}
+	}
+}
+
+// The frozen schemas keep their exact result key set: the two schema-4 keys are
+// omitted entirely rather than spelled out as null.
+func TestMarshalResultKeepsOverviewKeysOutOfFrozenSchemas(t *testing.T) {
+	for _, result := range []Result{validResult(), relatedResult(), changedResult()} {
+		var encoded bytes.Buffer
+		if err := EncodeResult(&encoded, result); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"groups", "overview"} {
+			if strings.Contains(encoded.String(), `"`+key+`"`) {
+				t.Fatalf("schema-%s result carries %q: %s", result.SchemaVersion, key, encoded.String())
+			}
+		}
 	}
 }

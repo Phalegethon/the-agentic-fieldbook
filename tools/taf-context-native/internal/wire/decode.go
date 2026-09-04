@@ -69,9 +69,10 @@ func validateEnvelopeShape(raw []byte) error {
 	required := []string{"schema_version", "request_identity", "consumer_identity", "operation", "repository_identity", "worktree_identity", "committed_head", "dirty_overlay_fingerprint", "provider_identity", "index_identity", "required_capability", "minimum_freshness", "query", "result_identities", "filters", "maximum_results", "maximum_model_output_characters", "allow_inferred"}
 	nullable := map[string]bool{"index_identity": true, "query": true}
 	// The key set is schema-dependent: schema 2 requires direction (possibly
-	// null), schema 3 requires direction and changed_ranges (both possibly
-	// null), and schema 1 must not carry either. A malformed schema_version
-	// falls through to the schema-1 key set and the typed validator rejects it.
+	// null), schemas 3 and 4 require direction and changed_ranges (both
+	// possibly null, and schema 4 always null), and schema 1 must not carry
+	// either. A malformed schema_version falls through to the schema-1 key set
+	// and the typed validator rejects it.
 	var schemaVersion string
 	if err := json.Unmarshal(request["schema_version"], &schemaVersion); err != nil {
 		schemaVersion = ""
@@ -80,7 +81,7 @@ func validateEnvelopeShape(raw []byte) error {
 	case "2":
 		required = append(required, "direction")
 		nullable["direction"] = true
-	case "3":
+	case "3", "4":
 		required = append(required, "direction", "changed_ranges")
 		nullable["direction"], nullable["changed_ranges"] = true, true
 	}
@@ -137,7 +138,7 @@ func validPhaseOperation(phase string, operation Operation) bool {
 	case "update":
 		return operation == Update
 	case "query":
-		return operation == RepositoryMap || operation == SearchDocs || operation == SearchSymbols || operation == SourceSnippets || operation == RelatedSymbols || operation == ChangedSymbols
+		return operation == RepositoryMap || operation == SearchDocs || operation == SearchSymbols || operation == SourceSnippets || operation == RelatedSymbols || operation == ChangedSymbols || operation == RepositoryOverview
 	default:
 		return false
 	}
@@ -275,12 +276,21 @@ func ValidateRequest(request Request) error {
 	if isControlOperation(request.Operation) && !filtersEmpty(request.Filters) {
 		return ErrInvalidWire
 	}
+	// The overview counts files, not symbols, so the two symbol-shaped filters
+	// would promise a narrowing it cannot perform.
+	if request.Operation == RepositoryOverview && (len(request.Filters.SymbolKinds) != 0 || len(request.Filters.SourceTypes) != 0) {
+		return ErrInvalidWire
+	}
 	return nil
 }
 
 // maximumRelatedAnchors bounds the anchors a single relationship request may
 // carry, keeping the query-time edge resolution work predictable.
 const maximumRelatedAnchors = 16
+
+// The overview keeps 16 directory groups and folds the surplus into one "*"
+// row, so a result never carries more than 17 group rows.
+const maximumOverviewGroups = 17
 
 // The changed selector is bounded independently of the collection limit: a
 // change set names many more paths than a result may return, and the two
@@ -290,16 +300,19 @@ const (
 	maximumChangedRangesPerPath = 64
 )
 
-// validSchemaOperation binds the two schema-gated operations to the schema that
-// introduced them: related-symbols exists only in schema 2 and changed-symbols
-// only in schema 3, so neither can appear under the frozen schema 1 nor leak
-// into the other's schema.
+// validSchemaOperation binds the three schema-gated operations to the schema
+// that introduced them: related-symbols exists only in schema 2, changed-symbols
+// only in schema 3, and repository-overview only in schema 4, so none of them
+// can appear under the frozen schema 1 nor leak into another's schema. Every
+// other operation is schema-agnostic and may travel under any known schema.
 func validSchemaOperation(schemaVersion string, operation Operation) bool {
 	switch operation {
 	case RelatedSymbols:
 		return schemaVersion == "2"
 	case ChangedSymbols:
 		return schemaVersion == "3"
+	case RepositoryOverview:
+		return schemaVersion == "4"
 	default:
 		return true
 	}
@@ -390,6 +403,103 @@ func validateDirection(request Request) error {
 	return nil
 }
 
+// validateOverview enforces the schema-4 overview payload. Only schema 4
+// carries the two result keys, and there both are required for every operation:
+// they belong to the schema, not to the operation that introduced them. Struct
+// marshaling omits a nil group list and a nil summary, so a schema-4 result
+// that left either unset would travel without a key the schema promises.
+func validateOverview(result Result) error {
+	if result.SchemaVersion != "4" {
+		if result.Groups != nil || result.Overview != nil {
+			return ErrInvalidWire
+		}
+		return nil
+	}
+	if result.Groups == nil || result.Overview == nil {
+		return ErrInvalidWire
+	}
+	groups := *result.Groups
+	if len(groups) > maximumOverviewGroups {
+		return ErrInvalidWire
+	}
+	for _, group := range groups {
+		if err := validateOverviewGroup(group); err != nil {
+			return err
+		}
+	}
+	summary := *result.Overview
+	if !validOverviewRoot(summary.Root) || !validCounter(summary.CountedFileCount) || !validCounter(summary.OtherGroupCount) {
+		return ErrInvalidWire
+	}
+	return nil
+}
+
+// validateOverviewGroup keeps one group row honest: a prefix of one of the four
+// admitted shapes, counters that cannot be negative, a language list ordered by
+// count descending then name ascending (which also rejects a repeated name),
+// and a representative the caller can cite back — absent exactly for the "*"
+// row, which sums several directories and represents none of them.
+func validateOverviewGroup(group OverviewGroup) error {
+	if !validOverviewPrefix(group.PathPrefix) || !validCounter(group.Depth) || !validCounter(group.FileCount) || !validCounter(group.DefinitionCount) || !validCounter(group.EntryPointCount) || !validCounter(group.DocumentCount) || !validCounter(group.ConfigurationCount) {
+		return ErrInvalidWire
+	}
+	if group.Languages == nil || len(group.Languages) > policy.ProductionLimits().MaximumCollectionItems {
+		return ErrInvalidWire
+	}
+	for index, language := range group.Languages {
+		if !validText(language.Language, false) || !validCounter(language.FileCount) {
+			return ErrInvalidWire
+		}
+		if index == 0 {
+			continue
+		}
+		previous := group.Languages[index-1]
+		if previous.FileCount < language.FileCount || (previous.FileCount == language.FileCount && previous.Language >= language.Language) {
+			return ErrInvalidWire
+		}
+	}
+	if group.PathPrefix == "*" {
+		if group.RepresentativeIdentity != nil {
+			return ErrInvalidWire
+		}
+		return nil
+	}
+	if group.RepresentativeIdentity != nil && !validSHA(*group.RepresentativeIdentity) {
+		return ErrInvalidWire
+	}
+	return nil
+}
+
+// validOverviewPrefix admits the four group prefix shapes: "." for the files at
+// the repository root, "*" for the folded surplus, "<directory>/" for a
+// directory subtree, and "<directory>/." for the files directly inside a
+// directory a split replaced by its children.
+func validOverviewPrefix(value string) bool {
+	if value == "." || value == "*" {
+		return true
+	}
+	if !validPath(value) || (!strings.HasSuffix(value, "/") && !strings.HasSuffix(value, "/.")) {
+		return false
+	}
+	directory := strings.TrimSuffix(strings.TrimSuffix(value, "."), "/")
+	if directory == "" {
+		return false
+	}
+	for _, segment := range strings.Split(directory, "/") {
+		if segment == "" || segment == "." {
+			return false
+		}
+	}
+	return true
+}
+
+// validOverviewRoot admits the repository root as "" and every other overview
+// root as a normalized directory prefix, so a consumer can join it to a group
+// prefix without guessing where a separator is missing.
+func validOverviewRoot(value string) bool {
+	return value == "" || (strings.HasSuffix(value, "/") && validOverviewPrefix(value))
+}
+
 func validateResult(result Result) error {
 	if err := validateResultWithoutBudgets(result); err != nil {
 		return err
@@ -424,6 +534,9 @@ func validateResultWithoutBudgets(result Result) error {
 	}
 	if !sortedText(result.Warnings) {
 		return ErrInvalidWire
+	}
+	if err := validateOverview(result); err != nil {
+		return err
 	}
 	for key, value := range result.ParserVersions {
 		if !validID(key) || !validText(value, false) {
@@ -532,7 +645,7 @@ func validStatus(value Status) bool {
 func validFreshness(value string) bool {
 	return oneOf(value, "exact", "commit-fresh-worktree-stale", "incrementally-stale", "structurally-stale", "partial", "unknown", "unusable")
 }
-func validSchemaVersion(value string) bool { return oneOf(value, "1", "2", "3") }
+func validSchemaVersion(value string) bool { return oneOf(value, "1", "2", "3", "4") }
 func validBudget(value int) bool {
 	return value == 2000 || value == 4000 || value == 8000 || value == 12000
 }
