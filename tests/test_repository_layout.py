@@ -16,6 +16,7 @@ PREPARE_REPO_CONTEXT_SKILL = ROOT / "skills" / "prepare-repo-context"
 EXPECTED_TAF_CONTEXT_FILES = {
     "__init__.py",
     "__main__.py",
+    "change_ranges.py",
     "cli.py",
     "context_operations.py",
     "dossier.py",
