@@ -178,6 +178,11 @@ def changed_ranges(repo: Path, base: ChangeBase, snapshot) -> tuple[tuple[Change
             "--no-color",
             "--no-renames",
             "--ignore-submodules=all",
+            # Pin the path prefixes the parser assumes: a repo-local
+            # diff.mnemonicPrefix or diff.noprefix would otherwise silently
+            # corrupt every parsed path. Command-line flags override config.
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             target,
             "--",
             allow_failure=True,

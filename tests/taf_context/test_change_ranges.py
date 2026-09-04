@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from taf_context import change_ranges
 from taf_context.change_ranges import (
     MAXIMUM_CHANGED_PATHS,
     MAXIMUM_RANGES_PER_PATH,
@@ -379,6 +380,73 @@ class ChangedRangesTests(unittest.TestCase):
 
         self.assertEqual(paths, ())
         self.assertEqual(warnings, ["changed-diff-unavailable"])
+
+    def test_unresolved_base_and_git_failure_warnings_co_occur(self) -> None:
+        repo, _ = self._fixture()
+        run(repo, "git", "branch", "-m", "work")
+        base = resolve_change_base(repo, None)
+
+        with patch("taf_context.change_ranges._git", return_value=None):
+            paths, warnings = changed_ranges(repo, base, _snapshot_stub())
+
+        self.assertEqual(paths, ())
+        self.assertEqual(warnings, ["base-unresolved", "changed-diff-unavailable"])
+
+    def test_diff_over_the_byte_cap_is_treated_as_unavailable(self) -> None:
+        repo, first = self._fixture()
+        base = resolve_change_base(repo, first)
+        oversized = b"x" * (change_ranges._MAXIMUM_DIFF_BYTES + 1)
+
+        with patch("taf_context.change_ranges._git", return_value=oversized):
+            paths, warnings = changed_ranges(repo, base, _snapshot_stub())
+
+        self.assertEqual(paths, ())
+        self.assertEqual(warnings, ["changed-diff-unavailable"])
+
+    def test_diff_at_exactly_the_byte_cap_is_parsed_normally(self) -> None:
+        repo, first = self._fixture()
+        base = resolve_change_base(repo, first)
+        text = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-a1\n+A1\n"
+        encoded = text.encode("utf-8")
+        padded = encoded + b" " * (change_ranges._MAXIMUM_DIFF_BYTES - len(encoded))
+        self.assertEqual(len(padded), change_ranges._MAXIMUM_DIFF_BYTES)
+
+        with patch("taf_context.change_ranges._git", return_value=padded):
+            paths, warnings = changed_ranges(repo, base, _snapshot_stub())
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(paths, (ChangedPath("a.py", ((1, 1),)),))
+
+    def test_mnemonic_prefix_config_does_not_corrupt_the_path(self) -> None:
+        """A repo-local `diff.mnemonicPrefix` must not survive into the reported path."""
+        repo = init_repo(self.root / "repo")
+        write(repo / "a.py", _numbered("a", 3))
+        first = commit_all(repo, "first")
+        run(repo, "git", "config", "diff.mnemonicPrefix", "true")
+        lines = (repo / "a.py").read_text(encoding="utf-8").splitlines(True)
+        lines[1] = "A2\n"
+        write(repo / "a.py", "".join(lines))
+        base = resolve_change_base(repo, first)
+
+        paths, warnings = changed_ranges(repo, base, _snapshot_stub())
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(paths, (ChangedPath("a.py", ((2, 2),)),))
+
+    def test_noprefix_config_does_not_corrupt_a_path_under_a_directory_named_a(self) -> None:
+        """A repo-local `diff.noprefix`, with a real top-level `a/` directory, must not
+        corrupt the reported path."""
+        repo = init_repo(self.root / "repo")
+        write(repo / "a" / "foo.py", _numbered("f", 3))
+        first = commit_all(repo, "first")
+        run(repo, "git", "config", "diff.noprefix", "true")
+        (repo / "a" / "foo.py").unlink()
+        base = resolve_change_base(repo, first)
+
+        paths, warnings = changed_ranges(repo, base, _snapshot_stub())
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(paths, (ChangedPath("a/foo.py", ((1, 1),)),))
 
     def test_warnings_are_unique_and_ordered(self) -> None:
         repo, _ = self._fixture()
