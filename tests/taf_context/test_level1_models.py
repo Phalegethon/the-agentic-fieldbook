@@ -1365,15 +1365,20 @@ class Level1SchemaFourContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     Level1Result.from_dict(wire)
 
-    def test_the_group_table_is_bounded_at_seventeen_rows(self) -> None:
+    def test_the_group_table_is_bounded_at_the_wire_row_cap(self) -> None:
+        # The table grows with the caller's output budget, not with a fixed
+        # row count, so the only bound left is the wire's own: a repository
+        # cannot have more directory rows than the wire will carry.
         rows = [
-            overview_group_wire(path_prefix=f"group{index:02d}/")
-            for index in range(17)
+            overview_group_wire(path_prefix=f"group{index:04d}/")
+            for index in range(4096)
         ]
-        self.assertEqual(len(Level1Result.from_dict(overview_result_wire(groups=rows)).groups), 17)
+        self.assertEqual(
+            len(Level1Result.from_dict(overview_result_wire(groups=rows)).groups), 4096
+        )
         with self.assertRaises(ValueError):
             Level1Result.from_dict(
-                overview_result_wire(groups=rows + [overview_group_wire(path_prefix="group17/")])
+                overview_result_wire(groups=rows + [overview_group_wire(path_prefix="over/")])
             )
 
     def test_the_summary_names_a_root_prefix_or_the_repository_root(self) -> None:

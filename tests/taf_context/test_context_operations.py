@@ -16,6 +16,7 @@ from taf_context.context_operations import (
     MAXIMUM_REQUEST_BYTES,
     PrepareCLIError,
     QueryArguments,
+    _fold_overview_tail,
     bound_changed_selector,
     compose_impact_candidates,
     fit_overview_to_budget,
@@ -1152,9 +1153,35 @@ class OverviewQueryRequestTests(unittest.TestCase):
 
 
 class OverviewBudgetTests(unittest.TestCase):
-    """The group table is never trimmed; an overrun is reported instead."""
+    """The table's tail folds into `*` until the answer fits its budget."""
 
-    def _summary(self, group_count: int, finding_count: int = 0) -> dict[str, object]:
+    def _group(self, path_prefix: str, **overrides: object) -> dict[str, object]:
+        """One directory row with the exact nine keys the wire names."""
+        row: dict[str, object] = {
+            "path_prefix": path_prefix,
+            "depth": 2,
+            "file_count": 12,
+            "definition_count": 120,
+            "entry_point_count": 1,
+            "document_count": 2,
+            "configuration_count": 3,
+            "languages": [],
+            "representative_identity": None,
+        }
+        row.update(overrides)
+        return row
+
+    def _summary(
+        self,
+        group_count: int,
+        finding_count: int = 0,
+        *,
+        folded: dict[str, object] | None = None,
+        other_group_count: int = 0,
+    ) -> dict[str, object]:
+        groups = [self._group(f"tools/{index:02d}/") for index in range(group_count)]
+        if folded is not None:
+            groups.append(folded)
         return {
             "schema_version": "1",
             "mode": "query",
@@ -1178,24 +1205,11 @@ class OverviewBudgetTests(unittest.TestCase):
             "required_authorizations": [],
             "next_safe_action": "use-index",
             "refresh": {"performed": False, "changed_path_count": 0, "duration_ms": 0},
-            "groups": [
-                {
-                    "path_prefix": f"tools/{index:02d}/",
-                    "depth": 2,
-                    "file_count": 12,
-                    "definition_count": 120,
-                    "entry_point_count": 1,
-                    "document_count": 2,
-                    "configuration_count": 3,
-                    "languages": [],
-                    "representative_identity": None,
-                }
-                for index in range(group_count)
-            ],
+            "groups": groups,
             "overview": {
                 "root": "",
                 "counted_file_count": 240,
-                "other_group_count": 4,
+                "other_group_count": other_group_count,
             },
         }
 
@@ -1204,34 +1218,200 @@ class OverviewBudgetTests(unittest.TestCase):
             json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         )
 
-    def test_a_seventeen_row_table_over_the_smallest_budget_is_reported(self) -> None:
-        fitted = fit_overview_to_budget(self._summary(17, finding_count=4), 2000)
+    def _directory_rows(self, fitted: dict[str, object]) -> list[dict[str, object]]:
+        """The rows that still name a directory, so without the folded one."""
+        groups = fitted["groups"]
+        assert isinstance(groups, list)
+        return [row for row in groups if row["path_prefix"] != "*"]
 
-        self.assertEqual(len(fitted["groups"]), 17)
-        self.assertIn("output-budget-exceeded", fitted["warnings"])
+    def test_folding_turns_the_last_row_into_the_folded_row(self) -> None:
+        result = {
+            "groups": [
+                self._group("src/", languages=[{"language": "Go", "file_count": 12}]),
+                self._group(
+                    "web/",
+                    depth=1,
+                    file_count=3,
+                    definition_count=7,
+                    languages=[{"language": "Python", "file_count": 3}],
+                    representative_identity="sha256:" + "a" * 64,
+                ),
+            ],
+            "overview": {"root": "", "counted_file_count": 15, "other_group_count": 0},
+        }
+
+        self.assertTrue(_fold_overview_tail(result))
+
+        # The folded row keeps the nine keys, stands at the root depth, and
+        # names no single file because it speaks for whole directories.
+        self.assertEqual(
+            result["groups"][-1],
+            {
+                "path_prefix": "*",
+                "depth": 0,
+                "file_count": 3,
+                "definition_count": 7,
+                "entry_point_count": 1,
+                "document_count": 2,
+                "configuration_count": 3,
+                "languages": [{"language": "Python", "file_count": 3}],
+                "representative_identity": None,
+            },
+        )
+        self.assertEqual(result["overview"]["other_group_count"], 1)
+        # One directory row is the floor: a table of nothing but `*` would
+        # describe no repository at all, so the fold refuses and says so.
+        self.assertFalse(_fold_overview_tail(result))
+        self.assertEqual([row["path_prefix"] for row in result["groups"]], ["src/", "*"])
+        self.assertEqual(result["overview"]["other_group_count"], 1)
+
+    def test_folding_merges_into_the_row_the_engine_already_folded(self) -> None:
+        # A 2.5.0 engine answers with a folded row of its own. A second `*`
+        # row would be a table no reader could add up, so the tail merges into
+        # the one that is already there.
+        result = {
+            "groups": [
+                self._group("src/", languages=[{"language": "Go", "file_count": 12}]),
+                self._group(
+                    "web/",
+                    file_count=3,
+                    definition_count=7,
+                    languages=[
+                        {"language": "Python", "file_count": 2},
+                        {"language": "Go", "file_count": 1},
+                    ],
+                    representative_identity="sha256:" + "a" * 64,
+                ),
+                self._group(
+                    "*",
+                    depth=0,
+                    file_count=5,
+                    definition_count=9,
+                    languages=[{"language": "Go", "file_count": 5}],
+                ),
+            ],
+            "overview": {"root": "", "counted_file_count": 20, "other_group_count": 4},
+        }
+
+        self.assertTrue(_fold_overview_tail(result))
+
+        self.assertEqual(
+            result["groups"],
+            [
+                self._group("src/", languages=[{"language": "Go", "file_count": 12}]),
+                {
+                    "path_prefix": "*",
+                    "depth": 0,
+                    "file_count": 8,
+                    "definition_count": 16,
+                    "entry_point_count": 2,
+                    "document_count": 4,
+                    "configuration_count": 6,
+                    # Merged by language and ranked again: most files first,
+                    # ties by name, exactly as a group's own list is ordered.
+                    "languages": [
+                        {"language": "Go", "file_count": 6},
+                        {"language": "Python", "file_count": 2},
+                    ],
+                    "representative_identity": None,
+                },
+            ],
+        )
+        self.assertEqual(result["overview"]["other_group_count"], 5)
+
+    def test_the_tail_folds_before_a_single_finding_is_dropped(self) -> None:
+        fitted = fit_overview_to_budget(self._summary(20, finding_count=6), 4900)
+
+        self.assertLessEqual(fitted["output_characters"], 4900)
         self.assertEqual(fitted["output_characters"], self._length(fitted))
-        self.assertGreater(fitted["output_characters"], 2000)
-        # Zero findings is not enough for the table alone to fit, so every
-        # finding is dropped and the omission is reported honestly.
+        self.assertEqual(fitted["warnings"], [])
+        # Dropping two findings alone would have fit as well. The file layer
+        # is the reserve, so the table's tail pays first and every finding
+        # survives.
+        self.assertEqual(fitted["returned_count"], 6)
+        self.assertEqual(fitted["omitted_count"], 0)
+        self.assertFalse(fitted["truncated"])
+        rows = self._directory_rows(fitted)
+        self.assertLess(len(rows), 20)
+        self.assertEqual(fitted["groups"][-1]["path_prefix"], "*")
+        # Every row the table lost is counted, so the reader can still add the
+        # whole repository up.
+        self.assertEqual(
+            len(rows) + int(fitted["overview"]["other_group_count"]), 20
+        )
+
+    def test_findings_are_dropped_only_after_the_table_is_one_row(self) -> None:
+        fitted = fit_overview_to_budget(self._summary(20, finding_count=6), 1500)
+
+        self.assertLessEqual(fitted["output_characters"], 1500)
+        self.assertEqual(fitted["output_characters"], self._length(fitted))
+        self.assertEqual(fitted["warnings"], [])
+        # Folding ran out first: one directory row plus the folded one.
+        self.assertEqual(len(self._directory_rows(fitted)), 1)
+        self.assertEqual(fitted["groups"][-1]["path_prefix"], "*")
+        self.assertEqual(fitted["overview"]["other_group_count"], 19)
+        # Only then does the file layer lose its tail, and it says how much.
+        self.assertLess(fitted["returned_count"], 6)
+        self.assertTrue(fitted["truncated"])
+        self.assertEqual(
+            int(fitted["returned_count"]) + int(fitted["omitted_count"]), 6
+        )
+
+    def test_only_a_one_row_table_with_no_findings_reports_the_overrun(self) -> None:
+        fitted = fit_overview_to_budget(self._summary(20, finding_count=6), 500)
+
+        # Nothing is left to lose: one directory row, the folded row, and no
+        # findings at all, so the overrun is reported rather than hidden.
+        self.assertEqual(len(self._directory_rows(fitted)), 1)
+        self.assertEqual(fitted["groups"][-1]["path_prefix"], "*")
         self.assertEqual(fitted["findings"], [])
         self.assertEqual(fitted["returned_count"], 0)
+        self.assertEqual(fitted["omitted_count"], 6)
         self.assertTrue(fitted["truncated"])
-        self.assertEqual(fitted["omitted_count"], 4)
+        self.assertIn("output-budget-exceeded", fitted["warnings"])
+        self.assertEqual(fitted["output_characters"], self._length(fitted))
+        self.assertGreater(fitted["output_characters"], 500)
 
-    def test_a_middle_band_answer_drops_only_enough_findings_to_fit(self) -> None:
-        fitted = fit_overview_to_budget(self._summary(17, finding_count=4), 4000)
+    def test_every_budget_either_fits_or_says_it_could_not(self) -> None:
+        for budget in (400, 800, 1200, 1600, 2000, 3000, 4000, 5000, 8000):
+            with self.subTest(budget=budget):
+                fitted = fit_overview_to_budget(
+                    self._summary(20, finding_count=6), budget
+                )
 
-        self.assertEqual(len(fitted["groups"]), 17)
+                self.assertEqual(fitted["output_characters"], self._length(fitted))
+                if "output-budget-exceeded" in fitted["warnings"]:
+                    # The warning is only honest once nothing is left to fold
+                    # or drop.
+                    self.assertEqual(len(self._directory_rows(fitted)), 1)
+                    self.assertEqual(fitted["findings"], [])
+                else:
+                    self.assertLessEqual(fitted["output_characters"], budget)
+                self.assertEqual(
+                    len(self._directory_rows(fitted))
+                    + int(fitted["overview"]["other_group_count"]),
+                    20,
+                )
+
+    def test_a_table_inside_the_budget_is_never_folded(self) -> None:
+        original = self._summary(20, finding_count=6)
+        fitted = fit_overview_to_budget(original, 12000)
+
+        self.assertEqual(fitted["groups"], original["groups"])
+        self.assertEqual(fitted["overview"]["other_group_count"], 0)
+        self.assertEqual(fitted["returned_count"], 6)
         self.assertEqual(fitted["warnings"], [])
         self.assertEqual(fitted["output_characters"], self._length(fitted))
-        self.assertLessEqual(fitted["output_characters"], 4000)
-        # The table plus overview fits under 4000 on its own, so only enough
-        # findings are dropped from the tail to bring the whole answer under
-        # budget; the survivors keep their original, contiguous ranks.
-        self.assertEqual([item["rank"] for item in fitted["findings"]], [1, 2])
-        self.assertEqual(fitted["returned_count"], 2)
-        self.assertEqual(fitted["omitted_count"], 2)
-        self.assertTrue(fitted["truncated"])
+        self.assertLessEqual(fitted["output_characters"], 12000)
+
+    def test_folding_leaves_the_answer_it_was_handed_alone(self) -> None:
+        original = self._summary(20, finding_count=6)
+
+        fit_overview_to_budget(original, 4900)
+
+        self.assertEqual(len(original["groups"]), 20)
+        self.assertEqual(original["overview"]["other_group_count"], 0)
+        self.assertEqual(len(original["findings"]), 6)
 
     def test_a_table_inside_the_budget_only_reports_its_length(self) -> None:
         fitted = fit_overview_to_budget(self._summary(1), 12000)

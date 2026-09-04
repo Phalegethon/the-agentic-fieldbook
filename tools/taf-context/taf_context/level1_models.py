@@ -122,9 +122,11 @@ _SCHEMA_GATED_OPERATIONS = {
 # change set names many more paths than a result may return.
 _MAX_CHANGED_PATHS = 200
 _MAX_CHANGED_RANGES = 64
-# Sixteen kept directory rows plus the one folded row the engine appends.
-_MAX_OVERVIEW_GROUPS = 17
-# The folded row stands for every directory the table could not keep.
+# The table grows with the caller's output budget rather than with a fixed row
+# count, so the only bound left is the wire's own row cap: a repository cannot
+# have more directory rows than the wire will carry.
+_MAX_OVERVIEW_GROUPS = 4096
+# The folded row stands for every directory the answer had no room for.
 _OVERVIEW_OTHER_PREFIX = "*"
 
 

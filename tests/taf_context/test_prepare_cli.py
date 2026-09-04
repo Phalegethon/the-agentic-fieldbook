@@ -74,6 +74,7 @@ def write_fake_native_engine(
     stale: bool = False,
     snippet_stale: bool = False,
     update_outcome: str = "ready",
+    wide_overview: bool = False,
 ) -> None:
     source = textwrap.dedent(
             """\
@@ -340,6 +341,27 @@ def write_fake_native_engine(
                         "counted_file_count": 2,
                         "other_group_count": 0,
                     }
+                    if __WIDE_OVERVIEW__:
+                        # A table wider than a small budget, so the broker's
+                        # fold has a tail to fold. The wide rows hold more
+                        # definitions than the canned pair, so they lead the
+                        # table exactly as the engine's ordering would put
+                        # them.
+                        payload["groups"] = [
+                            {
+                                "path_prefix": "tools/%02d/" % index,
+                                "depth": 2,
+                                "file_count": 12,
+                                "definition_count": 120,
+                                "entry_point_count": 1,
+                                "document_count": 2,
+                                "configuration_count": 3,
+                                "languages": [{"language": "Python", "file_count": 12}],
+                                "representative_identity": None,
+                            }
+                            for index in range(24)
+                        ] + payload["groups"]
+                        payload["overview"]["counted_file_count"] = 2 + 24 * 12
                 return payload
 
             def respond(line):
@@ -369,7 +391,7 @@ def write_fake_native_engine(
             "__PARTIAL__", repr(partial)
         ).replace("__STALE__", repr(stale)).replace("__SNIPPET_STALE__", repr(snippet_stale)).replace(
             "__UPDATE_OUTCOME__", repr(update_outcome)
-        )
+        ).replace("__WIDE_OVERVIEW__", repr(wide_overview))
     path.write_text(source, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
@@ -2119,6 +2141,47 @@ class QueryArgumentInvariantTests(unittest.TestCase):
                 run_query(repo, cli, environment=environment, transport_for=OneShotTransport),
                 run_query(repo, mcp, environment=environment, transport_for=OneShotTransport),
             )
+
+    def test_both_surfaces_fold_a_wide_overview_table_identically(self) -> None:
+        parser = argparse.ArgumentParser()
+        register_prepare_command(parser.add_subparsers(dest="command", required=True))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            write_fake_native_engine(native, wide_overview=True)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+
+            cli = self._cli_arguments(
+                parser,
+                "prepare", "query", "--repo", str(repo),
+                "--operation", "repository-overview",
+                "--maximum-output-characters", "4000",
+            )
+            mcp = _query_arguments(
+                "repository-overview",
+                {"repo": str(repo), "maximum_output_characters": 4000},
+            )
+
+            self.assertEqual(cli, mcp)
+            answered = run_query(
+                repo, cli, environment=environment, transport_for=OneShotTransport
+            )
+            self.assertEqual(
+                answered,
+                run_query(repo, mcp, environment=environment, transport_for=OneShotTransport),
+            )
+            # The wide table does not fit 4000, so its tail became the folded
+            # row and the answer stays inside the budget it was given.
+            self.assertEqual(answered["groups"][-1]["path_prefix"], "*")
+            self.assertGreater(answered["overview"]["other_group_count"], 0)
+            self.assertLess(len(answered["groups"]), 26)
+            self.assertEqual(answered["warnings"], [])
+            self.assertLessEqual(answered["output_characters"], 4000)
 
     def test_both_surfaces_default_the_output_budget_by_operation(self) -> None:
         """The overview's table alone fills 4000 characters, so both default to 8000."""

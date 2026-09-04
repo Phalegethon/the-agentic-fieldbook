@@ -428,9 +428,9 @@ def _query_summary(
         "refresh": refresh,
     }
     if result.groups is not None and result.overview is not None:
-        # Schema 4 adds the directory table. It is bounded by the wire (at most
-        # seventeen rows of bounded fields), so it is carried verbatim and
-        # never trimmed.
+        # Schema 4 adds the directory table. It is carried verbatim here; what
+        # the caller's output budget cannot hold is folded into the `*` row
+        # afterwards, by `fit_overview_to_budget`.
         summary["groups"] = [item.to_dict() for item in result.groups]
         summary["overview"] = result.overview.to_dict()
     return summary
@@ -655,6 +655,18 @@ CHANGE_QUERY_OPERATIONS = ("changed-symbols", "impact-candidates")
 # The operation that answers with a directory table instead of a ranked
 # search: it names no query, no anchor, no direction, and no base.
 OVERVIEW_QUERY_OPERATION = "repository-overview"
+# The row the table's tail folds into. It speaks for several directories at
+# once, so `level1_models` refuses it a representative file; the same literal
+# is the wire's, and a table carries at most one of it.
+OVERVIEW_OTHER_PREFIX = "*"
+# The five counters every group row sums when two rows become one.
+_OVERVIEW_COUNTERS = (
+    "file_count",
+    "definition_count",
+    "entry_point_count",
+    "document_count",
+    "configuration_count",
+)
 # The output budget an operation answers with when the caller names none.
 # repository-overview's group table alone is about 3700 characters of
 # canonical JSON, so it gets a larger default than the shared 4000 and both
@@ -1070,25 +1082,91 @@ def _drop_findings_to_budget(
     return result
 
 
+def _merge_overview_languages(
+    *lists: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Sum the language counts of several rows, most files first, ties by name.
+
+    That is the order a single group's list already promises, so the merged
+    row reads exactly like every other row of the table.
+    """
+    totals: dict[str, int] = {}
+    for languages in lists:
+        for item in languages:
+            name = str(item["language"])
+            totals[name] = totals.get(name, 0) + int(item["file_count"])
+    return [
+        {"language": name, "file_count": count}
+        for name, count in sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+
+def _fold_overview_tail(result: dict[str, object]) -> bool:
+    """Fold the table's last directory row into `*`; say whether it could.
+
+    The folded row speaks for every directory the answer had no room for, so
+    there is exactly one of it and it is always last: an engine that folded
+    rows of its own is merged into, never doubled, and the merged row keeps
+    the nine keys the wire names - depth 0 and no representative file, because
+    it stands for whole directories rather than one of them. `other_group_count`
+    counts every row the table lost, so a reader can still add the repository
+    up. One directory row is the floor - a table of nothing but `*` would
+    describe no repository at all - and reaching it is what `False` reports.
+    The answer handed in is left alone; the fold rebuilds what it changes.
+    """
+    groups = list(result.get("groups") or [])
+    overview = result.get("overview")
+    if not isinstance(overview, dict):
+        return False
+    folded = None
+    if groups and groups[-1]["path_prefix"] == OVERVIEW_OTHER_PREFIX:
+        folded = groups.pop()
+    if len(groups) < 2:
+        return False
+    tail = groups.pop()
+    merged: dict[str, object] = {
+        "path_prefix": OVERVIEW_OTHER_PREFIX,
+        "depth": 0,
+        "languages": _merge_overview_languages(
+            list(tail["languages"]), list(folded["languages"]) if folded else []
+        ),
+        "representative_identity": None,
+    }
+    for counter in _OVERVIEW_COUNTERS:
+        merged[counter] = int(tail[counter]) + (int(folded[counter]) if folded else 0)
+    groups.append(merged)
+    result["groups"] = groups
+    result["overview"] = dict(
+        overview, other_group_count=int(overview["other_group_count"]) + 1
+    )
+    return True
+
+
 def fit_overview_to_budget(
     summary: dict[str, object], maximum_output_characters: int
 ) -> dict[str, object]:
-    """Fit an overview answer into its output budget without ever trimming the table.
+    """Fit an overview answer into its output budget, cheapest loss first.
 
-    `groups` and `overview` describe the whole repository as the wire bounds
-    it (at most seventeen rows of bounded fields); a partial table would
-    describe a repository that does not exist, so they are never trimmed.
-    What can still be dropped is the file layer: findings are dropped from
-    the tail, cheapest loss first, exactly as `trim_to_budget` does for the
-    standard summary shape, until the canonical JSON fits. If it still does
-    not fit with zero findings, `output-budget-exceeded` says so instead of a
-    silent overrun. `output_characters` is always the final canonical
-    length.
+    The table's tail is the cheapest loss there is: folding the last directory
+    row into `*` keeps the answer describing the whole repository - the counts
+    stay in the table, only the detail behind them goes - while a dropped
+    finding takes a file the reader can no longer see at all. So the table
+    folds all the way down to a single directory row before the file layer
+    loses anything, and that ordering is what reserves the file layer its
+    share of a small budget. Only then are findings dropped from the tail,
+    exactly as `trim_to_budget` does for the standard summary shape. If a
+    one-row table with no findings still does not fit,
+    `output-budget-exceeded` says so instead of a silent overrun.
+    `output_characters` is always the final canonical length.
     """
     fitted = dict(summary)
     fitted["output_characters"] = _output_characters(fitted)
     if int(fitted["output_characters"]) <= maximum_output_characters:
         return fitted
+    while int(
+        fitted["output_characters"]
+    ) > maximum_output_characters and _fold_overview_tail(fitted):
+        fitted["output_characters"] = _output_characters(fitted)
     fitted = _drop_findings_to_budget(fitted, maximum_output_characters)
     if int(fitted["output_characters"]) > maximum_output_characters:
         _add_warning(fitted, WARNING_OUTPUT_BUDGET_EXCEEDED)
@@ -1284,9 +1362,10 @@ def run_query(
     touch_binding(binding_path)
     summary = _query_summary(result, refresh_summary)
     if arguments.operation == OVERVIEW_QUERY_OPERATION:
-        # The group table and overview summary describe the whole repository
-        # and are never trimmed; the broker drops findings from the tail
-        # instead and reports the canonical length of what it actually sends.
+        # The engine returns the whole ordered table; the caller's output
+        # budget is what sizes it. The broker folds the tail into the `*` row
+        # until the answer fits, drops findings only after that, and reports
+        # the canonical length of what it actually sends.
         return fit_overview_to_budget(summary, arguments.maximum_output_characters)
     return summary
 
