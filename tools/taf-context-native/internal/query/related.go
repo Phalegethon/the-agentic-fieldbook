@@ -55,7 +55,11 @@ func Related(snapshot store.Snapshot, request wire.Request, limits policy.Limits
 		return empty
 	}
 	resolver := newRelatedResolver(snapshot, budget)
-	collector := &relatedCollector{request: request, edges: make(map[string]relatedEdge, 16)}
+	collector := &relatedCollector{
+		request: request,
+		edges:   make(map[string]relatedEdge, 16),
+		ranking: newBoundedRanking(request.MaximumResults, budget),
+	}
 	for _, identity := range request.ResultIdentities {
 		ordinal, found := anchorOrdinal(snapshot.Records, identity)
 		if !found {
@@ -78,16 +82,7 @@ func Related(snapshot store.Snapshot, request wire.Request, limits policy.Limits
 			return empty
 		}
 	}
-	ranking := newBoundedRanking(request.MaximumResults, budget)
-	partial := resolver.partial
-	for _, identity := range collector.order {
-		edge := collector.edges[identity]
-		if !ranking.offer(edge.record, relatedEdgeTier(edge.evidence)) {
-			partial = true
-			break
-		}
-	}
-	selected, omitted := ranking.records()
+	selected, omitted := collector.ranking.records()
 	findings := make([]RelatedFinding, 0, len(selected))
 	for _, record := range selected {
 		edge := collector.edges[record.Identity]
@@ -96,7 +91,27 @@ func Related(snapshot store.Snapshot, request wire.Request, limits policy.Limits
 			ReferenceLine: edge.line, ReferenceCount: edge.count,
 		})
 	}
-	return RelatedResponse{Findings: findings, Omitted: omitted, Partial: partial || budget.exhausted}
+	sortRelatedFindings(findings)
+	partial := resolver.partial || collector.partial || budget.exhausted
+	return RelatedResponse{Findings: findings, Omitted: omitted, Partial: partial}
+}
+
+// sortRelatedFindings restores the ranking order over the final edge evidence.
+// An edge is offered to the ranking as soon as it is resolved, so a later,
+// better-evidenced edge to the same record can upgrade it after it was placed;
+// re-sorting the selected findings costs nothing and keeps the promise that
+// verified edges come before inferred ones.
+func sortRelatedFindings(findings []RelatedFinding) {
+	sort.SliceStable(findings, func(left, right int) bool {
+		return compareRelatedFinding(findings[left], findings[right]) < 0
+	})
+}
+
+func compareRelatedFinding(left, right RelatedFinding) int {
+	return compareRankedCandidate(
+		newRankedCandidate(left.Record, relatedEdgeTier(left.EdgeEvidence)),
+		newRankedCandidate(right.Record, relatedEdgeTier(right.EdgeEvidence)),
+	)
 }
 
 // relationshipAnchor names the record kinds a relationship question may start
@@ -142,12 +157,15 @@ type relatedEdge struct {
 	count    int
 }
 
-// relatedCollector keeps one edge per related record. The insertion order is
-// the deterministic order the resolvers produced; the map only deduplicates.
+// relatedCollector keeps one edge per related record and offers each new
+// record to the ranking as soon as it is resolved, the way Search admits a
+// posting entry. Interleaving is what keeps an exhausted budget from throwing
+// away everything that was already resolved; the map only deduplicates.
 type relatedCollector struct {
 	request wire.Request
 	edges   map[string]relatedEdge
-	order   []string
+	ranking boundedRanking
+	partial bool
 }
 
 func (collector *relatedCollector) add(edge relatedEdge) {
@@ -155,13 +173,15 @@ func (collector *relatedCollector) add(edge relatedEdge) {
 		return
 	}
 	current, exists := collector.edges[edge.record.Identity]
-	if !exists {
-		collector.edges[edge.record.Identity] = edge
-		collector.order = append(collector.order, edge.record.Identity)
+	if exists {
+		if betterRelatedEdge(edge, current) {
+			collector.edges[edge.record.Identity] = edge
+		}
 		return
 	}
-	if betterRelatedEdge(edge, current) {
-		collector.edges[edge.record.Identity] = edge
+	collector.edges[edge.record.Identity] = edge
+	if !collector.ranking.offer(edge.record, relatedEdgeTier(edge.evidence)) {
+		collector.partial = true
 	}
 }
 
@@ -185,11 +205,17 @@ func betterRelatedEdge(candidate, current relatedEdge) bool {
 	return candidate.line < current.line
 }
 
+// relatedFile groups one file's records. language is the language every record
+// of the file is written in, and is the only language a name written in this
+// file may resolve to. complete is false when the work budget cut the grouping
+// short, which stops any resolution reading it from claiming to be verified.
 type relatedFile struct {
 	definitions []uint32
 	imports     []uint32
 	references  []uint32
 	module      int
+	language    string
+	complete    bool
 }
 
 type relatedResolution struct {
@@ -199,20 +225,26 @@ type relatedResolution struct {
 }
 
 type relatedResolver struct {
-	snapshot store.Snapshot
-	budget   *workBudget
-	files    map[string]*relatedFile
-	targets  map[string]relatedResolution
-	modules  map[string]int
-	partial  bool
+	snapshot    store.Snapshot
+	budget      *workBudget
+	files       map[string]*relatedFile
+	targets     map[string]relatedResolution
+	candidates  map[string]relatedCandidates
+	named       map[string]namedDefinitionScan
+	modules     map[string]int
+	fileModules map[string]string
+	partial     bool
 }
 
 func newRelatedResolver(snapshot store.Snapshot, budget *workBudget) *relatedResolver {
 	return &relatedResolver{
 		snapshot: snapshot, budget: budget,
-		files:   make(map[string]*relatedFile, 8),
-		targets: make(map[string]relatedResolution, 32),
-		modules: make(map[string]int, 8),
+		files:       make(map[string]*relatedFile, 8),
+		targets:     make(map[string]relatedResolution, 32),
+		candidates:  make(map[string]relatedCandidates, 32),
+		named:       make(map[string]namedDefinitionScan, 32),
+		modules:     make(map[string]int, 8),
+		fileModules: make(map[string]string, 8),
 	}
 }
 
@@ -223,9 +255,18 @@ func (resolver *relatedResolver) visit(ordinal uint32) (model.Record, bool) {
 		resolver.partial = true
 		return model.Record{}, false
 	}
-	if uint64(ordinal) >= uint64(len(resolver.snapshot.Records)) {
+	record, ok := resolver.peek(ordinal)
+	if !ok {
 		resolver.budget.exhausted = true
 		resolver.partial = true
+	}
+	return record, ok
+}
+
+// peek reads a record the caller has already paid for. Re-reading an ordinal a
+// scan has just charged is free; only the scan itself is bounded.
+func (resolver *relatedResolver) peek(ordinal uint32) (model.Record, bool) {
+	if uint64(ordinal) >= uint64(len(resolver.snapshot.Records)) {
 		return model.Record{}, false
 	}
 	return resolver.snapshot.Records[ordinal], true
@@ -238,17 +279,21 @@ func (resolver *relatedResolver) file(path string) *relatedFile {
 	if cached, exists := resolver.files[path]; exists {
 		return cached
 	}
-	view := &relatedFile{module: -1}
+	view := &relatedFile{module: -1, complete: true}
 	ordinals := resolver.snapshot.Query.PathOrdinals()
 	start, end := relatedPathRange(resolver.snapshot.Records, ordinals, path)
 	for index := start; index < end; index++ {
 		ordinal := ordinals[index]
 		record, ok := resolver.visit(ordinal)
 		if !ok {
+			view.complete = false
 			break
 		}
 		if record.Path != path {
 			continue
+		}
+		if view.language == "" {
+			view.language = record.Language
 		}
 		switch {
 		case record.RecordKind == model.Reference:
@@ -285,63 +330,70 @@ func relatedPathRange(records []model.Record, ordinals []uint32, path string) (i
 }
 
 // resolveTarget maps a name as it is written inside one file to the
-// definitions it can mean, following the three rules of the design: the same
-// file, then the file's imports, then the name alone. Results are memoized
-// per file and name because one anchor is usually reached by the same name
-// from many call sites.
-func (resolver *relatedResolver) resolveTarget(path, target string) relatedResolution {
-	key := path + "\x00" + target
+// definitions it can mean, following the three rules of the design: the names
+// visible at the use, then the file's imports, then the name alone. Results are
+// memoized per file, enclosing scope, and name; the scans behind them are
+// memoized per file and name alone, so widening a call site's scope never costs
+// another pass over a posting.
+func (resolver *relatedResolver) resolveTarget(path, enclosing, target string) relatedResolution {
+	key := path + "\x00" + enclosing + "\x00" + target
 	if cached, exists := resolver.targets[key]; exists {
 		return cached
 	}
-	resolution := resolver.resolve(path, target)
+	resolution := resolver.resolve(path, enclosing, target)
 	resolver.targets[key] = resolution
 	return resolution
 }
 
-// resolve applies the three resolution rules in order. The first rule reads
-// "the same file" as the same module scope: the definitions the file itself
-// carries, then the definitions of the same module in the same directory. The
-// two are the same thing in the languages where one file is one module, and
-// the package in Go, where a module spans the files of one directory.
-func (resolver *relatedResolver) resolve(path, target string) relatedResolution {
+// resolve applies the three resolution rules. Rule 1 reads "the same file" as
+// the same module scope - the definitions the file itself carries and the
+// definitions of the same module in the same directory, which is one file in
+// the languages where a file is a module and a package in Go - narrowed to the
+// names actually visible where the use is written. Rule 2 follows the file's
+// imports. A name both rules answer is ambiguous, so its edge is inferred; a
+// name neither answers falls to rule 3, the name alone.
+func (resolver *relatedResolver) resolve(path, enclosing, target string) relatedResolution {
 	short := lastNameSegment(normalize(target))
 	if short == "" {
 		return relatedResolution{}
 	}
 	view := resolver.file(path)
-	local := make([]uint32, 0, 2)
-	for _, ordinal := range view.definitions {
-		record, ok := resolver.visit(ordinal)
-		if !ok {
-			break
-		}
-		if matchesTargetName(record, target, short) {
-			local = append(local, ordinal)
-		}
+	candidates := resolver.candidatesFor(view, path, target, short)
+	scope := mergeOrdinals(candidates.local, candidates.scoped)
+	// Visibility narrows a bare name only. A dotted target names its own scope,
+	// and matchesTargetName has already required the definition's qualified
+	// name to end with it, which is the stronger claim of the two.
+	if !strings.Contains(normalize(target), ".") {
+		scope = resolver.visibleOnly(scope, candidates.module, enclosing)
 	}
-	if len(local) == 1 {
-		return relatedResolution{candidates: local, evidence: model.Verified, resolved: true}
+	complete := view.complete && candidates.complete
+	switch {
+	case len(scope) == 1 && len(candidates.imported) == 0:
+		return resolvedTo(scope, complete)
+	case len(candidates.imported) == 1 && len(scope) == 0:
+		return resolvedTo(append([]uint32(nil), candidates.imported...), complete)
+	case len(scope) != 0 || len(candidates.imported) != 0:
+		return resolver.inferredTo(mergeOrdinals(scope, candidates.imported))
 	}
-	if module := resolver.fileModuleName(path); module != "" {
-		scoped := resolver.definitionsNamed(short, target, module, pathDirectory(path))
-		if len(scoped) == 1 {
-			return relatedResolution{candidates: scoped, evidence: model.Verified, resolved: true}
-		}
-	}
-	if module, directory, ok := resolver.importedModuleOf(view, target); ok {
-		scoped := resolver.definitionsNamed(short, target, module, directory)
-		if len(scoped) == 0 && directory != "" {
-			scoped = resolver.definitionsNamed(short, target, module, "")
-		}
-		if len(scoped) == 1 {
-			return relatedResolution{candidates: scoped, evidence: model.Verified, resolved: true}
-		}
-	}
-	candidates := resolver.definitionsNamed(short, target, "", "")
-	if len(candidates) == 0 {
+	named, _ := resolver.definitionsNamed(short, target, view.language)
+	if len(named) == 0 {
 		return relatedResolution{}
 	}
+	return resolver.inferredTo(append([]uint32(nil), named...))
+}
+
+// resolvedTo answers a single candidate. A scan the work budget cut short has
+// proved nothing about the candidates it never reached, so it may name the one
+// it found but never claim the resolution was unambiguous.
+func resolvedTo(candidates []uint32, complete bool) relatedResolution {
+	evidence := model.Verified
+	if !complete {
+		evidence = model.Inferred
+	}
+	return relatedResolution{candidates: candidates, evidence: evidence, resolved: true}
+}
+
+func (resolver *relatedResolver) inferredTo(candidates []uint32) relatedResolution {
 	resolver.sortByPath(candidates)
 	if len(candidates) > maximumInferredCandidates {
 		candidates = candidates[:maximumInferredCandidates]
@@ -349,29 +401,158 @@ func (resolver *relatedResolver) resolve(path, target string) relatedResolution 
 	return relatedResolution{candidates: candidates, evidence: model.Inferred, resolved: true}
 }
 
+func mergeOrdinals(left, right []uint32) []uint32 {
+	output := make([]uint32, 0, len(left)+len(right))
+	output = append(output, left...)
+	for _, ordinal := range right {
+		if !slices.Contains(output, ordinal) {
+			output = append(output, ordinal)
+		}
+	}
+	return output
+}
+
+// relatedCandidates is what one name written in one file can mean before the
+// call site is taken into account: the definitions the file carries, those of
+// its module scope, and those its imports bind. Only the visibility filter
+// depends on where the name is written, and that filter reads records the scans
+// already paid for, so the whole set is memoized per file and name.
+type relatedCandidates struct {
+	module   string
+	local    []uint32
+	scoped   []uint32
+	imported []uint32
+	complete bool
+}
+
+func (resolver *relatedResolver) candidatesFor(view *relatedFile, path, target, short string) relatedCandidates {
+	key := path + "\x00" + target
+	if cached, exists := resolver.candidates[key]; exists {
+		return cached
+	}
+	built := relatedCandidates{module: resolver.fileModuleName(path), complete: true}
+	for _, ordinal := range view.definitions {
+		record, ok := resolver.visit(ordinal)
+		if !ok {
+			built.complete = false
+			break
+		}
+		if record.Language == view.language && matchesTargetName(record, target, short) {
+			built.local = append(built.local, ordinal)
+		}
+	}
+	if built.complete && built.module != "" {
+		named, scanned := resolver.definitionsNamed(short, target, view.language)
+		built.scoped = resolver.restrictDefinitions(named, built.module, pathDirectory(path))
+		built.complete = scanned
+	}
+	if built.complete {
+		module, directory, found, scanned := resolver.importedModuleOf(view, target)
+		built.complete = scanned
+		if found {
+			named, ok := resolver.definitionsNamed(short, target, view.language)
+			built.imported = resolver.restrictDefinitions(named, module, directory)
+			if len(built.imported) == 0 && directory != "" {
+				built.imported = resolver.restrictDefinitions(named, module, "")
+			}
+			built.complete = built.complete && ok
+		}
+	}
+	resolver.candidates[key] = built
+	return built
+}
+
+// visibleOnly keeps the candidates a bare name written at one call site could
+// actually reach. The records were charged to the budget by the scans that
+// produced the candidates, so narrowing them is free.
+func (resolver *relatedResolver) visibleOnly(ordinals []uint32, module, enclosing string) []uint32 {
+	output := make([]uint32, 0, len(ordinals))
+	for _, ordinal := range ordinals {
+		record, ok := resolver.peek(ordinal)
+		if !ok {
+			continue
+		}
+		if visibleAtScope(record.QualifiedName, module, enclosing) {
+			output = append(output, ordinal)
+		}
+	}
+	return output
+}
+
+// restrictDefinitions narrows an already-scanned candidate set to one module
+// and, for a specifier naming a neighbour, one directory.
+func (resolver *relatedResolver) restrictDefinitions(ordinals []uint32, module, directory string) []uint32 {
+	output := make([]uint32, 0, len(ordinals))
+	for _, ordinal := range ordinals {
+		record, ok := resolver.peek(ordinal)
+		if !ok {
+			continue
+		}
+		if module != "" && recordModuleName(record) != module {
+			continue
+		}
+		if directory != "" && pathDirectory(record.Path) != directory {
+			continue
+		}
+		output = append(output, ordinal)
+	}
+	return output
+}
+
+// visibleAtScope reports whether a definition can be reached by a bare name
+// written at one place in its file: a definition of the file's own module
+// scope, or one nested in the chain of scopes enclosing the use. A class method
+// is neither, so a method never answers a bare call written outside its class -
+// a call that does name the class, or a receiver, writes a dotted target and is
+// not asked this question at all.
+func visibleAtScope(qualified, module, enclosing string) bool {
+	parent := parentScopeName(normalize(qualified))
+	if parent == "" {
+		// A definition whose qualified name carries no scope sits at the top
+		// level of its file.
+		return true
+	}
+	if parent == module {
+		return true
+	}
+	scope := normalize(enclosing)
+	if scope == "" {
+		return false
+	}
+	return scope == parent || strings.HasPrefix(scope, parent+".")
+}
+
+// parentScopeName is the qualified name of the scope one definition sits in,
+// and is empty for a name that carries no scope at all.
+func parentScopeName(name string) string {
+	index := strings.LastIndexByte(name, '.')
+	if index < 0 {
+		return ""
+	}
+	return name[:index]
+}
+
 // importedModuleOf names the module a dotted target's first segment, or a
 // plain target under a single wildcard import, was imported from. The second
 // value is the directory the import resolves in: a module named relative to
 // the importing file can only be that file's neighbour, which is what tells
 // two same-named modules of one repository apart. It is empty when the
-// specifier is absolute, and the caller then searches the whole index.
-func (resolver *relatedResolver) importedModuleOf(view *relatedFile, target string) (string, string, bool) {
+// specifier is absolute, and the caller then searches the whole index. The
+// fourth value reports whether the file's imports were all examined.
+func (resolver *relatedResolver) importedModuleOf(view *relatedFile, target string) (string, string, bool, bool) {
 	first := firstNameSegment(normalize(target))
 	wildcards := 0
 	wildcardModule, wildcardDirectory := "", ""
 	for _, ordinal := range view.imports {
 		record, ok := resolver.visit(ordinal)
 		if !ok {
-			break
+			return "", "", false, false
 		}
 		module := importedModuleName(record)
 		if module == "" {
 			continue
 		}
-		directory := ""
-		if neighbouringImport(record) {
-			directory = pathDirectory(record.Path)
-		}
+		directory := importDirectory(record)
 		bound := boundImportName(record)
 		if bound == wildcardBinding {
 			wildcards++
@@ -379,13 +560,23 @@ func (resolver *relatedResolver) importedModuleOf(view *relatedFile, target stri
 			continue
 		}
 		if bound == first {
-			return module, directory, true
+			return module, directory, true, true
 		}
 	}
 	if wildcards == 1 && !strings.Contains(normalize(target), ".") {
-		return wildcardModule, wildcardDirectory, true
+		return wildcardModule, wildcardDirectory, true, true
 	}
-	return "", "", false
+	return "", "", false, true
+}
+
+// importDirectory is the directory an import specifier resolves in: the
+// importing file's own for a neighbouring specifier, and none otherwise, which
+// leaves the whole index to search.
+func importDirectory(record model.Record) string {
+	if neighbouringImport(record) {
+		return pathDirectory(record.Path)
+	}
+	return ""
 }
 
 // neighbouringImport reports whether a specifier names a module in the
@@ -404,29 +595,39 @@ func neighbouringImport(record model.Record) bool {
 	}
 }
 
-// definitionsNamed collects the definitions carrying one short name,
-// optionally restricted to one module and one directory. A Rust macro
-// definition keeps the "!" its call sites do not write, so its own short key
-// is looked up as well.
-func (resolver *relatedResolver) definitionsNamed(short, target, module, directory string) []uint32 {
+// definitionsNamed collects every definition carrying one short name in one
+// language. The scan is memoized and the resolution rules narrow its result by
+// module and directory in memory, so one posting is walked once per name and
+// language however many files ask about it. A Rust macro definition keeps the
+// "!" its call sites do not write, so its own short key is looked up as well.
+// The second value reports whether the scan finished: a truncated scan has not
+// seen the candidates that would make the name ambiguous, so its caller may not
+// call the resolution verified.
+func (resolver *relatedResolver) definitionsNamed(short, target, language string) ([]uint32, bool) {
+	key := language + "\x00" + short + "\x00" + target
+	if cached, exists := resolver.named[key]; exists {
+		return cached.ordinals, cached.complete
+	}
 	output := make([]uint32, 0, 4)
+	complete := true
 	postings := [][]uint32{resolver.snapshot.Query.ShortOrdinals(short)}
 	if macro := short + "!"; macro != short {
 		postings = append(postings, resolver.snapshot.Query.ShortOrdinals(macro))
 	}
+scan:
 	for _, posting := range postings {
 		for _, ordinal := range posting {
 			record, ok := resolver.visit(ordinal)
 			if !ok {
-				return output
+				complete = false
+				break scan
 			}
 			if !definitionRecord(record.RecordKind) || !matchesTargetName(record, target, short) {
 				continue
 			}
-			if module != "" && recordModuleName(record) != module {
-				continue
-			}
-			if directory != "" && pathDirectory(record.Path) != directory {
+			// A name written in one language never means a definition written
+			// in another; the two files share nothing but the spelling.
+			if language != "" && record.Language != language {
 				continue
 			}
 			if !slices.Contains(output, ordinal) {
@@ -434,7 +635,13 @@ func (resolver *relatedResolver) definitionsNamed(short, target, module, directo
 			}
 		}
 	}
-	return output
+	resolver.named[key] = namedDefinitionScan{ordinals: output, complete: complete}
+	return output, complete
+}
+
+type namedDefinitionScan struct {
+	ordinals []uint32
+	complete bool
 }
 
 func (resolver *relatedResolver) sortByPath(ordinals []uint32) {
@@ -463,6 +670,15 @@ func compareRelatedRecord(left, right model.Record) int {
 // the language emits one, and otherwise the module part the extractors put in
 // front of every qualified name of the file.
 func (resolver *relatedResolver) fileModuleName(path string) string {
+	if cached, exists := resolver.fileModules[path]; exists {
+		return cached
+	}
+	name := resolver.readFileModuleName(path)
+	resolver.fileModules[path] = name
+	return name
+}
+
+func (resolver *relatedResolver) readFileModuleName(path string) string {
 	view := resolver.file(path)
 	if view.module >= 0 {
 		if record, ok := resolver.visit(uint32(view.module)); ok {
@@ -505,8 +721,9 @@ func pathDirectory(path string) string {
 // it lives in one directory, and the record reported for it is the first of
 // that directory in path order. A name spread over two directories names two
 // modules and can carry no verified claim.
-func (resolver *relatedResolver) moduleNamed(name string) (int, bool) {
-	if cached, exists := resolver.modules[name]; exists {
+func (resolver *relatedResolver) moduleNamed(name, language string) (int, bool) {
+	key := language + "\x00" + name
+	if cached, exists := resolver.modules[key]; exists {
 		return cached, cached >= 0
 	}
 	candidates := make([]uint32, 0, 4)
@@ -521,6 +738,9 @@ func (resolver *relatedResolver) moduleNamed(name string) (int, bool) {
 		if record.RecordKind != model.Module || normalize(lastNameSegment(record.QualifiedName)) != name {
 			continue
 		}
+		if language != "" && record.Language != language {
+			continue
+		}
 		if len(candidates) != 0 && pathDirectory(record.Path) != directory {
 			ambiguous = true
 			break
@@ -533,7 +753,7 @@ func (resolver *relatedResolver) moduleNamed(name string) (int, bool) {
 		resolver.sortByPath(candidates)
 		found = int(candidates[0])
 	}
-	resolver.modules[name] = found
+	resolver.modules[key] = found
 	return found, found >= 0
 }
 
@@ -582,7 +802,7 @@ func (resolver *relatedResolver) callerEdge(collector *relatedCollector, anchor 
 		if lastNameSegment(normalize(entry.Name)) != written {
 			continue
 		}
-		resolution := resolver.resolveTarget(reference.Path, entry.Name)
+		resolution := resolver.resolveTarget(reference.Path, reference.QualifiedName, entry.Name)
 		if !resolution.resolved || !slices.Contains(resolution.candidates, anchor) {
 			continue
 		}
@@ -646,7 +866,7 @@ func (resolver *relatedResolver) callees(collector *relatedCollector, anchor mod
 			continue
 		}
 		for _, entry := range entries {
-			resolution := resolver.resolveTarget(anchor.Path, entry.Name)
+			resolution := resolver.resolveTarget(anchor.Path, reference.QualifiedName, entry.Name)
 			if !resolution.resolved {
 				continue
 			}
@@ -677,7 +897,7 @@ func (resolver *relatedResolver) importers(collector *relatedCollector, anchor u
 	if isModule {
 		// The claim is verified when the imported module name resolves to the
 		// anchor's own package and to no other.
-		if hosted, ok := resolver.moduleNamed(module); ok {
+		if hosted, ok := resolver.moduleNamed(module, record.Language); ok {
 			if hostRecord, visited := resolver.visit(uint32(hosted)); visited {
 				unique = pathDirectory(hostRecord.Path) == pathDirectory(record.Path)
 			}
@@ -690,6 +910,11 @@ func (resolver *relatedResolver) importers(collector *relatedCollector, anchor u
 			return
 		}
 		if imported.RecordKind != model.Import || importedModuleName(imported) != module {
+			continue
+		}
+		// An import written in another language names another module that
+		// happens to be spelled the same way.
+		if imported.Language != record.Language {
 			continue
 		}
 		bound := boundImportName(imported)
@@ -705,7 +930,9 @@ func (resolver *relatedResolver) importers(collector *relatedCollector, anchor u
 		case bound != short:
 			continue
 		default:
-			resolution := resolver.resolveTarget(imported.Path, bound)
+			// An import sits at the file's module level, so nothing nested is
+			// visible to the name it binds.
+			resolution := resolver.resolveTarget(imported.Path, "", bound)
 			if !resolution.resolved || !slices.Contains(resolution.candidates, anchor) {
 				continue
 			}
@@ -734,10 +961,18 @@ func (resolver *relatedResolver) imports(collector *relatedCollector, anchor mod
 		}
 		bound := boundImportName(imported)
 		if bound != wildcardBinding && bound != module {
-			candidates := resolver.definitionsNamed(bound, bound, module, "")
+			// A neighbouring specifier names the module of this file's own
+			// directory, exactly as rule 2 reads it, so the same import
+			// carries the same evidence whichever direction it is asked from.
+			directory := importDirectory(imported)
+			named, complete := resolver.definitionsNamed(bound, bound, view.language)
+			candidates := resolver.restrictDefinitions(named, module, directory)
+			if len(candidates) == 0 && directory != "" {
+				candidates = resolver.restrictDefinitions(named, module, "")
+			}
 			if len(candidates) != 0 {
 				evidence := model.Inferred
-				if len(candidates) == 1 {
+				if len(candidates) == 1 && complete && view.complete {
 					evidence = model.Verified
 				} else {
 					resolver.sortByPath(candidates)
@@ -758,7 +993,7 @@ func (resolver *relatedResolver) imports(collector *relatedCollector, anchor mod
 				continue
 			}
 		}
-		if hosted, ok := resolver.moduleNamed(module); ok {
+		if hosted, ok := resolver.moduleNamed(module, view.language); ok {
 			record, visited := resolver.visit(uint32(hosted))
 			if !visited {
 				return

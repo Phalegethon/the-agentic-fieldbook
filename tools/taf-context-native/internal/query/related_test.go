@@ -1,6 +1,7 @@
 package query
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -350,5 +351,265 @@ func pythonReference(identity, path, host string, start, end int, entries []mode
 		record.ReferenceCount += entry.Count
 		record.SearchTerms = append(record.SearchTerms, normalize(entry.Name))
 	}
+	return record
+}
+
+// An exhausted work budget must not empty the result: the ranking is charged as
+// each edge is resolved, the way Search charges admission, so what was already
+// resolved survives and only the unscanned remainder is reported as partial.
+func TestRelatedKeepsResolvedEdgesWhenTheWorkBudgetRunsOut(t *testing.T) {
+	const callerCount = 26
+	records := []model.Record{
+		pythonRecord("m-module", "pkg/m.py", "m", model.Module, 1, 4),
+		pythonRecord("m-load", "pkg/m.py", "m.load", model.Definition, 2, 4),
+	}
+	records = append(records, pythonImport("c-import", "pkg/c.py", "load", "pkg.m", 1))
+	for index := 0; index < callerCount; index++ {
+		name := fmt.Sprintf("c.f%02d", index)
+		start := 3 + index*3
+		records = append(records,
+			pythonRecord(fmt.Sprintf("c-f%02d", index), "pkg/c.py", name, model.Definition, start, start+2),
+			pythonReference(fmt.Sprintf("c-f%02d-uses", index), "pkg/c.py", name, start, start+2,
+				[]model.ReferenceEntry{{Name: "load", Line: start + 1, Count: 1}}),
+		)
+	}
+	snapshot := relatedSnapshot(records)
+	request := relatedRequest("callers", "m-load")
+
+	full := Related(snapshot, request, policy.ProductionLimits())
+	if len(full.Findings) != callerCount || full.Partial {
+		t.Fatalf("unbounded callers = %d findings partial=%v, want %d and false", len(full.Findings), full.Partial, callerCount)
+	}
+
+	counts := make([]int, 0, 256)
+	best, bestBudget := 0, 0
+	for budget := 25; budget <= 20000; budget += 25 {
+		response := Related(snapshot, request, relatedLimits(budget))
+		counts = append(counts, len(response.Findings))
+		if size := len(counts); size > 1 && counts[size-1] < counts[size-2] {
+			t.Fatalf("findings dropped as the budget grew, at %d: %v", budget, counts)
+		}
+		if response.Partial && len(response.Findings) > best {
+			best, bestBudget = len(response.Findings), budget
+		}
+	}
+	if best < callerCount-2 {
+		t.Fatalf("best partial result = %d findings at budget %d, want at least %d: %v", best, bestBudget, callerCount-2, counts)
+	}
+}
+
+// Resolution never crosses languages. A Python file that imports a name whose
+// only definition is Rust resolves to nothing at all: the candidate is excluded
+// rather than downgraded, in both directions and under allow_inferred.
+func TestRelatedNeverResolvesAcrossLanguages(t *testing.T) {
+	records := []model.Record{
+		pythonImport("a-import-load", "app/a.py", "load", "b", 1),
+		pythonRecord("a-run", "app/a.py", "a.run", model.Definition, 3, 6),
+		pythonReference("a-run-uses", "app/a.py", "a.run", 3, 6, []model.ReferenceEntry{{Name: "load", Line: 4, Count: 1}}),
+		rustRecord("rs-b-load", "rs/b.rs", "b.load", model.Definition, 2, 5),
+		// A Go package sharing one directory and one module name with a Python
+		// module must not join that module's scope either.
+		pythonReference("util-uses", "pkg/util.py", "util", 1, 6, []model.ReferenceEntry{{Name: "helper", Line: 3, Count: 1}}),
+		goRecord("go-util-module", "pkg/util.go", "util", model.Module, 1, 1),
+		goRecord("go-util-helper", "pkg/util.go", "util.helper", model.Definition, 3, 5),
+	}
+	snapshot := relatedSnapshot(records)
+	for _, probe := range []struct{ direction, anchor string }{
+		{"callees", "a-run"},
+		{"callers", "rs-b-load"},
+		{"callers", "go-util-helper"},
+	} {
+		request := relatedRequest(probe.direction, probe.anchor)
+		request.AllowInferred = true
+		response := Related(snapshot, request, policy.ProductionLimits())
+		if len(response.Findings) != 0 {
+			t.Fatalf("%s(%s) crossed languages: %#v", probe.direction, probe.anchor, response.Findings)
+		}
+	}
+}
+
+// Rule 1 sees only the names visible where the call is written. A method is not
+// bare-callable from the file's module level, so an explicit import of the same
+// name is the one candidate and the edge is verified.
+func TestRelatedIgnoresAMethodThatIsNotVisibleAtTheCall(t *testing.T) {
+	records := []model.Record{
+		pythonImport("a-import-load", "pkg/a.py", "load", "pkg.b", 1),
+		pythonRecord("a-class", "pkg/a.py", "a.A", model.Definition, 3, 6),
+		pythonRecord("a-class-load", "pkg/a.py", "a.A.load", model.Definition, 4, 6),
+		pythonRecord("a-run", "pkg/a.py", "a.run", model.Definition, 8, 10),
+		pythonReference("a-run-uses", "pkg/a.py", "a.run", 8, 10, []model.ReferenceEntry{{Name: "load", Line: 9, Count: 1}}),
+		pythonRecord("b-module", "pkg/b.py", "b", model.Module, 1, 4),
+		pythonRecord("b-load", "pkg/b.py", "b.load", model.Definition, 2, 4),
+	}
+	snapshot := relatedSnapshot(records)
+
+	callees := Related(snapshot, relatedRequest("callees", "a-run"), policy.ProductionLimits())
+	if got, want := relatedIdentities(callees.Findings), []string{"b-load"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callees of a.run = %#v, want %#v", got, want)
+	}
+	if callees.Findings[0].EdgeEvidence != model.Verified {
+		t.Fatalf("callee edge = %#v", callees.Findings[0])
+	}
+	callers := Related(snapshot, relatedRequest("callers", "b-load"), policy.ProductionLimits())
+	if got, want := relatedIdentities(callers.Findings), []string{"a-run"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callers of b.load = %#v, want %#v", got, want)
+	}
+	if callers.Findings[0].EdgeEvidence != model.Verified {
+		t.Fatalf("caller edge = %#v", callers.Findings[0])
+	}
+}
+
+// Visibility narrows a bare name. A dotted target names its own scope, and the
+// qualified name already had to end with it, so a receiver call still reaches
+// the method it names.
+func TestRelatedResolvesADottedReceiverCallToItsMethod(t *testing.T) {
+	records := []model.Record{
+		goRecord("engine-module", "internal/engine/engine.go", "engine", model.Module, 1, 1),
+		goRecord("engine-type", "internal/engine/engine.go", "engine.Engine", model.Definition, 3, 20),
+		goRecord("engine-execute", "internal/engine/engine.go", "engine.Engine.Execute", model.Definition, 10, 18),
+		goRecord("engine-test-module", "internal/engine/engine_test.go", "engine", model.Module, 1, 1),
+		goRecord("engine-test", "internal/engine/engine_test.go", "engine.TestExecute", model.Definition, 5, 12),
+		goReference("engine-test-uses", "internal/engine/engine_test.go", "engine.TestExecute", 5, 12,
+			[]model.ReferenceEntry{{Name: "engine.Execute", Line: 7, Count: 1}}),
+	}
+	snapshot := relatedSnapshot(records)
+	response := Related(snapshot, relatedRequest("callers", "engine-execute"), policy.ProductionLimits())
+	if got, want := relatedIdentities(response.Findings), []string{"engine-test"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callers of the method = %#v, want %#v", got, want)
+	}
+	if response.Findings[0].EdgeEvidence != model.Verified {
+		t.Fatalf("receiver call edge = %#v", response.Findings[0])
+	}
+}
+
+// When a definition visible at the call and an import bind the same name,
+// neither is provably the target, so the edge is ambiguous and both candidates
+// are inferred.
+func TestRelatedTreatsAVisibleDefinitionAndAnImportOfOneNameAsAmbiguous(t *testing.T) {
+	records := []model.Record{
+		pythonImport("a-import-load", "pkg/a.py", "load", "pkg.b", 1),
+		pythonRecord("a-load", "pkg/a.py", "a.load", model.Definition, 3, 5),
+		pythonRecord("a-run", "pkg/a.py", "a.run", model.Definition, 8, 10),
+		pythonReference("a-run-uses", "pkg/a.py", "a.run", 8, 10, []model.ReferenceEntry{{Name: "load", Line: 9, Count: 1}}),
+		pythonRecord("b-module", "pkg/b.py", "b", model.Module, 1, 4),
+		pythonRecord("b-load", "pkg/b.py", "b.load", model.Definition, 2, 4),
+	}
+	snapshot := relatedSnapshot(records)
+
+	if hidden := Related(snapshot, relatedRequest("callers", "b-load"), policy.ProductionLimits()); len(hidden.Findings) != 0 {
+		t.Fatalf("ambiguous callers of b.load without allow_inferred = %#v", hidden.Findings)
+	}
+	request := relatedRequest("callees", "a-run")
+	request.AllowInferred = true
+	callees := Related(snapshot, request, policy.ProductionLimits())
+	if got, want := relatedIdentities(callees.Findings), []string{"a-load", "b-load"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ambiguous callees of a.run = %#v, want %#v", got, want)
+	}
+	for _, finding := range callees.Findings {
+		if finding.EdgeEvidence != model.Inferred {
+			t.Fatalf("ambiguous edge = %#v", finding)
+		}
+	}
+}
+
+// A candidate scan that could not finish has proved nothing about the
+// candidates it never reached, so it must not report the one it did reach as
+// the unambiguous target. Two definitions carry the imported name; the index
+// still points at the second while the record slice no longer carries it, which
+// is what a scan cut short looks like from inside the resolver.
+func TestRelatedDoesNotClaimVerifiedFromATruncatedCandidateScan(t *testing.T) {
+	records := []model.Record{
+		goRecord("app-module", "app/main.go", "app", model.Module, 1, 1),
+		goImport("app-import-store", "app/main.go", "store", "example.com/x/store", 3),
+		goRecord("app-run", "app/main.go", "app.Run", model.Definition, 5, 8),
+		goReference("app-run-uses", "app/main.go", "app.Run", 5, 8, []model.ReferenceEntry{{Name: "store.Load", Line: 6, Count: 1}}),
+		goRecord("store-one-load", "store/one.go", "store.Load", model.Definition, 3, 6),
+		goRecord("store-one-module", "store/one.go", "store", model.Module, 1, 1),
+		goRecord("store-two-load", "store/two.go", "store.Load", model.Definition, 3, 6),
+		goRecord("store-two-module", "store/two.go", "store", model.Module, 1, 1),
+	}
+	request := relatedRequest("callers", "store-one-load")
+	request.AllowInferred = true
+
+	// Both candidates present: the name is plainly ambiguous.
+	whole := Related(relatedSnapshot(records), request, policy.ProductionLimits())
+	if got, want := relatedIdentities(whole.Findings), []string{"app-run"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("ambiguous callers = %#v, want %#v", got, want)
+	}
+	if whole.Findings[0].EdgeEvidence != model.Inferred {
+		t.Fatalf("ambiguous edge = %#v", whole.Findings[0])
+	}
+
+	truncated := Related(relatedTruncatedSnapshot(records, 2), request, policy.ProductionLimits())
+	if !truncated.Partial {
+		t.Fatalf("a scan that ran off the record slice is not partial: %#v", truncated)
+	}
+	for _, finding := range truncated.Findings {
+		if finding.EdgeEvidence == model.Verified {
+			t.Fatalf("a truncated scan manufactured a verified edge: %#v", finding)
+		}
+	}
+
+	// The same must hold whatever the work budget stops the scan.
+	for budget := 1; budget <= 600; budget++ {
+		response := Related(relatedSnapshot(records), request, relatedLimits(budget))
+		for _, finding := range response.Findings {
+			if finding.EdgeEvidence == model.Verified {
+				t.Fatalf("budget %d manufactured a verified edge: %#v", budget, finding)
+			}
+		}
+	}
+}
+
+// A relative specifier names the neighbouring module, and imports() must read
+// it the way callers and callees do, so one edge carries one evidence class
+// whichever direction it is asked from.
+func TestRelatedImportsResolveARelativeSpecifierInsideItsOwnDirectory(t *testing.T) {
+	records := []model.Record{
+		pythonImport("a-import-load", "pkg/a.py", "load", ".b", 1),
+		pythonRecord("a-run", "pkg/a.py", "a.run", model.Definition, 3, 6),
+		pythonReference("a-run-uses", "pkg/a.py", "a.run", 3, 6, []model.ReferenceEntry{{Name: "load", Line: 4, Count: 1}}),
+		pythonRecord("pkg-b-load", "pkg/b.py", "b.load", model.Definition, 2, 4),
+		pythonRecord("other-b-load", "other/b.py", "b.load", model.Definition, 2, 4),
+	}
+	snapshot := relatedSnapshot(records)
+
+	imports := Related(snapshot, relatedRequest("imports", "a-run"), policy.ProductionLimits())
+	if got, want := relatedIdentities(imports.Findings), []string{"pkg-b-load"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("imports of a.run = %#v, want %#v", got, want)
+	}
+	if finding := imports.Findings[0]; finding.EdgeEvidence != model.Verified || finding.ReferenceLine != 1 {
+		t.Fatalf("relative import edge = %#v", finding)
+	}
+	callees := Related(snapshot, relatedRequest("callees", "a-run"), policy.ProductionLimits())
+	if got, want := relatedIdentities(callees.Findings), []string{"pkg-b-load"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callees of a.run = %#v, want %#v", got, want)
+	}
+	if callees.Findings[0].EdgeEvidence != model.Verified {
+		t.Fatalf("relative call edge = %#v", callees.Findings[0])
+	}
+}
+
+// relatedLimits is the production policy with one lowered record budget, so a
+// test can put the resolver under budget pressure without touching the frozen
+// policy artifact.
+func relatedLimits(records int) policy.Limits {
+	limits := policy.ProductionLimits()
+	limits.MaximumLexicalCandidates = records
+	return limits
+}
+
+// relatedTruncatedSnapshot keeps the query index of the whole record set but
+// hands the resolver a shorter record slice, so a posting entry runs off the
+// end exactly as it does when a scan cannot finish.
+func relatedTruncatedSnapshot(records []model.Record, dropped int) store.Snapshot {
+	sorted := append([]model.Record(nil), records...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Identity < sorted[j].Identity })
+	return store.Snapshot{Records: sorted[:len(sorted)-dropped], Query: store.BuildQueryIndex(sorted)}
+}
+
+func rustRecord(identity, path, name string, kind model.RecordKind, start, end int) model.Record {
+	record := pythonRecord(identity, path, name, kind, start, end)
+	record.Language, record.ExtractionMethod = "rust", "tree-sitter-rust"
 	return record
 }
