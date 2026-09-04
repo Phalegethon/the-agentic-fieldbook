@@ -11,9 +11,11 @@ than a recording of whatever the engine happened to answer.
 The first test asserts the whole group table, the summary and the ordering
 invariants of the file layer; the second that the same request answers byte
 for byte the same way twice; the third that a `--path-prefix` re-roots the
-answer on the children of that subtree, folds the surplus into the `"*"` row
-and re-derives the same counts one level down; the fourth that asking for
-several prefixes is served from the first in sorted order and says so.
+answer on the children of that subtree and re-derives the same counts one
+level down; the fourth that asking for several prefixes is served from the
+first in sorted order and says so; the fifth that the output budget is what
+sizes the table, folding its tail into the `"*"` row around a reserved file
+layer, so a wider budget buys a wider table.
 """
 
 from __future__ import annotations
@@ -108,11 +110,15 @@ class DogfoodOverviewTests(unittest.TestCase):
         return text, json.loads(text)
 
     @classmethod
-    def _overview(cls, *prefixes: str, cached: bool = True) -> tuple[str, dict[str, object]]:
+    def _overview(
+        cls, *prefixes: str, cached: bool = True, budget: int | None = None
+    ) -> tuple[str, dict[str, object]]:
         # The stages of the tests below ask for the same few answers, so one
-        # engine call per prefix tuple is enough; `cached=False` is what the
-        # determinism test uses to ask for a genuinely second call.
+        # engine call per prefix tuple and budget is enough; `cached=False` is
+        # what the determinism test uses to ask for a genuinely second call.
         request = cls.fixture["request"]
+        if budget is None:
+            budget = int(request["maximum_output_characters"])
         argv = [
             "prepare",
             "query",
@@ -127,13 +133,14 @@ class DogfoodOverviewTests(unittest.TestCase):
             "--maximum-results",
             str(request["maximum_results"]),
             "--maximum-output-characters",
-            str(request["maximum_output_characters"]),
+            str(budget),
         ]
         if not cached:
             return cls._invoke(*argv)
-        if prefixes not in cls._cache:
-            cls._cache[prefixes] = cls._invoke(*argv)
-        return cls._cache[prefixes]
+        key = prefixes + (str(budget),)
+        if key not in cls._cache:
+            cls._cache[key] = cls._invoke(*argv)
+        return cls._cache[key]
 
     def _table(self, result: dict[str, object]) -> list[dict[str, object]]:
         return [{key: group[key] for key in GROUP_KEYS} for group in result["groups"]]
@@ -232,18 +239,16 @@ class DogfoodOverviewTests(unittest.TestCase):
             },
         )
         self.assertEqual(self._table(result), expected["groups"])
-        folded = [
-            group for group in result["groups"] if group["path_prefix"] == FOLDED_PREFIX
-        ]
-        # The subtree has more directories than the table keeps, so the surplus
-        # is folded into one row that names no file of its own.
-        self.assertEqual(len(folded), 1)
-        self.assertIsNone(folded[0]["representative_identity"])
-        self.assertEqual(folded[0]["depth"], 0)
-        self.assertEqual(folded[0]["file_count"], len(expected["folded_paths"]))
+        # This budget holds the whole subtree table, so every row names a real
+        # directory of it: nothing was folded and nothing is missing.
+        self.assertNotIn(
+            FOLDED_PREFIX, [group["path_prefix"] for group in result["groups"]]
+        )
+        self.assertEqual(
+            sum(group["file_count"] for group in result["groups"]),
+            expected["counted_file_count"],
+        )
         for group in result["groups"]:
-            if group["path_prefix"] == FOLDED_PREFIX:
-                continue
             self.assertTrue(group["path_prefix"].startswith(expected["root"]), group)
         for finding in result["findings"]:
             self.assertTrue(finding["path"].startswith(expected["root"]), finding["path"])
@@ -264,6 +269,61 @@ class DogfoodOverviewTests(unittest.TestCase):
         # table reports for it.
         self.assertEqual(result["overview"]["counted_file_count"], counted)
 
+
+    def test_the_output_budget_is_what_sizes_the_table(self) -> None:
+        # The table has no fixed width any more: the engine returns every
+        # group and the broker folds the tail into `"*"` until the answer fits
+        # the caller's budget, so the same repository answers with a wider
+        # table the more room it is given.
+        matrix = self.fixture["budgets"]
+        reserve = matrix["finding_reserve"]
+        for key, prefixes in (("repository", ()), ("subtree", (self.fixture["subtree"]["path_prefix"],))):
+            width = len(self.fixture[key]["groups"])
+            widths: list[int] = []
+            for expected in matrix[key]:
+                budget = expected["maximum_output_characters"]
+                with self.subTest(request=key, budget=budget):
+                    _text, result = self._overview(*prefixes, budget=budget)
+                    rows = [
+                        group
+                        for group in result["groups"]
+                        if group["path_prefix"] != FOLDED_PREFIX
+                    ]
+                    folded = [
+                        group
+                        for group in result["groups"]
+                        if group["path_prefix"] == FOLDED_PREFIX
+                    ]
+                    self.assertEqual(len(rows), expected["directory_rows"])
+                    self.assertEqual(
+                        result["overview"]["other_group_count"],
+                        expected["other_group_count"],
+                    )
+                    # Every directory the answer stopped naming is counted in
+                    # exactly one folded row, so the reader can still add the
+                    # whole subtree up whatever the budget was.
+                    self.assertEqual(
+                        len(rows) + int(result["overview"]["other_group_count"]), width
+                    )
+                    self.assertEqual(
+                        len(folded), 1 if expected["other_group_count"] else 0
+                    )
+                    if folded:
+                        self.assertIsNone(folded[0]["representative_identity"])
+                        self.assertEqual(folded[0]["depth"], 0)
+                        self.assertEqual(
+                            result["groups"][-1]["path_prefix"], FOLDED_PREFIX
+                        )
+                    # The file layer is what the fold reserves room for, and
+                    # the answer never silently overruns the budget it was
+                    # given.
+                    self.assertEqual(result["returned_count"], expected["returned_count"])
+                    self.assertGreaterEqual(result["returned_count"], reserve)
+                    self.assertNotIn("output-budget-exceeded", result["warnings"])
+                    self.assertLessEqual(result["output_characters"], budget)
+                    widths.append(len(rows))
+            # A wider budget never buys a narrower table.
+            self.assertEqual(widths, sorted(widths), key)
 
     def test_a_root_that_is_not_a_directory_is_answered_with_a_warning(self) -> None:
         # README.md is a real path at the pinned commit but not a directory, so

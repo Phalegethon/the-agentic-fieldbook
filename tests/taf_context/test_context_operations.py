@@ -1319,39 +1319,64 @@ class OverviewBudgetTests(unittest.TestCase):
         )
         self.assertEqual(result["overview"]["other_group_count"], 5)
 
-    def test_the_tail_folds_before_a_single_finding_is_dropped(self) -> None:
+    def test_the_file_layer_pays_down_to_its_reserve_before_the_table_folds(self) -> None:
         fitted = fit_overview_to_budget(self._summary(20, finding_count=6), 4900)
 
         self.assertLessEqual(fitted["output_characters"], 4900)
         self.assertEqual(fitted["output_characters"], self._length(fitted))
         self.assertEqual(fitted["warnings"], [])
-        # Dropping two findings alone would have fit as well. The file layer
-        # is the reserve, so the table's tail pays first and every finding
-        # survives.
-        self.assertEqual(fitted["returned_count"], 6)
-        self.assertEqual(fitted["omitted_count"], 0)
-        self.assertFalse(fitted["truncated"])
-        rows = self._directory_rows(fitted)
-        self.assertLess(len(rows), 20)
+        # Dropping one finding is enough here, and a finding above the reserve
+        # is the cheapest loss there is: the table is what the operation is
+        # asked for, so no row is folded while the file layer is still long.
+        self.assertEqual(len(self._directory_rows(fitted)), 20)
+        self.assertEqual(fitted["overview"]["other_group_count"], 0)
+        self.assertNotIn("*", [row["path_prefix"] for row in fitted["groups"]])
+        self.assertEqual(fitted["returned_count"], 5)
+        self.assertEqual(fitted["omitted_count"], 1)
+        self.assertTrue(fitted["truncated"])
+
+    def test_the_table_folds_once_the_file_layer_is_down_to_its_reserve(self) -> None:
+        fitted = fit_overview_to_budget(self._summary(20, finding_count=6), 4000)
+
+        self.assertLessEqual(fitted["output_characters"], 4000)
+        self.assertEqual(fitted["output_characters"], self._length(fitted))
+        self.assertEqual(fitted["warnings"], [])
+        # The reserve stands: four files are what the table may not take.
+        self.assertEqual(fitted["returned_count"], 4)
+        self.assertEqual(fitted["omitted_count"], 2)
+        # Everything the budget still lacks comes out of the table's tail.
+        self.assertEqual(len(self._directory_rows(fitted)), 14)
         self.assertEqual(fitted["groups"][-1]["path_prefix"], "*")
         # Every row the table lost is counted, so the reader can still add the
         # whole repository up.
-        self.assertEqual(
-            len(rows) + int(fitted["overview"]["other_group_count"]), 20
-        )
+        self.assertEqual(fitted["overview"]["other_group_count"], 6)
 
-    def test_findings_are_dropped_only_after_the_table_is_one_row(self) -> None:
-        fitted = fit_overview_to_budget(self._summary(20, finding_count=6), 1500)
+    def test_a_shorter_file_layer_is_its_own_reserve(self) -> None:
+        # The reserve is `min(returned_count, 4)`, so an answer that carries
+        # fewer files than the reserve keeps all of them while the table folds.
+        fitted = fit_overview_to_budget(self._summary(20, finding_count=2), 2000)
 
-        self.assertLessEqual(fitted["output_characters"], 1500)
+        self.assertLessEqual(fitted["output_characters"], 2000)
+        self.assertEqual(fitted["warnings"], [])
+        self.assertEqual(fitted["returned_count"], 2)
+        self.assertEqual(fitted["omitted_count"], 0)
+        self.assertFalse(fitted["truncated"])
+        self.assertEqual(len(self._directory_rows(fitted)), 5)
+        self.assertEqual(fitted["overview"]["other_group_count"], 15)
+
+    def test_the_reserve_is_spent_only_after_the_table_is_one_row(self) -> None:
+        fitted = fit_overview_to_budget(self._summary(20, finding_count=6), 1200)
+
+        self.assertLessEqual(fitted["output_characters"], 1200)
         self.assertEqual(fitted["output_characters"], self._length(fitted))
         self.assertEqual(fitted["warnings"], [])
         # Folding ran out first: one directory row plus the folded one.
         self.assertEqual(len(self._directory_rows(fitted)), 1)
         self.assertEqual(fitted["groups"][-1]["path_prefix"], "*")
         self.assertEqual(fitted["overview"]["other_group_count"], 19)
-        # Only then does the file layer lose its tail, and it says how much.
-        self.assertLess(fitted["returned_count"], 6)
+        # Only then does the file layer go below its reserve, and it says how
+        # much it lost.
+        self.assertEqual(fitted["returned_count"], 2)
         self.assertTrue(fitted["truncated"])
         self.assertEqual(
             int(fitted["returned_count"]) + int(fitted["omitted_count"]), 6
@@ -1373,11 +1398,13 @@ class OverviewBudgetTests(unittest.TestCase):
         self.assertGreater(fitted["output_characters"], 500)
 
     def test_every_budget_either_fits_or_says_it_could_not(self) -> None:
+        widths: list[int] = []
         for budget in (400, 800, 1200, 1600, 2000, 3000, 4000, 5000, 8000):
             with self.subTest(budget=budget):
                 fitted = fit_overview_to_budget(
                     self._summary(20, finding_count=6), budget
                 )
+                widths.append(len(self._directory_rows(fitted)))
 
                 self.assertEqual(fitted["output_characters"], self._length(fitted))
                 if "output-budget-exceeded" in fitted["warnings"]:
@@ -1392,6 +1419,9 @@ class OverviewBudgetTests(unittest.TestCase):
                     + int(fitted["overview"]["other_group_count"]),
                     20,
                 )
+        # A wider budget buys a wider table, which is the whole point of
+        # sizing the table by the budget rather than by a fixed row count.
+        self.assertEqual(widths, sorted(widths))
 
     def test_a_table_inside_the_budget_is_never_folded(self) -> None:
         original = self._summary(20, finding_count=6)
@@ -1407,7 +1437,7 @@ class OverviewBudgetTests(unittest.TestCase):
     def test_folding_leaves_the_answer_it_was_handed_alone(self) -> None:
         original = self._summary(20, finding_count=6)
 
-        fit_overview_to_budget(original, 4900)
+        fit_overview_to_budget(original, 4000)
 
         self.assertEqual(len(original["groups"]), 20)
         self.assertEqual(original["overview"]["other_group_count"], 0)

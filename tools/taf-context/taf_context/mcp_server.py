@@ -352,12 +352,14 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "warning overview-root-first-prefix says so. A path_prefix names whole "
                 "directory segments, so a file path or a partial segment answers with an "
                 "empty table and the warning overview-root-not-a-directory. The group "
-                "table is never trimmed: when the serialized answer is longer than "
-                "maximum_output_characters the warning output-budget-exceeded says so, and "
-                "a larger budget or fewer maximum_results is the way to fit it. "
-                "maximum_output_characters defaults to 8000 here, not the other tools' "
-                "4000, because the group table alone is about 3700 characters of "
-                "canonical JSON, leaving room for the ranked file layer."
+                "table has no fixed width: maximum_output_characters sizes it, first "
+                "dropping the file layer to four findings, then folding the table's tail "
+                "into the row `*` down to a single directory row, and only then reporting "
+                "output-budget-exceeded. A larger budget therefore answers with a wider "
+                "table as well as more files, while path_prefixes is the way to go deeper "
+                "into one subtree. maximum_output_characters defaults to 8000 here, not "
+                "the other tools' 4000, because the group table alone is about 3700 "
+                "characters of canonical JSON, leaving room for the ranked file layer."
                 + query_description_suffix
             ),
             "inputSchema": _schema(

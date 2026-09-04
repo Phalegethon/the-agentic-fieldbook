@@ -48,7 +48,7 @@ An unknown value fails fast and the error lists the valid values.
 
 ## Overview questions
 
-- The group table is never trimmed, so the output budget takes the file layer first. At 4000 characters the table usually fills the answer on its own and `findings` comes back empty, which is why this operation defaults to 8000 on both surfaces; ask for `--maximum-output-characters 12000` when the answer should carry more files. Only a budget that not even the table fits in is reported as `output-budget-exceeded`.
+- The group table has no fixed width; the output budget sizes it. The budget is spent on the file layer down to four files, then on folding the table's tail into `*` down to one directory row, so at 4000 characters the answer keeps a few files and a short table, and 8000 - the default on both surfaces - usually carries the whole table. Ask for `--maximum-output-characters 12000` when the answer should be wider still, and use `--path-prefix D/` to go deeper into one subtree rather than wider over all of them. Only a budget that not even one row with no files fits in is reported as `output-budget-exceeded`.
 - Read the table first and query second: a group's `representative_identity` and every file-layer finding is an ordinary record identity, never a `reference`, so `source-snippets` can fetch one without another search; `related-symbols` still needs an identity that names a `definition`, `module`, or `entry-point` record.
 - Narrow with `--path-prefix D/` to describe one subtree, or with `--language` to count only that language's files. Neither changes what a row means: prefixes stay relative to the repository root.
 

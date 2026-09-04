@@ -50,7 +50,10 @@ than absolute: the `overview` block divides the median by the `mcp-warm`
 median and reports the quotient as `ratio_to_warm` next to the tolerance the
 owner named (three to four times a warm search). The tolerance is reported,
 never enforced: the benchmark is evidence for the execution ledger, not a
-gate.
+gate. The same block reports how wide a table that budget bought -
+`directory_row_count` rows still naming a directory, `other_group_count`
+directories behind the `*` row - because the table has no fixed width and the
+cost of the answer is the cost of the table the budget allowed.
 """
 
 from __future__ import annotations
@@ -383,6 +386,14 @@ def main(argv: list[str] | None = None) -> int:
                         "root": described["overview"]["root"],
                         "counted_file_count": described["overview"]["counted_file_count"],
                         "group_count": len(described["groups"]),
+                        # How many rows still name a directory: the table is
+                        # sized by the output budget, so this is what this
+                        # budget bought, not a constant of the operation.
+                        "directory_row_count": sum(
+                            1
+                            for group in described["groups"]
+                            if group["path_prefix"] != "*"
+                        ),
                         "other_group_count": described["overview"]["other_group_count"],
                         "returned_count": described["returned_count"],
                         "omitted_count": described["omitted_count"],

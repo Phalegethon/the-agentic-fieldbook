@@ -15,7 +15,7 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.7.0 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, and reclaim unused index state without loading the full repository into model context. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.7.1 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, and reclaim unused index state without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.1.0 | Recover interrupted work and the single best next step from bounded, read-only Git evidence, optionally naming the symbols the work touched. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
@@ -244,10 +244,12 @@ configuration counts and the languages; an `overview` block naming the
 described root and the counted files; and a ranked file layer that leads with
 entry points and well-known entry file names such as `main.go` under `cmd/` or
 `index.ts`. `--path-prefix D/` describes one subtree, and `--language` counts
-one language's files. The table is never trimmed, so the output budget takes
-the file layer first: this operation defaults to 8000 characters rather than
-the 4000 the other queries use, and `--maximum-output-characters 12000` buys
-more files still.
+one language's files. The table has no fixed width: the output budget sizes
+it, keeping four files back for the file layer and folding the table's tail
+into a `*` row for whatever does not fit. This operation therefore defaults to
+8000 characters rather than the 4000 the other queries use;
+`--maximum-output-characters 12000` buys a wider table and more files, while
+`--path-prefix D/` is the way to go deeper into one subtree.
 
 A change question is answered in one step and needs no identity.
 `query --operation changed-symbols` reports the definitions, entry points,
@@ -318,9 +320,10 @@ that references changed work, not a defect.
 directory table in `groups`, the `overview` block, and a ranked file layer in
 `findings`. It takes only `path_prefixes`, `languages`, `allow_inferred`, and
 the two budgets; `path_prefixes` names whole directory segments and describes
-the first of them in sorted order. Because the group table is never trimmed,
-this tool's `maximum_output_characters` defaults to 8000 rather than the 4000
-the other query tools use.
+the first of them in sorted order. The group table is sized by the budget
+rather than by a fixed row count, so this tool's `maximum_output_characters`
+defaults to 8000 rather than the 4000 the other query tools use; a larger
+value answers with a wider table.
 
 Claude Code starts the server when the plugin is enabled; the tools appear as
 `mcp__plugin_taf_repo-context__<tool>` (permission matcher
@@ -351,7 +354,7 @@ TAF and its skills have separate versions:
 
 - TAF `2.5.0` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.7.0` versions its behavior contract.
+- `prepare-repo-context` `1.7.1` versions its behavior contract.
 - `work-recovery` `1.1.0` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with

@@ -1,6 +1,6 @@
 {
-  "schema_version": "1",
-  "description": "Hand-checked directory groups of this repository at the pinned commit 3b9e5ae284447d80099e3677ab1e4b55899da0de, used by tests/taf_context/test_dogfood_overview.py to check repository-overview end to end. Every row was re-derived without the engine: the file counts and the language rows from `git ls-files` at that commit restricted to the indexed extensions (.go, .py, .js/.mjs/.cjs/.jsx, .ts/.tsx, .rs, .md/.mdx, .json, .toml) with the paths the inventory excludes removed, as internal/inventory/exclude.go lists them: the directory components of excludedDirectoryPolicy (.git, vendor, vendors, node_modules, third_party, generated, dist, build, coverage, .next, target) and the file suffixes of generatedSuffixPolicy (.generated.go, .gen.go, .pb.go), of which only vendor matches a tracked path at this commit (130 of them); the definition counts from the language's own parser (CPython's ast for the class and function definitions of a Python file, go/ast for the top-level type specs and function declarations of a Go file, methods included); the entry-point count from the one main.main with the entry-point signature; the document and configuration counts from the Markdown and JSON files, whose extractors emit nothing but headings, document chunks and configuration records. Two indexed paths carry no record at all and are therefore not counted files; they are listed under uncounted_indexed_paths.",
+  "schema_version": "2",
+  "description": "Hand-checked directory groups of this repository at the pinned commit 3b9e5ae284447d80099e3677ab1e4b55899da0de, used by tests/taf_context/test_dogfood_overview.py to check repository-overview end to end. Every row was re-derived without the engine: the file counts and the language rows from `git ls-files` at that commit restricted to the indexed extensions (.go, .py, .js/.mjs/.cjs/.jsx, .ts/.tsx, .rs, .md/.mdx, .json, .toml) with the paths the inventory excludes removed, as internal/inventory/exclude.go lists them: the directory components of excludedDirectoryPolicy (.git, vendor, vendors, node_modules, third_party, generated, dist, build, coverage, .next, target) and the file suffixes of generatedSuffixPolicy (.generated.go, .gen.go, .pb.go), of which only vendor matches a tracked path at this commit (130 of them); the definition counts from the language's own parser (CPython's ast for the class and function definitions of a Python file, go/ast for the top-level type specs and function declarations of a Go file, methods included); the entry-point count from the one main.main with the entry-point signature; the document and configuration counts from the Markdown and JSON files, whose extractors emit nothing but headings, document chunks and configuration records. Two indexed paths carry no record at all and are therefore not counted files; they are listed under uncounted_indexed_paths. Schema 2 of this fixture drops folded_paths and adds budgets: the engine returns the whole ordered table and the broker folds its tail into the `*` row only as far as the caller's output budget requires, so which rows survive is a property of the budget rather than of a fixed row count. The budgets block pins that, per request and budget: how many rows still name a directory, how many directories the `*` row speaks for, and how many files the ranked layer keeps. directory_rows plus other_group_count is the full width of the table at every budget (10 for the repository, 17 for the tools/ subtree), and returned_count 4 is the file layer's reserve, which the table folds around rather than through.",
   "commit": "3b9e5ae284447d80099e3677ab1e4b55899da0de",
   "request": {
     "maximum_results": 64,
@@ -48,10 +48,7 @@
     "path_prefix": "tools",
     "root": "tools/",
     "counted_file_count": 115,
-    "other_group_count": 1,
-    "folded_paths": [
-      "tools/taf-context-native/policy/production-v1.json"
-    ],
+    "other_group_count": 0,
     "groups": [
       {"path_prefix": "tools/taf-context-native/internal/store/", "depth": 3, "file_count": 10, "definition_count": 413, "entry_point_count": 0, "document_count": 0, "configuration_count": 0, "languages": [{"file_count": 10, "language": "go"}]},
       {"path_prefix": "tools/taf-context/", "depth": 1, "file_count": 24, "definition_count": 402, "entry_point_count": 0, "document_count": 0, "configuration_count": 2, "languages": [{"file_count": 22, "language": "python"}, {"file_count": 2, "language": "json"}]},
@@ -69,7 +66,21 @@
       {"path_prefix": "tools/taf-context-native/testdata/", "depth": 2, "file_count": 3, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 3, "languages": [{"file_count": 3, "language": "json"}]},
       {"path_prefix": "tools/taf-context-native/.", "depth": 1, "file_count": 1, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 1, "languages": [{"file_count": 1, "language": "json"}]},
       {"path_prefix": "tools/taf-context-native/adapter/", "depth": 2, "file_count": 1, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 1, "languages": [{"file_count": 1, "language": "json"}]},
-      {"path_prefix": "*", "depth": 0, "file_count": 1, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 1, "languages": [{"file_count": 1, "language": "json"}]}
+      {"path_prefix": "tools/taf-context-native/policy/", "depth": 2, "file_count": 1, "definition_count": 0, "entry_point_count": 0, "document_count": 0, "configuration_count": 1, "languages": [{"file_count": 1, "language": "json"}]}
+    ]
+  },
+  "budgets": {
+    "maximum_results": 64,
+    "finding_reserve": 4,
+    "repository": [
+      {"maximum_output_characters": 4000, "directory_rows": 3, "other_group_count": 7, "returned_count": 4},
+      {"maximum_output_characters": 8000, "directory_rows": 10, "other_group_count": 0, "returned_count": 9},
+      {"maximum_output_characters": 12000, "directory_rows": 10, "other_group_count": 0, "returned_count": 17}
+    ],
+    "subtree": [
+      {"maximum_output_characters": 4000, "directory_rows": 4, "other_group_count": 13, "returned_count": 4},
+      {"maximum_output_characters": 8000, "directory_rows": 17, "other_group_count": 0, "returned_count": 4},
+      {"maximum_output_characters": 12000, "directory_rows": 17, "other_group_count": 0, "returned_count": 13}
     ]
   }
 }

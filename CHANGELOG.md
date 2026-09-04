@@ -5,6 +5,34 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Native runtime `0.6.0` (no index format change, so existing indexes are kept;
+the next `inspect` reports `install-native-engine` until `activate` downloads
+the new runtime). Bundled skills: `branch-handoff` 1.2.1,
+`prepare-repo-context` 1.7.1, `work-recovery` 1.1.0.
+
+### Changed
+
+- The `repository-overview` group table is sized by the output budget instead
+  of by fixed row counts. The engine no longer stops splitting once the table
+  has a certain number of groups and no longer cuts the table to a maximum row
+  count: it applies the 40 % share rule, the single-directory descent, and the
+  depth cap of four segments, and returns every group it arrives at, ordered by
+  definition count, then file count, then prefix, with no `*` row of its own.
+  The broker then spends the caller's `maximum_output_characters` in one order:
+  the ranked file layer drops from its tail down to four findings, the table
+  folds its tail into `*` a row at a time - counts summed, languages merged,
+  `other_group_count` counting every folded directory - down to a single
+  directory row, and only a budget too small for that spends the last four
+  findings before reporting `output-budget-exceeded`. So a wider budget buys a
+  wider table as well as more files, and `--path-prefix D/` is what goes deeper
+  into one subtree instead of wider over all of them. This replaces the fixed
+  twelve-group split stop and sixteen-row table of 2.5.0, whose counts were
+  design guesses that left a dominant directory unsplit on a large repository.
+  The wire shape is unchanged: a schema-4 result still carries the same nine
+  keys per row, `*` still sums directories and names no representative file,
+  and the row cap is now the indexed-path bound rather than seventeen.
+  `repository-map` and every other operation are untouched.
+
 ## [2.5.0] - 2026-09-05
 
 Native runtime `0.5.0` (no index format change, so existing indexes are kept;

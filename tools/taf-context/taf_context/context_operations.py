@@ -659,6 +659,11 @@ OVERVIEW_QUERY_OPERATION = "repository-overview"
 # once, so `level1_models` refuses it a representative file; the same literal
 # is the wire's, and a table carries at most one of it.
 OVERVIEW_OTHER_PREFIX = "*"
+# The file layer's share of a small budget: the table folds around it rather
+# than through it, so an overview always names at least this many files as long
+# as it has that many to name. Four is one screenful of evidence and, on a table
+# of the width this repository has, about two rows' worth of characters.
+OVERVIEW_FINDING_RESERVE = 4
 # The five counters every group row sums when two rows become one.
 _OVERVIEW_COUNTERS = (
     "file_count",
@@ -1062,17 +1067,26 @@ def trim_to_budget(
 
 
 def _drop_findings_to_budget(
-    result: dict[str, object], maximum_output_characters: int
+    result: dict[str, object],
+    maximum_output_characters: int,
+    *,
+    keep_at_least: int = 0,
 ) -> dict[str, object]:
     """Drop findings from the tail, cheapest loss first, until the object fits.
 
     Popping from the tail leaves every surviving finding's rank exactly as it
     was, so ranks stay contiguous from 1 without renumbering.
     `returned_count`/`omitted_count` and `truncated` are updated to match each
-    drop, and `output_characters` is remeasured after every one.
+    drop, and `output_characters` is remeasured after every one. `keep_at_least`
+    stops the drop short of a floor, which is how the overview reserves its
+    file layer a share of the budget before the table pays; the default of zero
+    is the unconditional drop every other composed result uses.
     """
     findings = list(result["findings"])  # type: ignore[arg-type]
-    while findings and int(result["output_characters"]) > maximum_output_characters:
+    while (
+        len(findings) > keep_at_least
+        and int(result["output_characters"]) > maximum_output_characters
+    ):
         findings.pop()
         result["findings"] = findings
         result["returned_count"] = len(findings)
@@ -1147,22 +1161,26 @@ def fit_overview_to_budget(
 ) -> dict[str, object]:
     """Fit an overview answer into its output budget, cheapest loss first.
 
-    The table's tail is the cheapest loss there is: folding the last directory
-    row into `*` keeps the answer describing the whole repository - the counts
-    stay in the table, only the detail behind them goes - while a dropped
-    finding takes a file the reader can no longer see at all. So the table
-    folds all the way down to a single directory row before the file layer
-    loses anything, and that ordering is what reserves the file layer its
-    share of a small budget. Only then are findings dropped from the tail,
-    exactly as `trim_to_budget` does for the standard summary shape. If a
-    one-row table with no findings still does not fit,
-    `output-budget-exceeded` says so instead of a silent overrun.
-    `output_characters` is always the final canonical length.
+    The table is what this operation is asked for, so it is not the first
+    thing to pay: the engine ranks far more files than a small budget holds,
+    and a file beyond the reserve is the cheapest loss there is. So the file
+    layer drops from its tail down to `OVERVIEW_FINDING_RESERVE` findings
+    first; then, and only then, the table's tail folds into `*` a row at a
+    time - the counts stay in the table, only the detail behind them goes -
+    down to a single directory row; and only a budget that still does not fit
+    spends the reserve as well. That ordering is what makes a wider budget buy
+    a wider table instead of nothing but more files. If a one-row table with no
+    findings still does not fit, `output-budget-exceeded` says so instead of a
+    silent overrun. `output_characters` is always the final canonical length.
     """
     fitted = dict(summary)
     fitted["output_characters"] = _output_characters(fitted)
     if int(fitted["output_characters"]) <= maximum_output_characters:
         return fitted
+    reserve = min(int(fitted["returned_count"]), OVERVIEW_FINDING_RESERVE)
+    fitted = _drop_findings_to_budget(
+        fitted, maximum_output_characters, keep_at_least=reserve
+    )
     while int(
         fitted["output_characters"]
     ) > maximum_output_characters and _fold_overview_tail(fitted):
@@ -1363,9 +1381,9 @@ def run_query(
     summary = _query_summary(result, refresh_summary)
     if arguments.operation == OVERVIEW_QUERY_OPERATION:
         # The engine returns the whole ordered table; the caller's output
-        # budget is what sizes it. The broker folds the tail into the `*` row
-        # until the answer fits, drops findings only after that, and reports
-        # the canonical length of what it actually sends.
+        # budget is what sizes it. The broker drops the file layer to its
+        # reserve, folds the table's tail into the `*` row until the answer
+        # fits, and reports the canonical length of what it actually sends.
         return fit_overview_to_budget(summary, arguments.maximum_output_characters)
     return summary
 
