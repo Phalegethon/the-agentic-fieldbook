@@ -1,0 +1,1065 @@
+{
+  "schema_version": "1",
+  "description": "Hand-checked symbols that the commit range 9bce09b..f33d96c of this repository touched, used by tests/taf_context/test_dogfood_changed.py to measure the precision and the recall of changed-symbols and to cross-check impact-candidates against callers.json. Every entry is a record whose line span at f33d96c meets a changed hunk of its own path: the hunks come from a diff parsed independently of the broker, and the spans from the language's own parser (CPython's ast for Python, go/ast for Go), then every entry was reviewed against the diff by hand. A change inside a method also changes the class that contains it, and a Python definition owns its decorator lines, so nested definitions appear together. Precision and recall are measured over the definition and entry-point findings; module findings are listed separately because a Go module record covers only the package clause, so it is changed only when line 1 is.",
+  "range": {
+    "base": "9bce09b",
+    "head": "f33d96c"
+  },
+  "restriction": "The range touches 64 paths and 376 symbols, too many to hand-check, so the fixture covers three subtrees: the Python broker package, the Go wire package and the Go extractors. Every one of those paths fits a single query at the largest request settings the CLI accepts (64 results, 12000 characters), which is why the subtree of the change-heavy query package is not part of it: one file added there in the range carries 63 changed symbols and cannot be returned in one answer.",
+  "unindexed_paths": [
+    "tools/taf-context-native/internal/store/testdata/mixed-case-2000.bin"
+  ],
+  "paths": [
+    {
+      "path": "tools/taf-context-native/internal/extract/extract_test.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "extract.referenceExpectation",
+          "record_kind": "definition",
+          "start_line": 596,
+          "end_line": 603
+        },
+        {
+          "qualified_name": "extract.assertReference",
+          "record_kind": "definition",
+          "start_line": 605,
+          "end_line": 639
+        },
+        {
+          "qualified_name": "extract.assertImportTarget",
+          "record_kind": "definition",
+          "start_line": 641,
+          "end_line": 652
+        },
+        {
+          "qualified_name": "extract.referencesOf",
+          "record_kind": "definition",
+          "start_line": 654,
+          "end_line": 662
+        },
+        {
+          "qualified_name": "extract.referenceEntriesOf",
+          "record_kind": "definition",
+          "start_line": 664,
+          "end_line": 675
+        },
+        {
+          "qualified_name": "extract.TestGoExtractorGroupsCallReferencesPerDefinition",
+          "record_kind": "definition",
+          "start_line": 677,
+          "end_line": 715
+        },
+        {
+          "qualified_name": "extract.TestGoExtractorSkipsComputedCallTargets",
+          "record_kind": "definition",
+          "start_line": 717,
+          "end_line": 735
+        },
+        {
+          "qualified_name": "extract.TestGoExtractorCapsTableEntriesPerDefinition",
+          "record_kind": "definition",
+          "start_line": 737,
+          "end_line": 751
+        },
+        {
+          "qualified_name": "extract.TestGoExtractorCapsTheRenderedTableBytes",
+          "record_kind": "definition",
+          "start_line": 753,
+          "end_line": 772
+        },
+        {
+          "qualified_name": "extract.TestFinalizeRecordsDropsInconsistentReferenceFields",
+          "record_kind": "definition",
+          "start_line": 774,
+          "end_line": 794
+        },
+        {
+          "qualified_name": "extract.TestRecordIdentityDistinguishesReferenceTables",
+          "record_kind": "definition",
+          "start_line": 796,
+          "end_line": 809
+        },
+        {
+          "qualified_name": "extract.TestGoExtractorBoundsTheImportSpecifierWithoutDroppingTheBinding",
+          "record_kind": "definition",
+          "start_line": 814,
+          "end_line": 822
+        },
+        {
+          "qualified_name": "extract.TestGoModuleReferenceRangeCoversItsEntries",
+          "record_kind": "definition",
+          "start_line": 826,
+          "end_line": 847
+        },
+        {
+          "qualified_name": "extract.TestReferenceCollectorAppliesTheEntryCapAfterOrderingByLine",
+          "record_kind": "definition",
+          "start_line": 852,
+          "end_line": 875
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/extract/golang.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "extract.goExtractor.Extract",
+          "record_kind": "definition",
+          "start_line": 30,
+          "end_line": 108
+        },
+        {
+          "qualified_name": "extract.goCollectReferences",
+          "record_kind": "definition",
+          "start_line": 114,
+          "end_line": 161
+        },
+        {
+          "qualified_name": "extract.goDeclarationName",
+          "record_kind": "definition",
+          "start_line": 165,
+          "end_line": 174
+        },
+        {
+          "qualified_name": "extract.goCallTarget",
+          "record_kind": "definition",
+          "start_line": 179,
+          "end_line": 195
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/extract/javascript.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "extract.handleECMAScriptNode",
+          "record_kind": "definition",
+          "start_line": 53,
+          "end_line": 124
+        },
+        {
+          "qualified_name": "extract.ecmaLexicalPrefix",
+          "record_kind": "definition",
+          "start_line": 131,
+          "end_line": 133
+        },
+        {
+          "qualified_name": "extract.ecmaScope",
+          "record_kind": "definition",
+          "start_line": 137,
+          "end_line": 150
+        },
+        {
+          "qualified_name": "extract.ecmaImportBindings",
+          "record_kind": "definition",
+          "start_line": 172,
+          "end_line": 220
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/extract/python.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "extract.handlePythonNode",
+          "record_kind": "definition",
+          "start_line": 50,
+          "end_line": 81
+        },
+        {
+          "qualified_name": "extract.pythonDefinitionRange",
+          "record_kind": "definition",
+          "start_line": 86,
+          "end_line": 95
+        },
+        {
+          "qualified_name": "extract.pythonScope",
+          "record_kind": "definition",
+          "start_line": 99,
+          "end_line": 106
+        },
+        {
+          "qualified_name": "extract.importBinding",
+          "record_kind": "definition",
+          "start_line": 115,
+          "end_line": 118
+        },
+        {
+          "qualified_name": "extract.pythonImportBindings",
+          "record_kind": "definition",
+          "start_line": 120,
+          "end_line": 168
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/extract/references.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "extract",
+          "record_kind": "module",
+          "start_line": 1,
+          "end_line": 1
+        },
+        {
+          "qualified_name": "extract.referenceScope",
+          "record_kind": "definition",
+          "start_line": 14,
+          "end_line": 18
+        },
+        {
+          "qualified_name": "extract.referenceCollector",
+          "record_kind": "definition",
+          "start_line": 24,
+          "end_line": 29
+        },
+        {
+          "qualified_name": "extract.referenceGroup",
+          "record_kind": "definition",
+          "start_line": 31,
+          "end_line": 35
+        },
+        {
+          "qualified_name": "extract.referenceCollector.add",
+          "record_kind": "definition",
+          "start_line": 39,
+          "end_line": 73
+        },
+        {
+          "qualified_name": "extract.referenceCollector.flush",
+          "record_kind": "definition",
+          "start_line": 80,
+          "end_line": 118
+        },
+        {
+          "qualified_name": "extract.referenceCollector.boundedEntries",
+          "record_kind": "definition",
+          "start_line": 123,
+          "end_line": 138
+        },
+        {
+          "qualified_name": "extract.referenceRange",
+          "record_kind": "definition",
+          "start_line": 145,
+          "end_line": 151
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/extract/registry.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "extract.finalizeRecords",
+          "record_kind": "definition",
+          "start_line": 285,
+          "end_line": 372
+        },
+        {
+          "qualified_name": "extract.consistentReferenceFields",
+          "record_kind": "definition",
+          "start_line": 379,
+          "end_line": 392
+        },
+        {
+          "qualified_name": "extract.referenceSearchTerms",
+          "record_kind": "definition",
+          "start_line": 398,
+          "end_line": 415
+        },
+        {
+          "qualified_name": "extract.recordIdentity",
+          "record_kind": "definition",
+          "start_line": 417,
+          "end_line": 437
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/extract/rust.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "extract.handleRustNode",
+          "record_kind": "definition",
+          "start_line": 54,
+          "end_line": 109
+        },
+        {
+          "qualified_name": "extract.dottedRustPath",
+          "record_kind": "definition",
+          "start_line": 121,
+          "end_line": 123
+        },
+        {
+          "qualified_name": "extract.rustLexicalPrefix",
+          "record_kind": "definition",
+          "start_line": 125,
+          "end_line": 127
+        },
+        {
+          "qualified_name": "extract.rustScope",
+          "record_kind": "definition",
+          "start_line": 131,
+          "end_line": 146
+        },
+        {
+          "qualified_name": "extract.rustUseBindings",
+          "record_kind": "definition",
+          "start_line": 154,
+          "end_line": 212
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/extract/treesitter.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "extract.treeSitterAnalysis",
+          "record_kind": "definition",
+          "start_line": 38,
+          "end_line": 51
+        },
+        {
+          "qualified_name": "extract.extractTreeSitter",
+          "record_kind": "definition",
+          "start_line": 53,
+          "end_line": 159
+        },
+        {
+          "qualified_name": "extract.treeSitterAnalysis.appendImportRecord",
+          "record_kind": "definition",
+          "start_line": 310,
+          "end_line": 317
+        },
+        {
+          "qualified_name": "extract.treeSitterAnalysis.appendReference",
+          "record_kind": "definition",
+          "start_line": 322,
+          "end_line": 335
+        },
+        {
+          "qualified_name": "extract.treeSitterAnalysis.flushReferences",
+          "record_kind": "definition",
+          "start_line": 340,
+          "end_line": 352
+        },
+        {
+          "qualified_name": "extract.treeSitterAnalysis.enclosingScope",
+          "record_kind": "definition",
+          "start_line": 359,
+          "end_line": 379
+        },
+        {
+          "qualified_name": "extract.dottedTargetRules",
+          "record_kind": "definition",
+          "start_line": 386,
+          "end_line": 389
+        },
+        {
+          "qualified_name": "extract.dottedContainer",
+          "record_kind": "definition",
+          "start_line": 393,
+          "end_line": 397
+        },
+        {
+          "qualified_name": "extract.treeSitterAnalysis.dottedTarget",
+          "record_kind": "definition",
+          "start_line": 399,
+          "end_line": 421
+        },
+        {
+          "qualified_name": "extract.treeSitterAnalysis.lexicalPrefix",
+          "record_kind": "definition",
+          "start_line": 436,
+          "end_line": 439
+        },
+        {
+          "qualified_name": "extract.treeSitterAnalysis.lexicalScope",
+          "record_kind": "definition",
+          "start_line": 444,
+          "end_line": 465
+        },
+        {
+          "qualified_name": "extract.boundedImportSpecifier",
+          "record_kind": "definition",
+          "start_line": 538,
+          "end_line": 543
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/extract/treesitter_test.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "extract.TestPythonExtractorGroupsCallReferencesPerDefinition",
+          "record_kind": "definition",
+          "start_line": 969,
+          "end_line": 999
+        },
+        {
+          "qualified_name": "extract.TestPythonExtractorCapsTableEntriesPerDefinition",
+          "record_kind": "definition",
+          "start_line": 1001,
+          "end_line": 1014
+        },
+        {
+          "qualified_name": "extract.TestJavaScriptExtractorGroupsConstructorAndMemberReferences",
+          "record_kind": "definition",
+          "start_line": 1016,
+          "end_line": 1038
+        },
+        {
+          "qualified_name": "extract.TestTypeScriptExtractorGroupsReferencesAndKeepsImportTargets",
+          "record_kind": "definition",
+          "start_line": 1040,
+          "end_line": 1057
+        },
+        {
+          "qualified_name": "extract.TestRustExtractorGroupsScopedCallAndMacroReferences",
+          "record_kind": "definition",
+          "start_line": 1059,
+          "end_line": 1080
+        },
+        {
+          "qualified_name": "extract.TestPythonReferenceRangeMatchesTheDecoratedDefinitionRecord",
+          "record_kind": "definition",
+          "start_line": 1086,
+          "end_line": 1103
+        },
+        {
+          "qualified_name": "extract.TestPythonExtractorKeepsSameNamedDefinitionsApart",
+          "record_kind": "definition",
+          "start_line": 1108,
+          "end_line": 1135
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/wire/decode.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "wire.validateEnvelopeShape",
+          "record_kind": "definition",
+          "start_line": 52,
+          "end_line": 87
+        },
+        {
+          "qualified_name": "wire.validPhaseOperation",
+          "record_kind": "definition",
+          "start_line": 114,
+          "end_line": 131
+        },
+        {
+          "qualified_name": "wire.ValidateRequest",
+          "record_kind": "definition",
+          "start_line": 208,
+          "end_line": 260
+        },
+        {
+          "qualified_name": "wire.validateDirection",
+          "record_kind": "definition",
+          "start_line": 269,
+          "end_line": 283
+        },
+        {
+          "qualified_name": "wire.validateResultWithoutBudgets",
+          "record_kind": "definition",
+          "start_line": 295,
+          "end_line": 344
+        },
+        {
+          "qualified_name": "wire.renderedOutputCharacters",
+          "record_kind": "definition",
+          "start_line": 348,
+          "end_line": 366
+        },
+        {
+          "qualified_name": "wire.validateFinding",
+          "record_kind": "definition",
+          "start_line": 368,
+          "end_line": 376
+        },
+        {
+          "qualified_name": "wire.validateEdgeFields",
+          "record_kind": "definition",
+          "start_line": 383,
+          "end_line": 394
+        },
+        {
+          "qualified_name": "wire.validSchemaVersion",
+          "record_kind": "definition",
+          "start_line": 427,
+          "end_line": 427
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/wire/encode.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "wire.EncodeResult",
+          "record_kind": "definition",
+          "start_line": 12,
+          "end_line": 25
+        },
+        {
+          "qualified_name": "wire.MeasureResult",
+          "record_kind": "definition",
+          "start_line": 29,
+          "end_line": 38
+        },
+        {
+          "qualified_name": "wire.findingV1",
+          "record_kind": "definition",
+          "start_line": 47,
+          "end_line": 60
+        },
+        {
+          "qualified_name": "wire.resultV1",
+          "record_kind": "definition",
+          "start_line": 64,
+          "end_line": 67
+        },
+        {
+          "qualified_name": "wire.marshalableResult",
+          "record_kind": "definition",
+          "start_line": 70,
+          "end_line": 84
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/wire/types.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "wire.Request",
+          "record_kind": "definition",
+          "start_line": 60,
+          "end_line": 80
+        },
+        {
+          "qualified_name": "wire.Finding",
+          "record_kind": "definition",
+          "start_line": 116,
+          "end_line": 135
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context-native/internal/wire/wire_test.go",
+      "changed_symbols": [
+        {
+          "qualified_name": "wire.TestDecodeEnvelopeEnforcesAdvertisedPhaseOperationMapping",
+          "record_kind": "definition",
+          "start_line": 141,
+          "end_line": 177
+        },
+        {
+          "qualified_name": "wire.envelopeForOperation",
+          "record_kind": "definition",
+          "start_line": 179,
+          "end_line": 208
+        },
+        {
+          "qualified_name": "wire.TestRequestAcceptsEveryFrozenOperation",
+          "record_kind": "definition",
+          "start_line": 225,
+          "end_line": 266
+        },
+        {
+          "qualified_name": "wire.relatedRequest",
+          "record_kind": "definition",
+          "start_line": 512,
+          "end_line": 520
+        },
+        {
+          "qualified_name": "wire.envelopeWithRequestKeys",
+          "record_kind": "definition",
+          "start_line": 525,
+          "end_line": 554
+        },
+        {
+          "qualified_name": "wire.TestDecodeEnvelopeRejectsDirectionUnderSchemaOne",
+          "record_kind": "definition",
+          "start_line": 556,
+          "end_line": 569
+        },
+        {
+          "qualified_name": "wire.TestRequestRejectsRelatedSymbolsUnderSchemaOne",
+          "record_kind": "definition",
+          "start_line": 571,
+          "end_line": 578
+        },
+        {
+          "qualified_name": "wire.TestDecodeEnvelopeAcceptsSchemaTwoRelatedSymbols",
+          "record_kind": "definition",
+          "start_line": 580,
+          "end_line": 594
+        },
+        {
+          "qualified_name": "wire.TestDecodeEnvelopeAcceptsSchemaTwoNullDirectionForOtherOperations",
+          "record_kind": "definition",
+          "start_line": 596,
+          "end_line": 607
+        },
+        {
+          "qualified_name": "wire.TestDecodeEnvelopeRejectsInvalidSchemaTwoDirections",
+          "record_kind": "definition",
+          "start_line": 609,
+          "end_line": 634
+        },
+        {
+          "qualified_name": "wire.TestRequestRejectsUnknownSchemaVersions",
+          "record_kind": "definition",
+          "start_line": 636,
+          "end_line": 644
+        },
+        {
+          "qualified_name": "wire.TestRequestBoundsRelatedSymbolsAnchors",
+          "record_kind": "definition",
+          "start_line": 646,
+          "end_line": 672
+        },
+        {
+          "qualified_name": "wire.TestValidateResultBindsEdgeFieldsToRelatedSymbols",
+          "record_kind": "definition",
+          "start_line": 677,
+          "end_line": 709
+        },
+        {
+          "qualified_name": "wire.relatedResult",
+          "record_kind": "definition",
+          "start_line": 711,
+          "end_line": 721
+        },
+        {
+          "qualified_name": "wire.TestEncodeResultOmitsEdgeFieldsUnderSchemaOne",
+          "record_kind": "definition",
+          "start_line": 723,
+          "end_line": 742
+        },
+        {
+          "qualified_name": "wire.TestEncodeResultKeepsSchemaOneFindingKeysComplete",
+          "record_kind": "definition",
+          "start_line": 744,
+          "end_line": 766
+        },
+        {
+          "qualified_name": "wire.findingKeys",
+          "record_kind": "definition",
+          "start_line": 768,
+          "end_line": 784
+        },
+        {
+          "qualified_name": "wire.TestValidateResultRejectsInconsistentEdgeFields",
+          "record_kind": "definition",
+          "start_line": 786,
+          "end_line": 808
+        },
+        {
+          "qualified_name": "wire.TestOutputCharactersCoverSchemaTwoEdgeFields",
+          "record_kind": "definition",
+          "start_line": 810,
+          "end_line": 824
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context/taf_context/context_operations.py",
+      "changed_symbols": [
+        {
+          "qualified_name": "context_operations._invoke_native",
+          "record_kind": "definition",
+          "start_line": 173,
+          "end_line": 272
+        },
+        {
+          "qualified_name": "context_operations._query_summary",
+          "record_kind": "definition",
+          "start_line": 379,
+          "end_line": 405
+        },
+        {
+          "qualified_name": "context_operations.QueryArguments",
+          "record_kind": "definition",
+          "start_line": 598,
+          "end_line": 612
+        },
+        {
+          "qualified_name": "context_operations.validate_query_request",
+          "record_kind": "definition",
+          "start_line": 622,
+          "end_line": 654
+        },
+        {
+          "qualified_name": "context_operations.run_query",
+          "record_kind": "definition",
+          "start_line": 669,
+          "end_line": 734
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context/taf_context/git_snapshot.py",
+      "changed_symbols": [
+        {
+          "qualified_name": "git_snapshot.manifest_from_snapshot",
+          "record_kind": "definition",
+          "start_line": 719,
+          "end_line": 769
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context/taf_context/level1_models.py",
+      "changed_symbols": [
+        {
+          "qualified_name": "level1_models.Level1Operation",
+          "record_kind": "definition",
+          "start_line": 24,
+          "end_line": 34
+        },
+        {
+          "qualified_name": "level1_models.Level1Request",
+          "record_kind": "definition",
+          "start_line": 141,
+          "end_line": 264
+        },
+        {
+          "qualified_name": "level1_models.Level1Request.from_dict",
+          "record_kind": "definition",
+          "start_line": 165,
+          "end_line": 237
+        },
+        {
+          "qualified_name": "level1_models.Level1Request.to_dict",
+          "record_kind": "definition",
+          "start_line": 239,
+          "end_line": 264
+        },
+        {
+          "qualified_name": "level1_models.Level1Finding",
+          "record_kind": "definition",
+          "start_line": 267,
+          "end_line": 345
+        },
+        {
+          "qualified_name": "level1_models.Level1Finding.from_dict",
+          "record_kind": "definition",
+          "start_line": 289,
+          "end_line": 321
+        },
+        {
+          "qualified_name": "level1_models.Level1Finding.to_dict",
+          "record_kind": "definition",
+          "start_line": 323,
+          "end_line": 345
+        },
+        {
+          "qualified_name": "level1_models.Level1Result",
+          "record_kind": "definition",
+          "start_line": 383,
+          "end_line": 512
+        },
+        {
+          "qualified_name": "level1_models.Level1Result.from_dict",
+          "record_kind": "definition",
+          "start_line": 407,
+          "end_line": 485
+        },
+        {
+          "qualified_name": "level1_models.Level1Result.to_dict",
+          "record_kind": "definition",
+          "start_line": 487,
+          "end_line": 512
+        },
+        {
+          "qualified_name": "level1_models._wire_schema",
+          "record_kind": "definition",
+          "start_line": 659,
+          "end_line": 670
+        },
+        {
+          "qualified_name": "level1_models._schema_fields",
+          "record_kind": "definition",
+          "start_line": 673,
+          "end_line": 680
+        },
+        {
+          "qualified_name": "level1_models._direction",
+          "record_kind": "definition",
+          "start_line": 683,
+          "end_line": 699
+        },
+        {
+          "qualified_name": "level1_models._edge_label",
+          "record_kind": "definition",
+          "start_line": 702,
+          "end_line": 713
+        },
+        {
+          "qualified_name": "level1_models._edge",
+          "record_kind": "definition",
+          "start_line": 716,
+          "end_line": 737
+        },
+        {
+          "qualified_name": "level1_models._findings",
+          "record_kind": "definition",
+          "start_line": 979,
+          "end_line": 987
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context/taf_context/mcp_server.py",
+      "changed_symbols": [
+        {
+          "qualified_name": "mcp_server.tool_definitions",
+          "record_kind": "definition",
+          "start_line": 122,
+          "end_line": 274
+        },
+        {
+          "qualified_name": "mcp_server._check_schema",
+          "record_kind": "definition",
+          "start_line": 281,
+          "end_line": 316
+        },
+        {
+          "qualified_name": "mcp_server._query_arguments",
+          "record_kind": "definition",
+          "start_line": 327,
+          "end_line": 367
+        }
+      ]
+    },
+    {
+      "path": "tools/taf-context/taf_context/prepare_cli.py",
+      "changed_symbols": [
+        {
+          "qualified_name": "prepare_cli.register_prepare_command",
+          "record_kind": "definition",
+          "start_line": 50,
+          "end_line": 108
+        },
+        {
+          "qualified_name": "prepare_cli.run_prepare_command",
+          "record_kind": "definition",
+          "start_line": 111,
+          "end_line": 168
+        },
+        {
+          "qualified_name": "prepare_cli._validate_query_arguments",
+          "record_kind": "definition",
+          "start_line": 250,
+          "end_line": 253
+        }
+      ]
+    }
+  ],
+  "impact_cross_check": [
+    {
+      "id": "py-invoke-native",
+      "path_prefix": "tools/taf-context/taf_context/context_operations.py",
+      "anchor_query": "_invoke_native",
+      "anchor_path": "tools/taf-context/taf_context/context_operations.py",
+      "anchor_qualified_name": "context_operations._invoke_native",
+      "expected_candidates": [
+        {
+          "path": "tools/taf-context/taf_context/context_operations.py",
+          "qualified_name": "context_operations._refresh_if_stale"
+        }
+      ],
+      "absent_callers": [
+        {
+          "path": "tests/taf_context/benchmark_query_latency.py",
+          "qualified_name": "benchmark_query_latency.main",
+          "reason": "related-symbols-miss"
+        },
+        {
+          "path": "tools/taf-context/taf_context/context_operations.py",
+          "qualified_name": "context_operations.run_build",
+          "reason": "output-budget"
+        },
+        {
+          "path": "tools/taf-context/taf_context/context_operations.py",
+          "qualified_name": "context_operations.run_inspect",
+          "reason": "output-budget"
+        },
+        {
+          "path": "tools/taf-context/taf_context/context_operations.py",
+          "qualified_name": "context_operations.run_query",
+          "reason": "self-changed"
+        }
+      ]
+    },
+    {
+      "id": "py-run-query",
+      "path_prefix": "tools/taf-context/taf_context/context_operations.py",
+      "anchor_query": "run_query",
+      "anchor_path": "tools/taf-context/taf_context/context_operations.py",
+      "anchor_qualified_name": "context_operations.run_query",
+      "expected_candidates": [
+        {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.OperationTests.test_an_edit_sends_the_refresh_update_across_the_seam_as_non_idempotent"
+        },
+        {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.OperationTests.test_build_then_query_cross_the_seam_with_the_idempotency_flag"
+        },
+        {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.OperationTests.test_only_the_relationship_query_crosses_the_seam_as_schema_two"
+        },
+        {
+          "path": "tools/taf-context/taf_context/prepare_cli.py",
+          "qualified_name": "prepare_cli.run_prepare_command"
+        }
+      ],
+      "absent_callers": [
+        {
+          "path": "tools/taf-context/taf_context/mcp_server.py",
+          "qualified_name": "mcp_server.NativeOperations.query",
+          "reason": "output-budget"
+        }
+      ]
+    },
+    {
+      "id": "py-validate-query-request",
+      "path_prefix": "tools/taf-context/taf_context/context_operations.py",
+      "anchor_query": "validate_query_request",
+      "anchor_path": "tools/taf-context/taf_context/context_operations.py",
+      "anchor_qualified_name": "context_operations.validate_query_request",
+      "expected_candidates": [
+        {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.ValidateQueryRequestTests.test_direction_rules_match_the_cli"
+        },
+        {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.ValidateQueryRequestTests.test_rules_match_the_cli"
+        }
+      ],
+      "absent_callers": [
+        {
+          "path": "tools/taf-context/taf_context/prepare_cli.py",
+          "qualified_name": "prepare_cli._validate_query_arguments",
+          "reason": "output-budget"
+        }
+      ]
+    },
+    {
+      "id": "go-wire-encode-result",
+      "path_prefix": "tools/taf-context-native/internal/wire/encode.go",
+      "anchor_query": "EncodeResult",
+      "anchor_path": "tools/taf-context-native/internal/wire/encode.go",
+      "anchor_qualified_name": "wire.EncodeResult",
+      "expected_candidates": [
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestEncodeResultCanonicalizesOneLineAndVerifiesOutputCharacters"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestEncodeResultKeepsSchemaOneFindingKeysComplete"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestEncodeResultMatchesEmptySourcePreviewFixture"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestEncodeResultMatchesMultilinePreviewFixture"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestEncodeResultOmitsEdgeFieldsUnderSchemaOne"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestEncodeResultRejectsFindingLineInt32Overflow"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestEncodeResultRejectsNilCollectionsInvalidCountersAndDuplicateFindings"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestEncodeResultRejectsSerializedLengthInsteadOfRenderedTextLength"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestEncodeResultSortsObjectKeysRecursively"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestResultValidationRequiresTruncatedWhenOmissionsAreCounted"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestValidateResultBindsEdgeFieldsToRelatedSymbols"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestValidateResultRejectsInconsistentEdgeFields"
+        }
+      ],
+      "absent_callers": [
+        {
+          "path": "tools/taf-context-native/cmd/taf-level1/main.go",
+          "qualified_name": "main.runWithExecutor",
+          "reason": "related-symbols-miss"
+        },
+        {
+          "path": "tools/taf-context-native/internal/engine/update_test.go",
+          "qualified_name": "engine.TestUpdatePublishesAValidReadyResultWhenFitFailsAfterPublication",
+          "reason": "related-symbols-miss"
+        },
+        {
+          "path": "tools/taf-context-native/internal/render/render.go",
+          "qualified_name": "render.Fit",
+          "reason": "related-symbols-miss"
+        },
+        {
+          "path": "tools/taf-context-native/internal/render/render_test.go",
+          "qualified_name": "render.TestFinalTransportRejectsOverTwelveThousandCharacters",
+          "reason": "related-symbols-miss"
+        },
+        {
+          "path": "tools/taf-context-native/internal/render/render_test.go",
+          "qualified_name": "render.TestFitReducesInitiallyOversizedJSONAndCharacterResults",
+          "reason": "related-symbols-miss"
+        }
+      ]
+    },
+    {
+      "id": "go-store-map-kind-tier",
+      "path_prefix": "tools/taf-context-native/internal/store/query_index.go",
+      "anchor_query": "MapKindTier",
+      "anchor_path": "tools/taf-context-native/internal/store/query_index.go",
+      "anchor_qualified_name": "store.MapKindTier",
+      "expected_candidates": [
+        {
+          "path": "tools/taf-context-native/internal/store/query_index.go",
+          "qualified_name": "store.compareCanonicalMapRepresentative"
+        },
+        {
+          "path": "tools/taf-context-native/internal/store/query_index_test.go",
+          "qualified_name": "store.TestMapKindTierPrefersDefinitionsOverImports"
+        },
+        {
+          "path": "tools/taf-context-native/internal/store/query_index_test.go",
+          "qualified_name": "store.TestRawKindTierMirrorsMapKindTier"
+        }
+      ],
+      "absent_callers": [
+        {
+          "path": "tools/taf-context-native/internal/query/query.go",
+          "qualified_name": "query.mapKindTier",
+          "reason": "related-symbols-miss"
+        }
+      ]
+    }
+  ]
+}

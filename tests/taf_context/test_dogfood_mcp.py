@@ -143,6 +143,50 @@ class DogfoodMcpTests(unittest.TestCase):
                 self.assertTrue(any(f["qualified_name"].endswith("mcp_dogfood_marker") for f in refreshed["findings"]))
                 again = client.call("search_symbols", repo=str(work), query="mcp_dogfood_marker")
                 self.assertFalse(again["refresh"]["performed"])
+                # The change operations need a symbol that something else calls,
+                # so a second edit touches one line inside an existing function
+                # instead of appending a new one. The clone is committed, so
+                # base "HEAD" makes the change set exactly these two edits.
+                called = work / "tools" / "taf-context" / "taf_context" / "state_paths.py"
+                source = called.read_text(encoding="utf-8")
+                docstring = '    """Resolve state paths solely from the explicitly supplied inputs."""\n'
+                self.assertEqual(source.count(docstring), 1, "the edit anchor moved")
+                called.write_text(
+                    source.replace(docstring, docstring + "    # mcp dogfood edit\n"),
+                    encoding="utf-8",
+                )
+                changed = client.call(
+                    "changed_symbols",
+                    repo=str(work),
+                    base="HEAD",
+                    maximum_results=64,
+                    maximum_output_characters=12000,
+                )
+                self.assertEqual(changed["status"], "ready")
+                self.assertEqual(changed["base"]["source"], "explicit")
+                names = {finding["qualified_name"] for finding in changed["findings"]}
+                self.assertIn("state_paths.resolve_state_paths", names)
+                self.assertIn("state_paths.mcp_dogfood_marker", names)
+                impact = client.call(
+                    "impact_candidates",
+                    repo=str(work),
+                    base="HEAD",
+                    maximum_results=64,
+                    maximum_output_characters=12000,
+                )
+                self.assertIn(impact["status"], {"ready", "partial"})
+                self.assertGreaterEqual(impact["changed_count"], 2)
+                # The edited function has real call sites, so at least one
+                # candidate must name it as a verified anchor.
+                self.assertTrue(
+                    any(
+                        attribution["qualified_name"] == "state_paths.resolve_state_paths"
+                        and attribution["edge_evidence"] == "verified"
+                        for finding in impact["findings"]
+                        for attribution in finding["anchors"]
+                    ),
+                    [finding["qualified_name"] for finding in impact["findings"]],
+                )
             finally:
                 code = client.close()
             self.assertEqual(code, 0)

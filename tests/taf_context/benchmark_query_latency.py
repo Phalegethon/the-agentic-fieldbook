@@ -32,6 +32,16 @@ With `--related` (which needs `--mcp`), the warm session additionally answers
 search, reported as the `mcp-related-callers` stage. It measures the
 relationship query over an already-loaded index, not the anchor search that
 precedes it.
+
+With `--impact` (which also needs `--mcp`), the warm session answers the two
+change operations for `--base` at the largest request settings the tools
+accept, reported as the `mcp-changed-symbols` and `mcp-impact-candidates`
+stages. Both are measured over the already-loaded index of the same session, so
+they carry the per-call cost the acceptance bounds of the change phase name
+(0.15 s and 0.50 s); the `impact` block of the report repeats those bounds next
+to the medians. `impact-candidates` sends one relationship call per changed
+anchor, which is why it is worth measuring on the session transport rather than
+the one-shot CLI.
 """
 
 from __future__ import annotations
@@ -48,6 +58,10 @@ import time
 from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[2]
+# The acceptance bounds of the change phase, in seconds, for the warm session.
+IMPACT_BOUNDS = {"mcp-changed-symbols": 0.15, "mcp-impact-candidates": 0.50}
+IMPACT_MAXIMUM_RESULTS = 64
+IMPACT_MAXIMUM_OUTPUT_CHARACTERS = 12000
 PACKAGE_ROOT = ROOT / "tools" / "taf-context"
 ENTRYPOINT = ROOT / "skills" / "prepare-repo-context" / "scripts" / "prepare_repo_context.py"
 
@@ -74,9 +88,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--edit-file", default="tools/taf-context/taf_context/state_paths.py")
     parser.add_argument("--mcp", action="store_true")
     parser.add_argument("--related", action="store_true")
+    parser.add_argument("--impact", action="store_true")
+    parser.add_argument("--base")
     args = parser.parse_args(argv)
     if args.related and not args.mcp:
         parser.error("--related needs --mcp: the stage is measured over the warm MCP session")
+    if args.impact and not args.mcp:
+        parser.error("--impact needs --mcp: the stages are measured over the warm MCP session")
+    if args.base and not args.impact:
+        parser.error("--base is only used by the --impact stages")
     if os.environ.get("TAF_DOGFOOD") != "1" or not os.environ.get("TAF_LEVEL1_BINARY"):
         print("set TAF_DOGFOOD=1 and TAF_LEVEL1_BINARY to run the latency benchmark", file=sys.stderr)
         return 2
@@ -161,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
 
         edit_changed_path_count: int | None = None
         related_summary: dict[str, object] | None = None
+        impact_summary: dict[str, object] | None = None
         if args.edit:
             edit_file = repository / args.edit_file
             samples: list[float] = []
@@ -211,6 +232,16 @@ def main(argv: list[str] | None = None) -> int:
                         "related_symbols",
                         {"repo": str(repository), "result_ids": [identity], "direction": "callers"},
                     )
+
+                def change(self, tool: str) -> dict:
+                    arguments: dict[str, object] = {
+                        "repo": str(repository),
+                        "maximum_results": IMPACT_MAXIMUM_RESULTS,
+                        "maximum_output_characters": IMPACT_MAXIMUM_OUTPUT_CHARACTERS,
+                    }
+                    if args.base:
+                        arguments["base"] = args.base
+                    return self.call(tool, arguments)
 
                 def close(self) -> None:
                     self.process.stdin.close()
@@ -276,6 +307,32 @@ def main(argv: list[str] | None = None) -> int:
                     stages["mcp-related-callers"] = _timed(
                         lambda: client.related_callers(anchor["result_identity"]), args.repetitions
                     )
+                if args.impact:
+                    # Measured before any edit, so the change set is exactly the
+                    # difference between the base and the checkout.
+                    changed = client.change("changed_symbols")
+                    candidates = client.change("impact_candidates")
+                    stages["mcp-changed-symbols"] = _timed(
+                        lambda: client.change("changed_symbols"), args.repetitions
+                    )
+                    stages["mcp-impact-candidates"] = _timed(
+                        lambda: client.change("impact_candidates"), args.repetitions
+                    )
+                    impact_summary = {
+                        "base": changed["base"],
+                        "changed_status": changed["status"],
+                        "changed_returned_count": changed["returned_count"],
+                        "changed_truncated": changed["truncated"],
+                        "candidates_status": candidates["status"],
+                        "candidates_changed_count": candidates["changed_count"],
+                        "candidates_returned_count": candidates["returned_count"],
+                        "candidates_truncated": candidates["truncated"],
+                        "bounds_seconds": dict(IMPACT_BOUNDS),
+                        "within_bounds": {
+                            stage: stages[stage]["median_seconds"] <= bound
+                            for stage, bound in IMPACT_BOUNDS.items()
+                        },
+                    }
                 if args.edit:
                     edit_file = repository / args.edit_file
                     samples = []
@@ -305,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
             report["edit"] = {"edit_file": args.edit_file, "changed_path_count": edit_changed_path_count}
         if related_summary is not None:
             report["related"] = related_summary
+        if impact_summary is not None:
+            report["impact"] = impact_summary
         print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
