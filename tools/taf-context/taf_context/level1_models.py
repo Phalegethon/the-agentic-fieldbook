@@ -694,12 +694,12 @@ class Level1Result:
             "next_safe_action": self.next_safe_action,
         }
         if self.schema_version == "4":
-            wire["groups"] = [
-                item.to_dict() for item in (self.groups or ())
-            ]
-            wire["overview"] = (
-                None if self.overview is None else self.overview.to_dict()
-            )
+            if self.groups is None:
+                raise Level1ModelError("groups")
+            if self.overview is None:
+                raise Level1ModelError("overview")
+            wire["groups"] = [item.to_dict() for item in self.groups]
+            wire["overview"] = self.overview.to_dict()
         return wire
 
 

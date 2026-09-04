@@ -1118,8 +1118,8 @@ class OverviewQueryRequestTests(unittest.TestCase):
 
     def test_the_overview_accepts_neither_symbol_shaped_filter(self) -> None:
         for symbol_kinds, source_types, message in (
-            (["definition"], [], "selected query operation does not accept symbol kinds"),
-            ([], ["source"], "selected query operation does not accept source types"),
+            (["definition"], [], "selected query operation does not accept --symbol-kind"),
+            ([], ["source"], "selected query operation does not accept --source-type"),
         ):
             with self.subTest(message=message):
                 with self.assertRaises(PrepareCLIError) as caught:
@@ -1154,13 +1154,7 @@ class OverviewQueryRequestTests(unittest.TestCase):
 class OverviewBudgetTests(unittest.TestCase):
     """The group table is never trimmed; an overrun is reported instead."""
 
-    def _summary(self, group_count: int) -> dict[str, object]:
-        languages = [
-            {"language": name, "file_count": 64 - index}
-            for index, name in enumerate(
-                ["Python", "Go", "Rust", "TypeScript", "Markdown", "JSON", "TOML"]
-            )
-        ]
+    def _summary(self, group_count: int, finding_count: int = 0) -> dict[str, object]:
         return {
             "schema_version": "1",
             "mode": "query",
@@ -1168,8 +1162,15 @@ class OverviewBudgetTests(unittest.TestCase):
             "status": "ready",
             "freshness": "exact",
             "index_identity": "sha256:" + "4" * 64,
-            "findings": [],
-            "returned_count": 0,
+            "findings": [
+                {
+                    "rank": index + 1,
+                    "path": f"file{index:02d}.py",
+                    "result_identity": "sha256:" + f"{index:064x}",
+                }
+                for index in range(finding_count)
+            ],
+            "returned_count": finding_count,
             "omitted_count": 0,
             "truncated": False,
             "output_characters": 0,
@@ -1179,15 +1180,15 @@ class OverviewBudgetTests(unittest.TestCase):
             "refresh": {"performed": False, "changed_path_count": 0, "duration_ms": 0},
             "groups": [
                 {
-                    "path_prefix": f"tools/directory{index:02d}/",
+                    "path_prefix": f"tools/{index:02d}/",
                     "depth": 2,
                     "file_count": 12,
                     "definition_count": 120,
                     "entry_point_count": 1,
                     "document_count": 2,
                     "configuration_count": 3,
-                    "languages": languages,
-                    "representative_identity": "sha256:" + f"{index:064x}",
+                    "languages": [],
+                    "representative_identity": None,
                 }
                 for index in range(group_count)
             ],
@@ -1204,12 +1205,33 @@ class OverviewBudgetTests(unittest.TestCase):
         )
 
     def test_a_seventeen_row_table_over_the_smallest_budget_is_reported(self) -> None:
-        fitted = fit_overview_to_budget(self._summary(17), 2000)
+        fitted = fit_overview_to_budget(self._summary(17, finding_count=4), 2000)
 
         self.assertEqual(len(fitted["groups"]), 17)
         self.assertIn("output-budget-exceeded", fitted["warnings"])
         self.assertEqual(fitted["output_characters"], self._length(fitted))
         self.assertGreater(fitted["output_characters"], 2000)
+        # Zero findings is not enough for the table alone to fit, so every
+        # finding is dropped and the omission is reported honestly.
+        self.assertEqual(fitted["findings"], [])
+        self.assertEqual(fitted["returned_count"], 0)
+        self.assertTrue(fitted["truncated"])
+        self.assertEqual(fitted["omitted_count"], 4)
+
+    def test_a_middle_band_answer_drops_only_enough_findings_to_fit(self) -> None:
+        fitted = fit_overview_to_budget(self._summary(17, finding_count=4), 4000)
+
+        self.assertEqual(len(fitted["groups"]), 17)
+        self.assertEqual(fitted["warnings"], [])
+        self.assertEqual(fitted["output_characters"], self._length(fitted))
+        self.assertLessEqual(fitted["output_characters"], 4000)
+        # The table plus overview fits under 4000 on its own, so only enough
+        # findings are dropped from the tail to bring the whole answer under
+        # budget; the survivors keep their original, contiguous ranks.
+        self.assertEqual([item["rank"] for item in fitted["findings"]], [1, 2])
+        self.assertEqual(fitted["returned_count"], 2)
+        self.assertEqual(fitted["omitted_count"], 2)
+        self.assertTrue(fitted["truncated"])
 
     def test_a_table_inside_the_budget_only_reports_its_length(self) -> None:
         fitted = fit_overview_to_budget(self._summary(1), 12000)

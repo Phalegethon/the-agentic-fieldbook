@@ -645,8 +645,8 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
 
             for extra, message in (
-                (["--symbol-kind", "definition"], "does not accept symbol kinds"),
-                (["--source-type", "source"], "does not accept source types"),
+                (["--symbol-kind", "definition"], "does not accept --symbol-kind"),
+                (["--source-type", "source"], "does not accept --source-type"),
                 (["--query", "main"], "does not accept --query"),
                 (["--result-id", "sha256:" + "a" * 64], "does not accept --result-id"),
                 (["--base", "origin/main"], "does not accept --base"),

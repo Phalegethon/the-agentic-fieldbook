@@ -745,9 +745,9 @@ def validate_query_request(
         # such a request outright; refuse it here with a message that names
         # what to drop.
         if symbol_kinds:
-            raise PrepareCLIError("selected query operation does not accept symbol kinds")
+            raise PrepareCLIError("selected query operation does not accept --symbol-kind")
         if source_types:
-            raise PrepareCLIError("selected query operation does not accept source types")
+            raise PrepareCLIError("selected query operation does not accept --source-type")
     return query_text, identities
 
 
@@ -1029,14 +1029,7 @@ def trim_to_budget(
             dropped_changed = True
             _add_warning(trimmed, WARNING_CHANGED_LIST_TRIMMED)
         trimmed["output_characters"] = _output_characters(trimmed)
-    findings = list(trimmed["findings"])  # type: ignore[arg-type]
-    while findings and int(trimmed["output_characters"]) > maximum_output_characters:
-        findings.pop()
-        trimmed["findings"] = findings
-        trimmed["returned_count"] = len(findings)
-        trimmed["omitted_count"] = int(trimmed["omitted_count"]) + 1
-        trimmed["truncated"] = True
-        trimmed["output_characters"] = _output_characters(trimmed)
+    trimmed = _drop_findings_to_budget(trimmed, maximum_output_characters)
     if int(trimmed["output_characters"]) > maximum_output_characters:
         # Nothing left to lose: the envelope alone is over the budget, and the
         # reader is told rather than handed a silent overrun.
@@ -1045,24 +1038,47 @@ def trim_to_budget(
     return trimmed
 
 
+def _drop_findings_to_budget(
+    result: dict[str, object], maximum_output_characters: int
+) -> dict[str, object]:
+    """Drop findings from the tail, cheapest loss first, until the object fits.
+
+    Popping from the tail leaves every surviving finding's rank exactly as it
+    was, so ranks stay contiguous from 1 without renumbering.
+    `returned_count`/`omitted_count` and `truncated` are updated to match each
+    drop, and `output_characters` is remeasured after every one.
+    """
+    findings = list(result["findings"])  # type: ignore[arg-type]
+    while findings and int(result["output_characters"]) > maximum_output_characters:
+        findings.pop()
+        result["findings"] = findings
+        result["returned_count"] = len(findings)
+        result["omitted_count"] = int(result["omitted_count"]) + 1
+        result["truncated"] = True
+        result["output_characters"] = _output_characters(result)
+    return result
+
+
 def fit_overview_to_budget(
     summary: dict[str, object], maximum_output_characters: int
 ) -> dict[str, object]:
-    """Report how long an overview answer really is, and say when it overruns.
+    """Fit an overview answer into its output budget without ever trimming the table.
 
-    The engine's `output_characters` counts the rendered finding lines only, so
-    the directory table contributes nothing to it, and the engine's own fitting
-    loop has already trimmed the file layer. The table itself is the answer to
-    "how is this repository organized", it is bounded by the wire (at most
-    seventeen rows of bounded fields), and a partial table would describe a
-    repository that does not exist - so `groups` and `overview` are never
-    trimmed. What is left is to measure: `output_characters` becomes the length
-    of the broker's canonical JSON, and a serialized answer longer than the
-    requested budget carries `output-budget-exceeded` rather than a silent
-    overrun.
+    `groups` and `overview` describe the whole repository as the wire bounds
+    it (at most seventeen rows of bounded fields); a partial table would
+    describe a repository that does not exist, so they are never trimmed.
+    What can still be dropped is the file layer: findings are dropped from
+    the tail, cheapest loss first, exactly as `trim_to_budget` does for the
+    standard summary shape, until the canonical JSON fits. If it still does
+    not fit with zero findings, `output-budget-exceeded` says so instead of a
+    silent overrun. `output_characters` is always the final canonical
+    length.
     """
     fitted = dict(summary)
     fitted["output_characters"] = _output_characters(fitted)
+    if int(fitted["output_characters"]) <= maximum_output_characters:
+        return fitted
+    fitted = _drop_findings_to_budget(fitted, maximum_output_characters)
     if int(fitted["output_characters"]) > maximum_output_characters:
         _add_warning(fitted, WARNING_OUTPUT_BUDGET_EXCEEDED)
         fitted["output_characters"] = _output_characters(fitted)
@@ -1257,8 +1273,9 @@ def run_query(
     touch_binding(binding_path)
     summary = _query_summary(result, refresh_summary)
     if arguments.operation == OVERVIEW_QUERY_OPERATION:
-        # The engine trimmed the file layer to its own rendered budget; the
-        # broker measures what the caller actually receives.
+        # The group table and overview summary describe the whole repository
+        # and are never trimmed; the broker drops findings from the tail
+        # instead and reports the canonical length of what it actually sends.
         return fit_overview_to_budget(summary, arguments.maximum_output_characters)
     return summary
 

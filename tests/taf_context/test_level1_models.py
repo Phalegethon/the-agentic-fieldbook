@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 from pathlib import Path
 import re
@@ -13,6 +14,7 @@ from taf_context.level1_models import (
     CandidateManifest,
     Level1Finding,
     Level1Filters,
+    Level1ModelError,
     Level1Operation,
     Level1OverviewGroup,
     Level1OverviewLanguage,
@@ -1408,6 +1410,18 @@ class Level1SchemaFourContractTests(unittest.TestCase):
             "4",
         )
 
+    def test_to_dict_refuses_a_schema_four_result_missing_its_table(self) -> None:
+        result = Level1Result.from_dict(overview_result_wire())
+        for field, replacement in (
+            ("groups", {"groups": None}),
+            ("overview", {"overview": None}),
+        ):
+            with self.subTest(field=field):
+                broken = dataclasses.replace(result, **replacement)
+                with self.assertRaises(Level1ModelError) as caught:
+                    broken.to_dict()
+                self.assertEqual(caught.exception.field, field)
+
 
 class ContractSchemaTests(unittest.TestCase):
     def test_json_schemas_publish_the_same_top_level_fields_and_enums(self) -> None:
@@ -1447,6 +1461,20 @@ class ContractSchemaTests(unittest.TestCase):
             set(result_schema["$defs"]["overview_summary"]["properties"]),
             set(Level1OverviewSummary.__dataclass_fields__),
         )
+        path_prefix_pattern = re.compile(
+            result_schema["$defs"]["overview_group"]["properties"]["path_prefix"]["pattern"]
+        )
+        root_pattern = re.compile(
+            result_schema["$defs"]["overview_summary"]["properties"]["root"]["pattern"]
+        )
+        for value in ("tools//a/", "tools//./a/"):
+            self.assertIsNone(path_prefix_pattern.fullmatch(value), repr(value))
+        for value in ("tools/a/", "tools/a/.", ".", "*"):
+            self.assertIsNotNone(path_prefix_pattern.fullmatch(value), repr(value))
+        for value in ("tools//", "tools//a/"):
+            self.assertIsNone(root_pattern.fullmatch(value), repr(value))
+        for value in ("", "tools/", "tools/a/"):
+            self.assertIsNotNone(root_pattern.fullmatch(value), repr(value))
         self.assertEqual(
             result_schema["$defs"]["overview_group"]["properties"]["path_prefix"]["maxLength"],
             512,
