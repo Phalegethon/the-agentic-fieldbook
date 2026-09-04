@@ -262,7 +262,11 @@ func (visitor *queryKeyVisitor) visit(record model.Record, visit func(string) bo
 		if !visitor.visitReferenceNameKeys(record, visit) {
 			return false
 		}
-		return visitFacetQueryKeys(record, visit)
+		// A reference is selected by kind and resolved through the anchor's
+		// own record, so its language, source and evidence facets would carry
+		// postings no operation reads. The kind facet stays: it is the one
+		// the relationship operation and the validators select by.
+		return visit(facetQueryKey(QueryFacetKind, string(model.Reference)))
 	}
 	qualified := NormalizeQueryText(record.QualifiedName)
 	if !visit(queryQualifiedPrefix + qualified) {
@@ -292,11 +296,14 @@ func (visitor *queryKeyVisitor) visit(record model.Record, visit func(string) bo
 // visitReferenceNameKeys emits the name keys of a reference record. A
 // reference is found by the names it refers to, never by the name of the
 // definition it sits in, so every target name of its table carries the record
-// under its own qualified key and under the short key of its last segment.
-// SearchTerms already hold those names lower-cased and without
-// sub-tokenization, which is why a reference contributes no token keys. Two
-// targets sharing a name or a last segment contribute their key once: the
-// encoder counts one posting per emitted key and rejects a repeat.
+// under the short key of its last segment, and a dotted target under its
+// qualified key as well. An undotted target's qualified key would repeat its
+// short key over the same record, and the relationship operation reads the
+// short postings, so it is not emitted. SearchTerms already hold those names
+// lower-cased and without sub-tokenization, which is why a reference
+// contributes no token keys. Two targets sharing a name or a last segment
+// contribute their key once: the encoder counts one posting per emitted key
+// and rejects a repeat.
 func (visitor *queryKeyVisitor) visitReferenceNameKeys(record model.Record, visit func(string) bool) bool {
 	emitted := visitor.tokens[:0]
 	for _, term := range record.SearchTerms {
@@ -305,6 +312,9 @@ func (visitor *queryKeyVisitor) visitReferenceNameKeys(record model.Record, visi
 			continue
 		}
 		emitted = append(emitted, name)
+		if !strings.Contains(name, ".") {
+			continue
+		}
 		if !visit(queryQualifiedPrefix + name) {
 			visitor.tokens = emitted
 			return false

@@ -416,3 +416,53 @@ func TestReferenceRecordsAreKeyedByTargetNotByEnclosingName(t *testing.T) {
 		t.Fatalf("validateIndex = %v", err)
 	}
 }
+
+// TestReferenceKeysCarryOnlyWhatResolvesAnEdge freezes the reduced key set of
+// a reference record. The relationship operation reaches a reference through
+// the short postings of a name and through the kind facet, and through nothing
+// else: the qualified key of an undotted target would repeat its short key
+// over the same record, and a reference's language, source and evidence are
+// the anchor's own, never a filter a posting has to answer.
+func TestReferenceKeysCarryOnlyWhatResolvesAnEdge(t *testing.T) {
+	definition := testRecord(testRecordA, "pkg/a.py", "a.run", []string{"run"})
+	reference := testRecord(testRecordB, "pkg/a.py", "a.run", []string{"helpers.load", "store"})
+	reference.RecordKind = model.Reference
+	reference.TargetName, reference.ReferenceCount = "helpers.load:5:2;store:7:1", 3
+	records := []model.Record{definition, reference}
+	index := BuildQueryIndex(records)
+
+	want := []string{
+		queryFacetPrefix + string(QueryFacetKind) + "/" + string(model.Reference),
+		queryQualifiedPrefix + "helpers.load",
+		queryShortPrefix + "load",
+		queryShortPrefix + "store",
+	}
+	if got := canonicalQueryKeys(reference); !slices.Equal(got, want) {
+		t.Fatalf("reference keys = %v, want %v", got, want)
+	}
+	if got := index.QualifiedOrdinals("store"); len(got) != 0 {
+		t.Fatalf("qualified(store) = %v, an undotted target is reached by its short key alone", got)
+	}
+	if got := index.ShortOrdinals("store"); !slices.Equal(got, []uint32{1}) {
+		t.Fatalf("short(store) = %v, want the reference", got)
+	}
+	for _, facet := range []struct {
+		facet QueryFacet
+		value string
+	}{
+		{QueryFacetLanguage, reference.Language},
+		{QueryFacetSource, reference.SourceType},
+		{QueryFacetEvidence, string(reference.EvidenceClass)},
+	} {
+		if got := index.FacetOrdinals(facet.facet, facet.value); slices.Contains(got, uint32(1)) {
+			t.Fatalf("%s facet = %v, a reference joins the kind facet alone", facet.facet, got)
+		}
+	}
+	encoded, err := encodeIndex(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateIndex(encoded); err != nil {
+		t.Fatalf("validateIndex = %v", err)
+	}
+}

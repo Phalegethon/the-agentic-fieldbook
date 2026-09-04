@@ -644,6 +644,25 @@ type namedDefinitionScan struct {
 	complete bool
 }
 
+// packageRepresentative is the file that stands for a package whose records
+// are already in path order. A test file is a poor answer to "which package
+// does this name", so it is taken only when the package has nothing else.
+func (resolver *relatedResolver) packageRepresentative(ordinals []uint32) uint32 {
+	for _, ordinal := range ordinals {
+		if !testFilePath(resolver.snapshot.Records[ordinal].Path) {
+			return ordinal
+		}
+	}
+	return ordinals[0]
+}
+
+// testFilePath reports whether a path names a file the language builds only
+// for its tests. Only Go emits module records today, so only Go's convention
+// is recognised here.
+func testFilePath(path string) bool {
+	return strings.HasSuffix(path, "_test.go")
+}
+
 func (resolver *relatedResolver) sortByPath(ordinals []uint32) {
 	records := resolver.snapshot.Records
 	sort.SliceStable(ordinals, func(left, right int) bool {
@@ -718,9 +737,9 @@ func pathDirectory(path string) string {
 // moduleNamed resolves a module name to the one module the index has under
 // it. A Go package carries one module record per file, so the answer is a
 // whole directory: the name is unambiguous when every module record carrying
-// it lives in one directory, and the record reported for it is the first of
-// that directory in path order. A name spread over two directories names two
-// modules and can carry no verified claim.
+// it lives in one directory, and the record reported for it is the first
+// non-test file of that directory in path order. A name spread over two
+// directories names two modules and can carry no verified claim.
 func (resolver *relatedResolver) moduleNamed(name, language string) (int, bool) {
 	key := language + "\x00" + name
 	if cached, exists := resolver.modules[key]; exists {
@@ -751,7 +770,7 @@ func (resolver *relatedResolver) moduleNamed(name, language string) (int, bool) 
 	found := -1
 	if !ambiguous && len(candidates) != 0 {
 		resolver.sortByPath(candidates)
-		found = int(candidates[0])
+		found = int(resolver.packageRepresentative(candidates))
 	}
 	resolver.modules[key] = found
 	return found, found >= 0

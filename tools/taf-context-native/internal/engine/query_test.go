@@ -485,21 +485,76 @@ func TestRelatedSymbolsAnswersCallersWithPerEdgeEvidence(t *testing.T) {
 	}
 }
 
+// TestRelatedSymbolsRefusesAnAnchorThatIsNotASymbol covers the three anchors a
+// relationship cannot start from: an identity the index does not carry, a
+// reference record - a use of a name - and an import binding. The last two are
+// real records of the built index, so they pass every wire check and are
+// refused for what they are.
 func TestRelatedSymbolsRefusesAnAnchorThatIsNotASymbol(t *testing.T) {
-	repository, state := relatedRoots(t)
-	engine := New(ProductionDependencies())
+	repository, state := relatedRootsWithImport(t)
+	dependencies := ProductionDependencies()
+	load := dependencies.Load
+	var indexed store.Snapshot
+	dependencies.Load = func(ctx context.Context, roots *boundary.Roots, identity string) (store.Snapshot, error) {
+		snapshot, err := load(ctx, roots, identity)
+		if err == nil {
+			indexed = snapshot
+		}
+		return snapshot, err
+	}
+	engine := New(dependencies)
 	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	unknown := "sha256:" + strings.Repeat("b", 64)
-	result, err := engine.Execute(context.Background(), relatedEnvelope(repository, state, built.IndexIdentity, "callers", []string{unknown}))
-	if err != nil {
+	search := controlEnvelope(wire.SearchSymbols, repository, state, built.IndexIdentity)
+	text := "helper"
+	search.Request.Query = &text
+	if _, searchErr := engine.Execute(context.Background(), search); searchErr != nil {
+		t.Fatal(searchErr)
+	}
+	anchors := map[string]string{"unknown": "sha256:" + strings.Repeat("b", 64)}
+	for _, kind := range []model.RecordKind{model.Reference, model.Import} {
+		for _, record := range indexed.Records {
+			if record.RecordKind == kind {
+				anchors[string(kind)] = record.Identity
+				break
+			}
+		}
+	}
+	if len(anchors) != 3 {
+		t.Fatalf("anchors = %#v, want an unknown, a reference and an import identity", anchors)
+	}
+	for name, anchor := range anchors {
+		result, executeErr := engine.Execute(context.Background(), relatedEnvelope(repository, state, built.IndexIdentity, "callers", []string{anchor}))
+		if executeErr != nil {
+			t.Fatal(executeErr)
+		}
+		if result.SchemaVersion != "2" || result.Status != wire.Stale || result.Freshness != "structurally-stale" || result.NextSafeAction != "update-index" || len(result.Findings) != 0 {
+			t.Fatalf("%s anchor = %#v", name, result)
+		}
+	}
+}
+
+// relatedRootsWithImport carries an import binding and a call as well, so a
+// test can anchor on the two record kinds no query operation returns.
+func relatedRootsWithImport(t *testing.T) (string, string) {
+	t.Helper()
+	base := t.TempDir()
+	repository := filepath.Join(base, "repository")
+	if err := os.MkdirAll(filepath.Join(repository, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != wire.Stale || result.Freshness != "structurally-stale" || result.NextSafeAction != "update-index" || len(result.Findings) != 0 {
-		t.Fatalf("unknown anchor = %#v", result)
+	files := map[string]string{
+		"caller.go": "package sample\n\nimport \"strings\"\n\nfunc Main() {\n\thelper()\n\tstrings.ToUpper(\"x\")\n}\n",
+		"helper.go": "package sample\n\nfunc helper() {}\n",
 	}
+	for name, contents := range files {
+		if err := os.WriteFile(filepath.Join(repository, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return repository, filepath.Join(base, "state")
 }
 
 // A result always answers in the schema its request asked for, and the edge

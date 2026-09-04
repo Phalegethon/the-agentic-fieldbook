@@ -134,6 +134,14 @@ type candidateCollector struct {
 
 func (collector *candidateCollector) admitPosting(ordinals []uint32, tier int) {
 	for _, ordinal := range ordinals {
+		// A reference record is keyed by the name it uses, so it sits in the
+		// very postings a search for that name reads, and no search operation
+		// may return one. Skipping it before the budget is charged keeps the
+		// work a search does - and the counters that report it - the work of
+		// the records the search can actually return.
+		if uint64(ordinal) < uint64(len(collector.snapshot.Records)) && collector.snapshot.Records[ordinal].RecordKind == model.Reference {
+			continue
+		}
 		if !collector.budget.visitRecord() {
 			collector.partial = true
 			return

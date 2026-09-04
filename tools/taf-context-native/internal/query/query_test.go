@@ -873,3 +873,36 @@ func TestSearchAndMapNeverReturnReferenceRecords(t *testing.T) {
 		t.Fatalf("filtered map identities = %#v, want %#v", got, want)
 	}
 }
+
+// TestSearchWorkIsUnchangedByReferenceRecords keeps the §2 warm-search budget
+// meaningful: a reference sits in the postings of the name it uses, so a
+// short-name query would charge every use of that name to the work budget
+// before the operation filter drops it. The search considers exactly the
+// records it considered before the phase.
+func TestSearchWorkIsUnchangedByReferenceRecords(t *testing.T) {
+	structural := []model.Record{}
+	for index := 0; index < 12; index++ {
+		definition := testRecord(index, fmt.Sprintf("pkg.load%d", index), model.Definition, model.Verified)
+		definition.SearchTerms = []string{"load"}
+		structural = append(structural, definition)
+	}
+	withReferences := append([]model.Record{}, structural...)
+	for index := 0; index < 40; index++ {
+		reference := testRecord(100+index, fmt.Sprintf("pkg.caller%d", index), model.Reference, model.Verified)
+		reference.TargetName, reference.ReferenceCount = "load:2:1", 1
+		reference.SearchTerms = []string{"load"}
+		withReferences = append(withReferences, reference)
+	}
+
+	before := Search(indexedSnapshot(structural), searchRequest("load"), policy.ProductionLimits())
+	after := Search(indexedSnapshot(withReferences), searchRequest("load"), policy.ProductionLimits())
+	if !reflect.DeepEqual(identities(before.Records), identities(after.Records)) {
+		t.Fatalf("results = %#v, want %#v", identities(after.Records), identities(before.Records))
+	}
+	if before.Counters.ConsideredRecords != after.Counters.ConsideredRecords {
+		t.Fatalf("considered records = %d with references, %d without", after.Counters.ConsideredRecords, before.Counters.ConsideredRecords)
+	}
+	if before.TermVisits != after.TermVisits {
+		t.Fatalf("term visits = %d with references, %d without", after.TermVisits, before.TermVisits)
+	}
+}

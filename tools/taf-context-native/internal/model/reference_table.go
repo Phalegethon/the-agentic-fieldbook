@@ -19,10 +19,11 @@ const (
 	MaximumReferenceTableBytes = 4096
 	// MaximumReferenceTargetBytes bounds one referenced name.
 	MaximumReferenceTargetBytes = 256
-	// maximumReferenceTableNumber is the largest line or count a table entry
-	// may carry, so the sum of the counts still fits the uint32 the index
-	// format encodes.
-	maximumReferenceTableNumber = math.MaxUint32
+	// MaximumReferenceCount is the largest line or count a table entry may
+	// carry, and bounds the sum of the counts too. It is the wire's own
+	// counter bound: a table the store accepted but a result could not report
+	// would make the whole result unencodable, so the two agree here.
+	MaximumReferenceCount = 1<<31 - 1
 )
 
 // ReferenceEntry is one referenced name inside a reference record: the name as
@@ -108,7 +109,7 @@ func scanReferenceTable(table []byte, collect func(ReferenceEntry) bool) (int, u
 			return 0, 0, false
 		}
 		total += count
-		if total > maximumReferenceTableNumber {
+		if total > MaximumReferenceCount {
 			return 0, 0, false
 		}
 		if collect != nil && !collect(ReferenceEntry{Name: string(name), Line: int(line), Count: int(count)}) {
@@ -154,7 +155,7 @@ func referenceTableNumber(value []byte) (uint64, bool) {
 		}
 		number = number*10 + uint64(digit-'0')
 	}
-	if number > maximumReferenceTableNumber || number > uint64(math.MaxInt) {
+	if number > MaximumReferenceCount || number > uint64(math.MaxInt) {
 		return 0, false
 	}
 	return number, true

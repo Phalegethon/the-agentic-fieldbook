@@ -675,25 +675,34 @@ func TestRequestBoundsRelatedSymbolsAnchors(t *testing.T) {
 // it was resolved: a schema-2 result of any other operation carries no
 // relation, no edge evidence, and no reference numbers.
 func TestValidateResultBindsEdgeFieldsToRelatedSymbols(t *testing.T) {
-	cases := map[string]func(*Result){
-		"relation": func(result *Result) { result.Findings[0].Relation = "call" },
-		"evidence": func(result *Result) { result.Findings[0].EdgeEvidence = "verified" },
-		"line":     func(result *Result) { result.Findings[0].ReferenceLine = 7 },
-		"count":    func(result *Result) { result.Findings[0].ReferenceCount = 2 },
+	// One field per subtest, in a fixed order, and each subtest sets that one
+	// field on both halves: the same value is refused on another operation and
+	// accepted on related-symbols.
+	cases := []struct {
+		name   string
+		mutate func(*Result)
+	}{
+		{"relation", func(result *Result) { result.Findings[0].Relation = "call" }},
+		{"evidence", func(result *Result) { result.Findings[0].EdgeEvidence = "verified" }},
+		{"line", func(result *Result) { result.Findings[0].ReferenceLine = 7 }},
+		{"count", func(result *Result) { result.Findings[0].ReferenceCount = 2 }},
 	}
-	for name, mutate := range cases {
-		t.Run(name, func(t *testing.T) {
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
 			result := validResult()
 			result.SchemaVersion = "2"
-			mutate(&result)
+			testCase.mutate(&result)
 			result.OutputCharacters = renderedOutputCharacters(result)
 			if err := EncodeResult(ioDiscard{}, result); err == nil {
-				t.Fatalf("accepted %s on a %s result", name, result.Operation)
+				t.Fatalf("accepted %s on a %s result", testCase.name, result.Operation)
 			}
 			related := relatedResult()
+			related.Findings[0].Relation, related.Findings[0].EdgeEvidence = "", ""
+			related.Findings[0].ReferenceLine, related.Findings[0].ReferenceCount = 0, 0
+			testCase.mutate(&related)
 			related.OutputCharacters = renderedOutputCharacters(related)
 			if err := EncodeResult(ioDiscard{}, related); err != nil {
-				t.Fatalf("rejected the same field on a related-symbols result: %v", err)
+				t.Fatalf("rejected %s on a related-symbols result: %v", testCase.name, err)
 			}
 		})
 	}

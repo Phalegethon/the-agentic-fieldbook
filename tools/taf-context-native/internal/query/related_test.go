@@ -613,3 +613,35 @@ func rustRecord(identity, path, name string, kind model.RecordKind, start, end i
 	record.Language, record.ExtractionMethod = "rust", "tree-sitter-rust"
 	return record
 }
+
+// A Go package's files may sort a test file first, and naming a test file as
+// the package an import names is a poor answer: the representative is the
+// first non-test file of the directory, and a package that is only tests still
+// resolves.
+func TestRelatedPrefersANonTestFileAsTheGoPackageRepresentative(t *testing.T) {
+	records := []model.Record{
+		goRecord("boundary-test-module", "internal/boundary/boundary_test.go", "boundary", model.Module, 1, 1),
+		goRecord("boundary-module", "internal/boundary/roots.go", "boundary", model.Module, 1, 1),
+		goRecord("boundary-roots", "internal/boundary/roots.go", "boundary.Roots", model.Definition, 3, 6),
+		goRecord("app-module", "app/main.go", "app", model.Module, 1, 1),
+		goImport("app-import-boundary", "app/main.go", "boundary", "example.com/x/internal/boundary", 3),
+		goRecord("app-run", "app/main.go", "app.Run", model.Definition, 5, 8),
+		goReference("app-run-uses", "app/main.go", "app.Run", 5, 8, []model.ReferenceEntry{{Name: "boundary.Roots", Line: 6, Count: 1}}),
+	}
+	imports := Related(relatedSnapshot(records), relatedRequest("imports", "app-run"), policy.ProductionLimits())
+	if got, want := relatedIdentities(imports.Findings), []string{"boundary-module"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("imports = %#v, want the package's first non-test file %#v", got, want)
+	}
+
+	onlyTests := []model.Record{
+		goRecord("probe-test-module", "internal/probe/probe_test.go", "probe", model.Module, 1, 1),
+		goRecord("app-module", "app/main.go", "app", model.Module, 1, 1),
+		goImport("app-import-probe", "app/main.go", "probe", "example.com/x/internal/probe", 3),
+		goRecord("app-run", "app/main.go", "app.Run", model.Definition, 5, 8),
+		goReference("app-run-uses", "app/main.go", "app.Run", 5, 8, []model.ReferenceEntry{{Name: "probe.Check", Line: 6, Count: 1}}),
+	}
+	testsOnly := Related(relatedSnapshot(onlyTests), relatedRequest("imports", "app-run"), policy.ProductionLimits())
+	if got, want := relatedIdentities(testsOnly.Findings), []string{"probe-test-module"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("imports of a test-only package = %#v, want %#v", got, want)
+	}
+}

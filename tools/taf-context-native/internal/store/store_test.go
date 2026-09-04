@@ -878,17 +878,25 @@ func TestFormatRejectsInconsistentReferenceFields(t *testing.T) {
 	}
 }
 
-// TestFormatRejectsAReferenceCountBeyondTheEncodedWidth guards the uint32 the
-// tuple encodes: a wider count must be refused rather than silently truncated.
-func TestFormatRejectsAReferenceCountBeyondTheEncodedWidth(t *testing.T) {
-	oversized := uint64(math.MaxUint32) + 1
+// TestFormatRejectsAReferenceCountBeyondTheWireCounter guards the number the
+// tuple encodes as a uint32 and a result reports as a wire counter: a wider
+// count must be refused rather than silently truncated, and the store's bound
+// is the model's bound, so a table the store accepts is always reportable.
+func TestFormatRejectsAReferenceCountBeyondTheWireCounter(t *testing.T) {
+	oversized := uint64(model.MaximumReferenceCount) + 1
 	if oversized > uint64(math.MaxInt) {
-		t.Skip("int is narrower than the encoded width on this platform")
+		t.Skip("int is narrower than the counter bound on this platform")
 	}
 	record := testRecord(testRecordA, "pkg/a.py", "a.run", []string{"run"})
 	record.RecordKind, record.TargetName, record.ReferenceCount = model.Reference, "helpers.load:5:2", int(oversized)
 	if validReferenceFields(record) {
-		t.Fatal("a reference count beyond the encoded uint32 was accepted")
+		t.Fatal("a reference count beyond the wire counter bound was accepted")
+	}
+	// The bound the raw validator applies is the same one, through the shared
+	// scanner: a table whose total exceeds it never decodes.
+	beyond := strconv.FormatUint(oversized, 10)
+	if validReferenceFieldBytes([]byte(model.Reference), []byte("helpers.load:5:"+beyond), 1) {
+		t.Fatal("a raw reference table beyond the wire counter bound was accepted")
 	}
 }
 

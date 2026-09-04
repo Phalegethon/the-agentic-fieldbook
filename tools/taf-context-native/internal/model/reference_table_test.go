@@ -2,6 +2,7 @@ package model
 
 import (
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -35,7 +36,7 @@ func TestParseReferenceTableReturnsEveryEntry(t *testing.T) {
 }
 
 func TestParseReferenceTableRoundTripsWhatFormatWrites(t *testing.T) {
-	want := []ReferenceEntry{{Name: "a", Line: 1, Count: 1}, {Name: "b.c", Line: 2, Count: 4294967294}}
+	want := []ReferenceEntry{{Name: "a", Line: 1, Count: 1}, {Name: "b.c", Line: 2, Count: MaximumReferenceCount - 1}}
 	entries, ok := ParseReferenceTable(FormatReferenceTable(want))
 	if !ok || !reflect.DeepEqual(entries, want) {
 		t.Fatalf("entries = %#v, ok = %v, want %#v", entries, ok, want)
@@ -109,6 +110,29 @@ func TestValidReferenceTargetNameRejectsUnstableNames(t *testing.T) {
 	for _, name := range []string{"", "a:b", "a;b", "a b", "a\tb", "a\nb", "a\x00b", " x", strings.Repeat("x", MaximumReferenceTargetBytes+1)} {
 		if ValidReferenceTargetName(name) {
 			t.Fatalf("%q accepted", name)
+		}
+	}
+}
+
+// The numbers a table carries are reported over the wire, where a counter is
+// bounded by 2^31-1. A table beyond that bound would make the whole result
+// unencodable, so the scanner refuses it here instead.
+func TestScanReferenceTableBoundsNumbersByTheWireCounter(t *testing.T) {
+	largest := strconv.Itoa(MaximumReferenceCount)
+	if MaximumReferenceCount != 1<<31-1 {
+		t.Fatalf("bound = %d, want the wire counter bound %d", MaximumReferenceCount, 1<<31-1)
+	}
+	if _, total, ok := ScanReferenceTable([]byte("load:" + largest + ":" + largest)); !ok || total != uint64(MaximumReferenceCount) {
+		t.Fatalf("the largest legal table scanned as total = %d, ok = %v", total, ok)
+	}
+	beyond := strconv.FormatUint(uint64(MaximumReferenceCount)+1, 10)
+	for _, table := range []string{
+		"load:" + beyond + ":1",
+		"load:1:" + beyond,
+		"load:1:" + largest + ";store:2:1",
+	} {
+		if _, _, ok := ScanReferenceTable([]byte(table)); ok {
+			t.Fatalf("a table beyond the wire counter bound scanned: %q", table)
 		}
 	}
 }
