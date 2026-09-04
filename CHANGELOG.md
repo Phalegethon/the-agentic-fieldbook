@@ -48,10 +48,11 @@ the new runtime). Bundled skills: `branch-handoff` 1.2.1,
   `--direction`; `--base` is rejected by every other operation. The
   `repo-context` MCP server, now 1.2.0, gains the eighth and ninth tools,
   `changed_symbols` (with the usual filters) and `impact_candidates` (`base`,
-  `allow_inferred`, and the two budgets), both read-only. A warm
-  `impact_candidates` call on this repository answers a change set of 126
-  changed symbols across 18 paths in about 0.3 s, and `changed_symbols` alone
-  in about 0.2 s; a single-symbol change set answers in about 0.15 s each.
+  `allow_inferred`, and the two budgets), both read-only. One
+  `impact_candidates` call follows at most 64 changed symbols of the change
+  set, fewer under a tight output budget, reports the rest as omissions with
+  `truncated`, and returns the ranked one-hop candidates of the symbols it
+  followed; the cost grows with the size of the change set.
 - `work-recovery` 1.1.0 may, only on an explicit request for indexed context,
   add one readiness check and exactly one `impact-candidates` query against an
   index that is already ready, and append a "Symbols touched and one-hop

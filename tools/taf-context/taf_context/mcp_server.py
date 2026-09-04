@@ -311,8 +311,8 @@ def tool_definitions() -> list[dict[str, Any]]:
             "title": "Impact candidates",
             "description": (
                 "Answer 'what could my change break': the one-hop callers of the changed "
-                "definitions and the importers of the changed modules, each candidate "
-                "attributed to the changed symbols it depends on in `anchors`. Every "
+                "definitions and the importers of the changed modules and definitions, each "
+                "candidate attributed to the changed symbols it depends on in `anchors`. Every "
                 "candidate's edge is the strongest of its anchors; edge_evidence inferred is "
                 "a name match, never proof, and is returned only with allow_inferred. Read "
                 "`changed` for the change set itself."

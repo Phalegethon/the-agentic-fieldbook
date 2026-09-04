@@ -886,6 +886,16 @@
         },
         {
           "path": "tools/taf-context/taf_context/context_operations.py",
+          "qualified_name": "context_operations._run_change_query.changed_symbols",
+          "reason": "newer-than-the-range"
+        },
+        {
+          "path": "tools/taf-context/taf_context/context_operations.py",
+          "qualified_name": "context_operations._run_change_query.related",
+          "reason": "newer-than-the-range"
+        },
+        {
+          "path": "tools/taf-context/taf_context/context_operations.py",
           "qualified_name": "context_operations.run_build",
           "reason": "output-budget"
         },
@@ -927,9 +937,39 @@
       ],
       "absent_callers": [
         {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.OperationTests.test_an_unresolved_base_is_reported_and_covers_uncommitted_work_only",
+          "reason": "newer-than-the-range"
+        },
+        {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.OperationTests.test_impact_candidates_composes_one_related_call_per_anchor",
+          "reason": "newer-than-the-range"
+        },
+        {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.OperationTests.test_the_change_query_crosses_the_seam_as_schema_three",
+          "reason": "newer-than-the-range"
+        },
+        {
+          "path": "tests/taf_context/test_prepare_cli.py",
+          "qualified_name": "test_prepare_cli.ChangeQuerySessionTests.test_impact_candidates_runs_over_one_session_and_answers_the_same",
+          "reason": "newer-than-the-range"
+        },
+        {
+          "path": "tests/taf_context/test_prepare_cli.py",
+          "qualified_name": "test_prepare_cli.QueryArgumentInvariantTests.test_both_surfaces_answer_a_change_query_identically",
+          "reason": "newer-than-the-range"
+        },
+        {
           "path": "tools/taf-context/taf_context/mcp_server.py",
           "qualified_name": "mcp_server.NativeOperations.query",
           "reason": "output-budget"
+        },
+        {
+          "path": "tools/taf-context/taf_context/prepare_cli.py",
+          "qualified_name": "prepare_cli._run_change_query_over_a_session",
+          "reason": "newer-than-the-range"
         }
       ]
     },
@@ -950,6 +990,11 @@
         }
       ],
       "absent_callers": [
+        {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.ValidateQueryRequestTests.test_only_the_change_operations_accept_a_base",
+          "reason": "newer-than-the-range"
+        },
         {
           "path": "tools/taf-context/taf_context/prepare_cli.py",
           "qualified_name": "prepare_cli._validate_query_arguments",
@@ -1038,6 +1083,16 @@
           "path": "tools/taf-context-native/internal/render/render_test.go",
           "qualified_name": "render.TestFitReducesInitiallyOversizedJSONAndCharacterResults",
           "reason": "related-symbols-miss"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestEncodeResultAcceptsSchemaThreeChangedSymbols",
+          "reason": "newer-than-the-range"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestValidateResultBindsSchemaThreeToChangedSymbols",
+          "reason": "newer-than-the-range"
         }
       ]
     },

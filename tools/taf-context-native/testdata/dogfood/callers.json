@@ -11,6 +11,10 @@
       "expected_callers": [
         {
           "path": "tests/taf_context/test_prepare_cli.py",
+          "qualified_name": "test_prepare_cli.QueryArgumentInvariantTests._cli_arguments"
+        },
+        {
+          "path": "tests/taf_context/test_prepare_cli.py",
           "qualified_name": "test_prepare_cli.QueryArgumentTests.test_filter_values_are_lower_cased_deduplicated_and_sorted"
         },
         {
@@ -44,6 +48,14 @@
         },
         {
           "path": "tools/taf-context/taf_context/context_operations.py",
+          "qualified_name": "context_operations._run_change_query.changed_symbols"
+        },
+        {
+          "path": "tools/taf-context/taf_context/context_operations.py",
+          "qualified_name": "context_operations._run_change_query.related"
+        },
+        {
+          "path": "tools/taf-context/taf_context/context_operations.py",
           "qualified_name": "context_operations.run_build"
         },
         {
@@ -69,15 +81,39 @@
         },
         {
           "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.OperationTests.test_an_unresolved_base_is_reported_and_covers_uncommitted_work_only"
+        },
+        {
+          "path": "tests/taf_context/test_context_operations.py",
           "qualified_name": "test_context_operations.OperationTests.test_build_then_query_cross_the_seam_with_the_idempotency_flag"
+        },
+        {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.OperationTests.test_impact_candidates_composes_one_related_call_per_anchor"
         },
         {
           "path": "tests/taf_context/test_context_operations.py",
           "qualified_name": "test_context_operations.OperationTests.test_only_the_relationship_query_crosses_the_seam_as_schema_two"
         },
         {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.OperationTests.test_the_change_query_crosses_the_seam_as_schema_three"
+        },
+        {
+          "path": "tests/taf_context/test_prepare_cli.py",
+          "qualified_name": "test_prepare_cli.ChangeQuerySessionTests.test_impact_candidates_runs_over_one_session_and_answers_the_same"
+        },
+        {
+          "path": "tests/taf_context/test_prepare_cli.py",
+          "qualified_name": "test_prepare_cli.QueryArgumentInvariantTests.test_both_surfaces_answer_a_change_query_identically"
+        },
+        {
           "path": "tools/taf-context/taf_context/mcp_server.py",
           "qualified_name": "mcp_server.NativeOperations.query"
+        },
+        {
+          "path": "tools/taf-context/taf_context/prepare_cli.py",
+          "qualified_name": "prepare_cli._run_change_query_over_a_session"
         },
         {
           "path": "tools/taf-context/taf_context/prepare_cli.py",
@@ -218,6 +254,10 @@
         },
         {
           "path": "tests/taf_context/test_level1_models.py",
+          "qualified_name": "test_level1_models.Level1SchemaThreeContractTests.test_the_parser_accepts_a_schema_three_frame"
+        },
+        {
+          "path": "tests/taf_context/test_level1_models.py",
           "qualified_name": "test_level1_models.PreviewContractTests.test_go_encoded_empty_source_preview_fixture_has_a_physical_preview_line"
         },
         {
@@ -257,6 +297,10 @@
         {
           "path": "tests/taf_context/test_context_operations.py",
           "qualified_name": "test_context_operations.ValidateQueryRequestTests.test_direction_rules_match_the_cli"
+        },
+        {
+          "path": "tests/taf_context/test_context_operations.py",
+          "qualified_name": "test_context_operations.ValidateQueryRequestTests.test_only_the_change_operations_accept_a_base"
         },
         {
           "path": "tests/taf_context/test_context_operations.py",
@@ -347,6 +391,14 @@
         },
         {
           "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestDecodeEnvelopeAcceptsSchemaThreeChangedSymbols"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestDecodeEnvelopeAcceptsSchemaThreeNullChangedRangesForOtherOperations"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
           "qualified_name": "wire.TestDecodeEnvelopeAcceptsSchemaTwoNullDirectionForOtherOperations"
         },
         {
@@ -363,6 +415,10 @@
         },
         {
           "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestDecodeEnvelopeRejectsChangedRangesUnderFrozenSchemas"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
           "qualified_name": "wire.TestDecodeEnvelopeRejectsDirectionUnderSchemaOne"
         },
         {
@@ -372,6 +428,10 @@
         {
           "path": "tools/taf-context-native/internal/wire/wire_test.go",
           "qualified_name": "wire.TestDecodeEnvelopeRejectsInvalidSchemaTwoDirections"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestDecodeEnvelopeRejectsMalformedChangedRanges"
         },
         {
           "path": "tools/taf-context-native/internal/wire/wire_test.go",
@@ -409,6 +469,10 @@
         {
           "path": "tools/taf-context-native/internal/render/render_test.go",
           "qualified_name": "render.TestFitReducesInitiallyOversizedJSONAndCharacterResults"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestEncodeResultAcceptsSchemaThreeChangedSymbols"
         },
         {
           "path": "tools/taf-context-native/internal/wire/wire_test.go",
@@ -456,6 +520,10 @@
         },
         {
           "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestValidateResultBindsSchemaThreeToChangedSymbols"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
           "qualified_name": "wire.TestValidateResultRejectsInconsistentEdgeFields"
         }
       ]
@@ -470,6 +538,10 @@
         {
           "path": "tools/taf-context-native/internal/engine/control.go",
           "qualified_name": "engine.Engine.state"
+        },
+        {
+          "path": "tools/taf-context-native/internal/engine/control_test.go",
+          "qualified_name": "engine.TestFreshnessForKeepsAnIndexAnOlderEngineVersionWrote"
         },
         {
           "path": "tools/taf-context-native/internal/engine/control_test.go",

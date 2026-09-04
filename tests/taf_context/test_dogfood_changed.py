@@ -16,7 +16,7 @@ only when the first line of the file is.
 The second test cross-checks `impact-candidates` against the callers fixture:
 for every anchor of `callers.json` that this range changed, each hand-checked
 call site must come back as a verified candidate with that anchor attributed,
-and every call site that does not must be explained by one of the three
+and every call site that does not must be explained by one of the four
 reasons the fixture records. The accounting itself is asserted against
 `callers.json`, not just trusted: the union of this fixture's attributed and
 absent call sites for an anchor must equal that anchor's full expected-caller
@@ -30,6 +30,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -49,7 +50,17 @@ MINIMUM_RECALL = 0.90
 MAXIMUM_RESULTS = "64"
 MAXIMUM_OUTPUT_CHARACTERS = "12000"
 MEASURED_KINDS = frozenset({"definition", "entry-point"})
-ABSENCE_REASONS = frozenset({"self-changed", "related-symbols-miss", "output-budget"})
+# `newer-than-the-range` is the one reason that is not about the composition:
+# callers.json describes the current checkout while this fixture queries a
+# clone at the fixed range head, so a call site the work after that head added
+# cannot be a candidate here. It is proved from the clone's own source, not
+# from the index, so it can never stand in for a real recall gap.
+ABSENCE_REASONS = frozenset(
+    {"self-changed", "related-symbols-miss", "output-budget", "newer-than-the-range"}
+)
+# The definition forms of the two languages the fixture covers, used by that
+# proof to look for the call site in the source at the range head.
+DEFINITION_FORMS = ("def", "class", "func")
 
 
 @unittest.skipUnless(
@@ -340,6 +351,13 @@ class DogfoodChangedTests(unittest.TestCase):
                     # The relationship query itself does not reach this call
                     # site, so the composition cannot either.
                     self.assertNotIn(key, self._related_callers(entry), (entry["id"], key))
+                elif absent["reason"] == "newer-than-the-range":
+                    # The call site does not exist at the range head at all, so
+                    # no answer from this clone could carry it. Checked in the
+                    # clone's source rather than in its index: a call site that
+                    # is really there but unreachable is a recall gap and must
+                    # be recorded as one.
+                    self.assertNotIn(key, self._definitions_at_the_range_head(key[0]), (entry["id"], key))
                 else:
                     # "budget" cannot excuse a call site the relationship query
                     # itself does not reach: it must be a real, reachable
@@ -400,6 +418,31 @@ class DogfoodChangedTests(unittest.TestCase):
         ]
         self.assertEqual(len(identities), 1, key)
         return identities[0]
+
+    def _definitions_at_the_range_head(self, path: str) -> set[tuple[str, str]]:
+        # Every call site of `path` whose last qualified-name segment is
+        # defined in the clone's copy of that file, as the pair the cross-check
+        # keys on. A path the range head does not carry defines nothing.
+        source = self.repository / path
+        if not source.is_file():
+            return set()
+        text = source.read_text(encoding="utf-8", errors="replace")
+        defined = set()
+        for entry in self.callers_by_id.values():
+            for caller in entry["expected_callers"]:
+                if caller["path"] != path:
+                    continue
+                segment = caller["qualified_name"].rsplit(".", 1)[-1]
+                pattern = (
+                    r"(?m)^\s*(?:"
+                    + "|".join(DEFINITION_FORMS)
+                    + r")\s+(?:\([^)]*\)\s+)?"
+                    + re.escape(segment)
+                    + r"\b"
+                )
+                if re.search(pattern, text):
+                    defined.add((caller["path"], caller["qualified_name"]))
+        return defined
 
     def _related_callers(self, entry: dict[str, object]) -> set[tuple[str, str]]:
         found = self._invoke(

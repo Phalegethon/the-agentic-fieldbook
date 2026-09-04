@@ -2,12 +2,14 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -364,6 +366,74 @@ func hasWarning(warnings []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// The adapter template advertises capabilities, and a capability is an
+// operation name: the broker sets `required_capability` to the operation it
+// asks for and the wire layer refuses any other value
+// (wire.ErrRequiredCapability, decode.go), so an advertised capability that is
+// not an operation could never be required, and an operation that is not
+// advertised could never be reached. The rule is therefore exact rather than a
+// subset: the capability list is the whole frozen operation vocabulary,
+// sorted, with no duplicate and no extra entry. The lifecycle operations
+// (build, estimate, metrics, status, update) belong to that vocabulary and so
+// appear in the list too; `supported_phases` is a separate, coarser list and is
+// not part of this rule.
+func TestAdapterTemplateAdvertisesExactlyTheOperationsTheEngineServes(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "adapter", "manifest.template.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var template struct {
+		AdapterVersion  string   `json:"adapter_version"`
+		ProviderVersion string   `json:"provider_version"`
+		Capabilities    []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &template); err != nil {
+		t.Fatal(err)
+	}
+	want := make([]string, 0, len(wire.Operations()))
+	for _, operation := range wire.Operations() {
+		want = append(want, string(operation))
+	}
+	sort.Strings(want)
+	if !reflect.DeepEqual(template.Capabilities, want) {
+		t.Fatalf("template capabilities = %#v, want %#v", template.Capabilities, want)
+	}
+	if template.AdapterVersion != engineVersion || template.ProviderVersion != engineVersion {
+		t.Fatalf("template versions = %q/%q, want %q for both", template.AdapterVersion, template.ProviderVersion, engineVersion)
+	}
+}
+
+// The engine build does not decide whether a stored index still answers: the
+// index format, the extraction policies and the bindings do. 0.4.0 added
+// `changed-symbols` without touching the format, so an index 0.3.0 wrote stays
+// exact and is used as it is. A freshness rule that compared the engine
+// version instead would force a rebuild nothing needs on every release.
+func TestFreshnessForKeepsAnIndexAnOlderEngineVersionWrote(t *testing.T) {
+	index := "sha256:" + strings.Repeat("b", 64)
+	request := controlEnvelope(wire.ChangedSymbols, "", "", &index).Request
+	request.SchemaVersion = "3"
+	parsers := ProductionDependencies().ParserIDs()
+	manifest := model.Manifest{
+		FormatVersion:           "3",
+		EngineVersion:           "0.3.0",
+		InclusionPolicyIdentity: currentInclusionPolicyIdentity(),
+		ExclusionPolicyIdentity: currentExclusionPolicyIdentity(),
+		ParserIdentities:        parsers,
+		Binding: model.Binding{
+			RepositoryIdentity: request.RepositoryIdentity, WorktreeIdentity: request.WorktreeIdentity,
+			CommittedHead: request.CommittedHead, DirtyOverlayFingerprint: request.DirtyOverlayFingerprint,
+		},
+	}
+	// Without this the case would go vacuous the moment the engine version
+	// caught up with the manifest's.
+	if manifest.EngineVersion == engineVersion {
+		t.Fatalf("manifest engine version %q is the current one, so nothing is stale here", manifest.EngineVersion)
+	}
+	if freshness, action := freshnessFor(request, manifest, index, parsers); freshness != "exact" || action != "use-index" {
+		t.Fatalf("index written by %s = %s/%s, want exact/use-index", manifest.EngineVersion, freshness, action)
+	}
 }
 
 func TestFreshnessForRejectsAnIndexBuiltUnderTheOlderExtractionPolicy(t *testing.T) {

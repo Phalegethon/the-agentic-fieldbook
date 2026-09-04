@@ -109,12 +109,7 @@ func TestChangedAppliesTheRequestFilters(t *testing.T) {
 // An inferred definition is hidden from a change set the way it is hidden from
 // a search, and admitted only when the caller asked for inferred evidence.
 func TestChangedHidesInferredRecordsUnlessTheyAreAllowed(t *testing.T) {
-	records := changedFixture()
-	for index := range records {
-		if records[index].Identity == "a-second" {
-			records[index].EvidenceClass = model.Inferred
-		}
-	}
+	records := changedFixtureWithInferred("a-second")
 	if got, want := identities(Changed(relatedSnapshot(records), changedRequest(changedPath("pkg/a.py")), policy.ProductionLimits()).Records), []string{"a-module", "a-first"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("verified only = %#v, want %#v", got, want)
 	}
@@ -156,14 +151,87 @@ func TestChangedFlagsAChangedPathTheIndexDoesNotCarry(t *testing.T) {
 	}
 }
 
-func TestChangedOrdersByPathThenStartLineDeterministically(t *testing.T) {
-	request := changedRequest(changedPath("pkg/a.py"), changedPath("cmd/main.go"), changedPath("docs/readme.md"))
-	want := []string{"main-module", "main-run", "a-module", "a-first", "a-second"}
-	for attempt := 0; attempt < 3; attempt++ {
-		response := Changed(relatedSnapshot(changedFixture()), request, policy.ProductionLimits())
-		if got := identities(response.Records); !reflect.DeepEqual(got, want) {
-			t.Fatalf("attempt %d = %#v, want %#v", attempt, got, want)
-		}
+// The order is evidence-major, the house rule of boundedRanking: verified
+// findings first, then path, then start line. The second case is what
+// distinguishes that from a path-major order: an inferred definition of
+// `cmd/main.go` sorts behind every verified finding of `pkg/a.py`, even though
+// its own path comes first, so a truncated list is the strongest prefix rather
+// than the alphabetically first one.
+func TestChangedOrdersByEvidenceThenPathThenStartLineDeterministically(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		records       []model.Record
+		allowInferred bool
+		want          []string
+	}{
+		{
+			name:    "verified only",
+			records: changedFixture(),
+			want:    []string{"main-module", "main-run", "a-module", "a-first", "a-second"},
+		},
+		{
+			name:          "an inferred finding follows every verified one",
+			records:       changedFixtureWithInferred("main-run"),
+			allowInferred: true,
+			want:          []string{"main-module", "a-module", "a-first", "a-second", "main-run"},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := changedRequest(changedPath("pkg/a.py"), changedPath("cmd/main.go"), changedPath("docs/readme.md"))
+			request.AllowInferred = testCase.allowInferred
+			for attempt := 0; attempt < 3; attempt++ {
+				response := Changed(relatedSnapshot(testCase.records), request, policy.ProductionLimits())
+				if got := identities(response.Records); !reflect.DeepEqual(got, testCase.want) {
+					t.Fatalf("attempt %d = %#v, want %#v", attempt, got, testCase.want)
+				}
+			}
+		})
+	}
+}
+
+// Two findings of the same path, start line and kind fall through to the
+// qualified name, so the order stays total when nothing structural separates
+// them: `a.alpha` precedes `a.first`, which precedes `a.zulu`, whatever order
+// the scan offered them in.
+func TestChangedBreaksAPathAndLineTieByQualifiedName(t *testing.T) {
+	records := append(changedFixture(),
+		pythonRecord("a-tie-zulu", "pkg/a.py", "a.zulu", model.Definition, 5, 9),
+		pythonRecord("a-tie-alpha", "pkg/a.py", "a.alpha", model.Definition, 5, 9),
+	)
+	response := Changed(relatedSnapshot(records), changedRequest(changedPath("pkg/a.py", [2]int{6, 6})), policy.ProductionLimits())
+	want := []string{"a-module", "a-tie-alpha", "a-first", "a-tie-zulu"}
+	if got := identities(response.Records); !reflect.DeepEqual(got, want) {
+		t.Fatalf("tied findings = %#v, want %#v", got, want)
+	}
+}
+
+// A scan the budget cut short proves nothing about the path it was scanning,
+// so the unindexed report is guarded by `!partial`. The arithmetic of the cut:
+// with no lexical ceiling of its own the work budget is four units per record,
+// 32 for this eight-record fixture, and one unit is charged per record visited
+// plus one per record offered to the ranking. Three whole-file entries of
+// `pkg/a.py` (five records, three of them symbols) cost 8 each and one of
+// `cmd/main.go` (two records, both symbols) costs 4, which is 28. The last
+// entry names a path that differs from an indexed one only in letter case, so
+// no record of its range matches its exact path, and the scan is cut after
+// four more visits with the path still unproven.
+func TestChangedDoesNotReportAnUnindexedPathWhenTheBudgetCutTheScan(t *testing.T) {
+	request := changedRequest(
+		changedPath("pkg/a.py"), changedPath("pkg/a.py"), changedPath("pkg/a.py"),
+		changedPath("cmd/main.go"), changedPath("pkg/A.py"),
+	)
+	response := Changed(relatedSnapshot(changedFixture()), request, policy.Limits{})
+	if !response.Partial || response.Unindexed {
+		t.Fatalf("budget-cut scan = %#v, want partial without an unindexed report", response)
+	}
+	if response.Counters.ConsideredRecords != 32 {
+		t.Fatalf("considered records = %d, want the whole 32-unit budget", response.Counters.ConsideredRecords)
+	}
+	// The same case-variant path is reported once the scan is allowed to
+	// finish, so the silence above is the guard rather than a blind spot.
+	full := Changed(relatedSnapshot(changedFixture()), request, policy.ProductionLimits())
+	if full.Partial || !full.Unindexed {
+		t.Fatalf("complete scan = %#v, want an unindexed report", full)
 	}
 }
 
@@ -190,6 +258,18 @@ func TestChangedWithoutASelectorOrRecordsReturnsNothing(t *testing.T) {
 	if response := Changed(relatedSnapshot(changedFixture()), changedRequest(), policy.ProductionLimits()); response.Partial || len(response.Records) != 0 || response.Unindexed {
 		t.Fatalf("empty change set = %#v", response)
 	}
+}
+
+// changedFixtureWithInferred is the fixture with one record downgraded to
+// inferred evidence, so a test can watch what the evidence class alone changes.
+func changedFixtureWithInferred(identity string) []model.Record {
+	records := changedFixture()
+	for index := range records {
+		if records[index].Identity == identity {
+			records[index].EvidenceClass = model.Inferred
+		}
+	}
+	return records
 }
 
 func changedRequest(entries ...wire.ChangedRange) wire.Request {
