@@ -1013,9 +1013,9 @@ def trim_to_budget(
     return trimmed
 
 
-def _resolve_change_base(repository: Path, requested: str | None):
+def _resolve_change_base(repository: Path, requested: str | None, *, root: Path):
     try:
-        return resolve_change_base(repository, requested)
+        return resolve_change_base(repository, requested, root=root)
     except ValueError as exc:
         raise PrepareCLIError("selected change base could not be resolved") from exc
 
@@ -1030,8 +1030,12 @@ def _run_change_query(
     refresh_summary: dict[str, object],
 ) -> dict[str, object]:
     """Answer `changed-symbols` or `impact-candidates` for one resolved base."""
-    base = _resolve_change_base(repository, arguments.base)
-    changed, warnings = changed_ranges(repository, base, snapshot)
+    # `collect_snapshot` (inside `_resolve_repository`) already ran
+    # `git rev-parse --show-toplevel` once to produce `canonical_root`; reuse
+    # it here instead of resolving the same root twice more (H2).
+    root = Path(snapshot.canonical_root)
+    base = _resolve_change_base(repository, arguments.base, root=root)
+    changed, warnings = changed_ranges(repository, base, snapshot, root=root)
     selector, guard_warnings = bound_changed_selector(changed)
     change_warnings = set(warnings) | set(guard_warnings)
     base_block = {

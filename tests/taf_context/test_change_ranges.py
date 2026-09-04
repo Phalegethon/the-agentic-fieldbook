@@ -232,6 +232,26 @@ class ResolveChangeBaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve_change_base(repo, "no-such-ref")
 
+    def test_an_explicit_root_yields_the_same_resolution_as_deriving_it(self) -> None:
+        repo = init_repo(self.root / "repo")
+        write(repo / "a.py", "a\n")
+        first = commit_all(repo, "first")
+
+        derived = resolve_change_base(repo, first)
+        explicit = resolve_change_base(repo, first, root=repo)
+
+        self.assertEqual(derived, explicit)
+
+    def test_an_explicit_root_skips_the_repository_root_lookup(self) -> None:
+        repo = init_repo(self.root / "repo")
+        write(repo / "a.py", "a\n")
+        first = commit_all(repo, "first")
+
+        with patch("taf_context.change_ranges._repository_root") as lookup:
+            resolve_change_base(repo, first, root=repo)
+
+        lookup.assert_not_called()
+
 
 class ChangedRangesTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -457,6 +477,26 @@ class ChangedRangesTests(unittest.TestCase):
 
         self.assertEqual(warnings, ["base-unresolved", "changed-path-unsafe"])
         self.assertEqual([entry.path for entry in paths], ["a.py", "bin.dat", "c.py", "d.py"])
+
+    def test_an_explicit_root_yields_the_same_result_as_deriving_it(self) -> None:
+        repo, first = self._fixture()
+        base = resolve_change_base(repo, first)
+        snapshot = collect_snapshot(repo)
+
+        derived = changed_ranges(repo, base, snapshot)
+        explicit = changed_ranges(repo, base, snapshot, root=repo)
+
+        self.assertEqual(derived, explicit)
+
+    def test_an_explicit_root_skips_the_repository_root_lookup(self) -> None:
+        repo, first = self._fixture()
+        base = resolve_change_base(repo, first)
+        snapshot = collect_snapshot(repo)
+
+        with patch("taf_context.change_ranges._repository_root") as lookup:
+            changed_ranges(repo, base, snapshot, root=repo)
+
+        lookup.assert_not_called()
 
 
 if __name__ == "__main__":  # pragma: no cover - manual execution

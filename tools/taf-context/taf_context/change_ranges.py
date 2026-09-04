@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .git_snapshot import SnapshotError, _git
-from .recovery import _repository_root, resolve_recovery_base
+from .recovery import _repository_root, _resolve_recovery_base
 from .refresh import _safe_update_path
 
 
@@ -64,9 +64,16 @@ class ChangedPath:
     ranges: tuple[tuple[int, int], ...]
 
 
-def resolve_change_base(repo: Path, requested: str | None) -> ChangeBase:
-    """Resolve the base with the work-recovery priority and warnings."""
-    resolution = resolve_recovery_base(Path(repo), requested)
+def resolve_change_base(
+    repo: Path, requested: str | None, *, root: Path | None = None
+) -> ChangeBase:
+    """Resolve the base with the work-recovery priority and warnings.
+
+    `root` is the already-resolved repository root (H2): when the caller has
+    one, passing it here skips a second `git rev-parse --show-toplevel`.
+    """
+    resolved_root = root if root is not None else _repository_root(Path(repo))
+    resolution = _resolve_recovery_base(resolved_root, requested)
     return ChangeBase(
         resolution.requested,
         resolution.ref,
@@ -162,12 +169,18 @@ def parse_unified_diff_ranges(text: str) -> dict[str, list[tuple[int, int]] | No
     return found
 
 
-def changed_ranges(repo: Path, base: ChangeBase, snapshot) -> tuple[tuple[ChangedPath, ...], list[str]]:
-    """Return the bounded changed paths of `repo` against `base`, plus warnings."""
+def changed_ranges(
+    repo: Path, base: ChangeBase, snapshot, *, root: Path | None = None
+) -> tuple[tuple[ChangedPath, ...], list[str]]:
+    """Return the bounded changed paths of `repo` against `base`, plus warnings.
+
+    `root` is the already-resolved repository root (H2): when the caller has
+    one, passing it here skips a second `git rev-parse --show-toplevel`.
+    """
     warnings: set[str] = set()
     if base.warning:
         warnings.add(base.warning)
-    root = _repository_root(Path(repo))
+    root = root if root is not None else _repository_root(Path(repo))
     # An unresolved base still reports the uncommitted work of the worktree.
     target = base.sha if base.sha is not None else "HEAD"
     try:

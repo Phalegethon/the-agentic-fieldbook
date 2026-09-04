@@ -71,7 +71,16 @@ class RecoveryResult:
 
 def resolve_recovery_base(repo: Path, requested: str | None) -> BaseResolution:
     """Resolve a local base ref using the approved deterministic priority."""
-    root = _repository_root(repo)
+    return _resolve_recovery_base(_repository_root(repo), requested)
+
+
+def _resolve_recovery_base(root: Path, requested: str | None) -> BaseResolution:
+    """Resolve a local base ref from an already-resolved repository root.
+
+    Internal variant of `resolve_recovery_base` for a caller that has already
+    paid for `_repository_root`'s `git rev-parse --show-toplevel` (H2): it
+    skips that lookup instead of re-deriving the same root a second time.
+    """
     if requested is not None:
         if not requested or len(requested) > 512 or any(char in requested for char in "\x00\r\n"):
             raise ValueError("invalid recovery base")

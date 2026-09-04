@@ -1,12 +1,15 @@
-"""Opt-in end-to-end precision check of the callers direction against this checkout.
+"""Opt-in end-to-end precision check of the callers direction against a fixed commit.
 
-The fixture lists, for twenty functions of this repository, every enclosing
-definition that really calls them. Both passes run the same anchors: the first
-takes only ``verified`` edges (the default), the second adds the inferred ones
-with ``--allow-inferred``. Precision is the share of returned findings that the
-fixture confirms, recall the share of the fixture that came back; both are
-micro-averaged over the twenty anchors, so a single anchor with many call sites
-weighs as much as its call sites.
+The fixture lists, for twenty functions of this repository at the pinned
+commit `f33d96c`, every enclosing definition that really calls them (H1): a
+clone is checked out at that commit and measured there, the same head the
+changed dogfood (`test_dogfood_changed.py`) uses, so both fixtures describe
+one fixed point in history instead of the moving working tree. Both passes
+run the same anchors: the first takes only ``verified`` edges (the default),
+the second adds the inferred ones with ``--allow-inferred``. Precision is the
+share of returned findings that the fixture confirms, recall the share of the
+fixture that came back; both are micro-averaged over the twenty anchors, so a
+single anchor with many call sites weighs as much as its call sites.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
@@ -22,6 +26,10 @@ from taf_context.cli import main
 
 ROOT = Path(__file__).parents[2]
 FIXTURE = ROOT / "tools" / "taf-context-native" / "testdata" / "dogfood" / "callers.json"
+# The fixed commit the fixture describes; the same head the changed dogfood
+# (`test_dogfood_changed.py`) uses, so a clone at this commit sees exactly the
+# call sites both fixtures were hand-checked against.
+FIXED_COMMIT = "f33d96c"
 MINIMUM_PRECISION = 0.90
 MINIMUM_INFERRED_RECALL = 0.80
 # The widest anchor of the fixture has seventeen call sites, so the query has to
@@ -42,13 +50,13 @@ class DogfoodCallersTests(unittest.TestCase):
         self.assertEqual((code, stderr.getvalue()), (0, ""))
         return json.loads(stdout.getvalue())
 
-    def _anchor_identity(self, environment: dict[str, str], entry: dict) -> str:
+    def _anchor_identity(self, environment: dict[str, str], repository: Path, entry: dict) -> str:
         result = self._invoke(
             environment,
             "prepare",
             "query",
             "--repo",
-            str(ROOT),
+            str(repository),
             "--operation",
             "search-symbols",
             "--query",
@@ -71,13 +79,13 @@ class DogfoodCallersTests(unittest.TestCase):
         return anchors[0]["result_identity"]
 
     def _callers(
-        self, environment: dict[str, str], identity: str, *, allow_inferred: bool
+        self, environment: dict[str, str], repository: Path, identity: str, *, allow_inferred: bool
     ) -> dict[str, object]:
         argv = [
             "prepare",
             "query",
             "--repo",
-            str(ROOT),
+            str(repository),
             "--operation",
             "related-symbols",
             "--result-id",
@@ -94,12 +102,20 @@ class DogfoodCallersTests(unittest.TestCase):
         return self._invoke(environment, *argv)
 
     def _pass(
-        self, environment: dict[str, str], entries: list[dict], identities: dict[str, str], *, allow_inferred: bool
+        self,
+        environment: dict[str, str],
+        repository: Path,
+        entries: list[dict],
+        identities: dict[str, str],
+        *,
+        allow_inferred: bool,
     ) -> dict[str, object]:
         matched = returned_total = expected_total = 0
         per_entry = []
         for entry in entries:
-            result = self._callers(environment, identities[entry["id"]], allow_inferred=allow_inferred)
+            result = self._callers(
+                environment, repository, identities[entry["id"]], allow_inferred=allow_inferred
+            )
             self.assertIn(result["status"], {"ready", "partial"}, entry["id"])
             returned = [(finding["path"], finding["qualified_name"]) for finding in result["findings"]]
             expected = {(caller["path"], caller["qualified_name"]) for caller in entry["expected_callers"]}
@@ -135,6 +151,23 @@ class DogfoodCallersTests(unittest.TestCase):
         fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
         entries = fixture["entries"]
         with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repo"
+            try:
+                subprocess.run(
+                    ["git", "clone", "-q", "--no-hardlinks", str(ROOT), str(repository)],
+                    check=True, capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(repository), "checkout", "-q", "--detach", FIXED_COMMIT],
+                    check=True, capture_output=True,
+                )
+            except subprocess.CalledProcessError as error:
+                # A checkout that cannot reach the fixed commit says nothing
+                # about the operations, so it skips instead of failing.
+                raise unittest.SkipTest(
+                    f"the fixed commit {FIXED_COMMIT} is unreachable from this checkout: "
+                    f"{error.stderr.decode('utf-8', 'replace').strip()}"
+                )
             environment = {
                 "HOME": directory,
                 "PATH": "",
@@ -146,13 +179,15 @@ class DogfoodCallersTests(unittest.TestCase):
                 "prepare",
                 "build",
                 "--repo",
-                str(ROOT),
+                str(repository),
                 "--confirm-state-write",
             )
             self.assertEqual(built["next_safe_action"], "use-index")
-            identities = {entry["id"]: self._anchor_identity(environment, entry) for entry in entries}
-            verified = self._pass(environment, entries, identities, allow_inferred=False)
-            inferred = self._pass(environment, entries, identities, allow_inferred=True)
+            identities = {
+                entry["id"]: self._anchor_identity(environment, repository, entry) for entry in entries
+            }
+            verified = self._pass(environment, repository, entries, identities, allow_inferred=False)
+            inferred = self._pass(environment, repository, entries, identities, allow_inferred=True)
         summary = {
             "schema_version": "1",
             "anchors": len(entries),

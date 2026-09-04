@@ -9,6 +9,7 @@ import stat
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 from taf_context.change_ranges import ChangedPath
 from taf_context.context_operations import (
@@ -299,6 +300,43 @@ class OperationTests(unittest.TestCase):
             self.assertEqual(impact["findings"][1]["relation"], "call")
             self.assertLessEqual(int(impact["output_characters"]), 4000)
             self.assertEqual(impact["refresh"]["performed"], False)
+
+    def test_impact_candidates_reuses_the_resolved_root_instead_of_re_deriving_it(self) -> None:
+        # `collect_snapshot` already resolves the repository root once (H2);
+        # the change-query path used to re-derive it twice more, through
+        # `resolve_change_base` and `changed_ranges` each calling
+        # `_repository_root`, which both run `git rev-parse --show-toplevel`
+        # via `recovery._run_git`. Wrapping that one seam and filtering for
+        # that exact call proves the change-query path no longer adds any.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, base = change_fixture(root)
+            binary = root / "engine"
+            write_fake_native_engine(binary)
+            environment = self._environment(directory, binary)
+            run_build(repository, environment=environment, transport_for=OneShotTransport)
+
+            from taf_context import recovery as recovery_module
+
+            original_run_git = recovery_module._run_git
+            toplevel_calls: list[tuple[str, ...]] = []
+
+            def counting_run_git(repo, *args, **kwargs):
+                if args[:2] == ("rev-parse", "--show-toplevel"):
+                    toplevel_calls.append(args)
+                return original_run_git(repo, *args, **kwargs)
+
+            with patch("taf_context.recovery._run_git", side_effect=counting_run_git):
+                run_query(
+                    repository,
+                    QueryArguments(
+                        "impact-candidates", None, (), [], [], [], [], 8, 4000, False, None, base
+                    ),
+                    environment=environment,
+                    transport_for=OneShotTransport,
+                )
+
+            self.assertEqual(toplevel_calls, [])
 
     def test_an_unresolved_base_is_reported_and_covers_uncommitted_work_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
