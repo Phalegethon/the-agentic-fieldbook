@@ -38,7 +38,12 @@ const (
 	overviewTierCode          = 1
 	overviewTierDocument      = 2
 	overviewTierConfiguration = 3
-	overviewTierOther         = 4
+	// overviewTierOther is the catch-all for a counted file whose admitted
+	// records are none of a module, a definition, an entry point, a heading
+	// or document chunk, or a configuration record — for example a file
+	// whose only records are imports. Keeping it last keeps the file
+	// ordering total: every counted file has a tier, ranked or not.
+	overviewTierOther = 4
 )
 
 // wellKnownEntryNames are the base names a repository conventionally starts
@@ -120,10 +125,10 @@ func Overview(snapshot store.Snapshot, request wire.Request, limits policy.Limit
 	rows := make([]wire.OverviewGroup, 0, len(kept)+1)
 	for index := range kept {
 		rankOverviewFiles(kept[index].files, files)
-		rows = append(rows, overviewRow(root, kept[index], files))
+		rows = append(rows, overviewRow(root, kept[index], files, limits))
 	}
 	if len(folded) != 0 {
-		rows = append(rows, foldedOverviewRow(folded, files))
+		rows = append(rows, foldedOverviewRow(folded, files, limits))
 	}
 	selected := selectOverviewFiles(kept, files, request.MaximumResults)
 	return finish(selected, len(files)-len(selected), partial, rows, len(files), len(folded))
@@ -132,16 +137,27 @@ func Overview(snapshot store.Snapshot, request wire.Request, limits policy.Limit
 // overviewRoot normalizes the requested subtree into a directory prefix a
 // consumer can join a group prefix to. The wire caps path prefixes but does not
 // forbid several, so the first in sorted order wins and the caller is told.
+// The wire's own path grammar admits an interior "." segment, an empty
+// segment from a doubled separator, and a trailing "." segment; trimming only
+// the trailing separator would let one of those survive into the root and
+// make the render step reject the very result this function built, so the
+// root is rebuilt from the segments that name a real directory.
 func overviewRoot(prefixes []string) (string, bool) {
 	if len(prefixes) == 0 {
 		return "", false
 	}
 	sorted := canonicalFilterValues(prefixes)
-	root := strings.TrimRight(sorted[0], "/")
-	if root == "" || root == overviewRootPrefix {
+	segments := make([]string, 0, strings.Count(sorted[0], "/")+1)
+	for _, segment := range strings.Split(sorted[0], "/") {
+		if segment == "" || segment == overviewRootPrefix {
+			continue
+		}
+		segments = append(segments, segment)
+	}
+	if len(segments) == 0 {
 		return "", len(sorted) > 1
 	}
-	return root + "/", len(sorted) > 1
+	return strings.Join(segments, "/") + "/", len(sorted) > 1
 }
 
 // overviewFiles derives one fileFacts per counted path. Paths arrive from the
@@ -471,21 +487,21 @@ func compareFileFacts(left, right fileFacts) int {
 
 // overviewRow renders one kept group. The prefix stays relative to the
 // repository root, so a consumer never has to join it to the overview root.
-func overviewRow(root string, group overviewDirectoryGroup, files []fileFacts) wire.OverviewGroup {
+func overviewRow(root string, group overviewDirectoryGroup, files []fileFacts, limits policy.Limits) wire.OverviewGroup {
 	identity := files[group.files[0]].representative.record.Identity
 	return wire.OverviewGroup{
 		PathPrefix: root + group.prefix, Depth: group.depth,
 		FileCount: group.counters.files, DefinitionCount: group.counters.definitions,
 		EntryPointCount: group.counters.entryPoints, DocumentCount: group.counters.documents,
 		ConfigurationCount:     group.counters.configurations,
-		Languages:              overviewLanguages(group.files, files),
+		Languages:              overviewLanguages(group.files, files, limits),
 		RepresentativeIdentity: &identity,
 	}
 }
 
 // foldedOverviewRow sums the groups the table had no room for. It stands for
 // several directories and therefore represents no single file.
-func foldedOverviewRow(folded []overviewDirectoryGroup, files []fileFacts) wire.OverviewGroup {
+func foldedOverviewRow(folded []overviewDirectoryGroup, files []fileFacts, limits policy.Limits) wire.OverviewGroup {
 	row := wire.OverviewGroup{PathPrefix: overviewOtherPrefix}
 	indexes := make([]int, 0, len(folded))
 	for _, group := range folded {
@@ -496,13 +512,16 @@ func foldedOverviewRow(folded []overviewDirectoryGroup, files []fileFacts) wire.
 		row.ConfigurationCount += group.counters.configurations
 		indexes = append(indexes, group.files...)
 	}
-	row.Languages = overviewLanguages(indexes, files)
+	row.Languages = overviewLanguages(indexes, files, limits)
 	return row
 }
 
 // overviewLanguages counts the files of a group by language, most files first
-// and ties by name. The list is bounded like every other wire collection.
-func overviewLanguages(indexes []int, files []fileFacts) []wire.OverviewLanguage {
+// and ties by name. The list is bounded by the request's own injected limits,
+// the same bound Overview already applies to its work budget, not by a fixed
+// reference to the production limits — a caller enforcing a stricter cap must
+// see it honoured here too.
+func overviewLanguages(indexes []int, files []fileFacts, limits policy.Limits) []wire.OverviewLanguage {
 	counts := make([]languageCount, 0, 4)
 	for _, index := range indexes {
 		counts = countLanguage(counts, files[index].language)
@@ -513,7 +532,7 @@ func overviewLanguages(indexes []int, files []fileFacts) []wire.OverviewLanguage
 		}
 		return counts[left].language < counts[right].language
 	})
-	if maximum := policy.ProductionLimits().MaximumCollectionItems; len(counts) > maximum {
+	if maximum := limits.MaximumCollectionItems; len(counts) > maximum {
 		counts = counts[:maximum]
 	}
 	languages := make([]wire.OverviewLanguage, 0, len(counts))

@@ -788,6 +788,51 @@ func TestRepositoryOverviewNarrowsToARequestedSubtree(t *testing.T) {
 	}
 }
 
+// A path prefix that names the right directories through an irregular
+// spelling — an interior "." segment, an empty segment from a doubled
+// separator, or a trailing "." segment — normalizes to the same directory
+// prefix a plain spelling would, and the request still encodes: the wire
+// accepts all three as a path prefix, and the overview must answer them
+// rather than fail its own result validation.
+func TestRepositoryOverviewNormalizesAnIrregularPathPrefix(t *testing.T) {
+	repository, state := overviewRoots(t)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, testCase := range []struct {
+		name   string
+		prefix string
+		root   string
+		groups []string
+	}{
+		{name: "interior dot segment", prefix: "cmd/./tool", root: "cmd/tool/", groups: []string{"cmd/tool/."}},
+		{name: "doubled separator", prefix: "cmd//tool", root: "cmd/tool/", groups: []string{"cmd/tool/."}},
+		{name: "trailing dot segment", prefix: "cmd/.", root: "cmd/", groups: []string{"cmd/tool/"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			envelope := controlEnvelope(wire.RepositoryOverview, repository, state, built.IndexIdentity)
+			envelope.Request.SchemaVersion = "4"
+			envelope.Request.Filters.PathPrefixes = []string{testCase.prefix}
+			result, err := engine.Execute(context.Background(), envelope)
+			if err != nil {
+				t.Fatalf("prefix %q must still encode: %v", testCase.prefix, err)
+			}
+			if result.Overview == nil || result.Overview.Root != testCase.root || result.Overview.CountedFileCount != 1 {
+				t.Fatalf("summary = %#v, want root %q", result.Overview, testCase.root)
+			}
+			prefixes := make([]string, 0, len(*result.Groups))
+			for _, group := range *result.Groups {
+				prefixes = append(prefixes, group.PathPrefix)
+			}
+			if !reflect.DeepEqual(prefixes, testCase.groups) {
+				t.Fatalf("groups = %#v, want %#v", prefixes, testCase.groups)
+			}
+		})
+	}
+}
+
 // Several path prefixes root the overview at the first of them and say so, so
 // the answer stays one honest subtree rather than a union of several.
 func TestRepositoryOverviewWarnsWhenSeveralPrefixesAreRequested(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -193,6 +194,61 @@ func TestOverviewSplitsADirectoryHoldingMoreThanFortyPercent(t *testing.T) {
 	}
 	if response.Overview.CountedFileCount != 10 {
 		t.Fatalf("counted = %d, want 10", response.Overview.CountedFileCount)
+	}
+}
+
+// The split rule is "more than 40 %", not "at least 40 %": a group holding
+// exactly two fifths of the counted files stays whole, and one file above
+// that share is replaced by its children.
+func TestOverviewSplitsOnlyStrictlyAboveFortyPercent(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		bigChildren [2]int
+		singletons  int
+		split       bool
+	}{
+		{name: "exactly forty percent stays whole", bigChildren: [2]int{2, 2}, singletons: 6, split: false},
+		{name: "one file above forty percent splits", bigChildren: [2]int{3, 2}, singletons: 5, split: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			specs := append(overviewDirectory("big/p/", testCase.bigChildren[0]), overviewDirectory("big/q/", testCase.bigChildren[1])...)
+			for index := 0; index < testCase.singletons; index++ {
+				specs = append(specs, overviewDirectory(fmt.Sprintf("d%02d/", index), 1)...)
+			}
+			response := overviewOf(t, specs)
+			prefixes := groupPrefixes(response.Groups)
+			whole := slices.Contains(prefixes, "big/")
+			if whole == testCase.split {
+				t.Fatalf("groups = %#v, want big/ split = %v", prefixes, testCase.split)
+			}
+			if testCase.split {
+				if !slices.Contains(prefixes, "big/p/") || !slices.Contains(prefixes, "big/q/") {
+					t.Fatalf("groups = %#v, want big/p/ and big/q/", prefixes)
+				}
+			}
+		})
+	}
+}
+
+// Ties on the largest splittable group break by path ascending, so the
+// smaller-prefix group always splits first, however many groups tie.
+func TestOverviewBreaksLargestGroupTiesByPath(t *testing.T) {
+	specs := append(overviewDirectory("aa/p/", 10), overviewDirectory("aa/q/", 9)...)
+	specs = append(specs, overviewDirectory("bb/p/", 10)...)
+	specs = append(specs, overviewDirectory("bb/q/", 9)...)
+	for index := 0; index < 9; index++ {
+		specs = append(specs, overviewDirectory(fmt.Sprintf("d%02d/", index), 1)...)
+	}
+	response := overviewOf(t, specs)
+	prefixes := groupPrefixes(response.Groups)
+	if !slices.Contains(prefixes, "aa/p/") || !slices.Contains(prefixes, "aa/q/") {
+		t.Fatalf("aa/ must split first on the path tie-break: %#v", prefixes)
+	}
+	if !slices.Contains(prefixes, "bb/") {
+		t.Fatalf("bb/ must stay whole once the ceiling is reached: %#v", prefixes)
+	}
+	if slices.Contains(prefixes, "aa/") || slices.Contains(prefixes, "bb/p/") || slices.Contains(prefixes, "bb/q/") {
+		t.Fatalf("exactly one group splits before the ceiling: %#v", prefixes)
 	}
 }
 
@@ -444,10 +500,12 @@ func TestOverviewPicksTheRepresentativeOfEachCountedFile(t *testing.T) {
 
 // Tier 0 is entry points and the well-known entry base names, tier 1 the rest
 // of the code, tier 2 documents with README first, tier 3 configuration.
+// "0-guide.md" sorts before "README.md" by path alone, so README leading it
+// proves the readmeRank tie-break is doing the work, not the path order.
 func TestOverviewRanksFilesByTier(t *testing.T) {
 	response := overviewOf(t, []overviewSpec{
 		configurationFile("group/a-settings.json"),
-		documentFile("group/b-guide.md"),
+		documentFile("group/0-guide.md"),
 		documentFile("group/README.md"),
 		goFile("group/c-service.go", model.Module, model.Definition),
 		goFile("group/d-boot.go", model.Module, model.EntryPoint),
@@ -455,7 +513,7 @@ func TestOverviewRanksFilesByTier(t *testing.T) {
 	})
 	want := []string{
 		"group/d-boot.go", "group/index.ts", "group/c-service.go",
-		"group/README.md", "group/b-guide.md", "group/a-settings.json",
+		"group/README.md", "group/0-guide.md", "group/a-settings.json",
 	}
 	if got := recordPaths(response.Records); !reflect.DeepEqual(got, want) {
 		t.Fatalf("file layer = %#v, want %#v", got, want)
@@ -495,6 +553,25 @@ func TestOverviewRanksEveryWellKnownEntryName(t *testing.T) {
 			t.Fatalf("first file = %q, want %q", got, want)
 		}
 	})
+}
+
+// A counted file whose admitted records are none of module, definition,
+// entry-point, heading/document-chunk or configuration still needs a place in
+// the ranking, so it falls to the fifth "other" tier, last of every tier.
+func TestOverviewRanksAFileWithNoStructuralRecordsLast(t *testing.T) {
+	response := overviewOf(t, []overviewSpec{
+		goFile("pkg/a.go", model.Module, model.Definition),
+		documentFile("pkg/r.md"),
+		configurationFile("pkg/c.json"),
+		{path: "pkg/imports.go", language: "go", kinds: []model.RecordKind{model.Import, model.Import}},
+	})
+	want := []string{"pkg/a.go", "pkg/r.md", "pkg/c.json", "pkg/imports.go"}
+	if got := recordPaths(response.Records); !reflect.DeepEqual(got, want) {
+		t.Fatalf("file layer = %#v, want %#v", got, want)
+	}
+	if group := groupNamed(t, response.Groups, "pkg/"); group.FileCount != 4 {
+		t.Fatalf("pkg group = %#v, want 4 counted files including the imports-only one", group)
+	}
 }
 
 // The well-known list is a constant of the engine, so it is pinned here rather
@@ -665,6 +742,24 @@ func TestOverviewIgnoresSymbolShapedFilters(t *testing.T) {
 	}
 	if !reflect.DeepEqual(identities(plain.Records), identities(filtered.Records)) {
 		t.Fatalf("filtered file layer = %#v", recordPaths(filtered.Records))
+	}
+}
+
+// A group's language list is bounded by the limits the caller injects, not by
+// a hard-coded reference to the production limits, so a caller enforcing a
+// stricter cap sees it honoured rather than silently capped at 64.
+func TestOverviewLanguagesHonourTheInjectedLimit(t *testing.T) {
+	specs := []overviewSpec{
+		{path: "pkg/a.go", language: "go", kinds: []model.RecordKind{model.Module}},
+		{path: "pkg/b.py", language: "python", kinds: []model.RecordKind{model.Module}},
+		{path: "pkg/c.rs", language: "rust", kinds: []model.RecordKind{model.Module}},
+	}
+	limits := policy.ProductionLimits()
+	limits.MaximumCollectionItems = 2
+	response := Overview(relatedSnapshot(overviewFixture(specs...)), overviewRequest(), limits)
+	group := groupNamed(t, response.Groups, "pkg/")
+	if got, want := group.Languages, []wire.OverviewLanguage{{Language: "go", FileCount: 1}, {Language: "python", FileCount: 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("languages = %#v, want the two kept under the injected limit of 2: %#v", got, want)
 	}
 }
 
