@@ -69,15 +69,28 @@ func validateEnvelopeShape(raw []byte) error {
 	required := []string{"schema_version", "request_identity", "consumer_identity", "operation", "repository_identity", "worktree_identity", "committed_head", "dirty_overlay_fingerprint", "provider_identity", "index_identity", "required_capability", "minimum_freshness", "query", "result_identities", "filters", "maximum_results", "maximum_model_output_characters", "allow_inferred"}
 	nullable := map[string]bool{"index_identity": true, "query": true}
 	// The key set is schema-dependent: schema 2 requires direction (possibly
-	// null), schema 1 must not carry it at all. A malformed schema_version
+	// null), schema 3 requires direction and changed_ranges (both possibly
+	// null), and schema 1 must not carry either. A malformed schema_version
 	// falls through to the schema-1 key set and the typed validator rejects it.
 	var schemaVersion string
-	if err := json.Unmarshal(request["schema_version"], &schemaVersion); err == nil && schemaVersion == "2" {
+	if err := json.Unmarshal(request["schema_version"], &schemaVersion); err != nil {
+		schemaVersion = ""
+	}
+	switch schemaVersion {
+	case "2":
 		required = append(required, "direction")
 		nullable["direction"] = true
+	case "3":
+		required = append(required, "direction", "changed_ranges")
+		nullable["direction"], nullable["changed_ranges"] = true, true
 	}
 	if err := requireKeys(request, required, nullable); err != nil {
 		return err
+	}
+	if raw, ok := request["changed_ranges"]; ok && !isNull(raw) {
+		if err := validateChangedRangesShape(raw); err != nil {
+			return err
+		}
 	}
 	var filters map[string]json.RawMessage
 	if err := json.Unmarshal(request["filters"], &filters); err != nil {
@@ -124,7 +137,7 @@ func validPhaseOperation(phase string, operation Operation) bool {
 	case "update":
 		return operation == Update
 	case "query":
-		return operation == RepositoryMap || operation == SearchDocs || operation == SearchSymbols || operation == SourceSnippets || operation == RelatedSymbols
+		return operation == RepositoryMap || operation == SearchDocs || operation == SearchSymbols || operation == SourceSnippets || operation == RelatedSymbols || operation == ChangedSymbols
 	default:
 		return false
 	}
@@ -229,7 +242,13 @@ func ValidateRequest(request Request) error {
 	if queryOperation != (request.Query != nil) {
 		return ErrInvalidWire
 	}
+	if !validSchemaOperation(request.SchemaVersion, request.Operation) {
+		return ErrInvalidWire
+	}
 	if err := validateDirection(request); err != nil {
+		return err
+	}
+	if err := validateChangedRanges(request); err != nil {
 		return err
 	}
 	switch request.Operation {
@@ -263,12 +282,101 @@ func ValidateRequest(request Request) error {
 // carry, keeping the query-time edge resolution work predictable.
 const maximumRelatedAnchors = 16
 
-// validateDirection enforces the schema-2 relationship selector: schema 1 never
-// carries a direction and never names related-symbols, and under schema 2 the
-// direction is present exactly for related-symbols.
+// The changed selector is bounded independently of the collection limit: a
+// change set names many more paths than a result may return, and the two
+// ceilings below keep one request's intersection work predictable.
+const (
+	maximumChangedPaths         = 200
+	maximumChangedRangesPerPath = 64
+)
+
+// validSchemaOperation binds the two schema-gated operations to the schema that
+// introduced them: related-symbols exists only in schema 2 and changed-symbols
+// only in schema 3, so neither can appear under the frozen schema 1 nor leak
+// into the other's schema.
+func validSchemaOperation(schemaVersion string, operation Operation) bool {
+	switch operation {
+	case RelatedSymbols:
+		return schemaVersion == "2"
+	case ChangedSymbols:
+		return schemaVersion == "3"
+	default:
+		return true
+	}
+}
+
+// validateChangedRanges enforces the schema-3 change selector: only schema 3
+// carries changed ranges, and they are present exactly for changed-symbols.
+// Paths are sorted and unique, and every path's spans are bounded, ascending,
+// and non-overlapping, so the engine can intersect them by a single scan.
+func validateChangedRanges(request Request) error {
+	if request.SchemaVersion != "3" {
+		if request.ChangedRanges != nil {
+			return ErrInvalidWire
+		}
+		return nil
+	}
+	if (request.ChangedRanges != nil) != (request.Operation == ChangedSymbols) {
+		return ErrInvalidWire
+	}
+	if request.ChangedRanges == nil {
+		return nil
+	}
+	entries := *request.ChangedRanges
+	if len(entries) > maximumChangedPaths {
+		return ErrInvalidWire
+	}
+	for index, entry := range entries {
+		if !validPath(entry.Path) || (index > 0 && entries[index-1].Path >= entry.Path) {
+			return ErrInvalidWire
+		}
+		if len(entry.Ranges) > maximumChangedRangesPerPath {
+			return ErrInvalidWire
+		}
+		for position, span := range entry.Ranges {
+			if span[0] < 1 || span[1] < span[0] || !validCounter(span[1]) {
+				return ErrInvalidWire
+			}
+			if position > 0 && entry.Ranges[position-1][1] >= span[0] {
+				return ErrInvalidWire
+			}
+		}
+	}
+	return nil
+}
+
+// validateChangedRangesShape keeps the selector strict on the wire: every entry
+// spells both keys out and every span is a two-element array, so a malformed
+// span cannot be silently truncated or zero-filled by typed decoding.
+func validateChangedRangesShape(raw json.RawMessage) error {
+	var entries []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return ErrInvalidWire
+	}
+	for _, entry := range entries {
+		if err := requireKeys(entry, []string{"path", "ranges"}, nil); err != nil {
+			return err
+		}
+		var spans []json.RawMessage
+		if err := json.Unmarshal(entry["ranges"], &spans); err != nil {
+			return ErrInvalidWire
+		}
+		for _, span := range spans {
+			var bounds []json.Number
+			if err := json.Unmarshal(span, &bounds); err != nil || len(bounds) != 2 {
+				return ErrInvalidWire
+			}
+		}
+	}
+	return nil
+}
+
+// validateDirection enforces the schema-2 relationship selector: only schema 2
+// carries a direction, and there it is present exactly for related-symbols.
+// The operation-to-schema binding itself lives in validSchemaOperation.
 func validateDirection(request Request) error {
-	if request.SchemaVersion == "1" {
-		if request.Direction != nil || request.Operation == RelatedSymbols {
+	if request.SchemaVersion != "2" {
+		if request.Direction != nil {
 			return ErrInvalidWire
 		}
 		return nil
@@ -293,7 +401,7 @@ func validateResult(result Result) error {
 }
 
 func validateResultWithoutBudgets(result Result) error {
-	if !validSchemaVersion(result.SchemaVersion) || !validID(result.RequestIdentity) || !validOperation(result.Operation) || !validStatus(result.Status) || result.ProviderIdentity != "taf-context" || !validText(result.ProviderVersion, false) || !validSHA(result.RepositoryIdentity) || !validSHA(result.WorktreeIdentity) || !validObject(result.CommittedHead) || !validSHA(result.DirtyOverlayFingerprint) || !validFreshness(result.Freshness) || !validID(result.NextSafeAction) {
+	if !validSchemaVersion(result.SchemaVersion) || !validID(result.RequestIdentity) || !validOperation(result.Operation) || !validSchemaOperation(result.SchemaVersion, result.Operation) || !validStatus(result.Status) || result.ProviderIdentity != "taf-context" || !validText(result.ProviderVersion, false) || !validSHA(result.RepositoryIdentity) || !validSHA(result.WorktreeIdentity) || !validObject(result.CommittedHead) || !validSHA(result.DirtyOverlayFingerprint) || !validFreshness(result.Freshness) || !validID(result.NextSafeAction) {
 		return ErrInvalidWire
 	}
 	if result.IndexIdentity != nil && !validSHA(*result.IndexIdentity) {
@@ -375,11 +483,11 @@ func validateFinding(finding Finding, rank int, freshness string, schemaVersion 
 	return validateEdgeFields(finding, schemaVersion, operation)
 }
 
-// validateEdgeFields keeps the two schemas honest in both directions: schema 1
+// validateEdgeFields keeps the schemas honest in both directions: schema 1
 // carries no edge data at all (it would be silently dropped by the encoder),
-// and schema 2 admits only the frozen relation and evidence vocabularies, and
-// only on the one operation that resolves edges. Every other schema-2 result
-// leaves the four fields empty.
+// schema 3 resolves no edges, and schema 2 admits only the frozen relation and
+// evidence vocabularies, and only on the one operation that resolves edges.
+// Every other result leaves the four fields empty.
 func validateEdgeFields(finding Finding, schemaVersion string, operation Operation) error {
 	if schemaVersion != "2" || operation != RelatedSymbols {
 		if finding.Relation != "" || finding.EdgeEvidence != "" || finding.ReferenceLine != 0 || finding.ReferenceCount != 0 {
@@ -424,7 +532,7 @@ func validStatus(value Status) bool {
 func validFreshness(value string) bool {
 	return oneOf(value, "exact", "commit-fresh-worktree-stale", "incrementally-stale", "structurally-stale", "partial", "unknown", "unusable")
 }
-func validSchemaVersion(value string) bool { return oneOf(value, "1", "2") }
+func validSchemaVersion(value string) bool { return oneOf(value, "1", "2", "3") }
 func validBudget(value int) bool {
 	return value == 2000 || value == 4000 || value == 8000 || value == 12000
 }

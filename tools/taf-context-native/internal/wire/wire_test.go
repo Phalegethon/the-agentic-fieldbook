@@ -153,23 +153,16 @@ func TestDecodeEnvelopeEnforcesAdvertisedPhaseOperationMapping(t *testing.T) {
 		{"query", SearchSymbols},
 		{"query", SourceSnippets},
 		{"query", RelatedSymbols},
+		{"query", ChangedSymbols},
 	}
 	for _, item := range cases {
 		t.Run(item.phase+"-"+string(item.operation), func(t *testing.T) {
 			envelope := envelopeForOperation(item.phase, item.operation)
-			raw, err := json.Marshal(envelope)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := DecodeEnvelope(bytes.NewReader(append(raw, '\n'))); err != nil {
+			if _, err := DecodeEnvelope(bytes.NewReader(framedEnvelope(t, envelope))); err != nil {
 				t.Fatalf("rejected advertised phase/operation pair: %v", err)
 			}
 			envelope.Phase = mismatchedPhase(item.phase)
-			raw, err = json.Marshal(envelope)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := DecodeEnvelope(bytes.NewReader(append(raw, '\n'))); err == nil {
+			if _, err := DecodeEnvelope(bytes.NewReader(framedEnvelope(t, envelope))); err == nil {
 				t.Fatal("accepted mismatched phase/operation pair")
 			}
 		})
@@ -204,6 +197,11 @@ func envelopeForOperation(phase string, operation Operation) Envelope {
 		envelope.Request.Direction = ptr("callers")
 		envelope.Request.Filters = validRequest().Filters
 	}
+	if operation == ChangedSymbols {
+		envelope.Request.SchemaVersion = "3"
+		envelope.Request.ChangedRanges = changedRanges(ChangedRange{Path: "internal/query/changed.go", Ranges: [][2]int{{1, 4}}})
+		envelope.Request.Filters = validRequest().Filters
+	}
 	return envelope
 }
 
@@ -223,7 +221,7 @@ func TestRequestRequiresOperationCapabilityParity(t *testing.T) {
 }
 
 func TestRequestAcceptsEveryFrozenOperation(t *testing.T) {
-	expected := []Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets, RelatedSymbols}
+	expected := []Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets, RelatedSymbols, ChangedSymbols}
 	if got := Operations(); !equalOperations(got, expected) {
 		t.Fatalf("operations = %v", got)
 	}
@@ -257,6 +255,11 @@ func TestRequestAcceptsEveryFrozenOperation(t *testing.T) {
 			request.SchemaVersion = "2"
 			request.ResultIdentities = []string{resultIdentity}
 			request.Direction = ptr("callers")
+			request.Filters = validRequest().Filters
+		}
+		if operation == ChangedSymbols {
+			request.SchemaVersion = "3"
+			request.ChangedRanges = changedRanges(ChangedRange{Path: "internal/query/changed.go", Ranges: [][2]int{{1, 4}}})
 			request.Filters = validRequest().Filters
 		}
 		if err := ValidateRequest(request); err != nil {
@@ -634,7 +637,7 @@ func TestDecodeEnvelopeRejectsInvalidSchemaTwoDirections(t *testing.T) {
 }
 
 func TestRequestRejectsUnknownSchemaVersions(t *testing.T) {
-	for _, version := range []string{"", "0", "3", "2.0"} {
+	for _, version := range []string{"", "0", "4", "2.0"} {
 		request := validRequest()
 		request.SchemaVersion = version
 		if err := ValidateRequest(request); err == nil {
@@ -793,7 +796,7 @@ func TestValidateResultRejectsInconsistentEdgeFields(t *testing.T) {
 		"unknown edge evidence":    func(result *Result) { result.SchemaVersion, result.Findings[0].EdgeEvidence = "2", "guessed" },
 		"negative reference line":  func(result *Result) { result.SchemaVersion, result.Findings[0].ReferenceLine = "2", -1 },
 		"negative reference count": func(result *Result) { result.SchemaVersion, result.Findings[0].ReferenceCount = "2", -1 },
-		"unknown result schema":    func(result *Result) { result.SchemaVersion = "3" },
+		"unknown result schema":    func(result *Result) { result.SchemaVersion = "4" },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -843,4 +846,306 @@ func equalOperations(left, right []Operation) bool {
 		}
 	}
 	return true
+}
+
+// --- schema 3: changed-symbols and changed ranges ---------------------------
+
+// changedRanges builds the request-side selector; the pointed-to slice is never
+// nil so an empty selector still marshals as [] rather than null.
+func changedRanges(entries ...ChangedRange) *[]ChangedRange {
+	list := make([]ChangedRange, 0, len(entries))
+	list = append(list, entries...)
+	return &list
+}
+
+func changedRequest() Request {
+	request := validRequest()
+	request.SchemaVersion = "3"
+	request.Operation, request.RequiredCapability = ChangedSymbols, "changed-symbols"
+	request.Query = nil
+	request.ResultIdentities = []string{}
+	request.ChangedRanges = changedRanges(
+		ChangedRange{Path: "internal/query/changed.go", Ranges: [][2]int{{10, 20}, {40, 40}}},
+		ChangedRange{Path: "tools/taf-context/taf_context/recovery.py", Ranges: [][2]int{}},
+	)
+	return request
+}
+
+// framedEnvelope marshals an envelope for the decoder and spells out the
+// schema-3 keys that struct marshaling omits: the null direction and, for the
+// operations that carry no selector, the null changed_ranges.
+func framedEnvelope(t *testing.T, envelope Envelope) []byte {
+	t.Helper()
+	overrides := map[string]json.RawMessage{}
+	if envelope.Request.SchemaVersion == "3" {
+		overrides["direction"] = json.RawMessage("null")
+		if envelope.Request.ChangedRanges == nil {
+			overrides["changed_ranges"] = json.RawMessage("null")
+		}
+	}
+	return envelopeWithRequestKeys(t, envelope, overrides)
+}
+
+// changedEnvelopeWith replaces the changed_ranges value of a schema-3
+// changed-symbols envelope; an empty raw value removes the key entirely.
+func changedEnvelopeWith(t *testing.T, raw string) []byte {
+	t.Helper()
+	envelope := validEnvelope()
+	envelope.Request = changedRequest()
+	overrides := map[string]json.RawMessage{"direction": json.RawMessage("null")}
+	if raw == "" {
+		overrides["changed_ranges"] = nil
+	} else {
+		overrides["changed_ranges"] = json.RawMessage(raw)
+	}
+	return envelopeWithRequestKeys(t, envelope, overrides)
+}
+
+func TestDecodeEnvelopeRejectsChangedRangesUnderFrozenSchemas(t *testing.T) {
+	for _, schemaVersion := range []string{"1", "2"} {
+		envelope := validEnvelope()
+		envelope.Request.SchemaVersion = schemaVersion
+		overrides := map[string]json.RawMessage{"changed_ranges": json.RawMessage(`[{"path":"a.go","ranges":[[1,2]]}]`)}
+		if schemaVersion == "2" {
+			overrides["direction"] = json.RawMessage("null")
+		}
+		raw := envelopeWithRequestKeys(t, envelope, overrides)
+		if _, err := DecodeEnvelope(bytes.NewReader(raw)); !errors.Is(err, ErrInvalidWire) {
+			t.Fatalf("schema-%s changed_ranges: error = %v", schemaVersion, err)
+		}
+		request := validRequest()
+		request.SchemaVersion = schemaVersion
+		request.ChangedRanges = changedRanges(ChangedRange{Path: "a.go", Ranges: [][2]int{{1, 2}}})
+		if err := ValidateRequest(request); !errors.Is(err, ErrInvalidWire) {
+			t.Fatalf("typed schema-%s changed ranges: error = %v", schemaVersion, err)
+		}
+	}
+}
+
+func TestDecodeEnvelopeAcceptsSchemaThreeChangedSymbols(t *testing.T) {
+	envelope := validEnvelope()
+	envelope.Request = changedRequest()
+	decoded, err := DecodeEnvelope(bytes.NewReader(framedEnvelope(t, envelope)))
+	if err != nil {
+		t.Fatalf("rejected schema-3 changed-symbols: %v", err)
+	}
+	if decoded.Request.ChangedRanges == nil {
+		t.Fatal("changed ranges dropped")
+	}
+	entries := *decoded.Request.ChangedRanges
+	if len(entries) != 2 || entries[0].Path != "internal/query/changed.go" || len(entries[0].Ranges) != 2 || entries[0].Ranges[1] != [2]int{40, 40} || len(entries[1].Ranges) != 0 {
+		t.Fatalf("changed ranges = %+v", entries)
+	}
+	if decoded.Request.Direction != nil {
+		t.Fatalf("direction = %q", *decoded.Request.Direction)
+	}
+}
+
+func TestDecodeEnvelopeAcceptsSchemaThreeNullChangedRangesForOtherOperations(t *testing.T) {
+	envelope := validEnvelope()
+	envelope.Request.SchemaVersion = "3"
+	decoded, err := DecodeEnvelope(bytes.NewReader(framedEnvelope(t, envelope)))
+	if err != nil {
+		t.Fatalf("rejected schema-3 search-symbols with null changed ranges: %v", err)
+	}
+	if decoded.Request.ChangedRanges != nil {
+		t.Fatalf("changed ranges = %+v", *decoded.Request.ChangedRanges)
+	}
+}
+
+func TestDecodeEnvelopeRejectsMalformedChangedRanges(t *testing.T) {
+	manyPaths := make([]string, 0, 201)
+	for index := 0; index < 201; index++ {
+		manyPaths = append(manyPaths, fmt.Sprintf(`{"path":"a/p%03d.go","ranges":[[1,2]]}`, index))
+	}
+	manyRanges := make([]string, 0, 65)
+	for index := 0; index < 65; index++ {
+		manyRanges = append(manyRanges, fmt.Sprintf("[%d,%d]", 2*index+1, 2*index+1))
+	}
+	cases := map[string]string{
+		"null selector":       "null",
+		"missing key":         "",
+		"not an array":        `{"path":"a.go","ranges":[[1,2]]}`,
+		"missing path key":    `[{"ranges":[[1,2]]}]`,
+		"missing ranges key":  `[{"path":"a.go"}]`,
+		"unknown entry key":   `[{"path":"a.go","ranges":[[1,2]],"note":"x"}]`,
+		"null path":           `[{"path":null,"ranges":[[1,2]]}]`,
+		"null ranges":         `[{"path":"a.go","ranges":null}]`,
+		"absolute path":       `[{"path":"/a.go","ranges":[[1,2]]}]`,
+		"parent path":         `[{"path":"../a.go","ranges":[[1,2]]}]`,
+		"unsorted paths":      `[{"path":"b.go","ranges":[]},{"path":"a.go","ranges":[]}]`,
+		"duplicate paths":     `[{"path":"a.go","ranges":[]},{"path":"a.go","ranges":[]}]`,
+		"descending bounds":   `[{"path":"a.go","ranges":[[5,3]]}]`,
+		"zero start":          `[{"path":"a.go","ranges":[[0,1]]}]`,
+		"overflowing end":     `[{"path":"a.go","ranges":[[1,2147483648]]}]`,
+		"three element range": `[{"path":"a.go","ranges":[[1,2,3]]}]`,
+		"one element range":   `[{"path":"a.go","ranges":[[1]]}]`,
+		"string bounds":       `[{"path":"a.go","ranges":[["1","2"]]}]`,
+		"unsorted ranges":     `[{"path":"a.go","ranges":[[5,6],[1,2]]}]`,
+		"overlapping ranges":  `[{"path":"a.go","ranges":[[1,4],[4,6]]}]`,
+		"too many paths":      "[" + strings.Join(manyPaths, ",") + "]",
+		"too many ranges":     `[{"path":"a.go","ranges":[` + strings.Join(manyRanges, ",") + `]}]`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeEnvelope(bytes.NewReader(changedEnvelopeWith(t, raw))); !errors.Is(err, ErrInvalidWire) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestRequestBoundsChangedRanges(t *testing.T) {
+	// The bounds are part of the contract, so the cases spell 200 and 64 out
+	// instead of deriving them from the constants they are meant to pin.
+	bounded := changedRequest()
+	entries := make([]ChangedRange, 0, 200)
+	for index := 0; index < 200; index++ {
+		entries = append(entries, ChangedRange{Path: fmt.Sprintf("a/p%03d.go", index), Ranges: [][2]int{{1, 2}}})
+	}
+	bounded.ChangedRanges = changedRanges(entries...)
+	if err := ValidateRequest(bounded); err != nil {
+		t.Fatalf("rejected 200 changed paths: %v", err)
+	}
+	tooMany := changedRequest()
+	tooMany.ChangedRanges = changedRanges(append(entries, ChangedRange{Path: "a/p200.go", Ranges: [][2]int{{1, 2}}})...)
+	if err := ValidateRequest(tooMany); err == nil {
+		t.Fatal("accepted 201 changed paths")
+	}
+	spans := make([][2]int, 0, 64)
+	for index := 0; index < 64; index++ {
+		spans = append(spans, [2]int{2*index + 1, 2*index + 1})
+	}
+	boundedSpans := changedRequest()
+	boundedSpans.ChangedRanges = changedRanges(ChangedRange{Path: "a.go", Ranges: spans})
+	if err := ValidateRequest(boundedSpans); err != nil {
+		t.Fatalf("rejected 64 ranges: %v", err)
+	}
+	tooManySpans := changedRequest()
+	tooManySpans.ChangedRanges = changedRanges(ChangedRange{Path: "a.go", Ranges: append(spans, [2]int{129, 129})})
+	if err := ValidateRequest(tooManySpans); err == nil {
+		t.Fatal("accepted 65 ranges")
+	}
+	empty := changedRequest()
+	empty.ChangedRanges = changedRanges()
+	if err := ValidateRequest(empty); err != nil {
+		t.Fatalf("rejected an empty changed selector: %v", err)
+	}
+}
+
+func TestRequestBindsChangedSymbolsAndRelatedSymbolsToTheirSchemas(t *testing.T) {
+	for _, schemaVersion := range []string{"1", "2"} {
+		request := changedRequest()
+		request.SchemaVersion = schemaVersion
+		request.ChangedRanges = nil
+		if err := ValidateRequest(request); !errors.Is(err, ErrInvalidWire) {
+			t.Fatalf("schema-%s changed-symbols: error = %v", schemaVersion, err)
+		}
+	}
+	related := relatedRequest()
+	related.SchemaVersion = "3"
+	if err := ValidateRequest(related); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("schema-3 related-symbols: error = %v", err)
+	}
+	missing := changedRequest()
+	missing.ChangedRanges = nil
+	if err := ValidateRequest(missing); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("changed-symbols without a selector: error = %v", err)
+	}
+	uninvited := validRequest()
+	uninvited.SchemaVersion = "3"
+	uninvited.ChangedRanges = changedRanges(ChangedRange{Path: "a.go", Ranges: [][2]int{{1, 2}}})
+	if err := ValidateRequest(uninvited); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("search-symbols carrying a selector: error = %v", err)
+	}
+	withQuery := changedRequest()
+	withQuery.Query = ptr("anchor")
+	if err := ValidateRequest(withQuery); err == nil {
+		t.Fatal("accepted changed-symbols carrying a query")
+	}
+	withAnchors := changedRequest()
+	withAnchors.ResultIdentities = []string{resultIdentity}
+	if err := ValidateRequest(withAnchors); err == nil {
+		t.Fatal("accepted changed-symbols carrying anchors")
+	}
+	withDirection := changedRequest()
+	withDirection.Direction = ptr("callers")
+	if err := ValidateRequest(withDirection); err == nil {
+		t.Fatal("accepted changed-symbols carrying a direction")
+	}
+}
+
+func changedResult() Result {
+	result := validResult()
+	result.SchemaVersion = "3"
+	result.Operation = ChangedSymbols
+	result.OutputCharacters = renderedOutputCharacters(result)
+	return result
+}
+
+func TestEncodeResultAcceptsSchemaThreeChangedSymbols(t *testing.T) {
+	var encoded bytes.Buffer
+	if err := EncodeResult(&encoded, changedResult()); err != nil {
+		t.Fatalf("rejected a schema-3 changed-symbols result: %v", err)
+	}
+	got, want := findingKeys(t, encoded.Bytes()), map[string]struct{}{}
+	var schemaTwo bytes.Buffer
+	two := validResult()
+	two.SchemaVersion = "2"
+	if err := EncodeResult(&schemaTwo, two); err != nil {
+		t.Fatal(err)
+	}
+	want = findingKeys(t, schemaTwo.Bytes())
+	if len(got) != len(want) {
+		t.Fatalf("schema-3 finding keys = %v, want %v", got, want)
+	}
+	for key := range want {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("schema-3 finding dropped %q", key)
+		}
+	}
+}
+
+func TestValidateResultBindsSchemaThreeToChangedSymbols(t *testing.T) {
+	related := validResult()
+	related.SchemaVersion = "3"
+	related.Operation = RelatedSymbols
+	related.OutputCharacters = renderedOutputCharacters(related)
+	if err := EncodeResult(ioDiscard{}, related); err == nil {
+		t.Fatal("accepted a schema-3 related-symbols result")
+	}
+	for _, schemaVersion := range []string{"1", "2"} {
+		result := validResult()
+		result.SchemaVersion = schemaVersion
+		result.Operation = ChangedSymbols
+		result.OutputCharacters = renderedOutputCharacters(result)
+		if err := EncodeResult(ioDiscard{}, result); err == nil {
+			t.Fatalf("accepted a schema-%s changed-symbols result", schemaVersion)
+		}
+	}
+	edged := changedResult()
+	edged.Findings[0].Relation = "call"
+	edged.OutputCharacters = renderedOutputCharacters(edged)
+	if err := EncodeResult(ioDiscard{}, edged); err == nil {
+		t.Fatal("accepted edge fields on a schema-3 result")
+	}
+}
+
+func TestMarshalRequestKeepsChangedRangesOutOfFrozenSchemas(t *testing.T) {
+	for _, request := range []Request{validRequest(), relatedRequest()} {
+		raw, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "changed_ranges") {
+			t.Fatalf("schema-%s request carries changed_ranges: %s", request.SchemaVersion, raw)
+		}
+	}
+	raw, err := json.Marshal(changedRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"changed_ranges":[{"path":"internal/query/changed.go","ranges":[[10,20],[40,40]]}`) {
+		t.Fatalf("schema-3 request selector = %s", raw)
+	}
 }

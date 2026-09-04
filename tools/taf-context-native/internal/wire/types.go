@@ -22,9 +22,10 @@ const (
 	SearchDocs      Operation = "search-docs"
 	SourceSnippets  Operation = "source-snippets"
 	RelatedSymbols  Operation = "related-symbols"
+	ChangedSymbols  Operation = "changed-symbols"
 )
 
-var operations = [...]Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets, RelatedSymbols}
+var operations = [...]Operation{Estimate, Build, Update, StatusOperation, Metrics, RepositoryMap, SearchSymbols, SearchDocs, SourceSnippets, RelatedSymbols, ChangedSymbols}
 
 // Operations returns a copy of the frozen operation vocabulary.
 func Operations() []Operation { return append([]Operation(nil), operations[:]...) }
@@ -54,29 +55,39 @@ type Filters struct {
 	SourceTypes  []string `json:"source_types"`
 }
 
-// Request carries the frozen schema-1 keys plus the schema-2 direction. The
-// direction tag is omitempty so a marshaled schema-1 request keeps its frozen
-// key set exactly; schema-2 producers spell the key out, null included.
+// ChangedRange names one changed path and the changed line spans inside it.
+// An empty Ranges means the whole file changed; every span is an inclusive
+// [start, end] line pair.
+type ChangedRange struct {
+	Path   string   `json:"path"`
+	Ranges [][2]int `json:"ranges"`
+}
+
+// Request carries the frozen schema-1 keys, the schema-2 direction, and the
+// schema-3 changed-range selector. Both added tags are omitempty so a marshaled
+// schema-1 request keeps its frozen key set exactly; schema-2 producers spell
+// direction out and schema-3 producers spell both out, null included.
 type Request struct {
-	SchemaVersion                string    `json:"schema_version"`
-	RequestIdentity              string    `json:"request_identity"`
-	ConsumerIdentity             string    `json:"consumer_identity"`
-	Operation                    Operation `json:"operation"`
-	RepositoryIdentity           string    `json:"repository_identity"`
-	WorktreeIdentity             string    `json:"worktree_identity"`
-	CommittedHead                string    `json:"committed_head"`
-	DirtyOverlayFingerprint      string    `json:"dirty_overlay_fingerprint"`
-	ProviderIdentity             string    `json:"provider_identity"`
-	IndexIdentity                *string   `json:"index_identity"`
-	RequiredCapability           string    `json:"required_capability"`
-	MinimumFreshness             string    `json:"minimum_freshness"`
-	Query                        *string   `json:"query"`
-	ResultIdentities             []string  `json:"result_identities"`
-	Direction                    *string   `json:"direction,omitempty"`
-	Filters                      Filters   `json:"filters"`
-	MaximumResults               int       `json:"maximum_results"`
-	MaximumModelOutputCharacters int       `json:"maximum_model_output_characters"`
-	AllowInferred                bool      `json:"allow_inferred"`
+	SchemaVersion                string          `json:"schema_version"`
+	RequestIdentity              string          `json:"request_identity"`
+	ConsumerIdentity             string          `json:"consumer_identity"`
+	Operation                    Operation       `json:"operation"`
+	RepositoryIdentity           string          `json:"repository_identity"`
+	WorktreeIdentity             string          `json:"worktree_identity"`
+	CommittedHead                string          `json:"committed_head"`
+	DirtyOverlayFingerprint      string          `json:"dirty_overlay_fingerprint"`
+	ProviderIdentity             string          `json:"provider_identity"`
+	IndexIdentity                *string         `json:"index_identity"`
+	RequiredCapability           string          `json:"required_capability"`
+	MinimumFreshness             string          `json:"minimum_freshness"`
+	Query                        *string         `json:"query"`
+	ResultIdentities             []string        `json:"result_identities"`
+	Direction                    *string         `json:"direction,omitempty"`
+	ChangedRanges                *[]ChangedRange `json:"changed_ranges,omitempty"`
+	Filters                      Filters         `json:"filters"`
+	MaximumResults               int             `json:"maximum_results"`
+	MaximumModelOutputCharacters int             `json:"maximum_model_output_characters"`
+	AllowInferred                bool            `json:"allow_inferred"`
 }
 
 type Result struct {
