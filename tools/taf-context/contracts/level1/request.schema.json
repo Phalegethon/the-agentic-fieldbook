@@ -24,7 +24,7 @@
     "allow_inferred"
   ],
   "properties": {
-    "schema_version": {"enum": ["1", "2", "3"]},
+    "schema_version": {"enum": ["1", "2", "3", "4"]},
     "request_identity": {"$ref": "#/$defs/canonical_id"},
     "consumer_identity": {"$ref": "#/$defs/canonical_id"},
     "operation": {
@@ -39,7 +39,8 @@
         "search-docs",
         "source-snippets",
         "related-symbols",
-        "changed-symbols"
+        "changed-symbols",
+        "repository-overview"
       ]
     },
     "repository_identity": {"$ref": "#/$defs/sha256"},
@@ -209,6 +210,26 @@
     },
     {
       "if": {
+        "properties": {"operation": {"const": "repository-overview"}},
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "schema_version": {"const": "4"},
+          "index_identity": {"$ref": "#/$defs/sha256"},
+          "query": {"type": "null"},
+          "result_identities": {"maxItems": 0},
+          "filters": {
+            "properties": {
+              "symbol_kinds": {"maxItems": 0},
+              "source_types": {"maxItems": 0}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
         "properties": {"schema_version": {"const": "1"}},
         "required": ["schema_version"]
       },
@@ -217,7 +238,7 @@
     },
     {
       "if": {
-        "properties": {"schema_version": {"const": "3"}},
+        "properties": {"schema_version": {"enum": ["3", "4"]}},
         "required": ["schema_version"]
       },
       "then": {"required": ["changed_ranges"]},

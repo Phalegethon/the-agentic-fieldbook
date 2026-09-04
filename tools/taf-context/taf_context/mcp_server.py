@@ -30,7 +30,7 @@ from .git_snapshot import SnapshotError
 from .native_transport import NativeTransport
 
 SERVER_NAME = "taf-repo-context"
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 LEGACY_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 MODERN_VERSION = "2026-07-28"
 INSTRUCTIONS = (
@@ -60,6 +60,7 @@ _QUERY_TOOLS = {
     "related_symbols": "related-symbols",
     "changed_symbols": "changed-symbols",
     "impact_candidates": "impact-candidates",
+    "repository_overview": "repository-overview",
 }
 
 
@@ -134,7 +135,7 @@ def _schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
 
 
 def tool_definitions() -> list[dict[str, Any]]:
-    """The nine tools, in `tools/list` order."""
+    """The ten tools, in `tools/list` order."""
     query_description_suffix = (
         " A query on a bound index behind the working tree refreshes it incrementally first."
     )
@@ -322,6 +323,38 @@ def tool_definitions() -> list[dict[str, Any]]:
                 {
                     "repo": _repo_property(),
                     "base": _base_property(),
+                    "maximum_results": _filter_properties()["maximum_results"],
+                    "maximum_output_characters": _filter_properties()["maximum_output_characters"],
+                    "allow_inferred": _filter_properties()["allow_inferred"],
+                },
+                ["repo"],
+            ),
+            "annotations": dict(_READ_ONLY),
+        },
+        {
+            "name": "repository_overview",
+            "title": "Repository overview",
+            "description": (
+                "Answer 'how is this repository organized, where is the code, where do I "
+                "start': one row per directory in `groups` with its file, definition, "
+                "entry-point, document, and configuration counts and its languages, plus a "
+                "ranked file layer in `findings` that leads with entry points and well-known "
+                "entry file names. `overview.root` names what was described and "
+                "`overview.other_group_count` how many directories the row `*` folds "
+                "together. Start here in an unfamiliar repository, then narrow with "
+                "path_prefixes to answer 'what is in directory D'; several path_prefixes "
+                "are not composed, so the first in sorted order becomes the root and the "
+                "warning overview-root-first-prefix says so. The group table is never "
+                "trimmed: when the serialized answer is longer than "
+                "maximum_output_characters the warning output-budget-exceeded says so, and "
+                "a larger budget or fewer maximum_results is the way to fit it."
+                + query_description_suffix
+            ),
+            "inputSchema": _schema(
+                {
+                    "repo": _repo_property(),
+                    "path_prefixes": _filter_properties()["path_prefixes"],
+                    "languages": _filter_properties()["languages"],
                     "maximum_results": _filter_properties()["maximum_results"],
                     "maximum_output_characters": _filter_properties()["maximum_output_characters"],
                     "allow_inferred": _filter_properties()["allow_inferred"],

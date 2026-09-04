@@ -222,10 +222,19 @@ def _invoke_native(
         material.append(json.dumps(selector, separators=(",", ":")))
     request_material = "\0".join(material).encode("utf-8")
     request_identity = "taf.prepare." + hashlib.sha256(request_material).hexdigest()[:24]
-    # Schema 2 exists for the one operation that carries a direction and
-    # schema 3 for the one that carries a change selector; every other request
-    # stays byte-identical to the frozen schema-1 envelope.
-    schema_version = "3" if selector is not None else "2" if direction is not None else "1"
+    # Schema 2 exists for the one operation that carries a direction, schema 3
+    # for the one that carries a change selector, and schema 4 for the one that
+    # answers with a directory table; every other request stays byte-identical
+    # to the frozen schema-1 envelope.
+    schema_version = (
+        "4"
+        if operation == OVERVIEW_QUERY_OPERATION
+        else "3"
+        if selector is not None
+        else "2"
+        if direction is not None
+        else "1"
+    )
     envelope = {
         "phase": {
             "build": "build",
@@ -257,11 +266,12 @@ def _invoke_native(
             "allow_inferred": allow_inferred,
         },
     }
-    if schema_version in {"2", "3"}:
-        # Schema 3 spells both added keys out, direction included, because the
-        # engine requires the whole key set of the schema it is given.
+    if schema_version in {"2", "3", "4"}:
+        # Schemas 3 and 4 spell both added keys out, direction included,
+        # because the engine requires the whole key set of the schema it is
+        # given; schema 4 reuses the schema-3 key set with both keys null.
         envelope["request"]["direction"] = direction
-    if schema_version == "3":
+    if schema_version in {"3", "4"}:
         envelope["request"]["changed_ranges"] = selector
     wire = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
     try:
@@ -398,7 +408,7 @@ def _query_summary(
     warnings = list(result.warnings)
     if prune_warnings:
         warnings = sorted(set(warnings) | set(prune_warnings))
-    return {
+    summary: dict[str, object] = {
         "schema_version": "1",
         "mode": "query",
         "operation": result.operation.value,
@@ -417,6 +427,13 @@ def _query_summary(
         "next_safe_action": result.next_safe_action,
         "refresh": refresh,
     }
+    if result.groups is not None and result.overview is not None:
+        # Schema 4 adds the directory table. It is bounded by the wire (at most
+        # seventeen rows of bounded fields), so it is carried verbatim and
+        # never trimmed.
+        summary["groups"] = [item.to_dict() for item in result.groups]
+        summary["overview"] = result.overview.to_dict()
+    return summary
 
 
 def _summary(
@@ -635,6 +652,9 @@ MAXIMUM_RELATED_ANCHORS = 16
 # The two operations that answer from a Git difference instead of from a query
 # string or a result identity, and the only ones that accept a base.
 CHANGE_QUERY_OPERATIONS = ("changed-symbols", "impact-candidates")
+# The operation that answers with a directory table instead of a ranked
+# search: it names no query, no anchor, no direction, and no base.
+OVERVIEW_QUERY_OPERATION = "repository-overview"
 # The composed operation asks the engine for the widest change set and the
 # widest relationship answer it will give, then trims what it composed to the
 # caller's own budget.
@@ -685,6 +705,9 @@ def validate_query_request(
     result_identities: tuple[str, ...],
     direction: str | None = None,
     base: str | None = None,
+    *,
+    symbol_kinds: list[str] | tuple[str, ...] = (),
+    source_types: list[str] | tuple[str, ...] = (),
 ) -> tuple[str | None, tuple[str, ...]]:
     """Apply the query/result-identity rules shared by the CLI and the MCP server."""
     query_operations = {"search-symbols", "search-docs"}
@@ -716,6 +739,15 @@ def validate_query_request(
         if operation not in CHANGE_QUERY_OPERATIONS:
             raise PrepareCLIError("selected query operation does not accept --base")
         normalize_change_base(base)
+    if operation == OVERVIEW_QUERY_OPERATION:
+        # The overview describes whole directories, so it narrows by path and
+        # by language and never by a symbol-shaped filter. The engine refuses
+        # such a request outright; refuse it here with a message that names
+        # what to drop.
+        if symbol_kinds:
+            raise PrepareCLIError("selected query operation does not accept symbol kinds")
+        if source_types:
+            raise PrepareCLIError("selected query operation does not accept source types")
     return query_text, identities
 
 
@@ -1013,6 +1045,30 @@ def trim_to_budget(
     return trimmed
 
 
+def fit_overview_to_budget(
+    summary: dict[str, object], maximum_output_characters: int
+) -> dict[str, object]:
+    """Report how long an overview answer really is, and say when it overruns.
+
+    The engine's `output_characters` counts the rendered finding lines only, so
+    the directory table contributes nothing to it, and the engine's own fitting
+    loop has already trimmed the file layer. The table itself is the answer to
+    "how is this repository organized", it is bounded by the wire (at most
+    seventeen rows of bounded fields), and a partial table would describe a
+    repository that does not exist - so `groups` and `overview` are never
+    trimmed. What is left is to measure: `output_characters` becomes the length
+    of the broker's canonical JSON, and a serialized answer longer than the
+    requested budget carries `output-budget-exceeded` rather than a silent
+    overrun.
+    """
+    fitted = dict(summary)
+    fitted["output_characters"] = _output_characters(fitted)
+    if int(fitted["output_characters"]) > maximum_output_characters:
+        _add_warning(fitted, WARNING_OUTPUT_BUDGET_EXCEEDED)
+        fitted["output_characters"] = _output_characters(fitted)
+    return fitted
+
+
 def _resolve_change_base(repository: Path, requested: str | None, *, root: Path):
     try:
         return resolve_change_base(repository, requested, root=root)
@@ -1199,7 +1255,12 @@ def run_query(
             )
         raise PrepareCLIError("ready context is required; run prepare inspect")
     touch_binding(binding_path)
-    return _query_summary(result, refresh_summary)
+    summary = _query_summary(result, refresh_summary)
+    if arguments.operation == OVERVIEW_QUERY_OPERATION:
+        # The engine trimmed the file layer to its own rendered budget; the
+        # broker measures what the caller actually receives.
+        return fit_overview_to_budget(summary, arguments.maximum_output_characters)
+    return summary
 
 
 def run_build(

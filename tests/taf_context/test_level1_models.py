@@ -14,6 +14,9 @@ from taf_context.level1_models import (
     Level1Finding,
     Level1Filters,
     Level1Operation,
+    Level1OverviewGroup,
+    Level1OverviewLanguage,
+    Level1OverviewSummary,
     Level1RecordKind,
     Level1Request,
     Level1Result,
@@ -60,7 +63,20 @@ def request_wire(operation: str = "search-symbols") -> dict[str, object]:
             "symbol_kinds": [],
             "source_types": [],
         }
-    schema = {"related-symbols": "2", "changed-symbols": "3"}.get(operation, "1")
+    if operation == "repository-overview":
+        # The overview groups whole directories, so it accepts the two
+        # path-shaped filters and neither symbol-shaped one.
+        filters = {
+            "path_prefixes": ["tools/taf-context"],
+            "languages": ["Python"],
+            "symbol_kinds": [],
+            "source_types": [],
+        }
+    schema = {
+        "related-symbols": "2",
+        "changed-symbols": "3",
+        "repository-overview": "4",
+    }.get(operation, "1")
     wire: dict[str, object] = {
         "schema_version": schema,
         "request_identity": "request-0001",
@@ -86,7 +102,7 @@ def request_wire(operation: str = "search-symbols") -> dict[str, object]:
     # exists only in schema 3, non-null exactly for the change operation.
     if schema != "1":
         wire["direction"] = "callers" if operation == "related-symbols" else None
-    if schema == "3":
+    if schema in {"3", "4"}:
         wire["changed_ranges"] = (
             copy.deepcopy(CHANGED_RANGES) if operation == "changed-symbols" else None
         )
@@ -298,6 +314,7 @@ class Level1VocabularyTests(unittest.TestCase):
                 "estimate", "build", "update", "status", "metrics",
                 "repository-map", "search-symbols", "search-docs",
                 "source-snippets", "related-symbols", "changed-symbols",
+                "repository-overview",
             ],
         )
         self.assertEqual(
@@ -786,8 +803,8 @@ class Level1RelationshipSchemaTests(unittest.TestCase):
         raw = json.dumps(related_result_wire()).encode("utf-8")
         self.assertEqual(parse_level1_result(raw).schema_version, "2")
 
-    def test_the_wire_schema_vocabulary_is_exactly_one_two_and_three(self) -> None:
-        for version in ("0", "4", "2.0", 2):
+    def test_the_wire_schema_vocabulary_is_exactly_one_to_four(self) -> None:
+        for version in ("0", "5", "2.0", 2):
             wire = result_wire()
             wire["schema_version"] = version
             with self.subTest(version=version):
@@ -1064,6 +1081,334 @@ class Level1SchemaThreeContractTests(unittest.TestCase):
         )
 
 
+def schema4_request_wire(
+    operation: str = "repository-overview", **overrides: object
+) -> dict[str, object]:
+    """A schema-4 request: the schema-3 key set with both selectors null."""
+    wire = request_wire(operation)
+    wire["schema_version"] = "4"
+    wire.setdefault("direction", None)
+    wire.setdefault("changed_ranges", None)
+    wire.update(overrides)
+    return wire
+
+
+def overview_language_wire(language: str, file_count: int) -> dict[str, object]:
+    return {"language": language, "file_count": file_count}
+
+
+def overview_group_wire(**overrides: object) -> dict[str, object]:
+    """One directory row of the overview table, with the exact nine keys."""
+    wire: dict[str, object] = {
+        "path_prefix": "tools/",
+        "depth": 1,
+        "file_count": 4,
+        "definition_count": 12,
+        "entry_point_count": 1,
+        "document_count": 1,
+        "configuration_count": 0,
+        "languages": [
+            overview_language_wire("Python", 3),
+            overview_language_wire("Markdown", 1),
+        ],
+        "representative_identity": RESULT_IDENTITY,
+    }
+    wire.update(overrides)
+    return wire
+
+
+def other_group_wire(**overrides: object) -> dict[str, object]:
+    """The folded row: it stands for many directories, so it names no file."""
+    wire = overview_group_wire(
+        path_prefix="*",
+        depth=0,
+        languages=[overview_language_wire("Python", 3)],
+        representative_identity=None,
+    )
+    wire.update(overrides)
+    return wire
+
+
+def overview_result_wire(**overrides: object) -> dict[str, object]:
+    """A schema-4 result: the schema-2 finding field set plus the group table."""
+    wire = result_wire()
+    wire.update(
+        {
+            "schema_version": "4",
+            "operation": "repository-overview",
+            "findings": [
+                edge_finding_wire(
+                    relation=None,
+                    edge_evidence=None,
+                    reference_line=0,
+                    reference_count=0,
+                )
+            ],
+            "groups": [overview_group_wire(), other_group_wire()],
+            "overview": {
+                "root": "",
+                "counted_file_count": 24,
+                "other_group_count": 3,
+            },
+            "next_safe_action": "use-index",
+        }
+    )
+    wire.update(overrides)
+    return wire
+
+
+class Level1SchemaFourContractTests(unittest.TestCase):
+    """Schema 4: the directory table of the repository-overview operation."""
+
+    def test_repository_overview_request_round_trips_under_schema_four(self) -> None:
+        wire = schema4_request_wire()
+        request = Level1Request.from_dict(wire)
+
+        self.assertIs(request.operation, Level1Operation.REPOSITORY_OVERVIEW)
+        self.assertIsNone(request.direction)
+        self.assertIsNone(request.changed_ranges)
+        self.assertEqual(request.to_dict(), wire)
+
+    def test_schema_four_carries_the_schema_three_key_set(self) -> None:
+        for missing in ("direction", "changed_ranges"):
+            wire = schema4_request_wire()
+            del wire[missing]
+            with self.subTest(missing=missing):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+
+    def test_repository_overview_belongs_to_schema_four_alone(self) -> None:
+        for schema in ("1", "2", "3"):
+            wire = schema4_request_wire()
+            wire["schema_version"] = schema
+            if schema == "1":
+                del wire["direction"]
+            if schema in {"1", "2"}:
+                del wire["changed_ranges"]
+            with self.subTest(schema=schema):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+        for schema in ("1", "2", "3"):
+            wire = overview_result_wire()
+            wire["schema_version"] = schema
+            del wire["groups"]
+            del wire["overview"]
+            with self.subTest(result_schema=schema):
+                with self.assertRaises(ValueError):
+                    Level1Result.from_dict(wire)
+
+    def test_a_schema_agnostic_operation_may_travel_under_schema_four(self) -> None:
+        wire = schema4_request_wire("search-symbols")
+        self.assertIs(
+            Level1Request.from_dict(wire).operation, Level1Operation.SEARCH_SYMBOLS
+        )
+        result = overview_result_wire(operation="search-symbols")
+        self.assertEqual(Level1Result.from_dict(result).schema_version, "4")
+
+    def test_repository_overview_refuses_symbol_shaped_filters(self) -> None:
+        for field, item in (("symbol_kinds", "definition"), ("source_types", "source")):
+            wire = schema4_request_wire()
+            filters = dict(wire["filters"])  # type: ignore[arg-type]
+            filters[field] = [item]
+            wire["filters"] = filters
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+
+    def test_repository_overview_accepts_no_query_anchor_or_direction(self) -> None:
+        cases: list[dict[str, object]] = []
+        with_query = schema4_request_wire()
+        with_query["query"] = "anything"
+        cases.append(with_query)
+        with_anchor = schema4_request_wire()
+        with_anchor["result_identities"] = [RESULT_IDENTITY]
+        cases.append(with_anchor)
+        with_direction = schema4_request_wire()
+        with_direction["direction"] = "callers"
+        cases.append(with_direction)
+        with_selector = schema4_request_wire()
+        with_selector["changed_ranges"] = copy.deepcopy(CHANGED_RANGES)
+        cases.append(with_selector)
+        for wire in cases:
+            with self.subTest(wire=wire):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+
+    def test_overview_result_round_trip_carries_the_group_table(self) -> None:
+        wire = overview_result_wire()
+        result = Level1Result.from_dict(wire)
+
+        self.assertEqual(len(result.groups), 2)
+        self.assertEqual(result.groups[0].path_prefix, "tools/")
+        self.assertEqual(result.groups[0].definition_count, 12)
+        self.assertEqual(
+            [item.language for item in result.groups[0].languages],
+            ["Python", "Markdown"],
+        )
+        self.assertEqual(result.groups[0].representative_identity, RESULT_IDENTITY)
+        self.assertIsNone(result.groups[1].representative_identity)
+        self.assertEqual(result.overview.root, "")
+        self.assertEqual(result.overview.counted_file_count, 24)
+        self.assertEqual(result.overview.other_group_count, 3)
+        self.assertEqual(result.to_dict(), wire)
+
+    def test_schemas_one_to_three_refuse_the_overview_keys(self) -> None:
+        for schema, operation in (("1", "search-symbols"), ("2", "related-symbols"), ("3", "changed-symbols")):
+            wire = result_wire()
+            wire["schema_version"] = schema
+            wire["operation"] = operation
+            wire["findings"] = []
+            wire["returned_count"] = 0
+            if schema != "1":
+                wire["findings"] = [
+                    edge_finding_wire(
+                        relation="call" if operation == "related-symbols" else None,
+                        edge_evidence="verified" if operation == "related-symbols" else None,
+                        reference_line=5 if operation == "related-symbols" else 0,
+                        reference_count=2 if operation == "related-symbols" else 0,
+                    )
+                ]
+                wire["returned_count"] = 1
+            wire["groups"] = []
+            wire["overview"] = {"root": "", "counted_file_count": 0, "other_group_count": 0}
+            with self.subTest(schema=schema):
+                with self.assertRaises(ValueError):
+                    Level1Result.from_dict(wire)
+
+    def test_schema_four_requires_both_overview_keys(self) -> None:
+        for missing in ("groups", "overview"):
+            wire = overview_result_wire()
+            del wire[missing]
+            with self.subTest(missing=missing):
+                with self.assertRaises(ValueError):
+                    Level1Result.from_dict(wire)
+
+    def test_an_empty_table_is_the_answer_of_a_refusal(self) -> None:
+        wire = overview_result_wire(
+            status="stale",
+            freshness="incrementally-stale",
+            findings=[],
+            returned_count=0,
+            groups=[],
+            overview={"root": "", "counted_file_count": 0, "other_group_count": 0},
+            next_safe_action="rebuild-index",
+        )
+        result = Level1Result.from_dict(wire)
+
+        self.assertEqual(result.groups, ())
+        self.assertEqual(result.overview.counted_file_count, 0)
+
+    def test_every_group_prefix_shape_is_accepted(self) -> None:
+        for prefix, depth in ((".", 0), ("*", 0), ("tools/", 1), ("tools/a/", 2), ("tools/.", 1)):
+            wire = overview_result_wire(
+                groups=[
+                    overview_group_wire(
+                        path_prefix=prefix,
+                        depth=depth,
+                        representative_identity=None if prefix == "*" else RESULT_IDENTITY,
+                    )
+                ]
+            )
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    Level1Result.from_dict(wire).groups[0].path_prefix, prefix
+                )
+
+    def test_group_rows_fail_closed(self) -> None:
+        cases: dict[str, dict[str, object]] = {
+            "unknown key": overview_group_wire(unexpected=1),
+            "negative count": overview_group_wire(definition_count=-1),
+            "negative depth": overview_group_wire(depth=-1),
+            "absolute prefix": overview_group_wire(path_prefix="/tools/"),
+            "parent prefix": overview_group_wire(path_prefix="../tools/"),
+            "bare prefix": overview_group_wire(path_prefix="tools"),
+            "empty prefix": overview_group_wire(path_prefix=""),
+            "dot directory prefix": overview_group_wire(path_prefix="./"),
+            "empty segment": overview_group_wire(path_prefix="tools//a/"),
+            "folded row names a file": other_group_wire(
+                representative_identity=RESULT_IDENTITY
+            ),
+            "invalid identity": overview_group_wire(representative_identity="sha256:zz"),
+            "unsorted languages": overview_group_wire(
+                languages=[
+                    overview_language_wire("Markdown", 1),
+                    overview_language_wire("Python", 3),
+                ]
+            ),
+            "language tie out of name order": overview_group_wire(
+                languages=[
+                    overview_language_wire("Python", 3),
+                    overview_language_wire("Markdown", 3),
+                ]
+            ),
+            "repeated language": overview_group_wire(
+                languages=[
+                    overview_language_wire("Python", 3),
+                    overview_language_wire("Python", 1),
+                ]
+            ),
+            "empty language name": overview_group_wire(
+                languages=[overview_language_wire("", 3)]
+            ),
+            "negative language count": overview_group_wire(
+                languages=[overview_language_wire("Python", -1)]
+            ),
+            "language is not an object": overview_group_wire(languages=["Python"]),
+            "languages are not a list": overview_group_wire(languages={}),
+            "row is not an object": "tools/",
+        }
+        for name, group in cases.items():
+            wire = overview_result_wire(groups=[group])
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    Level1Result.from_dict(wire)
+
+    def test_the_group_table_is_bounded_at_seventeen_rows(self) -> None:
+        rows = [
+            overview_group_wire(path_prefix=f"group{index:02d}/")
+            for index in range(17)
+        ]
+        self.assertEqual(len(Level1Result.from_dict(overview_result_wire(groups=rows)).groups), 17)
+        with self.assertRaises(ValueError):
+            Level1Result.from_dict(
+                overview_result_wire(groups=rows + [overview_group_wire(path_prefix="group17/")])
+            )
+
+    def test_the_summary_names_a_root_prefix_or_the_repository_root(self) -> None:
+        for root in ("", "tools/", "tools/taf-context/"):
+            wire = overview_result_wire(
+                overview={"root": root, "counted_file_count": 1, "other_group_count": 0}
+            )
+            with self.subTest(root=root):
+                self.assertEqual(Level1Result.from_dict(wire).overview.root, root)
+        cases: dict[str, object] = {
+            "no trailing separator": {"root": "tools", "counted_file_count": 1, "other_group_count": 0},
+            "the folded prefix": {"root": "*", "counted_file_count": 1, "other_group_count": 0},
+            "the root file group": {"root": ".", "counted_file_count": 1, "other_group_count": 0},
+            "absolute": {"root": "/tools/", "counted_file_count": 1, "other_group_count": 0},
+            "negative counter": {"root": "", "counted_file_count": -1, "other_group_count": 0},
+            "unknown key": {"root": "", "counted_file_count": 1, "other_group_count": 0, "extra": 1},
+            "missing key": {"root": "", "counted_file_count": 1},
+            "not an object": [],
+        }
+        for name, overview in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    Level1Result.from_dict(overview_result_wire(overview=overview))
+
+    def test_the_parser_accepts_a_schema_four_frame(self) -> None:
+        raw = json.dumps(schema4_request_wire()).encode("utf-8")
+        self.assertIs(
+            parse_level1_request(raw).operation, Level1Operation.REPOSITORY_OVERVIEW
+        )
+        self.assertEqual(
+            parse_level1_result(
+                json.dumps(overview_result_wire()).encode("utf-8")
+            ).schema_version,
+            "4",
+        )
+
+
 class ContractSchemaTests(unittest.TestCase):
     def test_json_schemas_publish_the_same_top_level_fields_and_enums(self) -> None:
         root = Path(__file__).parents[2] / "tools" / "taf-context" / "contracts" / "level1"
@@ -1085,10 +1430,26 @@ class ContractSchemaTests(unittest.TestCase):
             set(Level1Finding.__dataclass_fields__),
         )
         self.assertEqual(
-            request_schema["properties"]["schema_version"]["enum"], ["1", "2", "3"]
+            request_schema["properties"]["schema_version"]["enum"], ["1", "2", "3", "4"]
         )
         self.assertEqual(
-            result_schema["properties"]["schema_version"]["enum"], ["1", "2", "3"]
+            result_schema["properties"]["schema_version"]["enum"], ["1", "2", "3", "4"]
+        )
+        self.assertEqual(
+            set(result_schema["$defs"]["overview_group"]["properties"]),
+            set(Level1OverviewGroup.__dataclass_fields__),
+        )
+        self.assertEqual(
+            set(result_schema["$defs"]["overview_language"]["properties"]),
+            set(Level1OverviewLanguage.__dataclass_fields__),
+        )
+        self.assertEqual(
+            set(result_schema["$defs"]["overview_summary"]["properties"]),
+            set(Level1OverviewSummary.__dataclass_fields__),
+        )
+        self.assertEqual(
+            result_schema["$defs"]["overview_group"]["properties"]["path_prefix"]["maxLength"],
+            512,
         )
         self.assertEqual(
             request_schema["properties"]["operation"]["enum"],

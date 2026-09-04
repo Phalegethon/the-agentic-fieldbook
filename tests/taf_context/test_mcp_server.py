@@ -117,6 +117,7 @@ class HandshakeTests(unittest.TestCase):
                 "related_symbols",
                 "changed_symbols",
                 "impact_candidates",
+                "repository_overview",
             ],
         )
         self.assertTrue(operations.closed)
@@ -164,7 +165,7 @@ class ToolListTests(unittest.TestCase):
     def test_tool_definitions_match_the_checked_in_fixture(self) -> None:
         self.assertEqual(tool_definitions(), json.loads(FIXTURE.read_text(encoding="utf-8")))
 
-    def test_the_nine_tools_are_listed_in_a_stable_order(self) -> None:
+    def test_the_ten_tools_are_listed_in_a_stable_order(self) -> None:
         names = [tool["name"] for tool in tool_definitions()]
         self.assertEqual(
             names,
@@ -178,9 +179,10 @@ class ToolListTests(unittest.TestCase):
                 "related_symbols",
                 "changed_symbols",
                 "impact_candidates",
+                "repository_overview",
             ],
         )
-        self.assertEqual(SERVER_VERSION, "1.2.0")
+        self.assertEqual(SERVER_VERSION, "1.3.0")
         tools = {tool["name"]: tool for tool in tool_definitions()}
         related = tools["related_symbols"]["inputSchema"]
         self.assertEqual(related["required"], ["repo", "result_ids", "direction"])
@@ -199,6 +201,26 @@ class ToolListTests(unittest.TestCase):
             sorted(tools["impact_candidates"]["inputSchema"]["properties"]),
             ["allow_inferred", "base", "maximum_output_characters", "maximum_results", "repo"],
         )
+
+    def test_the_overview_tool_takes_only_the_path_shaped_filters(self) -> None:
+        tools = {tool["name"]: tool for tool in tool_definitions()}
+        schema = tools["repository_overview"]["inputSchema"]
+        self.assertEqual(schema["required"], ["repo"])
+        self.assertEqual(
+            sorted(schema["properties"]),
+            [
+                "allow_inferred",
+                "languages",
+                "maximum_output_characters",
+                "maximum_results",
+                "path_prefixes",
+                "repo",
+            ],
+        )
+        # The two warnings only this operation can raise are named where the
+        # model reads them.
+        for warning in ("overview-root-first-prefix", "output-budget-exceeded"):
+            self.assertIn(warning, tools["repository_overview"]["description"])
 
     def test_build_is_the_only_writing_tool_and_requires_user_interaction(self) -> None:
         tools = {tool["name"]: tool for tool in tool_definitions()}
@@ -288,6 +310,77 @@ class ToolCallTests(unittest.TestCase):
         self.assertEqual(
             (snippets.operation, snippets.result_identities), ("source-snippets", (sha,))
         )
+
+    def test_the_overview_tool_routes_its_filters_and_budgets(self) -> None:
+        responses, _, _, operations = run_server(
+            [
+                call(
+                    1,
+                    "repository_overview",
+                    {
+                        "repo": REPO,
+                        "path_prefixes": ["tools/", "skills/"],
+                        "languages": ["Go", "go"],
+                        "maximum_results": 32,
+                        "maximum_output_characters": 12000,
+                    },
+                ),
+                call(2, "repository_overview", {"repo": REPO}),
+            ]
+        )
+
+        self.assertEqual([entry[0] for entry in operations.calls], ["query", "query"])
+        _, _, narrowed = operations.calls[0]
+        self.assertEqual(
+            (
+                narrowed.operation,
+                narrowed.path_prefixes,
+                narrowed.languages,
+                narrowed.symbol_kinds,
+                narrowed.source_types,
+                narrowed.query,
+                narrowed.result_identities,
+                narrowed.direction,
+                narrowed.base,
+                narrowed.maximum_results,
+                narrowed.maximum_output_characters,
+            ),
+            (
+                "repository-overview",
+                ["skills/", "tools/"],
+                ["go"],
+                [],
+                [],
+                None,
+                (),
+                None,
+                None,
+                32,
+                12000,
+            ),
+        )
+        _, _, plain = operations.calls[1]
+        self.assertEqual(
+            (plain.operation, plain.maximum_results, plain.maximum_output_characters),
+            ("repository-overview", 8, 4000),
+        )
+        for response in responses:
+            self.assertNotIn("error", response)
+
+    def test_the_overview_tool_refuses_a_symbol_shaped_argument(self) -> None:
+        responses, _, _, operations = run_server(
+            [
+                call(1, "repository_overview", {"repo": REPO, "symbol_kinds": ["definition"]}),
+                call(2, "repository_overview", {"repo": REPO, "source_types": ["source"]}),
+                call(3, "repository_overview", {"repo": REPO, "maximum_results": 65}),
+                call(4, "repository_overview", {"repo": REPO, "languages": ["cobol"]}),
+            ]
+        )
+
+        self.assertEqual([response["error"]["code"] for response in responses], [-32602] * 4)
+        self.assertIn("unknown argument symbol_kinds", responses[0]["error"]["message"])
+        self.assertIn("unknown argument source_types", responses[1]["error"]["message"])
+        self.assertEqual(operations.calls, [])
 
     def test_the_change_tools_route_their_base_and_their_budgets(self) -> None:
         responses, _, _, operations = run_server(

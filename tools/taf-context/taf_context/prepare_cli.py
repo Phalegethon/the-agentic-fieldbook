@@ -87,6 +87,7 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
             "related-symbols",
             "changed-symbols",
             "impact-candidates",
+            "repository-overview",
         ),
     )
     query.add_argument("--query")
@@ -289,7 +290,13 @@ def _validate_query_arguments(
 ) -> tuple[str | None, tuple[str, ...], str | None]:
     """The validated query, anchors, and change base of one parsed command."""
     query_text, result_identities = validate_query_request(
-        args.operation, args.query, tuple(args.result_id), args.direction, args.base
+        args.operation,
+        args.query,
+        tuple(args.result_id),
+        args.direction,
+        args.base,
+        symbol_kinds=args.symbol_kind,
+        source_types=args.source_type,
     )
     return query_text, result_identities, normalize_change_base(args.base)
 

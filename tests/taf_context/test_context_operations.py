@@ -18,6 +18,7 @@ from taf_context.context_operations import (
     QueryArguments,
     bound_changed_selector,
     compose_impact_candidates,
+    fit_overview_to_budget,
     normalize_change_base,
     run_build,
     run_inspect,
@@ -254,6 +255,87 @@ class OperationTests(unittest.TestCase):
             self.assertEqual(
                 [(item["qualified_name"], item["record_kind"]) for item in changed["findings"]],
                 [("app", "module"), ("app.first", "definition")],
+            )
+
+    def test_the_overview_query_crosses_the_seam_as_schema_four(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = init_committed_repo(Path(directory) / "repo")
+            binary = Path(directory) / "engine"
+            write_fake_native_engine(binary)
+            environment = self._environment(directory, binary)
+            transports: list[RecordingTransport] = []
+
+            def transport_for(path: Path) -> RecordingTransport:
+                transports.append(RecordingTransport(path))
+                return transports[-1]
+
+            run_build(repository, environment=environment, transport_for=transport_for)
+            overview = run_query(
+                repository,
+                QueryArguments(
+                    "repository-overview", None, (), [], [], [], [], 8, 12000, False
+                ),
+                environment=environment,
+                transport_for=transport_for,
+            )
+
+            requests = [request for transport in transports for request in transport.requests]
+            sent = [item for item in requests if item["operation"] == "repository-overview"][0]
+            self.assertEqual(sent["schema_version"], "4")
+            # The schema-4 request is the schema-3 key set with both selectors
+            # spelled out as null.
+            self.assertIsNone(sent["direction"])
+            self.assertIsNone(sent["changed_ranges"])
+            self.assertIsNone(sent["query"])
+            self.assertEqual(sent["result_identities"], [])
+            self.assertEqual(sent["filters"]["symbol_kinds"], [])
+            self.assertEqual(sent["filters"]["source_types"], [])
+            self.assertEqual(
+                [group["path_prefix"] for group in overview["groups"]], [".", "web/"]
+            )
+            self.assertEqual(
+                overview["overview"],
+                {"root": "", "counted_file_count": 2, "other_group_count": 0},
+            )
+            self.assertEqual(
+                [group["languages"] for group in overview["groups"]],
+                [[{"language": "Python", "file_count": 1}]] * 2,
+            )
+            self.assertEqual(
+                [finding["path"] for finding in overview["findings"]],
+                ["app.py", "web/handler.py"],
+            )
+            self.assertEqual(overview["operation"], "repository-overview")
+            self.assertEqual(overview["status"], "ready")
+            self.assertNotIn("base", overview)
+
+    def test_the_overview_summary_is_never_trimmed_and_reports_its_length(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = init_committed_repo(Path(directory) / "repo")
+            binary = Path(directory) / "engine"
+            write_fake_native_engine(binary)
+            environment = self._environment(directory, binary)
+
+            run_build(repository, environment=environment, transport_for=OneShotTransport)
+            overview = run_query(
+                repository,
+                QueryArguments(
+                    "repository-overview", None, (), [], [], [], [], 8, 2000, False
+                ),
+                environment=environment,
+                transport_for=OneShotTransport,
+            )
+
+            # The table survives the smallest budget; only the honest length
+            # and the warning report the overrun.
+            self.assertEqual(len(overview["groups"]), 2)
+            self.assertEqual(
+                overview["output_characters"],
+                len(
+                    json.dumps(
+                        overview, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    )
+                ),
             )
 
     def test_impact_candidates_composes_one_related_call_per_anchor(self) -> None:
@@ -1013,6 +1095,139 @@ class ValidateQueryRequestTests(unittest.TestCase):
                 with self.assertRaises(PrepareCLIError) as caught:
                     validate_query_request(operation, query, ids, direction, base)
                 self.assertEqual(str(caught.exception), message)
+
+
+class OverviewQueryRequestTests(unittest.TestCase):
+    """The overview names no query, no anchor, no direction, and no base."""
+
+    def test_the_overview_accepts_no_query_anchor_direction_or_base(self) -> None:
+        sha = "sha256:" + "a" * 64
+        self.assertEqual(validate_query_request("repository-overview", None, ()), (None, ()))
+        for query, ids, direction, base, message in (
+            ("main", (), None, None, "selected query operation does not accept --query"),
+            (None, (sha,), None, None, "selected query operation does not accept --result-id"),
+            (None, (), "callers", None, "selected query operation does not accept --direction"),
+            (None, (), None, "origin/main", "selected query operation does not accept --base"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaises(PrepareCLIError) as caught:
+                    validate_query_request(
+                        "repository-overview", query, ids, direction, base
+                    )
+                self.assertEqual(str(caught.exception), message)
+
+    def test_the_overview_accepts_neither_symbol_shaped_filter(self) -> None:
+        for symbol_kinds, source_types, message in (
+            (["definition"], [], "selected query operation does not accept symbol kinds"),
+            ([], ["source"], "selected query operation does not accept source types"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaises(PrepareCLIError) as caught:
+                    validate_query_request(
+                        "repository-overview",
+                        None,
+                        (),
+                        symbol_kinds=symbol_kinds,
+                        source_types=source_types,
+                    )
+                self.assertEqual(str(caught.exception), message)
+
+    def test_every_other_operation_still_accepts_both_filters(self) -> None:
+        for operation, query, ids in (
+            ("repository-map", None, ()),
+            ("search-symbols", "main", ()),
+            ("changed-symbols", None, ()),
+        ):
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    validate_query_request(
+                        operation,
+                        query,
+                        ids,
+                        symbol_kinds=["definition"],
+                        source_types=["source"],
+                    ),
+                    (query, ids),
+                )
+
+
+class OverviewBudgetTests(unittest.TestCase):
+    """The group table is never trimmed; an overrun is reported instead."""
+
+    def _summary(self, group_count: int) -> dict[str, object]:
+        languages = [
+            {"language": name, "file_count": 64 - index}
+            for index, name in enumerate(
+                ["Python", "Go", "Rust", "TypeScript", "Markdown", "JSON", "TOML"]
+            )
+        ]
+        return {
+            "schema_version": "1",
+            "mode": "query",
+            "operation": "repository-overview",
+            "status": "ready",
+            "freshness": "exact",
+            "index_identity": "sha256:" + "4" * 64,
+            "findings": [],
+            "returned_count": 0,
+            "omitted_count": 0,
+            "truncated": False,
+            "output_characters": 0,
+            "warnings": [],
+            "required_authorizations": [],
+            "next_safe_action": "use-index",
+            "refresh": {"performed": False, "changed_path_count": 0, "duration_ms": 0},
+            "groups": [
+                {
+                    "path_prefix": f"tools/directory{index:02d}/",
+                    "depth": 2,
+                    "file_count": 12,
+                    "definition_count": 120,
+                    "entry_point_count": 1,
+                    "document_count": 2,
+                    "configuration_count": 3,
+                    "languages": languages,
+                    "representative_identity": "sha256:" + f"{index:064x}",
+                }
+                for index in range(group_count)
+            ],
+            "overview": {
+                "root": "",
+                "counted_file_count": 240,
+                "other_group_count": 4,
+            },
+        }
+
+    def _length(self, value: dict[str, object]) -> int:
+        return len(
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+
+    def test_a_seventeen_row_table_over_the_smallest_budget_is_reported(self) -> None:
+        fitted = fit_overview_to_budget(self._summary(17), 2000)
+
+        self.assertEqual(len(fitted["groups"]), 17)
+        self.assertIn("output-budget-exceeded", fitted["warnings"])
+        self.assertEqual(fitted["output_characters"], self._length(fitted))
+        self.assertGreater(fitted["output_characters"], 2000)
+
+    def test_a_table_inside_the_budget_only_reports_its_length(self) -> None:
+        fitted = fit_overview_to_budget(self._summary(1), 12000)
+
+        self.assertEqual(fitted["warnings"], [])
+        self.assertEqual(fitted["output_characters"], self._length(fitted))
+        self.assertLessEqual(fitted["output_characters"], 12000)
+
+    def test_the_reported_length_counts_the_field_that_reports_it(self) -> None:
+        original = self._summary(3)
+        fitted = fit_overview_to_budget(original, 12000)
+
+        self.assertEqual(fitted["groups"], original["groups"])
+        self.assertEqual(fitted["overview"], original["overview"])
+        self.assertEqual(
+            fitted["output_characters"],
+            self._length(dict(fitted, output_characters=fitted["output_characters"])),
+        )
 
 
 class NormalizeChangeBaseTests(unittest.TestCase):

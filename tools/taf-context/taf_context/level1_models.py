@@ -33,6 +33,7 @@ class Level1Operation(str, Enum):
     SOURCE_SNIPPETS = "source-snippets"
     RELATED_SYMBOLS = "related-symbols"
     CHANGED_SYMBOLS = "changed-symbols"
+    REPOSITORY_OVERVIEW = "repository-overview"
 
 
 class Level1RecordKind(str, Enum):
@@ -81,6 +82,7 @@ _READ_OPERATIONS = {
     Level1Operation.SOURCE_SNIPPETS,
     Level1Operation.RELATED_SYMBOLS,
     Level1Operation.CHANGED_SYMBOLS,
+    Level1Operation.REPOSITORY_OVERVIEW,
 }
 _CONTROL_OPERATIONS = set(Level1Operation) - _READ_OPERATIONS
 _QUERY_OPERATIONS = {
@@ -93,7 +95,7 @@ _IDENTITY_OPERATIONS = {
     Level1Operation.RELATED_SYMBOLS,
 }
 _ALLOWED_BUDGETS = {2000, 4000, 8000, 12000}
-_WIRE_SCHEMAS = ("1", "2", "3")
+_WIRE_SCHEMAS = ("1", "2", "3", "4")
 _DIRECTIONS = ("callers", "callees", "importers", "imports")
 # One relationship request stays cheap to resolve, so it carries few anchors.
 _MAXIMUM_RELATED_ANCHORS = 16
@@ -104,19 +106,26 @@ _SCHEMA_TWO_REQUEST_FIELDS = frozenset({"direction"})
 _SCHEMA_TWO_FINDING_FIELDS = frozenset(
     {"relation", "edge_evidence", "reference_line", "reference_count"}
 )
-# Keys that exist only in wire schema 3.
+# Keys that exist only from wire schema 3 on.
 _SCHEMA_THREE_REQUEST_FIELDS = frozenset({"changed_ranges"})
+# Result keys that exist only in wire schema 4.
+_SCHEMA_FOUR_RESULT_FIELDS = frozenset({"groups", "overview"})
 # Each schema-gated operation belongs to exactly the schema that introduced
 # it, so neither can appear under the frozen schema 1 nor leak into the
 # other's schema.
 _SCHEMA_GATED_OPERATIONS = {
     Level1Operation.RELATED_SYMBOLS: "2",
     Level1Operation.CHANGED_SYMBOLS: "3",
+    Level1Operation.REPOSITORY_OVERVIEW: "4",
 }
 # The change selector is bounded independently of the collection limit: a
 # change set names many more paths than a result may return.
 _MAX_CHANGED_PATHS = 200
 _MAX_CHANGED_RANGES = 64
+# Sixteen kept directory rows plus the one folded row the engine appends.
+_MAX_OVERVIEW_GROUPS = 17
+# The folded row stands for every directory the table could not keep.
+_OVERVIEW_OTHER_PREFIX = "*"
 
 
 @dataclass(frozen=True)
@@ -269,6 +278,12 @@ class Level1Request:
             raise Level1ModelError("result_identities")
         if operation in _CONTROL_OPERATIONS and not filters.is_empty():
             raise Level1ModelError("filters")
+        # The overview describes whole directories, so it narrows by path and
+        # by language and never by a symbol-shaped filter.
+        if operation is Level1Operation.REPOSITORY_OVERVIEW and (
+            filters.symbol_kinds or filters.source_types
+        ):
+            raise Level1ModelError("filters")
         if not 1 <= maximum_results <= _MAX_COLLECTION:
             raise Level1ModelError("maximum_results")
         if maximum_characters not in _ALLOWED_BUDGETS:
@@ -320,9 +335,9 @@ class Level1Request:
             ),
             "allow_inferred": self.allow_inferred,
         }
-        if self.schema_version in {"2", "3"}:
+        if self.schema_version in {"2", "3", "4"}:
             wire["direction"] = self.direction
-        if self.schema_version == "3":
+        if self.schema_version in {"3", "4"}:
             wire["changed_ranges"] = (
                 None
                 if self.changed_ranges is None
@@ -413,6 +428,102 @@ class Level1Finding:
 
 
 @dataclass(frozen=True)
+class Level1OverviewLanguage:
+    """One language of a directory group and how many of its files use it."""
+
+    language: str
+    file_count: int
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "Level1OverviewLanguage":
+        _exact(value, cls.__dataclass_fields__, "languages")
+        return cls(_text(value, "language"), _counter(value, "file_count"))
+
+    def to_dict(self) -> dict[str, object]:
+        return {"language": self.language, "file_count": self.file_count}
+
+
+@dataclass(frozen=True)
+class Level1OverviewGroup:
+    """One directory row of the overview table, with the exact nine keys.
+
+    ``path_prefix`` is relative to the repository root, never to the overview
+    root, and is one of four shapes: ``"."`` for the root files, ``"*"`` for
+    the folded row, ``"<dir>/"`` for a directory subtree, and ``"<dir>/."`` for
+    the files directly inside a split directory.
+    """
+
+    path_prefix: str
+    depth: int
+    file_count: int
+    definition_count: int
+    entry_point_count: int
+    document_count: int
+    configuration_count: int
+    languages: tuple[Level1OverviewLanguage, ...]
+    representative_identity: str | None
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "Level1OverviewGroup":
+        _exact(value, cls.__dataclass_fields__, "groups")
+        path_prefix = _overview_prefix(value, "path_prefix")
+        identity = _optional_sha256(value, "representative_identity")
+        # The folded row stands for many directories at once, so no single
+        # file may represent it.
+        if path_prefix == _OVERVIEW_OTHER_PREFIX and identity is not None:
+            raise Level1ModelError("representative_identity")
+        return cls(
+            path_prefix,
+            _counter(value, "depth"),
+            _counter(value, "file_count"),
+            _counter(value, "definition_count"),
+            _counter(value, "entry_point_count"),
+            _counter(value, "document_count"),
+            _counter(value, "configuration_count"),
+            _overview_languages(value, "languages"),
+            identity,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path_prefix": self.path_prefix,
+            "depth": self.depth,
+            "file_count": self.file_count,
+            "definition_count": self.definition_count,
+            "entry_point_count": self.entry_point_count,
+            "document_count": self.document_count,
+            "configuration_count": self.configuration_count,
+            "languages": [item.to_dict() for item in self.languages],
+            "representative_identity": self.representative_identity,
+        }
+
+
+@dataclass(frozen=True)
+class Level1OverviewSummary:
+    """What the overview table describes: its root and what it counted."""
+
+    root: str
+    counted_file_count: int
+    other_group_count: int
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "Level1OverviewSummary":
+        _exact(value, cls.__dataclass_fields__, "overview")
+        return cls(
+            _overview_root(value, "root"),
+            _counter(value, "counted_file_count"),
+            _counter(value, "other_group_count"),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "root": self.root,
+            "counted_file_count": self.counted_file_count,
+            "other_group_count": self.other_group_count,
+        }
+
+
+@dataclass(frozen=True)
 class Level1Coverage:
     path_coverage: float
     language_coverage: float
@@ -470,11 +581,16 @@ class Level1Result:
     output_characters: int
     warnings: tuple[str, ...]
     next_safe_action: str
+    # Schema 4 only, and then always both: the directory table and what it
+    # describes. A schema-4 refusal carries an empty table and a zeroed
+    # summary, never no table at all.
+    groups: tuple[Level1OverviewGroup, ...] | None = None
+    overview: Level1OverviewSummary | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> "Level1Result":
         schema = _wire_schema(value, "result")
-        _exact(value, cls.__dataclass_fields__, "result")
+        _exact(value, _schema_result_fields(cls.__dataclass_fields__, schema), "result")
         operation = _enum(value, "operation", Level1Operation)
         status = _enum(value, "status", Level1ResultStatus)
         index_identity = _optional_sha256(value, "index_identity")
@@ -548,10 +664,11 @@ class Level1Result:
             output_characters,
             _sorted_texts(value, "warnings"),
             _canonical_id(value, "next_safe_action"),
+            *_overview_table(value, schema),
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        wire: dict[str, object] = {
             "schema_version": self.schema_version,
             "request_identity": self.request_identity,
             "operation": self.operation.value,
@@ -576,6 +693,14 @@ class Level1Result:
             "warnings": list(self.warnings),
             "next_safe_action": self.next_safe_action,
         }
+        if self.schema_version == "4":
+            wire["groups"] = [
+                item.to_dict() for item in (self.groups or ())
+            ]
+            wire["overview"] = (
+                None if self.overview is None else self.overview.to_dict()
+            )
+        return wire
 
 
 @dataclass(frozen=True)
@@ -746,8 +871,16 @@ def _schema_fields(
     names = set(fields)
     if schema == "1":
         names -= schema_two_only
-    if schema != "3":
+    if schema not in {"3", "4"}:
         names -= schema_three_only
+    return names
+
+
+def _schema_result_fields(fields: object, schema: str) -> set[str]:
+    """The exact key set a result must carry under ``schema``."""
+    names = set(fields)
+    if schema != "4":
+        names -= _SCHEMA_FOUR_RESULT_FIELDS
     return names
 
 
@@ -778,8 +911,8 @@ def _direction(
 def _changed_ranges(
     value: dict[str, object], schema: str, operation: Level1Operation
 ) -> tuple[Level1ChangedRange, ...] | None:
-    """Read the schema-3 change selector; only changed-symbols carries one."""
-    if schema != "3":
+    """Read the change selector of schema 3 on; only changed-symbols has one."""
+    if schema not in {"3", "4"}:
         return None
     raw = value["changed_ranges"]
     if (raw is not None) != (operation is Level1Operation.CHANGED_SYMBOLS):
@@ -801,6 +934,83 @@ def _changed_ranges(
 
 def _reject_entry() -> "Level1ChangedRange":
     raise Level1ModelError("changed_ranges")
+
+
+def _overview_table(
+    value: dict[str, object], schema: str
+) -> tuple[tuple[Level1OverviewGroup, ...] | None, Level1OverviewSummary | None]:
+    """Read the schema-4 directory table; every schema-4 result carries one."""
+    if schema != "4":
+        return None, None
+    raw = value["groups"]
+    if type(raw) is not list or len(raw) > _MAX_OVERVIEW_GROUPS:
+        raise Level1ModelError("groups")
+    groups = tuple(
+        Level1OverviewGroup.from_dict(item)
+        if isinstance(item, dict)
+        else _reject_group()
+        for item in raw
+    )
+    return groups, Level1OverviewSummary.from_dict(_object(value, "overview"))
+
+
+def _reject_group() -> "Level1OverviewGroup":
+    raise Level1ModelError("groups")
+
+
+def _reject_language() -> "Level1OverviewLanguage":
+    raise Level1ModelError("languages")
+
+
+def _overview_languages(
+    value: dict[str, object], field: str
+) -> tuple[Level1OverviewLanguage, ...]:
+    """Read one group's languages, ranked by file count and then by name."""
+    raw = value[field]
+    if type(raw) is not list or len(raw) > _MAX_COLLECTION:
+        raise Level1ModelError(field)
+    items = tuple(
+        Level1OverviewLanguage.from_dict(item)
+        if isinstance(item, dict)
+        else _reject_language()
+        for item in raw
+    )
+    order = tuple((-item.file_count, item.language) for item in items)
+    names = tuple(item.language for item in items)
+    if order != tuple(sorted(order)) or len(set(names)) != len(names):
+        raise Level1ModelError(field)
+    return items
+
+
+def _overview_prefix(value: dict[str, object], field: str) -> str:
+    """One of the four group prefix shapes: `.`, `*`, `<dir>/`, `<dir>/.`."""
+    item = _text(value, field)
+    if item in {".", _OVERVIEW_OTHER_PREFIX}:
+        return item
+    if item.endswith("/."):
+        body = item[:-2]
+    elif item.endswith("/"):
+        body = item[:-1]
+    else:
+        raise Level1ModelError(field)
+    if not body or body == ".":
+        raise Level1ModelError(field)
+    _validate_relative_path(body, field)
+    return item
+
+
+def _overview_root(value: dict[str, object], field: str) -> str:
+    """The overview root: the repository root, or a directory prefix."""
+    item = _text(value, field, empty=True)
+    if not item:
+        return item
+    if not item.endswith("/"):
+        raise Level1ModelError(field)
+    body = item[:-1]
+    if not body or body == ".":
+        raise Level1ModelError(field)
+    _validate_relative_path(body, field)
+    return item
 
 
 def _edge_label(

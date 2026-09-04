@@ -661,5 +661,73 @@
     },
     "name": "impact_candidates",
     "title": "Impact candidates"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Answer 'how is this repository organized, where is the code, where do I start': one row per directory in `groups` with its file, definition, entry-point, document, and configuration counts and its languages, plus a ranked file layer in `findings` that leads with entry points and well-known entry file names. `overview.root` names what was described and `overview.other_group_count` how many directories the row `*` folds together. Start here in an unfamiliar repository, then narrow with path_prefixes to answer 'what is in directory D'; several path_prefixes are not composed, so the first in sorted order becomes the root and the warning overview-root-first-prefix says so. The group table is never trimmed: when the serialized answer is longer than maximum_output_characters the warning output-budget-exceeded says so, and a larger budget or fewer maximum_results is the way to fit it. A query on a bound index behind the working tree refreshes it incrementally first.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_inferred": {
+          "default": false,
+          "description": "Include findings whose evidence class is inferred.",
+          "type": "boolean"
+        },
+        "languages": {
+          "items": {
+            "enum": [
+              "go",
+              "javascript",
+              "json",
+              "markdown",
+              "python",
+              "rust",
+              "toml",
+              "typescript"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "maximum_output_characters": {
+          "default": 4000,
+          "enum": [
+            2000,
+            4000,
+            8000,
+            12000
+          ],
+          "type": "integer"
+        },
+        "maximum_results": {
+          "default": 8,
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path_prefixes": {
+          "description": "Repository-relative path prefixes (case-sensitive).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repo": {
+          "description": "Absolute path of the Git repository or worktree.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo"
+      ],
+      "type": "object"
+    },
+    "name": "repository_overview",
+    "title": "Repository overview"
   }
 ]

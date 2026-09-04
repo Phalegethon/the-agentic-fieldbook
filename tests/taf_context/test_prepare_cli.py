@@ -104,6 +104,7 @@ def write_fake_native_engine(
                         "source-snippets",
                         "related-symbols",
                         "changed-symbols",
+                        "repository-overview",
                     }
                     and (state / "fake-index").is_file()
                 )
@@ -208,6 +209,15 @@ def write_fake_native_engine(
                     "warnings": ["json-collection-limit"] if ready and __PARTIAL__ else [],
                     "next_safe_action": "use-index" if ready else "build-index",
                 }
+                if request["schema_version"] == "4":
+                    # Every schema-4 result carries the table, refusals with an
+                    # empty one, exactly as the engine does.
+                    payload["groups"] = []
+                    payload["overview"] = {
+                        "root": "",
+                        "counted_file_count": 0,
+                        "other_group_count": 0,
+                    }
                 if operation == "update":
                     payload.update(payload_override)
                 if __STALE__ and operation in {
@@ -218,6 +228,7 @@ def write_fake_native_engine(
                     "source-snippets",
                     "related-symbols",
                     "changed-symbols",
+                    "repository-overview",
                 }:
                     payload["status"] = "stale"
                     payload["freshness"] = "incrementally-stale"
@@ -283,6 +294,52 @@ def write_fake_native_engine(
                                 fixture_finding(kind, entry["path"], name, start, end)
                             )
                     fixture_answer(changed_found)
+                if (
+                    operation == "repository-overview"
+                    and request["schema_version"] == "4"
+                    and ready
+                    and payload["status"] in {"ready", "partial"}
+                ):
+                    # A canned two-group answer: the root files and one
+                    # directory, each represented by its first ranked file.
+                    overview_found = [
+                        fixture_finding("module", "app.py", "app", 1, 40),
+                        fixture_finding(
+                            "definition", "web/handler.py", "web.handler.handle", 5, 12
+                        ),
+                    ]
+                    fixture_answer(overview_found)
+                    payload["groups"] = [
+                        {
+                            "path_prefix": ".",
+                            "depth": 0,
+                            "file_count": 1,
+                            "definition_count": 2,
+                            "entry_point_count": 0,
+                            "document_count": 0,
+                            "configuration_count": 0,
+                            "languages": [{"language": "Python", "file_count": 1}],
+                            "representative_identity": fixture_identity("app.py", "app"),
+                        },
+                        {
+                            "path_prefix": "web/",
+                            "depth": 1,
+                            "file_count": 1,
+                            "definition_count": 1,
+                            "entry_point_count": 0,
+                            "document_count": 0,
+                            "configuration_count": 0,
+                            "languages": [{"language": "Python", "file_count": 1}],
+                            "representative_identity": fixture_identity(
+                                "web/handler.py", "web.handler.handle"
+                            ),
+                        },
+                    ]
+                    payload["overview"] = {
+                        "root": "",
+                        "counted_file_count": 2,
+                        "other_group_count": 0,
+                    }
                 return payload
 
             def respond(line):
@@ -523,6 +580,86 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
                 invocation_log.read_text(encoding="utf-8").splitlines(),
                 ["build", "related-symbols"],
             )
+
+    def test_repository_overview_query_carries_the_group_table(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            built = invoke(
+                environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write"
+            )
+            self.assertEqual((built[0], built[2]), (0, ""))
+
+            code, stdout, stderr = invoke(
+                environment,
+                "prepare",
+                "query",
+                "--repo",
+                str(repo),
+                "--operation",
+                "repository-overview",
+                "--path-prefix",
+                "web",
+                "--maximum-output-characters",
+                "12000",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["operation"], "repository-overview")
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(
+                [group["path_prefix"] for group in result["groups"]], [".", "web/"]
+            )
+            self.assertEqual(
+                result["groups"][0]["representative_identity"],
+                result["findings"][0]["result_identity"],
+            )
+            self.assertEqual(
+                result["overview"],
+                {"root": "", "counted_file_count": 2, "other_group_count": 0},
+            )
+            self.assertEqual(result["warnings"], [])
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["build", "repository-overview"],
+            )
+
+    def test_the_overview_accepts_no_symbol_shaped_filter_and_no_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+
+            for extra, message in (
+                (["--symbol-kind", "definition"], "does not accept symbol kinds"),
+                (["--source-type", "source"], "does not accept source types"),
+                (["--query", "main"], "does not accept --query"),
+                (["--result-id", "sha256:" + "a" * 64], "does not accept --result-id"),
+                (["--base", "origin/main"], "does not accept --base"),
+            ):
+                with self.subTest(extra=extra):
+                    code, stdout, stderr = invoke(
+                        environment,
+                        "prepare", "query", "--repo", str(repo),
+                        "--operation", "repository-overview", *extra,
+                    )
+                    self.assertEqual(code, 2)
+                    self.assertEqual(stdout, "")
+                    self.assertIn(message, stderr)
 
     def test_changed_symbols_query_reports_its_base_and_the_touched_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1941,6 +2078,44 @@ class QueryArgumentInvariantTests(unittest.TestCase):
             maximum_output_characters=args.maximum_output_characters,
             allow_inferred=args.allow_inferred,
         )
+
+    def test_both_surfaces_answer_an_overview_query_identically(self) -> None:
+        parser = argparse.ArgumentParser()
+        register_prepare_command(parser.add_subparsers(dest="command", required=True))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+
+            cli = self._cli_arguments(
+                parser,
+                "prepare", "query", "--repo", str(repo),
+                "--operation", "repository-overview",
+                "--path-prefix", "tools", "--language", "Python",
+                "--maximum-results", "16", "--maximum-output-characters", "8000",
+            )
+            mcp = _query_arguments(
+                "repository-overview",
+                {
+                    "repo": str(repo),
+                    "path_prefixes": ["tools"],
+                    "languages": ["python"],
+                    "maximum_results": 16,
+                    "maximum_output_characters": 8000,
+                },
+            )
+
+            self.assertEqual(cli, mcp)
+            self.assertEqual(
+                run_query(repo, cli, environment=environment, transport_for=OneShotTransport),
+                run_query(repo, mcp, environment=environment, transport_for=OneShotTransport),
+            )
 
     def test_both_surfaces_answer_a_change_query_identically(self) -> None:
         parser = argparse.ArgumentParser()

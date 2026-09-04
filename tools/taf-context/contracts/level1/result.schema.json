@@ -27,7 +27,7 @@
     "next_safe_action"
   ],
   "properties": {
-    "schema_version": {"enum": ["1", "2", "3"]},
+    "schema_version": {"enum": ["1", "2", "3", "4"]},
     "request_identity": {"$ref": "#/$defs/canonical_id"},
     "operation": {
       "enum": [
@@ -41,7 +41,8 @@
         "search-docs",
         "source-snippets",
         "related-symbols",
-        "changed-symbols"
+        "changed-symbols",
+        "repository-overview"
       ]
     },
     "status": {"enum": ["ready", "partial", "stale", "unsupported", "error"]},
@@ -86,7 +87,13 @@
       "uniqueItems": true,
       "items": {"type": "string", "minLength": 1, "maxLength": 512}
     },
-    "next_safe_action": {"$ref": "#/$defs/canonical_id"}
+    "next_safe_action": {"$ref": "#/$defs/canonical_id"},
+    "groups": {
+      "type": "array",
+      "maxItems": 17,
+      "items": {"$ref": "#/$defs/overview_group"}
+    },
+    "overview": {"$ref": "#/$defs/overview_summary"}
   },
   "allOf": [
     {
@@ -136,6 +143,26 @@
         "required": ["operation"]
       },
       "then": {"properties": {"schema_version": {"const": "3"}}}
+    },
+    {
+      "if": {
+        "properties": {"operation": {"const": "repository-overview"}},
+        "required": ["operation"]
+      },
+      "then": {"properties": {"schema_version": {"const": "4"}}}
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "4"}},
+        "required": ["schema_version"]
+      },
+      "then": {"required": ["groups", "overview"]},
+      "else": {
+        "allOf": [
+          {"not": {"required": ["groups"]}},
+          {"not": {"required": ["overview"]}}
+        ]
+      }
     },
     {
       "if": {
@@ -217,6 +244,67 @@
         "edge_evidence": {"oneOf": [{"enum": ["", "verified", "inferred"]}, {"type": "null"}]},
         "reference_line": {"type": "integer", "minimum": 0, "maximum": 2147483647},
         "reference_count": {"type": "integer", "minimum": 0, "maximum": 2147483647}
+      }
+    },
+    "overview_language": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "file_count"],
+      "properties": {
+        "language": {"type": "string", "minLength": 1, "maxLength": 512},
+        "file_count": {"type": "integer", "minimum": 0, "maximum": 2147483647}
+      }
+    },
+    "overview_group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path_prefix",
+        "depth",
+        "file_count",
+        "definition_count",
+        "entry_point_count",
+        "document_count",
+        "configuration_count",
+        "languages",
+        "representative_identity"
+      ],
+      "properties": {
+        "path_prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^(?:\\.|\\*|(?!/)(?![A-Za-z]:)(?!\\.(?:/|$))(?!.*/\\./)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+/(?:\\.)?)$"
+        },
+        "depth": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "file_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "definition_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "entry_point_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "document_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "configuration_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "languages": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/overview_language"}
+        },
+        "representative_identity": {
+          "oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]
+        }
+      },
+      "$comment": "Languages rank by file_count descending and then by language ascending, and the folded row (path_prefix \"*\") names no representative; JSON Schema cannot express either, so the wire validators enforce both."
+    },
+    "overview_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "counted_file_count", "other_group_count"],
+      "properties": {
+        "root": {
+          "type": "string",
+          "maxLength": 512,
+          "pattern": "^(?:|(?!/)(?![A-Za-z]:)(?!\\.(?:/|$))(?!.*/\\./)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+/)$"
+        },
+        "counted_file_count": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "other_group_count": {"type": "integer", "minimum": 0, "maximum": 2147483647}
       }
     },
     "coverage": {
