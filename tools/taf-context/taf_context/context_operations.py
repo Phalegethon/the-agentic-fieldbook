@@ -17,8 +17,6 @@ from typing import Callable, Mapping
 from . import refresh
 from .change_ranges import (
     ChangedPath,
-    WARNING_PATHS_LIMIT,
-    WARNING_RANGES_COLLAPSED,
     changed_ranges,
     resolve_change_base,
 )
@@ -642,6 +640,13 @@ CHANGE_QUERY_OPERATIONS = ("changed-symbols", "impact-candidates")
 # caller's own budget.
 IMPACT_CHANGED_MAXIMUM_RESULTS = 64
 IMPACT_CHANGED_OUTPUT_CHARACTERS = 12000
+# The composed result trims its own context before its answer, and says so.
+WARNING_CHANGED_LIST_TRIMMED = "changed-list-trimmed"
+WARNING_OUTPUT_BUDGET_EXCEEDED = "output-budget-exceeded"
+# The selector guard shrinks the request frame, which is a different loss from
+# the change-range limits of `change_ranges`, so it carries its own codes.
+WARNING_SELECTOR_COLLAPSED = "changed-selector-collapsed"
+WARNING_SELECTOR_LIMIT = "changed-selector-limit"
 # Which changed record kinds anchor which relationship question.
 _CALLER_ANCHOR_KINDS = ("definition", "entry-point")
 _IMPORTER_ANCHOR_KINDS = ("module", "definition")
@@ -654,6 +659,24 @@ MAXIMUM_REQUEST_BYTES = 256 * 1024
 # worst frame the engine would still accept.
 _SELECTOR_RESERVE_BYTES = 48 * 1024
 MAXIMUM_CHANGED_SELECTOR_BYTES = MAXIMUM_REQUEST_BYTES - _SELECTOR_RESERVE_BYTES
+
+
+def normalize_change_base(base: str | None) -> str | None:
+    """Strip a requested change base and refuse one no Git ref could match.
+
+    The CLI and the MCP server must resolve the same base for the same
+    request, so both normalize here instead of each on its own.
+    """
+    if base is None:
+        return None
+    normalized = base.strip() if isinstance(base, str) else ""
+    if (
+        not normalized
+        or len(normalized) > 512
+        or any(character in normalized for character in "\x00\r\n")
+    ):
+        raise PrepareCLIError("selected change base is invalid")
+    return normalized
 
 
 def validate_query_request(
@@ -692,12 +715,7 @@ def validate_query_request(
     if base is not None:
         if operation not in CHANGE_QUERY_OPERATIONS:
             raise PrepareCLIError("selected query operation does not accept --base")
-        if (
-            not base
-            or len(base) > 512
-            or any(character in base for character in "\x00\r\n")
-        ):
-            raise PrepareCLIError("selected change base is invalid")
+        normalize_change_base(base)
     return query_text, identities
 
 
@@ -749,10 +767,10 @@ def bound_changed_selector(
         widest = _widest_selector_entry(entries)
         if widest is None:
             entries.pop()
-            warnings.add(WARNING_PATHS_LIMIT)
+            warnings.add(WARNING_SELECTOR_LIMIT)
             continue
         entries[widest] = ChangedPath(entries[widest].path, ())
-        warnings.add(WARNING_RANGES_COLLAPSED)
+        warnings.add(WARNING_SELECTOR_COLLAPSED)
     return tuple(entries), sorted(warnings)
 
 
@@ -909,6 +927,10 @@ def compose_impact_candidates(
         "index_identity": changed.index_identity,
         "changed": [_changed_entry(item) for item in changed.findings],
         "changed_count": len(changed.findings),
+        # The changed set's own omissions, so a reader can tell them from the
+        # candidates `maximum_results` dropped; `omitted_count` keeps counting
+        # both together.
+        "changed_omitted_count": changed.omitted_count,
         "findings": findings,
         "returned_count": len(findings),
         "omitted_count": omitted,
@@ -937,14 +959,27 @@ def _output_characters(value: dict[str, object]) -> int:
     return length
 
 
+def _add_warning(trimmed: dict[str, object], warning: str) -> None:
+    """Record one trimming warning, keeping the sorted union the result promises."""
+    warnings = trimmed.get("warnings", [])
+    assert isinstance(warnings, list)
+    trimmed["warnings"] = sorted(set(warnings) | {warning})
+
+
 def trim_to_budget(
     result: dict[str, object], maximum_output_characters: int
 ) -> dict[str, object]:
     """Fit a composed result into its output budget, cheapest loss first.
 
-    The changed list shrinks to identities before any candidate is dropped,
-    and candidates go from the tail, so the strongest evidence survives
-    longest. Anchors of a kept candidate are never trimmed.
+    The candidates are the answer, and each one already carries its anchors'
+    path and qualified name, so the changed list is the context that shrinks
+    first: it becomes identity-only, then loses entries from the tail with
+    `changed-list-trimmed`, and only then do candidates go from the tail so
+    that the strongest evidence survives longest. `changed_count` keeps
+    counting the changed findings the engine returned, and the anchors of a
+    kept candidate are never trimmed. A budget that not even an empty answer
+    fits in is reported with `output-budget-exceeded` instead of trimming
+    forever.
     """
     trimmed = dict(result)
     trimmed["output_characters"] = _output_characters(trimmed)
@@ -952,8 +987,16 @@ def trim_to_budget(
         return trimmed
     changed = trimmed["changed"]
     assert isinstance(changed, list)
-    trimmed["changed"] = [{"result_identity": item["result_identity"]} for item in changed]
+    identities = [{"result_identity": item["result_identity"]} for item in changed]
+    trimmed["changed"] = identities
     trimmed["output_characters"] = _output_characters(trimmed)
+    dropped_changed = False
+    while identities and int(trimmed["output_characters"]) > maximum_output_characters:
+        identities.pop()
+        if not dropped_changed:
+            dropped_changed = True
+            _add_warning(trimmed, WARNING_CHANGED_LIST_TRIMMED)
+        trimmed["output_characters"] = _output_characters(trimmed)
     findings = list(trimmed["findings"])  # type: ignore[arg-type]
     while findings and int(trimmed["output_characters"]) > maximum_output_characters:
         findings.pop()
@@ -961,6 +1004,11 @@ def trim_to_budget(
         trimmed["returned_count"] = len(findings)
         trimmed["omitted_count"] = int(trimmed["omitted_count"]) + 1
         trimmed["truncated"] = True
+        trimmed["output_characters"] = _output_characters(trimmed)
+    if int(trimmed["output_characters"]) > maximum_output_characters:
+        # Nothing left to lose: the envelope alone is over the budget, and the
+        # reader is told rather than handed a silent overrun.
+        _add_warning(trimmed, WARNING_OUTPUT_BUDGET_EXCEEDED)
         trimmed["output_characters"] = _output_characters(trimmed)
     return trimmed
 

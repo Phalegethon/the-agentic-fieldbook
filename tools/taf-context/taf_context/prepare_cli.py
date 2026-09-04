@@ -11,6 +11,7 @@ import time
 from typing import Mapping
 
 from .context_operations import (  # noqa: F401 - re-exported for callers and tests
+    CHANGE_QUERY_OPERATIONS,
     FILTER_LANGUAGES,
     FILTER_SYMBOL_KINDS,
     PrepareCLIError,
@@ -25,6 +26,7 @@ from .context_operations import (  # noqa: F401 - re-exported for callers and te
     _set_descriptor_mode,
     _state_paths,
     _validate_binary,
+    normalize_change_base,
     normalize_filter_values,
     run_build,
     run_inspect,
@@ -145,13 +147,13 @@ def run_prepare_command(
         candidates = plan_remove(paths.root, repository_key, worktree_key)
         return _lifecycle_summary("remove", paths.root, candidates, confirmed=args.confirm_state_write)
     if args.prepare_command == "query":
-        query_text, result_identities = _validate_query_arguments(args)
+        query_text, result_identities, base = _validate_query_arguments(args)
         arguments = QueryArguments(
             operation=args.operation,
             query=query_text,
             result_identities=result_identities,
             direction=args.direction,
-            base=args.base,
+            base=base,
             path_prefixes=sorted(set(args.path_prefix)),
             languages=normalize_filter_values(args.language, "--language", FILTER_LANGUAGES),
             symbol_kinds=normalize_filter_values(args.symbol_kind, "--symbol-kind", FILTER_SYMBOL_KINDS),
@@ -160,6 +162,10 @@ def run_prepare_command(
             maximum_output_characters=args.maximum_output_characters,
             allow_inferred=args.allow_inferred,
         )
+        if args.operation in CHANGE_QUERY_OPERATIONS:
+            return _run_change_query_over_a_session(
+                repository, arguments, environment=environment
+            )
         return run_query(repository, arguments, environment=environment, transport_for=OneShotTransport)
     if args.prepare_command in {"activate", "build"}:
         return run_build(
@@ -170,6 +176,33 @@ def run_prepare_command(
             installer=_install_native_engine if args.prepare_command == "activate" else None,
         )
     return run_inspect(repository, environment=environment, transport_for=OneShotTransport)
+
+
+def _run_change_query_over_a_session(
+    repository: Path, arguments: QueryArguments, *, environment: Mapping[str, str]
+) -> dict[str, object]:
+    """Answer one change query over a single reused engine child.
+
+    A composed change query makes one engine call per changed symbol, and a
+    fresh process per call reloads the index every time. One session pays that
+    once, so the recovery command the skill runs stays interactive.
+    """
+    from .engine_session import Level1Session, SessionTransport  # change-query only
+
+    sessions: list[Level1Session] = []
+
+    def transport_for(binary: Path) -> SessionTransport:
+        session = Level1Session(binary)
+        sessions.append(session)
+        return SessionTransport(session)
+
+    try:
+        return run_query(
+            repository, arguments, environment=environment, transport_for=transport_for
+        )
+    finally:
+        for session in sessions:
+            session.close()
 
 
 def _install_native_engine(
@@ -251,10 +284,14 @@ def _download(url: str, maximum_bytes: int) -> bytes:
     return value
 
 
-def _validate_query_arguments(args: argparse.Namespace) -> tuple[str | None, tuple[str, ...]]:
-    return validate_query_request(
+def _validate_query_arguments(
+    args: argparse.Namespace,
+) -> tuple[str | None, tuple[str, ...], str | None]:
+    """The validated query, anchors, and change base of one parsed command."""
+    query_text, result_identities = validate_query_request(
         args.operation, args.query, tuple(args.result_id), args.direction, args.base
     )
+    return query_text, result_identities, normalize_change_base(args.base)
 
 
 def _lifecycle_summary(

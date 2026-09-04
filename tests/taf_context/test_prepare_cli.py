@@ -19,14 +19,19 @@ import time
 import unittest
 from unittest import mock
 
+from taf_context import engine_session
 from taf_context.cli import main
+from taf_context.context_operations import QueryArguments, run_query
 from taf_context.git_snapshot import collect_snapshot
+from taf_context.mcp_server import _query_arguments
+from taf_context.native_transport import OneShotTransport
 from taf_context.prepare_cli import (
     FILTER_LANGUAGES,
     FILTER_SYMBOL_KINDS,
     PrepareCLIError,
     _platform_asset,
     _state_paths,
+    _validate_query_arguments,
     normalize_filter_values,
     register_prepare_command,
 )
@@ -78,19 +83,134 @@ def write_fake_native_engine(
             from pathlib import Path
             import sys
 
-            envelope = json.loads(sys.stdin.read())
-            request = envelope["request"]
-            operation = request["operation"]
-            state = Path(envelope["state_root"])
             invocation_log = __INVOCATION_LOG__
-            if invocation_log is not None:
-                with Path(invocation_log).open("a", encoding="utf-8") as stream:
-                    stream.write(operation + "\\n")
-            if operation == "build":
-                state.mkdir(parents=True, exist_ok=True)
-                (state / "fake-index").write_text("ready", encoding="utf-8")
-            ready = operation == "build" or (
-                operation in {
+
+            def answer(envelope):
+                request = envelope["request"]
+                operation = request["operation"]
+                state = Path(envelope["state_root"])
+                if invocation_log is not None:
+                    with Path(invocation_log).open("a", encoding="utf-8") as stream:
+                        stream.write(operation + "\\n")
+                if operation == "build":
+                    state.mkdir(parents=True, exist_ok=True)
+                    (state / "fake-index").write_text("ready", encoding="utf-8")
+                ready = operation == "build" or (
+                    operation in {
+                        "status",
+                        "repository-map",
+                        "search-symbols",
+                        "search-docs",
+                        "source-snippets",
+                        "related-symbols",
+                        "changed-symbols",
+                    }
+                    and (state / "fake-index").is_file()
+                )
+                CHANGED_TABLE = {
+                    "app.py": [
+                        ("module", "app", 1, 40),
+                        ("definition", "app.first", 3, 9),
+                        ("definition", "app.second", 11, 20),
+                    ],
+                    "web.py": [("definition", "web.handle", 5, 12)],
+                }
+                CALLERS = {"app.first": [("definition", "web.py", "web.handle", 5, 12, "call")]}
+                IMPORTERS = {"app": [("import", "other.py", "app", 1, 1, "import")]}
+
+                def fixture_identity(path, name):
+                    return "sha256:" + hashlib.sha256((path + "\\x00" + name).encode("utf-8")).hexdigest()
+
+                NAMES = {}
+                for fixture_path, fixture_records in CHANGED_TABLE.items():
+                    for _kind, _name, _start, _end in fixture_records:
+                        NAMES[fixture_identity(fixture_path, _name)] = _name
+
+                def fixture_finding(kind, path, name, start, end, relation=""):
+                    return {
+                        "rank": 0,
+                        "result_identity": fixture_identity(path, name),
+                        "path": path,
+                        "start_line": start,
+                        "end_line": end,
+                        "language": "Python",
+                        "record_kind": kind,
+                        "source_type": "source",
+                        "qualified_name": name,
+                        "extraction_method": "fake-engine",
+                        "evidence_class": "verified",
+                        "preview": "",
+                        "relation": relation,
+                        "edge_evidence": "verified" if relation else "",
+                        "reference_line": 12 if relation else 0,
+                        "reference_count": 2 if relation else 0,
+                    }
+                if operation == "update":
+                    document_path = state / envelope["changed_paths_document"]
+                    document = json.loads(document_path.read_bytes().decode("utf-8"))
+                    required = {"schema_version", "prior_index_identity", "before_repository_identity",
+                                "before_worktree_identity", "before_committed_head", "before_dirty_overlay_fingerprint",
+                                "after_repository_identity", "after_worktree_identity", "after_committed_head",
+                                "after_dirty_overlay_fingerprint", "level0_change_manifest_identity", "changed_paths"}
+                    fields = {key: value for key, value in document.items() if key != "level0_change_manifest_identity"}
+                    text = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                    for raw, escaped in (("<", "\\\\u003c"), (">", "\\\\u003e"), ("&", "\\\\u0026"), (" ", "\\\\u2028"), (" ", "\\\\u2029")):
+                        text = text.replace(raw, escaped)
+                    expected = "sha256:" + hashlib.sha256(b"taf-level0-change-manifest-v1\\x00" + text.encode("utf-8")).hexdigest()
+                    valid = (
+                        set(document) == required
+                        and document["level0_change_manifest_identity"] == expected
+                        and document["prior_index_identity"] == request["index_identity"]
+                        and document["after_committed_head"] == request["committed_head"]
+                        and document["after_dirty_overlay_fingerprint"] == request["dirty_overlay_fingerprint"]
+                        and (state / "fake-index").is_file()
+                    )
+                    outcome = __UPDATE_OUTCOME__ if valid else "stale"
+                    new_identity = "sha256:" + hashlib.sha256(("fake-index:" + request["dirty_overlay_fingerprint"] + request["committed_head"]).encode()).hexdigest()
+                    ready = outcome == "ready"
+                    payload_override = {
+                        "ready": {"status": "ready", "freshness": "exact", "next_safe_action": "use-index", "index_identity": new_identity},
+                        "stale": {"status": "stale", "freshness": "structurally-stale", "next_safe_action": "rebuild-index", "index_identity": request["index_identity"]},
+                        "error": {"status": "error", "freshness": "unknown", "next_safe_action": "rebuild-index", "index_identity": request["index_identity"]},
+                    }[outcome]
+                payload = {
+                    "schema_version": request["schema_version"],
+                    "request_identity": request["request_identity"],
+                    "operation": operation,
+                    "status": "partial" if ready and __PARTIAL__ else "ready" if ready else "partial",
+                    "provider_identity": "taf-context",
+                    "provider_version": "0.1.1",
+                    "index_identity": (
+                        "sha256:" + hashlib.sha256(b"fake-index").hexdigest()
+                        if operation == "build" else request["index_identity"]
+                        if ready else None
+                    ),
+                    "repository_identity": request["repository_identity"],
+                    "worktree_identity": request["worktree_identity"],
+                    "committed_head": request["committed_head"],
+                    "dirty_overlay_fingerprint": request["dirty_overlay_fingerprint"],
+                    "freshness": "exact" if ready else "partial",
+                    "parser_versions": {},
+                    "coverage": {
+                        "path_coverage": 1.0,
+                        "language_coverage": 1.0,
+                        "indexed_path_count": 1,
+                        "excluded_path_count": 0,
+                        "unsupported_language_count": 0,
+                        "parse_failure_count": 0,
+                        "exclusion_reason_counts": {"incomplete-extraction": 1} if __PARTIAL__ else {},
+                    },
+                    "findings": [],
+                    "returned_count": 0,
+                    "omitted_count": 0,
+                    "truncated": False,
+                    "output_characters": 0,
+                    "warnings": ["json-collection-limit"] if ready and __PARTIAL__ else [],
+                    "next_safe_action": "use-index" if ready else "build-index",
+                }
+                if operation == "update":
+                    payload.update(payload_override)
+                if __STALE__ and operation in {
                     "status",
                     "repository-map",
                     "search-symbols",
@@ -98,186 +218,95 @@ def write_fake_native_engine(
                     "source-snippets",
                     "related-symbols",
                     "changed-symbols",
-                }
-                and (state / "fake-index").is_file()
-            )
-            CHANGED_TABLE = {
-                "app.py": [
-                    ("module", "app", 1, 40),
-                    ("definition", "app.first", 3, 9),
-                    ("definition", "app.second", 11, 20),
-                ],
-                "web.py": [("definition", "web.handle", 5, 12)],
-            }
-            CALLERS = {"app.first": [("definition", "web.py", "web.handle", 5, 12, "call")]}
-            IMPORTERS = {"app": [("import", "other.py", "app", 1, 1, "import")]}
+                }:
+                    payload["status"] = "stale"
+                    payload["freshness"] = "incrementally-stale"
+                    payload["next_safe_action"] = "rebuild-index"
+                if __SNIPPET_STALE__ and operation in {"source-snippets", "related-symbols"}:
+                    # Mirrors the engine's snippetStale helper: an exact index
+                    # that cannot verify the requested result identities, or an
+                    # anchor no relationship may start from, reports stale with
+                    # structurally-stale and update-index. A genuinely stale index
+                    # (above) answers rebuild-index instead, which is what tells
+                    # the two apart.
+                    payload["status"] = "stale"
+                    payload["freshness"] = "structurally-stale"
+                    payload["next_safe_action"] = "update-index"
+                def fixture_answer(found):
+                    found.sort(key=lambda item: (item["path"], item["start_line"], item["qualified_name"]))
+                    for rank, item in enumerate(found, start=1):
+                        item["rank"] = rank
+                    payload["findings"] = found
+                    payload["returned_count"] = len(found)
+                    payload["output_characters"] = 200 if found else 0
 
-            def fixture_identity(path, name):
-                return "sha256:" + hashlib.sha256((path + "\\x00" + name).encode("utf-8")).hexdigest()
-
-            NAMES = {}
-            for fixture_path, fixture_records in CHANGED_TABLE.items():
-                for _kind, _name, _start, _end in fixture_records:
-                    NAMES[fixture_identity(fixture_path, _name)] = _name
-
-            def fixture_finding(kind, path, name, start, end, relation=""):
-                return {
-                    "rank": 0,
-                    "result_identity": fixture_identity(path, name),
-                    "path": path,
-                    "start_line": start,
-                    "end_line": end,
-                    "language": "Python",
-                    "record_kind": kind,
-                    "source_type": "source",
-                    "qualified_name": name,
-                    "extraction_method": "fake-engine",
-                    "evidence_class": "verified",
-                    "preview": "",
-                    "relation": relation,
-                    "edge_evidence": "verified" if relation else "",
-                    "reference_line": 12 if relation else 0,
-                    "reference_count": 2 if relation else 0,
-                }
-            if operation == "update":
-                document_path = state / envelope["changed_paths_document"]
-                document = json.loads(document_path.read_bytes().decode("utf-8"))
-                required = {"schema_version", "prior_index_identity", "before_repository_identity",
-                            "before_worktree_identity", "before_committed_head", "before_dirty_overlay_fingerprint",
-                            "after_repository_identity", "after_worktree_identity", "after_committed_head",
-                            "after_dirty_overlay_fingerprint", "level0_change_manifest_identity", "changed_paths"}
-                fields = {key: value for key, value in document.items() if key != "level0_change_manifest_identity"}
-                text = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                for raw, escaped in (("<", "\\\\u003c"), (">", "\\\\u003e"), ("&", "\\\\u0026"), (" ", "\\\\u2028"), (" ", "\\\\u2029")):
-                    text = text.replace(raw, escaped)
-                expected = "sha256:" + hashlib.sha256(b"taf-level0-change-manifest-v1\\x00" + text.encode("utf-8")).hexdigest()
-                valid = (
-                    set(document) == required
-                    and document["level0_change_manifest_identity"] == expected
-                    and document["prior_index_identity"] == request["index_identity"]
-                    and document["after_committed_head"] == request["committed_head"]
-                    and document["after_dirty_overlay_fingerprint"] == request["dirty_overlay_fingerprint"]
-                    and (state / "fake-index").is_file()
-                )
-                outcome = __UPDATE_OUTCOME__ if valid else "stale"
-                new_identity = "sha256:" + hashlib.sha256(("fake-index:" + request["dirty_overlay_fingerprint"] + request["committed_head"]).encode()).hexdigest()
-                ready = outcome == "ready"
-                payload_override = {
-                    "ready": {"status": "ready", "freshness": "exact", "next_safe_action": "use-index", "index_identity": new_identity},
-                    "stale": {"status": "stale", "freshness": "structurally-stale", "next_safe_action": "rebuild-index", "index_identity": request["index_identity"]},
-                    "error": {"status": "error", "freshness": "unknown", "next_safe_action": "rebuild-index", "index_identity": request["index_identity"]},
-                }[outcome]
-            payload = {
-                "schema_version": request["schema_version"],
-                "request_identity": request["request_identity"],
-                "operation": operation,
-                "status": "partial" if ready and __PARTIAL__ else "ready" if ready else "partial",
-                "provider_identity": "taf-context",
-                "provider_version": "0.1.1",
-                "index_identity": (
-                    "sha256:" + hashlib.sha256(b"fake-index").hexdigest()
-                    if operation == "build" else request["index_identity"]
-                    if ready else None
-                ),
-                "repository_identity": request["repository_identity"],
-                "worktree_identity": request["worktree_identity"],
-                "committed_head": request["committed_head"],
-                "dirty_overlay_fingerprint": request["dirty_overlay_fingerprint"],
-                "freshness": "exact" if ready else "partial",
-                "parser_versions": {},
-                "coverage": {
-                    "path_coverage": 1.0,
-                    "language_coverage": 1.0,
-                    "indexed_path_count": 1,
-                    "excluded_path_count": 0,
-                    "unsupported_language_count": 0,
-                    "parse_failure_count": 0,
-                    "exclusion_reason_counts": {"incomplete-extraction": 1} if __PARTIAL__ else {},
-                },
-                "findings": [],
-                "returned_count": 0,
-                "omitted_count": 0,
-                "truncated": False,
-                "output_characters": 0,
-                "warnings": ["json-collection-limit"] if ready and __PARTIAL__ else [],
-                "next_safe_action": "use-index" if ready else "build-index",
-            }
-            if operation == "update":
-                payload.update(payload_override)
-            if __STALE__ and operation in {
-                "status",
-                "repository-map",
-                "search-symbols",
-                "search-docs",
-                "source-snippets",
-                "related-symbols",
-                "changed-symbols",
-            }:
-                payload["status"] = "stale"
-                payload["freshness"] = "incrementally-stale"
-                payload["next_safe_action"] = "rebuild-index"
-            if __SNIPPET_STALE__ and operation in {"source-snippets", "related-symbols"}:
-                # Mirrors the engine's snippetStale helper: an exact index
-                # that cannot verify the requested result identities, or an
-                # anchor no relationship may start from, reports stale with
-                # structurally-stale and update-index. A genuinely stale index
-                # (above) answers rebuild-index instead, which is what tells
-                # the two apart.
-                payload["status"] = "stale"
-                payload["freshness"] = "structurally-stale"
-                payload["next_safe_action"] = "update-index"
-            def fixture_answer(found):
-                found.sort(key=lambda item: (item["path"], item["start_line"], item["qualified_name"]))
-                for rank, item in enumerate(found, start=1):
-                    item["rank"] = rank
-                payload["findings"] = found
-                payload["returned_count"] = len(found)
-                payload["output_characters"] = 200 if found else 0
-
-            if (
-                operation == "related-symbols"
-                and request["schema_version"] == "2"
-                and ready
-                and payload["status"] in {"ready", "partial"}
-            ):
-                # One resolved edge, so the broker and the CLI carry the four
-                # schema-2 finding fields end to end. An anchor the change
-                # fixture knows answers from its own table instead, so the
-                # composition can be followed end to end.
-                direction = request["direction"]
-                table = {"callers": CALLERS, "importers": IMPORTERS}.get(direction, {})
-                related_found = {}
-                for identity in request["result_identities"]:
-                    name = NAMES.get(identity)
-                    if name is None:
-                        if direction == "callers":
-                            legacy = fixture_finding(
-                                "definition", "tools/example/caller.py", "caller.run", 10, 14, "call"
-                            )
-                            legacy["result_identity"] = "sha256:" + "e" * 64
-                            related_found[legacy["result_identity"]] = legacy
-                        continue
-                    for kind, path, related_name, start, end, relation in table.get(name, []):
-                        item = fixture_finding(kind, path, related_name, start, end, relation)
-                        related_found[item["result_identity"]] = item
-                fixture_answer(list(related_found.values()))
-            if (
-                operation == "changed-symbols"
-                and request["schema_version"] == "3"
-                and ready
-                and payload["status"] in {"ready", "partial"}
-            ):
-                changed_found = []
-                for entry in request["changed_ranges"]:
-                    for kind, name, start, end in CHANGED_TABLE.get(entry["path"], []):
-                        spans = entry["ranges"]
-                        if spans and not any(start <= high and end >= low for low, high in spans):
+                if (
+                    operation == "related-symbols"
+                    and request["schema_version"] == "2"
+                    and ready
+                    and payload["status"] in {"ready", "partial"}
+                ):
+                    # One resolved edge, so the broker and the CLI carry the four
+                    # schema-2 finding fields end to end. An anchor the change
+                    # fixture knows answers from its own table instead, so the
+                    # composition can be followed end to end.
+                    direction = request["direction"]
+                    table = {"callers": CALLERS, "importers": IMPORTERS}.get(direction, {})
+                    related_found = {}
+                    for identity in request["result_identities"]:
+                        name = NAMES.get(identity)
+                        if name is None:
+                            if direction == "callers":
+                                legacy = fixture_finding(
+                                    "definition", "tools/example/caller.py", "caller.run", 10, 14, "call"
+                                )
+                                legacy["result_identity"] = "sha256:" + "e" * 64
+                                related_found[legacy["result_identity"]] = legacy
                             continue
-                        changed_found.append(
-                            fixture_finding(kind, entry["path"], name, start, end)
-                        )
-                fixture_answer(changed_found)
-            sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\\n")
+                        for kind, path, related_name, start, end, relation in table.get(name, []):
+                            item = fixture_finding(kind, path, related_name, start, end, relation)
+                            related_found[item["result_identity"]] = item
+                    fixture_answer(list(related_found.values()))
+                if (
+                    operation == "changed-symbols"
+                    and request["schema_version"] == "3"
+                    and ready
+                    and payload["status"] in {"ready", "partial"}
+                ):
+                    changed_found = []
+                    for entry in request["changed_ranges"]:
+                        for kind, name, start, end in CHANGED_TABLE.get(entry["path"], []):
+                            spans = entry["ranges"]
+                            if spans and not any(start <= high and end >= low for low, high in spans):
+                                continue
+                            changed_found.append(
+                                fixture_finding(kind, entry["path"], name, start, end)
+                            )
+                    fixture_answer(changed_found)
+                return payload
+
+            def respond(line):
+                sys.stdout.write(
+                    json.dumps(answer(json.loads(line)), sort_keys=True, separators=(",", ":")) + "\\n"
+                )
+                sys.stdout.flush()
+
+            if sys.argv[1:] == ["--serve"]:
+                # One `--serve` child answers many requests on one pair of
+                # pipes, exactly as the real engine's session mode does.
+                if invocation_log is not None:
+                    with Path(invocation_log).open("a", encoding="utf-8") as stream:
+                        stream.write("serve\\n")
+                sys.stderr.write("__TAF_LEVEL1_SERVER_READY_V1__\\n")
+                sys.stderr.flush()
+                for served in sys.stdin.buffer:
+                    if served.strip():
+                        respond(served)
+            elif sys.argv[1:]:
+                sys.stderr.write("invalid-native-level1-request\\n")
+                sys.exit(2)
+            else:
+                respond(sys.stdin.read())
             """
         ).replace("__INVOCATION_LOG__", repr(None if invocation_log is None else str(invocation_log))).replace(
             "__PARTIAL__", repr(partial)
@@ -529,10 +558,82 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
                 [("app", 1), ("app.first", 3)],
             )
             self.assertEqual(result["warnings"], [])
+            # A change query answers over one served child, not a process per
+            # call, so the log records the session before the operation.
             self.assertEqual(
                 invocation_log.read_text(encoding="utf-8").splitlines(),
-                ["build", "changed-symbols"],
+                ["build", "serve", "changed-symbols"],
             )
+
+    def test_a_stale_index_refuses_the_change_operations(self) -> None:
+        # A change query names no result identity, so the identity refusal
+        # cannot apply and a stale index is the only refusal left; both
+        # operations must give the same answer the direct ones give.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, base = change_fixture(root)
+            fresh_binary = root / "taf-level1"
+            write_fake_native_engine(fresh_binary)
+            stale_binary = root / "taf-level1-stale"
+            write_fake_native_engine(stale_binary, stale=True)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(fresh_binary),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            code, _stdout, stderr = invoke(
+                environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write"
+            )
+            self.assertEqual((code, stderr), (0, ""))
+
+            environment["TAF_LEVEL1_BINARY"] = str(stale_binary)
+            for operation in ("changed-symbols", "impact-candidates"):
+                with self.subTest(operation=operation):
+                    code, stdout, stderr = invoke(
+                        environment,
+                        "prepare", "query", "--repo", str(repo),
+                        "--operation", operation, "--base", base,
+                    )
+
+                    self.assertEqual((code, stdout), (2, ""))
+                    self.assertIn("ready context is required; run prepare inspect", stderr)
+
+    def test_a_padded_base_resolves_exactly_as_the_bare_one_does(self) -> None:
+        # The MCP server strips a base before the broker sees it, so the CLI
+        # must too: the same request cannot mean two things on two surfaces.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, base = change_fixture(root)
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+
+            bare_code, bare_stdout, bare_stderr = invoke(
+                environment,
+                "prepare", "query", "--repo", str(repo),
+                "--operation", "changed-symbols", "--base", base,
+            )
+            padded_code, padded_stdout, padded_stderr = invoke(
+                environment,
+                "prepare", "query", "--repo", str(repo),
+                "--operation", "changed-symbols", "--base", f"  {base}\t",
+            )
+
+            self.assertEqual((bare_code, bare_stderr), (0, ""))
+            self.assertEqual((padded_code, padded_stderr), (0, ""))
+            self.assertEqual(padded_stdout, bare_stdout)
+            self.assertEqual(decoded(padded_stdout)["base"]["requested"], base)
+
+            blank_code, blank_stdout, blank_stderr = invoke(
+                environment,
+                "prepare", "query", "--repo", str(repo),
+                "--operation", "impact-candidates", "--base", "   ",
+            )
+            self.assertEqual((blank_code, blank_stdout), (2, ""))
+            self.assertIn("selected change base is invalid", blank_stderr)
 
     def test_impact_candidates_query_attributes_every_candidate_to_its_anchors(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -558,6 +659,11 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             self.assertEqual(result["operation"], "impact-candidates")
             self.assertEqual((result["status"], result["next_safe_action"]), ("ready", "use-index"))
             self.assertEqual(result["changed_count"], 2)
+            # The changed set's own omissions are reported next to its count;
+            # this fixture returns every changed symbol, so it omits none.
+            self.assertEqual(result["changed_omitted_count"], 0)
+            keys = list(result)
+            self.assertEqual(keys[keys.index("changed_count") + 1], "changed_omitted_count")
             self.assertEqual(
                 [item["qualified_name"] for item in result["changed"]], ["app", "app.first"]
             )
@@ -590,7 +696,14 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             # definition.
             self.assertEqual(
                 invocation_log.read_text(encoding="utf-8").splitlines(),
-                ["build", "changed-symbols", "related-symbols", "related-symbols", "related-symbols"],
+                [
+                    "build",
+                    "serve",
+                    "changed-symbols",
+                    "related-symbols",
+                    "related-symbols",
+                    "related-symbols",
+                ],
             )
 
     def test_change_operation_argument_rules_are_reported_before_the_engine_runs(self) -> None:
@@ -1681,6 +1794,186 @@ class BindingSchemaTests(unittest.TestCase):
             code, stdout, stderr = invoke(environment, "prepare", "query", "--repo", str(repo), "--operation", "repository-map")
             self.assertEqual((code, stdout), (2, ""))
             self.assertIn("context binding is invalid", stderr)
+
+
+class ChangeQuerySessionTests(unittest.TestCase):
+    """The CLI answers a change query over one reused engine session."""
+
+    def _recording_session(self) -> tuple[type, list[Path], list[Path]]:
+        started: list[Path] = []
+        closed: list[Path] = []
+
+        class Recording(engine_session.Level1Session):
+            def __init__(self, binary: Path, **keywords: object) -> None:
+                super().__init__(binary, **keywords)
+                started.append(binary)
+
+            def close(self) -> None:
+                closed.append(self._binary)
+                super().close()
+
+        return Recording, started, closed
+
+    def test_impact_candidates_runs_over_one_session_and_answers_the_same(self) -> None:
+        # Composition costs one engine call per changed symbol, so the CLI
+        # reuses one `--serve` child instead of spawning a process per call.
+        # The answer must not change with the transport.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, base = change_fixture(root)
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+            arguments = QueryArguments(
+                operation="impact-candidates",
+                query=None,
+                result_identities=(),
+                direction=None,
+                base=base,
+                path_prefixes=[],
+                languages=[],
+                symbol_kinds=[],
+                source_types=[],
+                maximum_results=8,
+                maximum_output_characters=4000,
+                allow_inferred=False,
+            )
+            one_shot = run_query(
+                repo, arguments, environment=environment, transport_for=OneShotTransport
+            )
+            invocation_log.write_text("", encoding="utf-8")
+            Recording, started, closed = self._recording_session()
+
+            with mock.patch.object(engine_session, "Level1Session", Recording):
+                code, stdout, stderr = invoke(
+                    environment,
+                    "prepare", "query", "--repo", str(repo),
+                    "--operation", "impact-candidates", "--base", base,
+                )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(decoded(stdout), one_shot)
+            self.assertEqual(len(started), 1)
+            self.assertEqual(closed, started)
+            # One served child answered the changed-symbols call and every
+            # relationship call after it.
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["serve", "changed-symbols", "related-symbols", "related-symbols", "related-symbols"],
+            )
+
+    def test_the_session_is_closed_when_the_query_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, base = change_fixture(root)
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            stale_binary = root / "taf-level1-stale"
+            write_fake_native_engine(stale_binary, stale=True)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+            environment["TAF_LEVEL1_BINARY"] = str(stale_binary)
+            Recording, started, closed = self._recording_session()
+
+            with mock.patch.object(engine_session, "Level1Session", Recording):
+                code, stdout, stderr = invoke(
+                    environment,
+                    "prepare", "query", "--repo", str(repo),
+                    "--operation", "changed-symbols", "--base", base,
+                )
+
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn("ready context is required; run prepare inspect", stderr)
+            self.assertEqual(len(started), 1)
+            self.assertEqual(len(closed), 1)
+
+    def test_the_other_query_operations_keep_spawning_one_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+            Recording, started, _closed = self._recording_session()
+
+            with mock.patch.object(engine_session, "Level1Session", Recording):
+                code, _stdout, stderr = invoke(
+                    environment,
+                    "prepare", "query", "--repo", str(repo),
+                    "--operation", "search-symbols", "--query", "line",
+                )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(started, [])
+
+
+class QueryArgumentInvariantTests(unittest.TestCase):
+    """Invariant 6: the CLI and the MCP server ask the engine the same question."""
+
+    def _cli_arguments(self, parser: argparse.ArgumentParser, *argv: str) -> QueryArguments:
+        args = parser.parse_args(list(argv))
+        query_text, result_identities, base = _validate_query_arguments(args)
+        return QueryArguments(
+            operation=args.operation,
+            query=query_text,
+            result_identities=result_identities,
+            direction=args.direction,
+            base=base,
+            path_prefixes=sorted(set(args.path_prefix)),
+            languages=normalize_filter_values(args.language, "--language", FILTER_LANGUAGES),
+            symbol_kinds=normalize_filter_values(
+                args.symbol_kind, "--symbol-kind", FILTER_SYMBOL_KINDS
+            ),
+            source_types=sorted(set(args.source_type)),
+            maximum_results=args.maximum_results,
+            maximum_output_characters=args.maximum_output_characters,
+            allow_inferred=args.allow_inferred,
+        )
+
+    def test_both_surfaces_answer_a_change_query_identically(self) -> None:
+        parser = argparse.ArgumentParser()
+        register_prepare_command(parser.add_subparsers(dest="command", required=True))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, base = change_fixture(root)
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+
+            for operation in ("changed-symbols", "impact-candidates"):
+                with self.subTest(operation=operation):
+                    cli = self._cli_arguments(
+                        parser,
+                        "prepare", "query", "--repo", str(repo),
+                        "--operation", operation, "--base", f"  {base} ",
+                    )
+                    mcp = _query_arguments(operation, {"repo": str(repo), "base": f" {base}  "})
+
+                    self.assertEqual(cli, mcp)
+                    self.assertEqual(
+                        run_query(
+                            repo, cli, environment=environment, transport_for=OneShotTransport
+                        ),
+                        run_query(
+                            repo, mcp, environment=environment, transport_for=OneShotTransport
+                        ),
+                    )
 
 
 class QueryPathImportTests(unittest.TestCase):

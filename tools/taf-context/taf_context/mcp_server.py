@@ -19,6 +19,7 @@ from .context_operations import (
     QUERY_DIRECTIONS,
     QueryArguments,
     _SHA256,
+    normalize_change_base,
     normalize_filter_values,
     run_build,
     run_inspect,
@@ -401,10 +402,12 @@ def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArgument
     base = arguments.get("base")
     if base is not None:
         # Only the two change tools declare the key, so a base anywhere else is
-        # already an unknown argument.
-        base = base.strip()
-        if not base or len(base) > 512 or any(item in base for item in "\x00\r\n"):
-            raise InvalidArguments("base must be a Git ref or commit")
+        # already an unknown argument. The broker owns the normalization, so
+        # the CLI resolves a padded base exactly as this surface does.
+        try:
+            base = normalize_change_base(base)
+        except PrepareCLIError as exc:
+            raise InvalidArguments("base must be a Git ref or commit") from exc
     try:
         languages = normalize_filter_values(
             arguments.get("languages", []), "languages", FILTER_LANGUAGES

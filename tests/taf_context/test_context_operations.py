@@ -17,6 +17,7 @@ from taf_context.context_operations import (
     QueryArguments,
     bound_changed_selector,
     compose_impact_candidates,
+    normalize_change_base,
     run_build,
     run_inspect,
     run_query,
@@ -657,6 +658,36 @@ class ComposeImpactCandidatesTests(unittest.TestCase):
         self.assertEqual(composed["omitted_count"], 3)
         self.assertIs(composed["truncated"], True)
 
+    def test_the_changed_sets_own_omissions_are_counted_on_their_own(self) -> None:
+        # `omitted_count` keeps its spec meaning (underlying omissions plus
+        # dropped candidates), so the changed set's share is reported next to
+        # `changed_count` where a reader looks for it.
+        changed = engine_result(
+            "changed-symbols",
+            "3",
+            [finding_wire(1, "app.first", path="app.py", start=3, end=9)],
+            omitted=8,
+            truncated=True,
+        )
+        related = FakeRelated(
+            {
+                (identity("app.py", "app.first"), "callers"): [
+                    caller_of(f"web.handle{index}", path=f"web{index}.py") for index in range(3)
+                ]
+            }
+        )
+        composed = compose_impact_candidates(
+            changed, related, allow_inferred=False, maximum_results=2
+        )
+
+        keys = list(composed)
+        self.assertEqual(
+            keys[keys.index("changed_count") + 1], "changed_omitted_count"
+        )
+        self.assertEqual(composed["changed_omitted_count"], 8)
+        self.assertEqual(composed["changed_count"], 1)
+        self.assertEqual(composed["omitted_count"], 9)
+
     def test_maximum_results_bounds_the_candidates_and_counts_the_rest(self) -> None:
         related = FakeRelated(
             {
@@ -728,6 +759,100 @@ class TrimToBudgetTests(unittest.TestCase):
             list(range(1, len(trimmed["findings"]) + 1)),
         )
 
+    def _wide_object(self, changed_symbols: int, candidates: int) -> dict[str, object]:
+        """A change set at the internal cap whose anchors reach few candidates."""
+        changed = engine_result(
+            "changed-symbols",
+            "3",
+            [
+                finding_wire(index + 1, f"app.symbol{index:03d}", path="app.py", start=index * 3 + 1, end=index * 3 + 2)
+                for index in range(changed_symbols)
+            ],
+        )
+        first = identity("app.py", "app.symbol000")
+        related = FakeRelated(
+            {
+                (first, "callers"): [
+                    caller_of(f"web.handle{index}", path=f"web{index}.py")
+                    for index in range(candidates)
+                ]
+            }
+        )
+        return compose_impact_candidates(
+            changed, related, allow_inferred=False, maximum_results=8
+        )
+
+    def test_the_changed_list_is_trimmed_before_the_last_candidate_goes(self) -> None:
+        # The identity-only changed list alone exceeds the default budget at
+        # the internal cap, so the candidates - the operation's answer - must
+        # survive it.
+        composed = self._wide_object(64, 1)
+        trimmed = trim_to_budget(composed, 2000)
+
+        self.assertLessEqual(int(trimmed["output_characters"]), 2000)
+        self.assertEqual(len(trimmed["findings"]), 1)
+        self.assertEqual(trimmed["returned_count"], 1)
+        self.assertIn("changed-list-trimmed", trimmed["warnings"])
+        self.assertNotIn("output-budget-exceeded", trimmed["warnings"])
+        self.assertLess(len(trimmed["changed"]), 64)
+        self.assertEqual(trimmed["changed_count"], 64)
+        self.assertEqual(
+            trimmed["changed"],
+            [
+                {"result_identity": item["result_identity"]}
+                for item in composed["changed"][: len(trimmed["changed"])]
+            ],
+        )
+        self.assertIs(trimmed["truncated"], False)
+        self.assertEqual(trimmed["omitted_count"], composed["omitted_count"])
+
+    def test_candidates_go_only_after_the_changed_list_is_empty(self) -> None:
+        composed = self._wide_object(64, 4)
+        trimmed = trim_to_budget(composed, 2000)
+
+        self.assertLessEqual(int(trimmed["output_characters"]), 2000)
+        self.assertEqual(trimmed["changed"], [])
+        self.assertLess(len(trimmed["findings"]), 4)
+        self.assertGreater(len(trimmed["findings"]), 0)
+        self.assertIs(trimmed["truncated"], True)
+        self.assertEqual(
+            int(trimmed["omitted_count"]),
+            int(composed["omitted_count"]) + 4 - len(trimmed["findings"]),
+        )
+        self.assertEqual(
+            [item["rank"] for item in trimmed["findings"]],
+            list(range(1, len(trimmed["findings"]) + 1)),
+        )
+
+    def test_a_budget_nothing_fits_in_is_reported_instead_of_looping(self) -> None:
+        composed = self._wide_object(8, 2)
+        trimmed = trim_to_budget(composed, 1)
+
+        self.assertEqual(trimmed["changed"], [])
+        self.assertEqual(trimmed["findings"], [])
+        self.assertEqual(trimmed["returned_count"], 0)
+        self.assertIn("output-budget-exceeded", trimmed["warnings"])
+        self.assertIn("changed-list-trimmed", trimmed["warnings"])
+        self.assertEqual(trimmed["warnings"], sorted(trimmed["warnings"]))
+        self.assertGreater(int(trimmed["output_characters"]), 1)
+        self.assertEqual(
+            int(trimmed["output_characters"]),
+            len(json.dumps(trimmed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),
+        )
+
+    def test_the_budget_holds_whenever_it_is_not_reported_as_exceeded(self) -> None:
+        for changed_symbols, candidates in ((0, 0), (3, 2), (64, 1), (64, 8)):
+            composed = self._wide_object(changed_symbols, candidates)
+            for budget in (1, 300, 900, 2000, 4000, 12000):
+                with self.subTest(changed=changed_symbols, candidates=candidates, budget=budget):
+                    trimmed = trim_to_budget(composed, budget)
+                    measured = len(json.dumps(
+                        trimmed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ))
+                    self.assertEqual(int(trimmed["output_characters"]), measured)
+                    if "output-budget-exceeded" not in trimmed["warnings"]:
+                        self.assertLessEqual(measured, budget)
+
 
 class ChangedSelectorGuardTests(unittest.TestCase):
     def test_a_selector_inside_the_frame_is_returned_unchanged(self) -> None:
@@ -749,7 +874,9 @@ class ChangedSelectorGuardTests(unittest.TestCase):
         )
         bounded, warnings = bound_changed_selector(changed)
 
-        self.assertEqual(warnings, ["changed-ranges-collapsed"])
+        # The frame guard has its own codes: a collapse here is request-frame
+        # pressure, not the per-path hunk limit of `change_ranges`.
+        self.assertEqual(warnings, ["changed-selector-collapsed"])
         self.assertEqual(len(bounded), 200)
         self.assertEqual([item.path for item in bounded], [item.path for item in changed])
         self.assertTrue(any(item.ranges == () for item in bounded))
@@ -767,14 +894,14 @@ class ChangedSelectorGuardTests(unittest.TestCase):
             (narrow, wide), available_bytes=len(b'[{"path":"narrow.py","ranges":[[1,2]]},') + 40
         )
 
-        self.assertEqual(warnings, ["changed-ranges-collapsed"])
+        self.assertEqual(warnings, ["changed-selector-collapsed"])
         self.assertEqual(bounded, (narrow, ChangedPath("wide.py", ())))
 
     def test_a_selector_that_cannot_fit_at_all_drops_paths_from_the_tail(self) -> None:
         changed = tuple(ChangedPath(f"{'p' * 200}-{index:03d}.py", ()) for index in range(200))
         bounded, warnings = bound_changed_selector(changed, available_bytes=1000)
 
-        self.assertEqual(warnings, ["changed-paths-limit"])
+        self.assertEqual(warnings, ["changed-selector-limit"])
         self.assertLess(len(bounded), 200)
         self.assertEqual(bounded, changed[: len(bounded)])
 
@@ -840,6 +967,7 @@ class ValidateQueryRequestTests(unittest.TestCase):
             ("impact-candidates", None, (), "importers", None,
              "selected query operation does not accept --direction"),
             ("changed-symbols", None, (), None, "", "selected change base is invalid"),
+            ("changed-symbols", None, (), None, "   ", "selected change base is invalid"),
             ("changed-symbols", None, (), None, "a" * 513, "selected change base is invalid"),
             ("impact-candidates", None, (), None, "bad\nref", "selected change base is invalid"),
         ):
@@ -847,6 +975,22 @@ class ValidateQueryRequestTests(unittest.TestCase):
                 with self.assertRaises(PrepareCLIError) as caught:
                     validate_query_request(operation, query, ids, direction, base)
                 self.assertEqual(str(caught.exception), message)
+
+
+class NormalizeChangeBaseTests(unittest.TestCase):
+    def test_a_padded_base_is_stripped_for_every_surface(self) -> None:
+        # The CLI and the MCP server must resolve the same base for the same
+        # request, so the normalization lives in one place.
+        self.assertIsNone(normalize_change_base(None))
+        self.assertEqual(normalize_change_base(" origin/main\t"), "origin/main")
+        self.assertEqual(normalize_change_base(" " + "a" * 512 + " "), "a" * 512)
+
+    def test_a_base_no_ref_could_match_is_refused(self) -> None:
+        for base in ("", "   ", "\n", "a" * 513, "bad\nref", "bad\rref", "bad\x00ref"):
+            with self.subTest(base=base):
+                with self.assertRaises(PrepareCLIError) as caught:
+                    normalize_change_base(base)
+                self.assertEqual(str(caught.exception), "selected change base is invalid")
 
 
 if __name__ == "__main__":
