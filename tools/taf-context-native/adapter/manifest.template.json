@@ -10,6 +10,7 @@
     "build",
     "estimate",
     "metrics",
+    "related-symbols",
     "repository-map",
     "search-docs",
     "search-symbols",

@@ -25,7 +25,7 @@ Each finding has `rank`, `result_identity`, `path`, `start_line`, `end_line`, `l
 
 ## Relationship findings (`related-symbols`)
 
-A `related-symbols` finding carries four extra fields beyond the ones above: `relation` (`call` or `import`), `edge_evidence` (`verified` or `inferred`), `reference_line`, and `reference_count`. These four fields are present only on `related-symbols` findings; every other operation's findings carry them as empty/zero and you should ignore them there.
+A `related-symbols` finding carries four extra fields beyond the ones above: `relation` (`call` or `import`), `edge_evidence` (`verified` or `inferred`), `reference_line`, and `reference_count`. These four fields are present only on `related-symbols` findings; every other operation's findings do not carry these keys at all, so do not look for them there.
 
 - `edge_evidence: verified` means the resolution from the reference to this specific record was unambiguous (same module scope, or through a single matching import). `edge_evidence: inferred` is a **name match, never proof** — the engine found a definition with the right name somewhere in the index but could not prove it is the one actually called. `related-symbols` hides `inferred` edges by default; only `--allow-inferred` (`allow_inferred` over MCP) returns them, and you must still present them as unconfirmed, not as fact.
 - `reference_line` is the source line of the call or import that produced this edge. `reference_count` is how many times that same target name is referenced from the same enclosing symbol (merged occurrences, not a count of distinct call sites elsewhere).

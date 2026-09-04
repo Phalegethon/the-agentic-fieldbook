@@ -846,13 +846,22 @@ func (resolver *relatedResolver) callerEdge(collector *relatedCollector, anchor 
 // the path and line stay usable.
 func (resolver *relatedResolver) callerRecord(reference model.Record, line int) model.Record {
 	view := resolver.file(reference.Path)
+	named, sameName := model.Record{}, false
 	for _, ordinal := range view.definitions {
 		record, ok := resolver.visit(ordinal)
 		if !ok {
 			break
 		}
-		if record.QualifiedName == reference.QualifiedName {
+		if record.QualifiedName != reference.QualifiedName {
+			continue
+		}
+		// One file may write two definitions with the same qualified name, so
+		// the host is the one whose range the reference record was given.
+		if record.StartLine == reference.StartLine && record.EndLine == reference.EndLine {
 			return record
+		}
+		if !sameName {
+			named, sameName = record, true
 		}
 	}
 	if view.module >= 0 {
@@ -860,12 +869,37 @@ func (resolver *relatedResolver) callerRecord(reference model.Record, line int) 
 			return record
 		}
 	}
+	// A range that matches no definition is the widening referenceRange applies
+	// when the enclosing scope does not contain the uses; the name still names
+	// one host there, because only a module scope is widened.
+	if sameName {
+		return named
+	}
 	host := reference
 	host.RecordKind = model.Module
 	host.StartLine, host.EndLine = line, line
 	host.Preview = ""
 	host.TargetName, host.ReferenceCount, host.SearchTerms = "", 0, nil
 	return host
+}
+
+// referenceHostedBy reports whether a reference record carries the uses
+// written inside anchor. A file may hold two definitions with one qualified
+// name - a Python property and its setter, an overload, a platform-conditional
+// def - and the extractor keeps a reference record for each, so the host is
+// identified by its range as well as its name. A module record is the
+// exception: referenceRange widens a module-scope record to the uses it
+// carries when the module's own range does not contain them, as Go's package
+// clause never does, and one file has a single module scope for the name to
+// identify.
+func referenceHostedBy(reference, anchor model.Record) bool {
+	if reference.Path != anchor.Path || reference.QualifiedName != anchor.QualifiedName {
+		return false
+	}
+	if anchor.RecordKind == model.Module {
+		return true
+	}
+	return reference.StartLine == anchor.StartLine && reference.EndLine == anchor.EndLine
 }
 
 // callees reads the anchor's own reference record and resolves every name it
@@ -877,7 +911,7 @@ func (resolver *relatedResolver) callees(collector *relatedCollector, anchor mod
 		if !ok {
 			return
 		}
-		if reference.QualifiedName != anchor.QualifiedName {
+		if !referenceHostedBy(reference, anchor) {
 			continue
 		}
 		entries, parsed := model.ParseReferenceTable(reference.TargetName)

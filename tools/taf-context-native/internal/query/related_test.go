@@ -645,3 +645,103 @@ func TestRelatedPrefersANonTestFileAsTheGoPackageRepresentative(t *testing.T) {
 		t.Fatalf("imports of a test-only package = %#v, want %#v", got, want)
 	}
 }
+
+// A Python property and its setter are written with one qualified name in one
+// file, and the extractor keeps a reference record for each of them. The query
+// side must keep them apart too: the getter calls only what its own body
+// calls, and the caller reported for a use is the definition whose range
+// contains it.
+func relatedSameNameFixture() []model.Record {
+	return []model.Record{
+		pythonRecord("prop-reader", "pkg/prop.py", "prop.reader", model.Definition, 1, 2),
+		pythonRecord("prop-writer", "pkg/prop.py", "prop.writer", model.Definition, 5, 6),
+		pythonRecord("prop-box", "pkg/prop.py", "prop.Box", model.Definition, 8, 16),
+		pythonRecord("prop-getter", "pkg/prop.py", "prop.Box.value", model.Definition, 9, 12),
+		pythonReference("prop-getter-uses", "pkg/prop.py", "prop.Box.value", 9, 12, []model.ReferenceEntry{
+			{Name: "reader", Line: 12, Count: 1},
+		}),
+		pythonRecord("prop-setter", "pkg/prop.py", "prop.Box.value", model.Definition, 14, 16),
+		pythonReference("prop-setter-uses", "pkg/prop.py", "prop.Box.value", 14, 16, []model.ReferenceEntry{
+			{Name: "writer", Line: 16, Count: 1},
+		}),
+	}
+}
+
+func TestRelatedKeepsSameNamedDefinitionsOfOneFileApart(t *testing.T) {
+	snapshot := relatedSnapshot(relatedSameNameFixture())
+
+	getter := Related(snapshot, relatedRequest("callees", "prop-getter"), policy.ProductionLimits())
+	if got, want := relatedIdentities(getter.Findings), []string{"prop-reader"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callees of the getter = %#v, want %#v", got, want)
+	}
+	if finding := getter.Findings[0]; finding.EdgeEvidence != model.Verified || finding.ReferenceLine != 12 {
+		t.Fatalf("getter callee edge = %#v", finding)
+	}
+	setter := Related(snapshot, relatedRequest("callees", "prop-setter"), policy.ProductionLimits())
+	if got, want := relatedIdentities(setter.Findings), []string{"prop-writer"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callees of the setter = %#v, want %#v", got, want)
+	}
+	if finding := setter.Findings[0]; finding.EdgeEvidence != model.Verified || finding.ReferenceLine != 16 {
+		t.Fatalf("setter callee edge = %#v", finding)
+	}
+
+}
+
+// A use is attributed to the definition whose range contains it, not to the
+// first definition of that name in the file.
+func TestRelatedAttributesACallToTheDefinitionThatContainsIt(t *testing.T) {
+	snapshot := relatedSnapshot(relatedSameNameFixture())
+
+	callers := Related(snapshot, relatedRequest("callers", "prop-writer"), policy.ProductionLimits())
+	if got, want := relatedIdentities(callers.Findings), []string{"prop-setter"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callers of writer = %#v, want the setter %#v", got, want)
+	}
+	host := callers.Findings[0].Record
+	line := callers.Findings[0].ReferenceLine
+	if host.StartLine != 14 || host.EndLine != 16 || line < host.StartLine || line > host.EndLine {
+		t.Fatalf("caller host = %d-%d, reference line %d", host.StartLine, host.EndLine, line)
+	}
+	readers := Related(snapshot, relatedRequest("callers", "prop-reader"), policy.ProductionLimits())
+	if got, want := relatedIdentities(readers.Findings), []string{"prop-getter"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callers of reader = %#v, want the getter %#v", got, want)
+	}
+	if host := readers.Findings[0].Record; host.StartLine != 9 || host.EndLine != 12 {
+		t.Fatalf("reader caller host = %d-%d, want the getter's range 9-12", host.StartLine, host.EndLine)
+	}
+}
+
+// The ordinary shape - one definition of a name in a file - keeps resolving as
+// it did before the ranges were compared.
+func TestRelatedSingleDefinitionHostsAreUnchanged(t *testing.T) {
+	snapshot := relatedSnapshot(relatedFixture())
+	callees := Related(snapshot, relatedRequest("callees", "a-run"), policy.ProductionLimits())
+	if got, want := relatedIdentities(callees.Findings), []string{"a-helper", "b-load"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callees of a.run = %#v, want %#v", got, want)
+	}
+	callers := Related(snapshot, relatedRequest("callers", "b-load"), policy.ProductionLimits())
+	if got, want := relatedIdentities(callers.Findings), []string{"a-run"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callers of b.load = %#v, want %#v", got, want)
+	}
+	if host := callers.Findings[0].Record; host.StartLine != 3 || host.EndLine != 9 {
+		t.Fatalf("caller host = %d-%d, want 3-9", host.StartLine, host.EndLine)
+	}
+}
+
+// Go's module scope is the package clause alone, so referenceRange widens the
+// module's reference record to the uses it carries and its range no longer
+// equals the module record's. A file has one module scope, so the name still
+// identifies that host and a package-level call keeps resolving.
+func TestRelatedCalleesOfAGoPackageScopeSurviveTheWidenedRange(t *testing.T) {
+	records := []model.Record{
+		goRecord("app-module", "app/main.go", "app", model.Module, 1, 1),
+		goReference("app-module-uses", "app/main.go", "app", 3, 3, []model.ReferenceEntry{{Name: "helper", Line: 3, Count: 1}}),
+		goRecord("app-helper", "app/main.go", "app.helper", model.Definition, 5, 7),
+	}
+	response := Related(relatedSnapshot(records), relatedRequest("callees", "app-module"), policy.ProductionLimits())
+	if got, want := relatedIdentities(response.Findings), []string{"app-helper"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callees of the package scope = %#v, want %#v", got, want)
+	}
+	if finding := response.Findings[0]; finding.EdgeEvidence != model.Verified || finding.ReferenceLine != 3 {
+		t.Fatalf("package-scope callee edge = %#v", finding)
+	}
+}
