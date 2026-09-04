@@ -659,11 +659,15 @@ OVERVIEW_QUERY_OPERATION = "repository-overview"
 # once, so `level1_models` refuses it a representative file; the same literal
 # is the wire's, and a table carries at most one of it.
 OVERVIEW_OTHER_PREFIX = "*"
-# The file layer's share of a small budget: the table folds around it rather
-# than through it, so an overview always names at least this many files as long
-# as it has that many to name. Four is one screenful of evidence and, on a table
-# of the width this repository has, about two rows' worth of characters.
-OVERVIEW_FINDING_RESERVE = 4
+# The two layers of an overview answer - the directory table and the ranked
+# file layer - share the caller's output budget, and neither takes more than
+# its half while the other still wants room. The engine hands both far wider
+# than a small budget holds, so a rule that fitted one layer first would always
+# spend the other one entirely: fitting the table first collapses it to a
+# single row, and fitting the file layer first answers 8000 characters with
+# four files. Halving is what makes a wider budget buy a wider table and more
+# files at the same time.
+OVERVIEW_BUDGET_SHARES = 2
 # The five counters every group row sums when two rows become one.
 _OVERVIEW_COUNTERS = (
     "file_count",
@@ -677,7 +681,23 @@ _OVERVIEW_COUNTERS = (
 # canonical JSON, so it gets a larger default than the shared 4000 and both
 # surfaces resolve it here, which is what keeps them from drifting apart.
 DEFAULT_OUTPUT_CHARACTERS = 4000
-DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION: dict[str, int] = {OVERVIEW_QUERY_OPERATION: 8000}
+DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION: dict[str, int] = {
+    OVERVIEW_QUERY_OPERATION: 8000,
+    # The composed answer carries the change set as well as the candidates, so
+    # 4000 characters were spent on context before the first candidate: the
+    # operation is the one that answers "what could my change break", and it
+    # could not answer it for a change set of any size.
+    "impact-candidates": 8000,
+}
+# The overview is fitted entirely by the broker, so it asks the engine for the
+# widest answer the wire allows - 12000 is the largest of the four budgets the
+# request schema accepts. Handing the engine the caller's own budget instead
+# let the engine's own fit - which measures rendered lines and their previews,
+# not the object the broker sends - drop findings before the broker ever saw
+# them, and no rule here could buy them back: on a repository whose previews
+# are long, an 8000-character overview arrived with four of the eight files it
+# asked for.
+OVERVIEW_ENGINE_OUTPUT_CHARACTERS = 12000
 # The composed operation asks the engine for the widest change set and the
 # widest relationship answer it will give, then trims what it composed to the
 # caller's own budget.
@@ -1067,26 +1087,17 @@ def trim_to_budget(
 
 
 def _drop_findings_to_budget(
-    result: dict[str, object],
-    maximum_output_characters: int,
-    *,
-    keep_at_least: int = 0,
+    result: dict[str, object], maximum_output_characters: int
 ) -> dict[str, object]:
     """Drop findings from the tail, cheapest loss first, until the object fits.
 
     Popping from the tail leaves every surviving finding's rank exactly as it
     was, so ranks stay contiguous from 1 without renumbering.
     `returned_count`/`omitted_count` and `truncated` are updated to match each
-    drop, and `output_characters` is remeasured after every one. `keep_at_least`
-    stops the drop short of a floor, which is how the overview reserves its
-    file layer a share of the budget before the table pays; the default of zero
-    is the unconditional drop every other composed result uses.
+    drop, and `output_characters` is remeasured after every one.
     """
     findings = list(result["findings"])  # type: ignore[arg-type]
-    while (
-        len(findings) > keep_at_least
-        and int(result["output_characters"]) > maximum_output_characters
-    ):
+    while findings and int(result["output_characters"]) > maximum_output_characters:
         findings.pop()
         result["findings"] = findings
         result["returned_count"] = len(findings)
@@ -1115,76 +1126,154 @@ def _merge_overview_languages(
     ]
 
 
-def _fold_overview_tail(result: dict[str, object]) -> bool:
-    """Fold the table's last directory row into `*`; say whether it could.
+def _overview_real_rows(groups: list[dict[str, object]]) -> int:
+    """How many rows still name a directory, so all of them but `*`."""
+    if groups and groups[-1]["path_prefix"] == OVERVIEW_OTHER_PREFIX:
+        return len(groups) - 1
+    return len(groups)
+
+
+def _overview_rows_folded_to(
+    groups: list[dict[str, object]], keep: int
+) -> tuple[list[dict[str, object]], int] | None:
+    """The table with `keep` directory rows left, and how many rows it lost.
 
     The folded row speaks for every directory the answer had no room for, so
     there is exactly one of it and it is always last: an engine that folded
     rows of its own is merged into, never doubled, and the merged row keeps
     the nine keys the wire names - depth 0 and no representative file, because
-    it stands for whole directories rather than one of them. `other_group_count`
-    counts every row the table lost, so a reader can still add the repository
-    up. One directory row is the floor - a table of nothing but `*` would
-    describe no repository at all - and reaching it is what `False` reports.
-    The answer handed in is left alone; the fold rebuilds what it changes.
+    it stands for whole directories rather than one of them. Folding several
+    rows at once sums and merges exactly what folding them one at a time would,
+    which is what lets the search below skip the intermediate tables. One
+    directory row is the floor - a table of nothing but `*` would describe no
+    repository at all - and `None` reports a table that is already at or below
+    `keep`. The rows handed in are read, never written: the fold builds new
+    ones.
     """
-    groups = list(result.get("groups") or [])
-    overview = result.get("overview")
-    if not isinstance(overview, dict):
-        return False
-    folded = None
-    if groups and groups[-1]["path_prefix"] == OVERVIEW_OTHER_PREFIX:
-        folded = groups.pop()
-    if len(groups) < 2:
-        return False
-    tail = groups.pop()
+    rows = list(groups)
+    folded = (
+        rows.pop()
+        if rows and rows[-1]["path_prefix"] == OVERVIEW_OTHER_PREFIX
+        else None
+    )
+    if keep < 1 or len(rows) <= keep:
+        return None
+    tail = rows[keep:]
     merged: dict[str, object] = {
         "path_prefix": OVERVIEW_OTHER_PREFIX,
         "depth": 0,
         "languages": _merge_overview_languages(
-            list(tail["languages"]), list(folded["languages"]) if folded else []
+            *(list(row["languages"]) for row in tail),
+            list(folded["languages"]) if folded else [],
         ),
         "representative_identity": None,
     }
     for counter in _OVERVIEW_COUNTERS:
-        merged[counter] = int(tail[counter]) + (int(folded[counter]) if folded else 0)
-    groups.append(merged)
-    result["groups"] = groups
+        merged[counter] = sum(int(row[counter]) for row in tail) + (
+            int(folded[counter]) if folded else 0
+        )
+    return rows[:keep] + [merged], len(tail)
+
+
+def _apply_overview_fold(
+    result: dict[str, object], folded: tuple[list[dict[str, object]], int] | None
+) -> None:
+    """Write a fold back, counting every directory row the table gave up.
+
+    `other_group_count` counts them all, so a reader can still add the whole
+    repository up. The answer handed in is left alone; the fold rebuilds what
+    it changes, and a fold of `None` changes nothing.
+    """
+    overview = result.get("overview")
+    if folded is None or not isinstance(overview, dict):
+        return
+    rows, lost = folded
+    result["groups"] = rows
     result["overview"] = dict(
-        overview, other_group_count=int(overview["other_group_count"]) + 1
+        overview, other_group_count=int(overview["other_group_count"]) + lost
     )
-    return True
+
+
+def _fold_overview_table_to_share(
+    result: dict[str, object], table_budget: int
+) -> None:
+    """Fold the table's tail until the table layer fits its share of the budget.
+
+    The widest table that fits is found by binary search over the serialized
+    length of the folded table - about `log2(rows)` serializations rather than
+    one per row given up, which is what keeps a table at the wire's four
+    thousand row bound from costing a minute of the caller's query. The length
+    grows with the row count, so the search lands on the same table folding one
+    row at a time would have left; the two single-step walks afterwards are
+    what makes that true rather than assumed, and on a real table they take no
+    steps at all. Only `groups` and `overview` are measured: the file layer has
+    its own share and must not push the table below what the table was given.
+    """
+    groups = list(result.get("groups") or [])
+    overview = result.get("overview")
+    widest = _overview_real_rows(groups)
+    if not isinstance(overview, dict) or widest < 2:
+        return
+    measured: dict[int, int] = {}
+
+    def length(keep: int) -> int:
+        if keep not in measured:
+            folded = _overview_rows_folded_to(groups, keep)
+            rows, lost = (groups, 0) if folded is None else folded
+            measured[keep] = _canonical_length(
+                {
+                    "groups": rows,
+                    "overview": dict(
+                        overview,
+                        other_group_count=int(overview["other_group_count"]) + lost,
+                    ),
+                }
+            )
+        return measured[keep]
+
+    low, high, keep = 1, widest, 1
+    while low <= high:
+        middle = (low + high) // 2
+        if length(middle) <= table_budget:
+            keep, low = middle, middle + 1
+        else:
+            high = middle - 1
+    while keep < widest and length(keep + 1) <= table_budget:
+        keep += 1
+    while keep > 1 and length(keep) > table_budget:
+        keep -= 1
+    _apply_overview_fold(result, _overview_rows_folded_to(groups, keep))
 
 
 def fit_overview_to_budget(
     summary: dict[str, object], maximum_output_characters: int
 ) -> dict[str, object]:
-    """Fit an overview answer into its output budget, cheapest loss first.
+    """Fit an overview answer into its output budget, half of it to each layer.
 
-    The table is what this operation is asked for, so it is not the first
-    thing to pay: the engine ranks far more files than a small budget holds,
-    and a file beyond the reserve is the cheapest loss there is. So the file
-    layer drops from its tail down to `OVERVIEW_FINDING_RESERVE` findings
-    first; then, and only then, the table's tail folds into `*` a row at a
-    time - the counts stay in the table, only the detail behind them goes -
-    down to a single directory row; and only a budget that still does not fit
-    spends the reserve as well. That ordering is what makes a wider budget buy
-    a wider table instead of nothing but more files. If a one-row table with no
-    findings still does not fit, `output-budget-exceeded` says so instead of a
-    silent overrun. `output_characters` is always the final canonical length.
+    The directory table and the ranked file layer are both what this operation
+    is asked for, so neither pays for the other: the table's share is half of
+    the budget, and it folds its tail into `*` only for as long as it is over
+    that half - the counts stay in the table, only the detail behind them goes
+    - down to a single directory row. Everything the table did not spend is the
+    file layer's, and the file layer drops from its tail until the whole answer
+    fits. A table already inside its half is therefore never folded and the
+    file layer gets all the rest, while a table wider than its half yields
+    exactly what it is over. That is what makes a wider budget buy a wider
+    table and more files at once. If a one-row table with no findings still
+    does not fit, `output-budget-exceeded` says so instead of a silent
+    overrun - and it can say nothing else, because an envelope small enough to
+    leave a two-row table inside half the budget is small enough for that table
+    to fit the whole of it. `output_characters` is always the final canonical
+    length.
     """
     fitted = dict(summary)
     fitted["output_characters"] = _output_characters(fitted)
     if int(fitted["output_characters"]) <= maximum_output_characters:
         return fitted
-    reserve = min(int(fitted["returned_count"]), OVERVIEW_FINDING_RESERVE)
-    fitted = _drop_findings_to_budget(
-        fitted, maximum_output_characters, keep_at_least=reserve
+    _fold_overview_table_to_share(
+        fitted, maximum_output_characters // OVERVIEW_BUDGET_SHARES
     )
-    while int(
-        fitted["output_characters"]
-    ) > maximum_output_characters and _fold_overview_tail(fitted):
-        fitted["output_characters"] = _output_characters(fitted)
+    fitted["output_characters"] = _output_characters(fitted)
     fitted = _drop_findings_to_budget(fitted, maximum_output_characters)
     if int(fitted["output_characters"]) > maximum_output_characters:
         _add_warning(fitted, WARNING_OUTPUT_BUDGET_EXCEEDED)
@@ -1355,7 +1444,11 @@ def run_query(
             "source_types": arguments.source_types,
         },
         maximum_results=arguments.maximum_results,
-        maximum_output_characters=arguments.maximum_output_characters,
+        maximum_output_characters=(
+            OVERVIEW_ENGINE_OUTPUT_CHARACTERS
+            if arguments.operation == OVERVIEW_QUERY_OPERATION
+            else arguments.maximum_output_characters
+        ),
         allow_inferred=arguments.allow_inferred,
     )
     if result.status.value not in {"ready", "partial"}:
@@ -1380,10 +1473,11 @@ def run_query(
     touch_binding(binding_path)
     summary = _query_summary(result, refresh_summary)
     if arguments.operation == OVERVIEW_QUERY_OPERATION:
-        # The engine returns the whole ordered table; the caller's output
-        # budget is what sizes it. The broker drops the file layer to its
-        # reserve, folds the table's tail into the `*` row until the answer
-        # fits, and reports the canonical length of what it actually sends.
+        # The engine returns the whole ordered table and the widest file layer
+        # it was asked for; the caller's own output budget is what sizes both.
+        # The broker folds the table's tail into the `*` row until the table
+        # is inside its half of that budget, drops findings until the whole
+        # answer fits, and reports the canonical length of what it sends.
         return fit_overview_to_budget(summary, arguments.maximum_output_characters)
     return summary
 

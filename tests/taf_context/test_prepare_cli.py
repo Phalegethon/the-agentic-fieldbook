@@ -2184,10 +2184,15 @@ class QueryArgumentInvariantTests(unittest.TestCase):
             self.assertLessEqual(answered["output_characters"], 4000)
 
     def test_both_surfaces_default_the_output_budget_by_operation(self) -> None:
-        """The overview's table alone fills 4000 characters, so both default to 8000."""
+        """Two operations answer with more than one layer, so both default to 8000."""
         parser = argparse.ArgumentParser()
         register_prepare_command(parser.add_subparsers(dest="command", required=True))
-        for operation, expected in (("repository-overview", 8000), ("repository-map", 4000)):
+        for operation, expected in (
+            ("repository-overview", 8000),
+            ("impact-candidates", 8000),
+            ("repository-map", 4000),
+            ("changed-symbols", 4000),
+        ):
             with self.subTest(operation=operation):
                 cli = self._cli_arguments(
                     parser,

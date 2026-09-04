@@ -14,8 +14,8 @@ for byte the same way twice; the third that a `--path-prefix` re-roots the
 answer on the children of that subtree and re-derives the same counts one
 level down; the fourth that asking for several prefixes is served from the
 first in sorted order and says so; the fifth that the output budget is what
-sizes the table, folding its tail into the `"*"` row around a reserved file
-layer, so a wider budget buys a wider table.
+sizes the table, folding its tail into the `"*"` row until the table fits its
+half of the budget, so a wider budget buys a wider table as well as more files.
 """
 
 from __future__ import annotations
@@ -284,11 +284,12 @@ class DogfoodOverviewTests(unittest.TestCase):
 
     def test_the_output_budget_is_what_sizes_the_table(self) -> None:
         # The table has no fixed width any more: the engine returns every
-        # group and the broker folds the tail into `"*"` until the answer fits
-        # the caller's budget, so the same repository answers with a wider
-        # table the more room it is given.
+        # group and the broker gives the table and the file layer half of the
+        # caller's budget each, folding the table's tail into `"*"` only for as
+        # long as the table is over its half. So the same repository answers
+        # with a wider table the more room it is given, and a table that fits
+        # its half is handed on whole while the file layer takes the rest.
         matrix = self.fixture["budgets"]
-        reserve = matrix["finding_reserve"]
         for key, prefixes in (("repository", ()), ("subtree", (self.fixture["subtree"]["path_prefix"],))):
             width = len(self.fixture[key]["groups"])
             widths: list[int] = []
@@ -326,13 +327,25 @@ class DogfoodOverviewTests(unittest.TestCase):
                         self.assertEqual(
                             result["groups"][-1]["path_prefix"], FOLDED_PREFIX
                         )
-                    # The file layer is what the fold reserves room for, and
+                    # The file layer keeps what the table did not spend, and
                     # the answer never silently overruns the budget it was
                     # given.
                     self.assertEqual(result["returned_count"], expected["returned_count"])
-                    self.assertGreaterEqual(result["returned_count"], reserve)
+                    self.assertGreater(result["returned_count"], 0)
                     self.assertNotIn("output-budget-exceeded", result["warnings"])
                     self.assertLessEqual(result["output_characters"], budget)
+                    # A table that gave rows up stopped at its own half; one
+                    # that kept them all was never charged for the file layer.
+                    table = len(
+                        json.dumps(
+                            {"groups": result["groups"], "overview": result["overview"]},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    )
+                    if expected["other_group_count"]:
+                        self.assertLessEqual(table, budget // 2)
                     widths.append(len(rows))
             # A wider budget never buys a narrower table.
             self.assertEqual(widths, sorted(widths), key)

@@ -5,18 +5,22 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import random
 import stat
 import tempfile
 import textwrap
+import time
 import unittest
 from unittest.mock import patch
 
+from taf_context import context_operations
 from taf_context.change_ranges import ChangedPath
 from taf_context.context_operations import (
     MAXIMUM_REQUEST_BYTES,
+    OVERVIEW_BUDGET_SHARES,
     PrepareCLIError,
     QueryArguments,
-    _fold_overview_tail,
+    _overview_rows_folded_to,
     bound_changed_selector,
     compose_impact_candidates,
     fit_overview_to_budget,
@@ -309,6 +313,76 @@ class OperationTests(unittest.TestCase):
             self.assertEqual(overview["operation"], "repository-overview")
             self.assertEqual(overview["status"], "ready")
             self.assertNotIn("base", overview)
+
+    def test_the_overview_always_asks_the_engine_for_the_widest_answer(self) -> None:
+        # The engine fits its own answer to the budget it is given, and it
+        # measures rendered lines rather than the object the broker sends, so
+        # a small budget passed straight through made the engine drop findings
+        # the broker's own two-layer rule could still have afforded - an 8000
+        # character request answering with four of eight candidates. The
+        # overview therefore asks for the widest answer the wire allows and
+        # does every bit of the fitting itself.
+        with tempfile.TemporaryDirectory() as directory:
+            repository = init_committed_repo(Path(directory) / "repo")
+            binary = Path(directory) / "engine"
+            write_fake_native_engine(binary, wide_overview=True)
+            environment = self._environment(directory, binary)
+            transports: list[RecordingTransport] = []
+
+            def transport_for(path: Path) -> RecordingTransport:
+                transports.append(RecordingTransport(path))
+                return transports[-1]
+
+            run_build(repository, environment=environment, transport_for=transport_for)
+            for budget in (2000, 4000, 8000, 12000):
+                with self.subTest(budget=budget):
+                    overview = run_query(
+                        repository,
+                        QueryArguments(
+                            "repository-overview", None, (), [], [], [], [], 6, budget, False
+                        ),
+                        environment=environment,
+                        transport_for=transport_for,
+                    )
+                    sent = [
+                        item
+                        for transport in transports
+                        for item in transport.requests
+                        if item["operation"] == "repository-overview"
+                    ][-1]
+
+                    self.assertEqual(sent["maximum_model_output_characters"], 12000)
+                    # Only the budget is widened: how many files the engine
+                    # ranks is still the caller's own limit.
+                    self.assertEqual(sent["maximum_results"], 6)
+                    # And the caller's budget is what bounds what it receives.
+                    self.assertLessEqual(overview["output_characters"], budget)
+                    self.assertEqual(
+                        overview["output_characters"],
+                        len(
+                            json.dumps(
+                                overview,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                        ),
+                    )
+            # Every other operation still hands the engine the caller's own
+            # budget, because the engine is what fits those answers.
+            run_query(
+                repository,
+                QueryArguments("repository-map", None, (), [], [], [], [], 6, 2000, False),
+                environment=environment,
+                transport_for=transport_for,
+            )
+            mapped = [
+                item
+                for transport in transports
+                for item in transport.requests
+                if item["operation"] == "repository-map"
+            ][-1]
+            self.assertEqual(mapped["maximum_model_output_characters"], 2000)
 
     def test_the_overview_summary_is_never_trimmed_and_reports_its_length(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1153,7 +1227,7 @@ class OverviewQueryRequestTests(unittest.TestCase):
 
 
 class OverviewBudgetTests(unittest.TestCase):
-    """The table's tail folds into `*` until the answer fits its budget."""
+    """The table and the file layer share the budget, half of it to each."""
 
     def _group(self, path_prefix: str, **overrides: object) -> dict[str, object]:
         """One directory row with the exact nine keys the wire names."""
@@ -1218,6 +1292,40 @@ class OverviewBudgetTests(unittest.TestCase):
             json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         )
 
+    def _table_length(self, value: dict[str, object]) -> int:
+        """The length of the table layer alone: its rows and its summary."""
+        return self._length({"groups": value["groups"], "overview": value["overview"]})
+
+    def _folded_one_row_at_a_time(
+        self, summary: dict[str, object], budget: int
+    ) -> dict[str, object]:
+        """The reference fold: one row given up per measurement, no search."""
+        reference = json.loads(json.dumps(summary))
+        reported = 0
+        for _attempt in range(8):
+            measured = self._length(dict(reference, output_characters=reported))
+            if measured == reported:
+                break
+            reported = measured
+        if reported <= budget:
+            # An answer already inside its budget is never folded, whatever
+            # the two layers would have been entitled to.
+            return reference
+        table_budget = budget // OVERVIEW_BUDGET_SHARES
+        while self._table_length(reference) > table_budget:
+            groups = reference["groups"]
+            keep = len(self._directory_rows(reference)) - 1
+            folded = _overview_rows_folded_to(groups, keep)
+            if folded is None:
+                break
+            rows, lost = folded
+            reference["groups"] = rows
+            reference["overview"] = dict(
+                reference["overview"],
+                other_group_count=int(reference["overview"]["other_group_count"]) + lost,
+            )
+        return reference
+
     def _directory_rows(self, fitted: dict[str, object]) -> list[dict[str, object]]:
         """The rows that still name a directory, so without the folded one."""
         groups = fitted["groups"]
@@ -1225,27 +1333,25 @@ class OverviewBudgetTests(unittest.TestCase):
         return [row for row in groups if row["path_prefix"] != "*"]
 
     def test_folding_turns_the_last_row_into_the_folded_row(self) -> None:
-        result = {
-            "groups": [
-                self._group("src/", languages=[{"language": "Go", "file_count": 12}]),
-                self._group(
-                    "web/",
-                    depth=1,
-                    file_count=3,
-                    definition_count=7,
-                    languages=[{"language": "Python", "file_count": 3}],
-                    representative_identity="sha256:" + "a" * 64,
-                ),
-            ],
-            "overview": {"root": "", "counted_file_count": 15, "other_group_count": 0},
-        }
+        groups = [
+            self._group("src/", languages=[{"language": "Go", "file_count": 12}]),
+            self._group(
+                "web/",
+                depth=1,
+                file_count=3,
+                definition_count=7,
+                languages=[{"language": "Python", "file_count": 3}],
+                representative_identity="sha256:" + "a" * 64,
+            ),
+        ]
 
-        self.assertTrue(_fold_overview_tail(result))
+        rows, lost = _overview_rows_folded_to(groups, 1)
 
         # The folded row keeps the nine keys, stands at the root depth, and
         # names no single file because it speaks for whole directories.
+        self.assertEqual(lost, 1)
         self.assertEqual(
-            result["groups"][-1],
+            rows[-1],
             {
                 "path_prefix": "*",
                 "depth": 0,
@@ -1258,45 +1364,44 @@ class OverviewBudgetTests(unittest.TestCase):
                 "representative_identity": None,
             },
         )
-        self.assertEqual(result["overview"]["other_group_count"], 1)
+        self.assertEqual([row["path_prefix"] for row in rows], ["src/", "*"])
+        # The table it was handed is read, never written.
+        self.assertEqual([row["path_prefix"] for row in groups], ["src/", "web/"])
         # One directory row is the floor: a table of nothing but `*` would
-        # describe no repository at all, so the fold refuses and says so.
-        self.assertFalse(_fold_overview_tail(result))
-        self.assertEqual([row["path_prefix"] for row in result["groups"]], ["src/", "*"])
-        self.assertEqual(result["overview"]["other_group_count"], 1)
+        # describe no repository at all, so the fold refuses.
+        self.assertIsNone(_overview_rows_folded_to(rows, 0))
+        self.assertIsNone(_overview_rows_folded_to(rows, 1))
 
     def test_folding_merges_into_the_row_the_engine_already_folded(self) -> None:
         # A 2.5.0 engine answers with a folded row of its own. A second `*`
         # row would be a table no reader could add up, so the tail merges into
         # the one that is already there.
-        result = {
-            "groups": [
-                self._group("src/", languages=[{"language": "Go", "file_count": 12}]),
-                self._group(
-                    "web/",
-                    file_count=3,
-                    definition_count=7,
-                    languages=[
-                        {"language": "Python", "file_count": 2},
-                        {"language": "Go", "file_count": 1},
-                    ],
-                    representative_identity="sha256:" + "a" * 64,
-                ),
-                self._group(
-                    "*",
-                    depth=0,
-                    file_count=5,
-                    definition_count=9,
-                    languages=[{"language": "Go", "file_count": 5}],
-                ),
-            ],
-            "overview": {"root": "", "counted_file_count": 20, "other_group_count": 4},
-        }
+        groups = [
+            self._group("src/", languages=[{"language": "Go", "file_count": 12}]),
+            self._group(
+                "web/",
+                file_count=3,
+                definition_count=7,
+                languages=[
+                    {"language": "Python", "file_count": 2},
+                    {"language": "Go", "file_count": 1},
+                ],
+                representative_identity="sha256:" + "a" * 64,
+            ),
+            self._group(
+                "*",
+                depth=0,
+                file_count=5,
+                definition_count=9,
+                languages=[{"language": "Go", "file_count": 5}],
+            ),
+        ]
 
-        self.assertTrue(_fold_overview_tail(result))
+        rows, lost = _overview_rows_folded_to(groups, 1)
 
+        self.assertEqual(lost, 1)
         self.assertEqual(
-            result["groups"],
+            rows,
             [
                 self._group("src/", languages=[{"language": "Go", "file_count": 12}]),
                 {
@@ -1317,65 +1422,69 @@ class OverviewBudgetTests(unittest.TestCase):
                 },
             ],
         )
-        self.assertEqual(result["overview"]["other_group_count"], 5)
 
-    def test_the_file_layer_pays_down_to_its_reserve_before_the_table_folds(self) -> None:
-        fitted = fit_overview_to_budget(self._summary(20, finding_count=6), 4900)
-
-        self.assertLessEqual(fitted["output_characters"], 4900)
-        self.assertEqual(fitted["output_characters"], self._length(fitted))
-        self.assertEqual(fitted["warnings"], [])
-        # Dropping one finding is enough here, and a finding above the reserve
-        # is the cheapest loss there is: the table is what the operation is
-        # asked for, so no row is folded while the file layer is still long.
-        self.assertEqual(len(self._directory_rows(fitted)), 20)
-        self.assertEqual(fitted["overview"]["other_group_count"], 0)
-        self.assertNotIn("*", [row["path_prefix"] for row in fitted["groups"]])
-        self.assertEqual(fitted["returned_count"], 5)
-        self.assertEqual(fitted["omitted_count"], 1)
-        self.assertTrue(fitted["truncated"])
-
-    def test_the_table_folds_once_the_file_layer_is_down_to_its_reserve(self) -> None:
+    def test_each_layer_gets_at_most_half_of_the_budget(self) -> None:
         fitted = fit_overview_to_budget(self._summary(20, finding_count=6), 4000)
 
         self.assertLessEqual(fitted["output_characters"], 4000)
         self.assertEqual(fitted["output_characters"], self._length(fitted))
         self.assertEqual(fitted["warnings"], [])
-        # The reserve stands: four files are what the table may not take.
-        self.assertEqual(fitted["returned_count"], 4)
-        self.assertEqual(fitted["omitted_count"], 2)
-        # Everything the budget still lacks comes out of the table's tail.
-        self.assertEqual(len(self._directory_rows(fitted)), 14)
+        # The table folds only for as long as it is over its own half, so it
+        # keeps as many rows as 2000 characters hold and the file layer is
+        # never charged for them.
+        self.assertLessEqual(self._table_length(fitted), 4000 // OVERVIEW_BUDGET_SHARES)
+        self.assertEqual(len(self._directory_rows(fitted)), 9)
         self.assertEqual(fitted["groups"][-1]["path_prefix"], "*")
         # Every row the table lost is counted, so the reader can still add the
         # whole repository up.
-        self.assertEqual(fitted["overview"]["other_group_count"], 6)
-
-    def test_a_shorter_file_layer_is_its_own_reserve(self) -> None:
-        # The reserve is `min(returned_count, 4)`, so an answer that carries
-        # fewer files than the reserve keeps all of them while the table folds.
-        fitted = fit_overview_to_budget(self._summary(20, finding_count=2), 2000)
-
-        self.assertLessEqual(fitted["output_characters"], 2000)
-        self.assertEqual(fitted["warnings"], [])
-        self.assertEqual(fitted["returned_count"], 2)
+        self.assertEqual(fitted["overview"]["other_group_count"], 11)
+        # And the file layer, which fits in what the table left, pays nothing.
+        self.assertEqual(fitted["returned_count"], 6)
         self.assertEqual(fitted["omitted_count"], 0)
         self.assertFalse(fitted["truncated"])
-        self.assertEqual(len(self._directory_rows(fitted)), 5)
-        self.assertEqual(fitted["overview"]["other_group_count"], 15)
 
-    def test_the_reserve_is_spent_only_after_the_table_is_one_row(self) -> None:
+    def test_a_table_inside_its_half_is_never_folded_and_keeps_the_rest(self) -> None:
+        # Six rows are far short of 2000 characters, so the table is handed on
+        # exactly as the engine ranked it and the whole remainder of the budget
+        # buys files - nineteen of them, not a fixed reserve of four.
+        original = self._summary(6, finding_count=40)
+        fitted = fit_overview_to_budget(original, 4000)
+
+        self.assertLessEqual(fitted["output_characters"], 4000)
+        self.assertEqual(fitted["output_characters"], self._length(fitted))
+        self.assertEqual(fitted["warnings"], [])
+        self.assertEqual(fitted["groups"], original["groups"])
+        self.assertEqual(fitted["overview"]["other_group_count"], 0)
+        self.assertNotIn("*", [row["path_prefix"] for row in fitted["groups"]])
+        self.assertEqual(fitted["returned_count"], 19)
+        self.assertEqual(fitted["omitted_count"], 21)
+        self.assertTrue(fitted["truncated"])
+
+    def test_the_file_layer_spends_only_what_the_table_left(self) -> None:
+        fitted = fit_overview_to_budget(self._summary(20, finding_count=6), 2000)
+
+        self.assertLessEqual(fitted["output_characters"], 2000)
+        self.assertEqual(fitted["output_characters"], self._length(fitted))
+        self.assertEqual(fitted["warnings"], [])
+        # A thousand characters of table is three rows here; the six findings
+        # fit in what is left, so none of them is dropped.
+        self.assertLessEqual(self._table_length(fitted), 2000 // OVERVIEW_BUDGET_SHARES)
+        self.assertEqual(len(self._directory_rows(fitted)), 3)
+        self.assertEqual(fitted["overview"]["other_group_count"], 17)
+        self.assertEqual(fitted["returned_count"], 6)
+
+    def test_the_table_reaches_its_floor_before_the_file_layer_empties(self) -> None:
         fitted = fit_overview_to_budget(self._summary(20, finding_count=6), 1200)
 
         self.assertLessEqual(fitted["output_characters"], 1200)
         self.assertEqual(fitted["output_characters"], self._length(fitted))
         self.assertEqual(fitted["warnings"], [])
-        # Folding ran out first: one directory row plus the folded one.
+        # 600 characters hold no table at all, so the fold runs to its floor:
+        # one directory row plus the row that speaks for the other nineteen.
         self.assertEqual(len(self._directory_rows(fitted)), 1)
         self.assertEqual(fitted["groups"][-1]["path_prefix"], "*")
         self.assertEqual(fitted["overview"]["other_group_count"], 19)
-        # Only then does the file layer go below its reserve, and it says how
-        # much it lost.
+        # Only then does the file layer pay, and it says how much it lost.
         self.assertEqual(fitted["returned_count"], 2)
         self.assertTrue(fitted["truncated"])
         self.assertEqual(
@@ -1414,6 +1523,12 @@ class OverviewBudgetTests(unittest.TestCase):
                     self.assertEqual(fitted["findings"], [])
                 else:
                     self.assertLessEqual(fitted["output_characters"], budget)
+                if 1 < len(self._directory_rows(fitted)) < 20:
+                    # A table that gave rows up and is not at its one-row floor
+                    # stopped exactly at its own half.
+                    self.assertLessEqual(
+                        self._table_length(fitted), budget // OVERVIEW_BUDGET_SHARES
+                    )
                 self.assertEqual(
                     len(self._directory_rows(fitted))
                     + int(fitted["overview"]["other_group_count"]),
@@ -1422,6 +1537,90 @@ class OverviewBudgetTests(unittest.TestCase):
         # A wider budget buys a wider table, which is the whole point of
         # sizing the table by the budget rather than by a fixed row count.
         self.assertEqual(widths, sorted(widths))
+
+    def test_the_search_folds_exactly_where_folding_row_by_row_would(self) -> None:
+        # The fast fold answers with the widest table that fits its share; the
+        # reference below reaches the same table by measuring after every
+        # single fold. Random tables, so the two are compared on shapes nobody
+        # chose: mixed row widths, mixed languages, and a table the engine had
+        # already folded once.
+        generator = random.Random(20260905)
+        languages = ("Go", "Python", "TypeScript", "Markdown", "JSON")
+        for case in range(40):
+            with self.subTest(case=case):
+                count = generator.randrange(2, 40)
+                groups = [
+                    self._group(
+                        "tools/" + "x" * generator.randrange(1, 24) + f"{index:02d}/",
+                        depth=generator.randrange(1, 5),
+                        file_count=generator.randrange(1, 500),
+                        definition_count=generator.randrange(0, 5000),
+                        languages=[
+                            {"language": name, "file_count": generator.randrange(1, 40)}
+                            for name in generator.sample(
+                                languages, generator.randrange(0, len(languages))
+                            )
+                        ],
+                    )
+                    for index in range(count)
+                ]
+                summary = self._summary(0, finding_count=generator.randrange(0, 8))
+                other = generator.choice((0, 3))
+                if other:
+                    groups.append(
+                        self._group("*", depth=0, languages=[{"language": "Go", "file_count": 5}])
+                    )
+                summary["groups"] = groups
+                summary["overview"]["other_group_count"] = other
+                budget = generator.randrange(600, 12000)
+
+                fitted = fit_overview_to_budget(summary, budget)
+                reference = self._folded_one_row_at_a_time(summary, budget)
+
+                self.assertEqual(fitted["groups"], reference["groups"])
+                self.assertEqual(fitted["overview"], reference["overview"])
+
+    def test_a_wide_table_folds_in_a_logarithmic_number_of_serializations(self) -> None:
+        # The fold used to remeasure the whole answer once per folded row, so
+        # a table at the wire's row bound cost thousands of serializations. A
+        # binary search over the kept row count costs about log2(4096) of them,
+        # which is what this counts - a measure that does not depend on how
+        # fast the machine running the tests happens to be.
+        summary = self._summary(0, finding_count=6)
+        summary["groups"] = [self._group(f"tools/{index:04d}/") for index in range(4096)]
+        original = context_operations._canonical_length
+        serializations = 0
+
+        def counted(value: dict[str, object]) -> int:
+            nonlocal serializations
+            serializations += 1
+            return original(value)
+
+        with patch.object(context_operations, "_canonical_length", counted):
+            fitted = fit_overview_to_budget(summary, 4000)
+
+        self.assertLess(serializations, 100)
+        self.assertLessEqual(fitted["output_characters"], 4000)
+        self.assertEqual(fitted["output_characters"], self._length(fitted))
+        self.assertEqual(
+            len(self._directory_rows(fitted))
+            + int(fitted["overview"]["other_group_count"]),
+            4096,
+        )
+
+    def test_a_wide_table_folds_well_inside_a_second(self) -> None:
+        # The generous bound is a sanity check, not a benchmark: the row-by-row
+        # fold took about a minute for this table, so anything in this range
+        # says the search is doing the work.
+        summary = self._summary(0, finding_count=6)
+        summary["groups"] = [self._group(f"tools/{index:04d}/") for index in range(4096)]
+
+        started = time.perf_counter()
+        fitted = fit_overview_to_budget(summary, 4000)
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 1.0)
+        self.assertLessEqual(fitted["output_characters"], 4000)
 
     def test_a_table_inside_the_budget_is_never_folded(self) -> None:
         original = self._summary(20, finding_count=6)

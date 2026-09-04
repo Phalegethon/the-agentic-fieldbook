@@ -242,12 +242,14 @@ call, which needs neither a query nor an identity: it returns a directory table
 in `groups` with, per prefix, the file, definition, entry-point, document, and
 configuration counts and the languages; an `overview` block naming the
 described root and the counted files; and a ranked file layer that leads with
-entry points and well-known entry file names such as `main.go` under `cmd/` or
-`index.ts`. `--path-prefix D/` describes one subtree, and `--language` counts
-one language's files. The table has no fixed width: the output budget sizes
-it, keeping four files back for the file layer and folding the table's tail
-into a `*` row for whatever does not fit. This operation therefore defaults to
-8000 characters rather than the 4000 the other queries use;
+entry points and well-known entry file names such as `main.go` under `cmd/`,
+`index.ts`, or a Next.js App Router `page.tsx`. `--path-prefix D/` describes
+one subtree, and `--language` counts one language's files. The table has no
+fixed width: the output budget sizes it, and the table and the file layer take
+at most half of it each — a table wider than its half folds its tail into a
+`*` row until it fits, a table inside its half is kept whole, and the file
+layer keeps everything the table did not spend. This operation therefore
+defaults to 8000 characters rather than the 4000 the single-layer queries use;
 `--maximum-output-characters 12000` buys a wider table and more files, while
 `--path-prefix D/` is the way to go deeper into one subtree.
 
@@ -312,7 +314,9 @@ and uncommitted changes are always included. `changed_symbols` accepts the
 same filters as the other query tools; `impact_candidates` accepts only
 `base`, `allow_inferred`, and the two budgets, and composes its answer from
 one `changed_symbols` call plus one relationship call per changed symbol and
-direction over the same engine process. Its candidates are attributed in
+direction over the same engine process. It answers in two layers — the change
+set in `changed` and the candidates in `findings` — so its
+`maximum_output_characters` defaults to 8000 rather than 4000. Its candidates are attributed in
 `anchors` to the changed symbols they depend on; a candidate is a symbol
 that references changed work, not a defect.
 
@@ -321,9 +325,10 @@ directory table in `groups`, the `overview` block, and a ranked file layer in
 `findings`. It takes only `path_prefixes`, `languages`, `allow_inferred`, and
 the two budgets; `path_prefixes` names whole directory segments and describes
 the first of them in sorted order. The group table is sized by the budget
-rather than by a fixed row count, so this tool's `maximum_output_characters`
-defaults to 8000 rather than the 4000 the other query tools use; a larger
-value answers with a wider table.
+rather than by a fixed row count, and the table and the file layer take at
+most half of it each, so this tool's `maximum_output_characters` defaults to
+8000 rather than the 4000 the single-layer query tools use; a larger value
+answers with a wider table and more files.
 
 Claude Code starts the server when the plugin is enabled; the tools appear as
 `mcp__plugin_taf_repo-context__<tool>` (permission matcher

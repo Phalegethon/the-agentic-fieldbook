@@ -5,16 +5,27 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
-from taf_context.context_operations import PrepareCLIError, QueryArguments
+from taf_context.context_operations import (
+    PrepareCLIError,
+    QueryArguments,
+    run_build,
+    run_query,
+)
 from taf_context.mcp_server import (
     SERVER_NAME,
     SERVER_VERSION,
     NativeOperations,
+    _query_arguments,
     serve,
     tool_definitions,
 )
+from taf_context.native_transport import OneShotTransport
+
+from .repo_factory import init_committed_repo
+from .test_prepare_cli import write_fake_native_engine
 
 FIXTURE = Path(__file__).parent / "testdata" / "mcp-tools.json"
 REPO = "/tmp/example-repository"
@@ -226,18 +237,21 @@ class ToolListTests(unittest.TestCase):
         ):
             self.assertIn(warning, tools["repository_overview"]["description"])
 
-    def test_the_overview_tool_defaults_to_a_larger_output_budget(self) -> None:
+    def test_the_two_layered_tools_default_to_a_larger_output_budget(self) -> None:
+        # Both of these answer with two layers - a table and a file layer, a
+        # change set and its candidates - so 4000 characters buy almost none
+        # of the second one.
         tools = {tool["name"]: tool for tool in tool_definitions()}
-        overview_budget = tools["repository_overview"]["inputSchema"]["properties"][
-            "maximum_output_characters"
-        ]
-        self.assertEqual(overview_budget["default"], 8000)
-        self.assertIn("8000", tools["repository_overview"]["description"])
+        larger = {"repository_overview", "impact_candidates"}
+        for name in sorted(larger):
+            budget = tools[name]["inputSchema"]["properties"]["maximum_output_characters"]
+            self.assertEqual(budget["default"], 8000, name)
+            self.assertIn("8000", tools[name]["description"], name)
         for name, tool in tools.items():
             if name in {"inspect", "build"}:
                 continue
             budget = tool["inputSchema"]["properties"]["maximum_output_characters"]
-            expected_default = 8000 if name == "repository_overview" else 4000
+            expected_default = 8000 if name in larger else 4000
             self.assertEqual(budget["default"], expected_default, name)
 
     def test_build_is_the_only_writing_tool_and_requires_user_interaction(self) -> None:
@@ -624,6 +638,64 @@ class ToolCallTests(unittest.TestCase):
         self.assertEqual(len(stderr.splitlines()), 2)
         self.assertRegex(stderr.splitlines()[0], r"^build \d+ms invalid-arguments$")
         self.assertRegex(stderr.splitlines()[1], r"^unknown_tool \d+ms invalid-arguments$")
+
+
+class OverviewInvariantTests(unittest.TestCase):
+    """Invariant 6 through the real dispatch: one object, two surfaces."""
+
+    def test_the_dispatch_answers_a_folded_overview_exactly_as_the_cli_does(self) -> None:
+        # The CLI and the tool call share `run_query`, but only this path also
+        # crosses the JSON-RPC framing, the argument normalization and the
+        # result envelope, so the fold is compared where a caller actually
+        # meets it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = init_committed_repo(root / "repo")
+            binary = root / "taf-level1"
+            write_fake_native_engine(binary, wide_overview=True)
+            environment = {
+                "HOME": str(root),
+                "PATH": "",
+                "TAF_LEVEL1_BINARY": str(binary),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            run_build(
+                repository, environment=environment, transport_for=OneShotTransport
+            )
+            arguments = {
+                "repo": str(repository),
+                "maximum_results": 6,
+                "maximum_output_characters": 4000,
+            }
+            operations = NativeOperations(environment, log=lambda _line: None)
+            try:
+                responses, _, code, _ = run_server(
+                    [call(1, "repository_overview", arguments)], operations
+                )
+            finally:
+                operations.close()
+
+            self.assertEqual(code, 0)
+            answered = responses[0]["result"]["structuredContent"]
+            self.assertNotIn("isError", responses[0]["result"])
+            self.assertEqual(
+                json.loads(responses[0]["result"]["content"][0]["text"]), answered
+            )
+            self.assertEqual(
+                answered,
+                run_query(
+                    repository,
+                    _query_arguments("repository-overview", arguments),
+                    environment=environment,
+                    transport_for=OneShotTransport,
+                ),
+            )
+            # A folded answer, so the comparison is about the fold and not
+            # about a table that fitted anyway.
+            self.assertEqual(answered["groups"][-1]["path_prefix"], "*")
+            self.assertGreater(answered["overview"]["other_group_count"], 0)
+            self.assertEqual(answered["warnings"], [])
+            self.assertLessEqual(answered["output_characters"], 4000)
 
 
 class NativeOperationsTests(unittest.TestCase):

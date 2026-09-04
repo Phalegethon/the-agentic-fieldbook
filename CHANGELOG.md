@@ -5,10 +5,12 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
-Native runtime `0.6.0` (no index format change, so existing indexes are kept;
-the next `inspect` reports `install-native-engine` until `activate` downloads
-the new runtime). Bundled skills: `branch-handoff` 1.2.1,
-`prepare-repo-context` 1.7.1, `work-recovery` 1.1.0.
+Native runtime `0.6.0` (no index format change, so existing indexes built by
+runtime 0.3.0 or later are kept; a generation written by an older runtime is
+rebuilt on the next `build`. The next `inspect` reports
+`install-native-engine` until `activate` downloads the new runtime). Bundled
+skills: `branch-handoff` 1.2.1, `prepare-repo-context` 1.7.1,
+`work-recovery` 1.1.0.
 
 ### Changed
 
@@ -18,20 +20,41 @@ the new runtime). Bundled skills: `branch-handoff` 1.2.1,
   count: it applies the 40 % share rule, the single-directory descent, and the
   depth cap of four segments, and returns every group it arrives at, ordered by
   definition count, then file count, then prefix, with no `*` row of its own.
-  The broker then spends the caller's `maximum_output_characters` in one order:
-  the ranked file layer drops from its tail down to four findings, the table
-  folds its tail into `*` a row at a time - counts summed, languages merged,
-  `other_group_count` counting every folded directory - down to a single
-  directory row, and only a budget too small for that spends the last four
-  findings before reporting `output-budget-exceeded`. So a wider budget buys a
-  wider table as well as more files, and `--path-prefix D/` is what goes deeper
-  into one subtree instead of wider over all of them. This replaces the fixed
-  twelve-group split stop and sixteen-row table of 2.5.0, whose counts were
-  design guesses that left a dominant directory unsplit on a large repository.
+  The broker then divides the caller's `maximum_output_characters` between the
+  two layers of the answer, at most half of it to each: a table wider than its
+  half folds its tail into `*` - counts summed, languages merged,
+  `other_group_count` counting every folded directory - until it fits that
+  half, down to a single directory row; a table already inside its half is
+  handed on whole; and the ranked file layer keeps everything the table did not
+  spend, dropping from its tail only for what is left. Only a one-row table
+  with no findings at all reports `output-budget-exceeded`. So a wider budget
+  buys a wider table *and* more files, and `--path-prefix D/` is what goes
+  deeper into one subtree instead of wider over all of them. This replaces the
+  fixed twelve-group split stop and sixteen-row table of 2.5.0, whose counts
+  were design guesses that left a dominant directory unsplit on a large
+  repository. The broker also asks the engine for the widest answer the wire
+  allows and does all of the fitting itself, so the engine's own rendered-line
+  fit can no longer drop findings a caller's budget could still have carried.
   The wire shape is unchanged: a schema-4 result still carries the same nine
   keys per row, `*` still sums directories and names no representative file,
   and the row cap is now the indexed-path bound rather than seventeen.
   `repository-map` and every other operation are untouched.
+- `repository-overview` counts and ranks framework entry points. A file counts
+  toward `entry_point_count` when it carries an entry-point record **or** when
+  its base name is one an ecosystem starts at, and the well-known names now
+  include the Next.js App Router segment conventions (`page`, `layout`,
+  `route`, `loading`, `error`, `not-found`, `template`, `default` in `.tsx`,
+  `.ts`, `.jsx` and `.js`) and its four single-file conventions
+  (`middleware.ts`, `instrumentation.ts`, `sitemap.ts`, `robots.ts`). The
+  column therefore counts entry-point *files*, one per file, rather than
+  entry-point records. The file layer also offers every group's entry points
+  before any group offers a second-tier file, so an `app/` directory of route
+  segments leads the answer even when larger directories head the table.
+- `impact-candidates` defaults to 8000 output characters on both surfaces
+  instead of 4000. It answers in two layers - the change set in `changed` and
+  the candidates in `findings` - and 4000 characters were spent on the change
+  set before the first candidate, which is what made `changed` shrink to
+  identities and then empty on an ordinary branch diff.
 
 ## [2.5.0] - 2026-09-05
 

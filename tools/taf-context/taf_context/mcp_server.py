@@ -321,7 +321,9 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "candidate attributed to the changed symbols it depends on in `anchors`. Every "
                 "candidate's edge is the strongest of its anchors; edge_evidence inferred is "
                 "a name match, never proof, and is returned only with allow_inferred. Read "
-                "`changed` for the change set itself."
+                "`changed` for the change set itself. maximum_output_characters defaults to "
+                "8000 here, not the other tools' 4000, because the answer carries the change "
+                "set as well as the candidates and the change set is what shrinks first."
                 + query_description_suffix
             ),
             "inputSchema": _schema(
@@ -329,7 +331,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "repo": _repo_property(),
                     "base": _base_property(),
                     "maximum_results": _filter_properties()["maximum_results"],
-                    "maximum_output_characters": _filter_properties()["maximum_output_characters"],
+                    "maximum_output_characters": _maximum_output_characters_property(8000),
                     "allow_inferred": _filter_properties()["allow_inferred"],
                 },
                 ["repo"],
@@ -352,14 +354,18 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "warning overview-root-first-prefix says so. A path_prefix names whole "
                 "directory segments, so a file path or a partial segment answers with an "
                 "empty table and the warning overview-root-not-a-directory. The group "
-                "table has no fixed width: maximum_output_characters sizes it, first "
-                "dropping the file layer to four findings, then folding the table's tail "
-                "into the row `*` down to a single directory row, and only then reporting "
-                "output-budget-exceeded. A larger budget therefore answers with a wider "
-                "table as well as more files, while path_prefixes is the way to go deeper "
-                "into one subtree. maximum_output_characters defaults to 8000 here, not "
-                "the other tools' 4000, because the group table alone is about 3700 "
-                "characters of canonical JSON, leaving room for the ranked file layer."
+                "table has no fixed width: maximum_output_characters sizes it, and the "
+                "table and the file layer take half of it each. A table wider than its "
+                "half folds its tail into the row `*` until it fits, down to a single "
+                "directory row; a table already inside its half is never folded and the "
+                "file layer gets everything the table did not spend; findings then drop "
+                "from the tail until the whole answer fits, and only a one-row table with "
+                "no findings reports output-budget-exceeded. A larger budget therefore "
+                "answers with a wider table as well as more files, while path_prefixes is "
+                "the way to go deeper into one subtree. maximum_output_characters defaults "
+                "to 8000 here, not the other tools' 4000, because the group table alone is "
+                "about 3700 characters of canonical JSON, leaving room for the ranked file "
+                "layer."
                 + query_description_suffix
             ),
             "inputSchema": _schema(
