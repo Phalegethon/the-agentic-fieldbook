@@ -295,7 +295,7 @@ const maximumRelatedAnchors = 16
 // produces and well below policy.MaximumEligiblePaths, and the transport byte
 // cap ends an honest wide table long before this bound does — so this one is
 // here to reject a payload that is no longer a directory table at all.
-const maximumOverviewGroups = 4096
+const MaximumOverviewGroups = 4096
 
 // The changed selector is bounded independently of the collection limit: a
 // change set names many more paths than a result may return, and the two
@@ -424,7 +424,7 @@ func validateOverview(result Result) error {
 		return ErrInvalidWire
 	}
 	groups := *result.Groups
-	if len(groups) > maximumOverviewGroups {
+	if len(groups) > MaximumOverviewGroups {
 		return ErrInvalidWire
 	}
 	for _, group := range groups {

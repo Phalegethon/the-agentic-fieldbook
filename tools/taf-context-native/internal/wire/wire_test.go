@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Phalegethon/the-agentic-fieldbook/tools/taf-context-native/internal/policy"
 )
 
 const (
@@ -1571,5 +1573,29 @@ func TestMarshalResultKeepsOverviewKeysOutOfFrozenSchemas(t *testing.T) {
 				t.Fatalf("schema-%s result carries %q: %s", result.SchemaVersion, key, encoded.String())
 			}
 		}
+	}
+}
+
+// The row bound is not the bound a real table meets. A table far below 4096
+// rows already exceeds the transport frame, and EncodeResult is where that
+// shows: the row count the frame can carry is what governs a wide table, and
+// TestValidateResultBoundsOverviewGroupRows calls validation directly for
+// exactly that reason. Pinning it here keeps the operative ceiling visible
+// rather than leaving the suite to speak only of a bound production can never
+// reach.
+func TestEncodeResultRejectsATableTheTransportCannotCarry(t *testing.T) {
+	const rows = 2000
+	if rows >= MaximumOverviewGroups {
+		t.Fatalf("the fixture must stay below the row bound of %d rows", MaximumOverviewGroups)
+	}
+	wide := overviewResult()
+	wide.Groups = overviewGroups(overviewRows(rows)...)
+	wide.OutputCharacters = renderedOutputCharacters(wide)
+	// The row bound admits the table; only the frame refuses it.
+	if err := validateResult(wide); err != nil {
+		t.Fatalf("the row bound rejected %d rows: %v", rows, err)
+	}
+	if err := EncodeResult(ioDiscard{}, wide); !errors.Is(err, ErrInvalidWire) {
+		t.Fatalf("a table of %d rows encoded within %d bytes: error = %v", rows, policy.ProductionLimits().MaximumStdoutBytes, err)
 	}
 }

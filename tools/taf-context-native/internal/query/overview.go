@@ -43,14 +43,27 @@ const (
 )
 
 // wellKnownEntryNames are the base names a repository conventionally starts
-// at. The list is a ranking hint and nothing more: a file it names keeps the
-// record kinds it really has, and no new record kind is invented for it.
-// main.go earns the hint only inside a cmd/ directory, where Go keeps its
-// commands; anywhere else it is an ordinary file of its package.
+// at: the interpreted and compiled entry files of the ecosystems this engine
+// indexes, and the file-name conventions of a framework whose routes are its
+// directory tree — a Next.js App Router segment names its page, layout,
+// route handler, loading and error boundaries, template and parallel-route
+// default by base name alone, and its four single-file conventions
+// (middleware, instrumentation, sitemap, robots) the same way. Naming a file
+// here says only that the repository starts there; the file keeps the record
+// kinds it really has, and no new record kind is invented for it. main.go
+// earns the hint only inside a cmd/ directory, where Go keeps its commands;
+// anywhere else it is an ordinary file of its package.
 var wellKnownEntryNames = [...]string{
-	"__main__.py", "app.py", "cli.py", "index.js", "index.ts", "index.tsx",
-	"layout.tsx", "lib.rs", "main.go", "main.py", "main.rs", "manage.py",
-	"page.tsx", "server.ts",
+	"__main__.py", "app.py", "cli.py", "default.js", "default.jsx",
+	"default.ts", "default.tsx", "error.js", "error.jsx", "error.ts",
+	"error.tsx", "index.js", "index.ts", "index.tsx", "instrumentation.ts",
+	"layout.js", "layout.jsx", "layout.ts", "layout.tsx", "lib.rs",
+	"loading.js", "loading.jsx", "loading.ts", "loading.tsx", "main.go",
+	"main.py", "main.rs", "manage.py", "middleware.ts", "not-found.js",
+	"not-found.jsx", "not-found.ts", "not-found.tsx", "page.js", "page.jsx",
+	"page.ts", "page.tsx", "robots.ts", "route.js", "route.jsx",
+	"route.ts", "route.tsx", "server.ts", "sitemap.ts", "template.js",
+	"template.jsx", "template.ts", "template.tsx",
 }
 
 // commandDirectory is the one directory segment that turns main.go into a
@@ -87,8 +100,11 @@ type overviewDirectoryGroup struct {
 }
 
 type overviewCounters struct {
-	files          int
-	definitions    int
+	files       int
+	definitions int
+	// entryPoints counts the files of the group that are entry points, not
+	// the entry-point records behind them: a reader asking where a repository
+	// starts is counting places to start, and one file is one place.
 	entryPoints    int
 	documents      int
 	configurations int
@@ -280,13 +296,22 @@ func dominantLanguage(counts []languageCount) string {
 	return best
 }
 
+// entryPointFile reports whether a counted file is one the repository starts
+// at, by either rule: the index found an entry-point record in it, or its base
+// name is one a framework conventionally starts at. A file is one entry point
+// however many entry-point records it carries and however many rules it
+// answers to, because the table counts files and not records.
+func entryPointFile(facts fileFacts) bool {
+	return facts.entryPointCount > 0 || facts.wellKnown
+}
+
 // overviewTier places one file in the rank order of the file layer: entry
 // points and the well-known names first, then the rest of the code, then prose
 // with a README ahead of it, then configuration. A file that is none of these
 // still has a tier, so no counted file is unrankable.
 func overviewTier(facts fileFacts, structural int) (int, int) {
 	switch {
-	case facts.entryPointCount > 0 || facts.wellKnown:
+	case entryPointFile(facts):
 		return overviewTierEntryPoint, 0
 	case structural > 0:
 		return overviewTierCode, 0
@@ -458,7 +483,9 @@ func countOverviewGroup(group overviewDirectoryGroup, files []fileFacts) overvie
 	counters := overviewCounters{files: len(group.files)}
 	for _, index := range group.files {
 		counters.definitions += files[index].definitionCount
-		counters.entryPoints += files[index].entryPointCount
+		if entryPointFile(files[index]) {
+			counters.entryPoints++
+		}
 		if files[index].document {
 			counters.documents++
 		}
@@ -545,25 +572,50 @@ func overviewLanguages(indexes []int, files []fileFacts, limits policy.Limits) [
 	return languages
 }
 
-// selectOverviewFiles spreads the file layer over the table: each round takes
-// every group's next best file, so a dominant directory cannot fill the answer
-// on its own and no group is left out of the rounds. maximum_results is what
-// bounds the layer, however wide the table is.
+// selectOverviewFiles spreads the file layer over the table. The first round is
+// global: every entry point of the repository is offered before anything else,
+// in table order, so where the repository starts is not buried behind the first
+// file of each larger directory — the question the file layer answers first is
+// "where do I begin reading", and that answer belongs to the repository rather
+// than to whichever group happens to lead the table. The rounds that follow are
+// the round-robin: each takes every group's next best file, so a dominant
+// directory cannot fill the answer on its own and no group is left out.
+// maximum_results is what bounds the layer, however wide the table is.
 func selectOverviewFiles(groups []overviewDirectoryGroup, files []fileFacts, maximum int) []model.Record {
 	selected := make([]model.Record, 0, min(max(0, maximum), len(files)))
-	for round := 0; len(selected) < maximum; round++ {
-		offered := false
-		for _, group := range groups {
-			if round >= len(group.files) {
-				continue
+	// A group's files are ranked, and the entry points are the first tier, so
+	// the entry points of a group are the prefix of its list this round takes
+	// and offered records the round-robin below starts after.
+	offered := make([]int, len(groups))
+	for index, group := range groups {
+		if len(selected) >= maximum {
+			break
+		}
+		for _, file := range group.files {
+			if files[file].tier != overviewTierEntryPoint {
+				break
 			}
-			offered = true
-			selected = append(selected, files[group.files[round]].representative.record)
+			selected = append(selected, files[file].representative.record)
+			offered[index]++
 			if len(selected) >= maximum {
 				break
 			}
 		}
-		if !offered {
+	}
+	for round := 0; len(selected) < maximum; round++ {
+		taken := false
+		for index, group := range groups {
+			position := offered[index] + round
+			if position >= len(group.files) {
+				continue
+			}
+			taken = true
+			selected = append(selected, files[group.files[position]].representative.record)
+			if len(selected) >= maximum {
+				break
+			}
+		}
+		if !taken {
 			break
 		}
 	}

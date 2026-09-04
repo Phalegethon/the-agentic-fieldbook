@@ -196,8 +196,20 @@ class DogfoodOverviewTests(unittest.TestCase):
 
         prefixes = [group["path_prefix"] for group in result["groups"]]
         paths = [finding["path"] for finding in result["findings"]]
-        # Round-robin: the first pass names every group once, in table order.
-        self.assertEqual(paths[: len(prefixes)], expected["first_findings"])
+        tier0 = set(expected["tier0_paths"])
+        # The first round is global: every entry point of the repository leads
+        # the layer, whichever group holds it, so where the repository starts
+        # is not buried behind the first file of each larger directory.
+        self.assertEqual(set(paths[: len(tier0)]), tier0)
+        # The round-robin follows it and names every group once, in table
+        # order, at the file the group ranks first — except where the global
+        # round already took that file, which is where a group's second file
+        # stands in for it.
+        rest = paths[len(tier0):]
+        for position, path in enumerate(expected["first_findings"]):
+            if path in tier0:
+                continue
+            self.assertEqual(rest[position], path, prefixes[position])
         identities = {finding["result_identity"]: finding["path"] for finding in result["findings"]}
         for group, path in zip(result["groups"], expected["first_findings"]):
             # A group is represented by the first file it ranks, so its
@@ -206,8 +218,8 @@ class DogfoodOverviewTests(unittest.TestCase):
             self.assertEqual(self._group_of(path, prefixes), group["path_prefix"], path)
 
         # Tier 0 is the entry points and the well-known entry names; each one
-        # must rank ahead of every ordinary file of its own group.
-        tier0 = set(expected["tier0_paths"])
+        # must rank ahead of every ordinary file, of its own group and of any
+        # other, which is the global first round seen from the file layer.
         self.assertTrue(tier0.issubset(set(paths)), sorted(tier0 - set(paths)))
         seen: dict[str, str] = {}
         for path in paths:

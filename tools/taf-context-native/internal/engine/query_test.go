@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -923,5 +924,83 @@ func TestSchemaFourResultsAlwaysCarryTheOverviewKeys(t *testing.T) {
 	frozen := controlEnvelope(wire.RepositoryMap, "", "", testPtr(engineSHA)).Request
 	if result := engine.unsupported(frozen); result.Groups != nil || result.Overview != nil {
 		t.Fatalf("frozen schema result = %#v", result)
+	}
+}
+
+// wideOverviewRoots builds a repository of count top-level directories, each
+// holding one small Go file, so its directory table has a row per directory
+// and no directory is anywhere near the split threshold.
+func wideOverviewRoots(t *testing.T, count int) (string, string) {
+	t.Helper()
+	base := t.TempDir()
+	repository := filepath.Join(base, "repository")
+	if err := os.Mkdir(repository, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(repository, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < count; index++ {
+		directory := filepath.Join(repository, fmt.Sprintf("directory%04d", index))
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		body := fmt.Sprintf("package directory%04d\n\nfunc Value() int { return %d }\n", index, index)
+		if err := os.WriteFile(filepath.Join(directory, "value.go"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return repository, filepath.Join(base, "state")
+}
+
+// A repository with more directories than a transport frame can carry rows for
+// is still described: the renderer folds the table's tail into the "*" row
+// until the answer encodes, so the caller is given a shorter table rather than
+// the engine's output error. Nothing the caller asked for pays for the table's
+// width — the file layer is untouched.
+func TestRepositoryOverviewFoldsATableTooWideForTheTransport(t *testing.T) {
+	repository, state := wideOverviewRoots(t, 1200)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := controlEnvelope(wire.RepositoryOverview, repository, state, built.IndexIdentity)
+	envelope.Request.SchemaVersion = "4"
+	result, err := engine.Execute(context.Background(), envelope)
+	if err != nil {
+		t.Fatalf("a repository wider than the transport must still answer: %v", err)
+	}
+	var encoded bytes.Buffer
+	if err := wire.EncodeResult(&encoded, result); err != nil {
+		t.Fatalf("the answer must encode: %v", err)
+	}
+	rows := *result.Groups
+	if len(rows) < 2 || len(rows) >= 1200 {
+		t.Fatalf("rows = %d, want the 1200-row table folded down to what the frame carries", len(rows))
+	}
+	folded := rows[len(rows)-1]
+	if folded.PathPrefix != "*" || folded.RepresentativeIdentity != nil || folded.Depth != 0 {
+		t.Fatalf("folded row = %#v", folded)
+	}
+	// Every directory the table stopped naming is counted once, so the counts
+	// still add the repository up.
+	if got, want := result.Overview.OtherGroupCount, 1200-(len(rows)-1); got != want {
+		t.Fatalf("other_group_count = %d, want %d", got, want)
+	}
+	if got, want := folded.FileCount, 1200-(len(rows)-1); got != want {
+		t.Fatalf("folded file_count = %d, want %d", got, want)
+	}
+	sum := 0
+	for _, row := range rows {
+		sum += row.FileCount
+	}
+	if sum != result.Overview.CountedFileCount {
+		t.Fatalf("rows hold %d files, summary counts %d", sum, result.Overview.CountedFileCount)
+	}
+	// The file layer is what the caller asked for, and it is not what a wide
+	// table costs.
+	if result.ReturnedCount != envelope.Request.MaximumResults {
+		t.Fatalf("returned = %d, want the %d requested files kept", result.ReturnedCount, envelope.Request.MaximumResults)
 	}
 }

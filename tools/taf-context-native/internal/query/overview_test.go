@@ -165,7 +165,9 @@ func TestOverviewGroupsRootFilesUnderTheDotPrefix(t *testing.T) {
 	if want := (wire.OverviewSummary{Root: "", CountedFileCount: 3, OtherGroupCount: 0}); response.Overview != want {
 		t.Fatalf("summary = %#v, want %#v", response.Overview, want)
 	}
-	if got, want := recordPaths(response.Records), []string{"pkg/a.go", "main.go", "readme.md"}; !reflect.DeepEqual(got, want) {
+	// The first round is global, so the repository's own entry point leads the
+	// layer even though its group is not the first row of the table.
+	if got, want := recordPaths(response.Records), []string{"main.go", "pkg/a.go", "readme.md"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("file layer = %#v, want %#v", got, want)
 	}
 }
@@ -609,8 +611,10 @@ func TestOverviewRanksFilesByTier(t *testing.T) {
 // Every well-known base name is a ranking hint on its own, and main.go is one
 // only inside a command directory.
 func TestOverviewRanksEveryWellKnownEntryName(t *testing.T) {
-	names := []string{"main.py", "__main__.py", "app.py", "manage.py", "cli.py", "index.js", "index.ts", "index.tsx", "page.tsx", "layout.tsx", "server.ts", "main.rs", "lib.rs"}
-	for _, name := range names {
+	for _, name := range wellKnownEntryNames {
+		if name == "main.go" {
+			continue
+		}
 		t.Run(name, func(t *testing.T) {
 			response := overviewOf(t, []overviewSpec{
 				goFile("group/a-plain.go", model.Module, model.Definition),
@@ -663,7 +667,18 @@ func TestOverviewRanksAFileWithNoStructuralRecordsLast(t *testing.T) {
 // The well-known list is a constant of the engine, so it is pinned here rather
 // than only exercised through the ranking.
 func TestOverviewWellKnownEntryNamesAreExact(t *testing.T) {
-	want := []string{"__main__.py", "app.py", "cli.py", "index.js", "index.ts", "index.tsx", "layout.tsx", "lib.rs", "main.go", "main.py", "main.rs", "manage.py", "page.tsx", "server.ts"}
+	want := []string{
+		"__main__.py", "app.py", "cli.py", "default.js", "default.jsx",
+		"default.ts", "default.tsx", "error.js", "error.jsx", "error.ts",
+		"error.tsx", "index.js", "index.ts", "index.tsx", "instrumentation.ts",
+		"layout.js", "layout.jsx", "layout.ts", "layout.tsx", "lib.rs",
+		"loading.js", "loading.jsx", "loading.ts", "loading.tsx", "main.go",
+		"main.py", "main.rs", "manage.py", "middleware.ts", "not-found.js",
+		"not-found.jsx", "not-found.ts", "not-found.tsx", "page.js", "page.jsx",
+		"page.ts", "page.tsx", "robots.ts", "route.js", "route.jsx",
+		"route.ts", "route.tsx", "server.ts", "sitemap.ts", "template.js",
+		"template.jsx", "template.ts", "template.tsx",
+	}
 	if got := append([]string(nil), wellKnownEntryNames[:]...); !reflect.DeepEqual(got, want) {
 		t.Fatalf("well-known names = %#v, want %#v", got, want)
 	}
@@ -857,5 +872,106 @@ func TestOverviewSkipsPathsRepresentedOnlyByReferences(t *testing.T) {
 	response := Overview(relatedSnapshot(records), overviewRequest(), policy.ProductionLimits())
 	if response.Overview.CountedFileCount != 1 {
 		t.Fatalf("counted = %d, want 1", response.Overview.CountedFileCount)
+	}
+}
+
+// A group's entry-point count is the number of its files that are entry
+// points, by either rule: the index found an entry-point record in the file,
+// or its base name is one a framework conventionally starts at. It counts
+// files and not records, so several entry-point records in one file are one
+// entry point, and a file that answers to both rules is not counted twice.
+func TestOverviewCountsEntryPointsByRecordOrName(t *testing.T) {
+	typescriptFile := func(path string) overviewSpec {
+		return overviewSpec{path: path, language: "typescript", kinds: []model.RecordKind{model.Module}}
+	}
+	for _, testCase := range []struct {
+		name  string
+		specs []overviewSpec
+		want  int
+	}{
+		{
+			name:  "an entry-point record",
+			specs: []overviewSpec{goFile("cmd/tool/boot.go", model.Module, model.EntryPoint)},
+			want:  1,
+		},
+		{
+			name:  "three entry-point records in one file",
+			specs: []overviewSpec{goFile("cmd/tool/boot.go", model.Module, model.EntryPoint, model.EntryPoint, model.EntryPoint)},
+			want:  1,
+		},
+		{
+			name:  "a well-known name carrying no entry-point record",
+			specs: []overviewSpec{typescriptFile("cmd/tool/page.tsx")},
+			want:  1,
+		},
+		{
+			name:  "both rules in one file",
+			specs: []overviewSpec{goFile("cmd/tool/main.go", model.Module, model.EntryPoint, model.EntryPoint)},
+			want:  1,
+		},
+		{
+			name: "one file of each rule beside an ordinary file",
+			specs: []overviewSpec{
+				goFile("cmd/tool/boot.go", model.Module, model.EntryPoint, model.EntryPoint, model.EntryPoint),
+				typescriptFile("cmd/tool/page.tsx"),
+				goFile("cmd/tool/plain.go", model.Module, model.Definition),
+			},
+			want: 2,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			// The filler directory keeps cmd/ at or below the split threshold,
+			// so the row the case is about is the one it names.
+			response := overviewOf(t, append(overviewDirectory("other/", 6), testCase.specs...))
+			command := groupNamed(t, response.Groups, "cmd/")
+			if command.FileCount != len(testCase.specs) || command.EntryPointCount != testCase.want {
+				t.Fatalf("cmd/ group = %#v, want %d of %d files counted as entry points", command, testCase.want, len(testCase.specs))
+			}
+			if other := groupNamed(t, response.Groups, "other/"); other.EntryPointCount != 0 {
+				t.Fatalf("other/ group = %#v, want no entry point", other)
+			}
+		})
+	}
+}
+
+// The first round of the file layer is global: every entry point of the
+// repository is offered before the round-robin starts, whichever group holds
+// it, so a framework's own entry files are not buried behind the first file of
+// each larger directory.
+func TestOverviewOffersEveryEntryPointBeforeTheRoundRobin(t *testing.T) {
+	specs := append(overviewDirectory("src/", 6), overviewDirectory("lib/", 6)...)
+	for _, name := range []string{"page.tsx", "layout.tsx", "route.ts"} {
+		specs = append(specs, overviewSpec{
+			path: "app/" + name, language: "typescript", kinds: []model.RecordKind{model.Module},
+		})
+	}
+	response := overviewOf(t, specs)
+	if got, want := groupPrefixes(response.Groups), []string{"lib/", "src/", "app/"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("group prefixes = %#v, want %#v", got, want)
+	}
+	want := []string{
+		"app/layout.tsx", "app/page.tsx", "app/route.ts",
+		"lib/file00.go", "src/file00.go",
+		"lib/file01.go", "src/file01.go",
+	}
+	if got := recordPaths(response.Records)[:len(want)]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("file layer = %#v, want it to open with %#v", got, want)
+	}
+}
+
+// maximum_results bounds the global first round too: a repository with more
+// entry points than the caller asked for files answers with the first of them
+// and nothing else, rather than with a round-robin the layer had no room for.
+func TestOverviewBoundsTheGlobalEntryPointRound(t *testing.T) {
+	specs := append(overviewDirectory("src/", 4),
+		overviewSpec{path: "app/page.tsx", language: "typescript", kinds: []model.RecordKind{model.Module}},
+		overviewSpec{path: "app/layout.tsx", language: "typescript", kinds: []model.RecordKind{model.Module}},
+	)
+	response := overviewOf(t, specs, withMaximumResults(2))
+	if got, want := recordPaths(response.Records), []string{"app/layout.tsx", "app/page.tsx"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("file layer = %#v, want %#v", got, want)
+	}
+	if response.Omitted != 4 {
+		t.Fatalf("omitted = %d, want 4", response.Omitted)
 	}
 }
