@@ -147,7 +147,7 @@ func (engine *Engine) Execute(ctx context.Context, envelope wire.Envelope) (wire
 		result, err = engine.state(ctx, &roots, envelope.Request, false)
 	case wire.Metrics:
 		result, err = engine.state(ctx, &roots, envelope.Request, true)
-	case wire.RepositoryMap, wire.SearchSymbols, wire.SearchDocs, wire.RelatedSymbols:
+	case wire.RepositoryMap, wire.SearchSymbols, wire.SearchDocs, wire.RelatedSymbols, wire.ChangedSymbols:
 		result, err = engine.query(ctx, &roots, envelope.Request)
 	case wire.SourceSnippets:
 		result, err = engine.sourceSnippets(ctx, &roots, envelope.Request)

@@ -1,13 +1,14 @@
 {
   "schema_version": "1",
   "adapter_identity": "taf.level1-native",
-  "adapter_version": "0.3.0",
+  "adapter_version": "0.4.0",
   "provider_identity": "taf-context",
-  "provider_version": "0.3.0",
+  "provider_version": "0.4.0",
   "executable": "bin/taf-level1",
   "arguments": [],
   "capabilities": [
     "build",
+    "changed-symbols",
     "estimate",
     "metrics",
     "related-symbols",

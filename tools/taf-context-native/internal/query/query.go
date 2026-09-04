@@ -22,6 +22,10 @@ type Response struct {
 	Partial    bool
 	Counters   model.WorkCounters
 	TermVisits int
+	// Unindexed is set by Changed alone: it reports that at least one changed
+	// path carried no record at all, which the caller turns into one warning
+	// rather than into findings or omissions.
+	Unindexed bool
 }
 
 // Match tiers, lower is better. Fuzzy tiers add the edit distance.

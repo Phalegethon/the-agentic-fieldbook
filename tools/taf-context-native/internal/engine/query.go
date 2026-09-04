@@ -74,9 +74,10 @@ func (engine *Engine) query(ctx context.Context, roots *boundary.Roots, request 
 
 func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, snapshot store.Snapshot) (wire.Result, error) {
 	var (
-		selected []wire.Finding
-		omitted  int
-		partial  bool
+		selected  []wire.Finding
+		omitted   int
+		partial   bool
+		unindexed bool
 	)
 	switch request.Operation {
 	case wire.RepositoryMap:
@@ -94,6 +95,13 @@ func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, s
 			return engine.snippetStale(request, snapshot.Manifest.Coverage), nil
 		}
 		selected, omitted, partial = relatedFindings(response.Findings), response.Omitted, response.Partial
+	case wire.ChangedSymbols:
+		response := query.Changed(snapshot, request, productionLimits())
+		selected, omitted, partial = findings(response.Records), response.Omitted, response.Partial
+		// A changed path the index carries no record for is neither a finding
+		// nor a counted omission; it is reported once, below, so the caller
+		// learns the change set reached further than the index.
+		unindexed = response.Unindexed
 	default:
 		return engine.unsupported(request), nil
 	}
@@ -117,6 +125,9 @@ func (engine *Engine) querySnapshot(ctx context.Context, request wire.Request, s
 	result.Warnings = sourceCatalogWarnings(snapshot.Manifest.SourceCatalog)
 	if partial {
 		result.Warnings = appendBoundedWarnings(result.Warnings, "query-frontier-exhausted")
+	}
+	if unindexed {
+		result.Warnings = appendBoundedWarnings(result.Warnings, "changed-path-not-indexed")
 	}
 	return result, nil
 }

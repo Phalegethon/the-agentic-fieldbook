@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -583,5 +584,94 @@ func TestQueryResultsEchoTheRequestSchemaVersion(t *testing.T) {
 				t.Fatalf("schema %s search finding carries edge fields: %#v", schema, finding)
 			}
 		}
+	}
+}
+
+func changedEnvelope(repository, state string, index *string, entries ...wire.ChangedRange) wire.Envelope {
+	envelope := controlEnvelope(wire.ChangedSymbols, repository, state, index)
+	envelope.Request.SchemaVersion = "3"
+	selector := append([]wire.ChangedRange(nil), entries...)
+	envelope.Request.ChangedRanges = &selector
+	return envelope
+}
+
+// The change set is the same evidence source as every other query operation:
+// the built generation. A hunk inside one function therefore answers with that
+// function alone, in the schema the request asked for and at the engine
+// version the release pins.
+func TestChangedSymbolsAnswersTheSymbolsAHunkTouches(t *testing.T) {
+	repository, state := relatedRoots(t)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// caller.go line 4 is the first call inside sample.Main, which spans lines
+	// 3 to 6; the package clause record of the file covers line 1 only.
+	result, err := engine.Execute(context.Background(), changedEnvelope(repository, state, built.IndexIdentity, wire.ChangedRange{Path: "caller.go", Ranges: [][2]int{{4, 4}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SchemaVersion != "3" || result.Status != wire.Ready || result.Freshness != "exact" || result.NextSafeAction != "use-index" {
+		t.Fatalf("changed result = %#v", result)
+	}
+	if result.ProviderVersion != "0.4.0" {
+		t.Fatalf("provider version = %q, want 0.4.0", result.ProviderVersion)
+	}
+	if len(result.Findings) != 1 {
+		t.Fatalf("findings = %#v, want sample.Main alone", result.Findings)
+	}
+	finding := result.Findings[0]
+	if finding.QualifiedName != "sample.Main" || finding.Path != "caller.go" || finding.RecordKind != "definition" {
+		t.Fatalf("finding = %#v", finding)
+	}
+	if finding.Relation != "" || finding.EdgeEvidence != "" || finding.ReferenceLine != 0 || finding.ReferenceCount != 0 {
+		t.Fatalf("schema-3 changed finding carries edge fields: %#v", finding)
+	}
+	if result.OmittedCount != 0 || result.Truncated || len(result.Warnings) != 0 {
+		t.Fatalf("changed result accounting = %#v", result)
+	}
+
+	// A whole-file entry admits every symbol of the path, including the module
+	// record the Go package clause carries.
+	whole, err := engine.Execute(context.Background(), changedEnvelope(repository, state, built.IndexIdentity, wire.ChangedRange{Path: "helper.go", Ranges: [][2]int{}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(whole.Findings))
+	for _, item := range whole.Findings {
+		names = append(names, item.QualifiedName)
+	}
+	if !reflect.DeepEqual(names, []string{"sample", "sample.helper"}) {
+		t.Fatalf("whole-file findings = %#v, want the module record and the definition", names)
+	}
+}
+
+// A changed path the index does not carry is not an omission and not an error:
+// the engine reports it once, so the caller knows the change set reached
+// further than the index.
+func TestChangedSymbolsWarnsOnceForPathsTheIndexDoesNotCarry(t *testing.T) {
+	repository, state := relatedRoots(t)
+	engine := New(ProductionDependencies())
+	built, err := engine.Execute(context.Background(), controlEnvelope(wire.Build, repository, state, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := engine.Execute(context.Background(), changedEnvelope(repository, state, built.IndexIdentity,
+		wire.ChangedRange{Path: "caller.go", Ranges: [][2]int{{4, 4}}},
+		wire.ChangedRange{Path: "docs/notes.md", Ranges: [][2]int{}},
+		wire.ChangedRange{Path: "vendor/gone.go", Ranges: [][2]int{}},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != wire.Ready || result.OmittedCount != 0 || result.Truncated {
+		t.Fatalf("changed result = %#v", result)
+	}
+	if !reflect.DeepEqual(result.Warnings, []string{"changed-path-not-indexed"}) {
+		t.Fatalf("warnings = %#v, want exactly one changed-path-not-indexed", result.Warnings)
+	}
+	if len(result.Findings) != 1 || result.Findings[0].QualifiedName != "sample.Main" {
+		t.Fatalf("findings = %#v", result.Findings)
 	}
 }
