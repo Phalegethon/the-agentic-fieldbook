@@ -5,6 +5,8 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-09-05
+
 Native runtime `0.5.0` (no index format change, so existing indexes are kept;
 the next `inspect` reports `install-native-engine` until `activate` downloads
 the new runtime). Bundled skills: `branch-handoff` 1.2.1,
