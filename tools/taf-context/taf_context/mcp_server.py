@@ -29,7 +29,7 @@ from .git_snapshot import SnapshotError
 from .native_transport import NativeTransport
 
 SERVER_NAME = "taf-repo-context"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 LEGACY_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 MODERN_VERSION = "2026-07-28"
 INSTRUCTIONS = (
@@ -57,6 +57,8 @@ _QUERY_TOOLS = {
     "search_docs": "search-docs",
     "source_snippets": "source-snippets",
     "related_symbols": "related-symbols",
+    "changed_symbols": "changed-symbols",
+    "impact_candidates": "impact-candidates",
 }
 
 
@@ -74,6 +76,17 @@ def _repo_property() -> dict[str, Any]:
     return {
         "type": "string",
         "description": "Absolute path of the Git repository or worktree.",
+    }
+
+
+def _base_property() -> dict[str, Any]:
+    return {
+        "type": "string",
+        "description": (
+            "Git ref or commit the change set is measured against. Defaults to "
+            "the branch's upstream main, then origin/HEAD, then a local "
+            "main/master; uncommitted changes are always included."
+        ),
     }
 
 
@@ -120,7 +133,7 @@ def _schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
 
 
 def tool_definitions() -> list[dict[str, Any]]:
-    """The seven tools, in `tools/list` order."""
+    """The nine tools, in `tools/list` order."""
     query_description_suffix = (
         " A query on a bound index behind the working tree refreshes it incrementally first."
     )
@@ -271,6 +284,51 @@ def tool_definitions() -> list[dict[str, Any]]:
             ),
             "annotations": dict(_READ_ONLY),
         },
+        {
+            "name": "changed_symbols",
+            "title": "Changed symbols",
+            "description": (
+                "Answer 'what did I change on this branch': the definitions, entry points, "
+                "and modules whose lines a changed hunk touches, between a base ref and the "
+                "working tree (committed, staged, unstaged, and untracked changes). The "
+                "result carries the resolved base; the warning changed-path-not-indexed "
+                "means the change set reached files the index does not carry."
+                + query_description_suffix
+            ),
+            "inputSchema": _schema(
+                {
+                    "repo": _repo_property(),
+                    "base": _base_property(),
+                    **_filter_properties(),
+                },
+                ["repo"],
+            ),
+            "annotations": dict(_READ_ONLY),
+        },
+        {
+            "name": "impact_candidates",
+            "title": "Impact candidates",
+            "description": (
+                "Answer 'what could my change break': the one-hop callers of the changed "
+                "definitions and the importers of the changed modules, each candidate "
+                "attributed to the changed symbols it depends on in `anchors`. Every "
+                "candidate's edge is the strongest of its anchors; edge_evidence inferred is "
+                "a name match, never proof, and is returned only with allow_inferred. Read "
+                "`changed` for the change set itself."
+                + query_description_suffix
+            ),
+            "inputSchema": _schema(
+                {
+                    "repo": _repo_property(),
+                    "base": _base_property(),
+                    "maximum_results": _filter_properties()["maximum_results"],
+                    "maximum_output_characters": _filter_properties()["maximum_output_characters"],
+                    "allow_inferred": _filter_properties()["allow_inferred"],
+                },
+                ["repo"],
+            ),
+            "annotations": dict(_READ_ONLY),
+        },
     ]
 
 
@@ -340,6 +398,13 @@ def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArgument
         # The schema enum accepts any case, as the filter values do; canonicalize
         # before the broker sees it.
         direction = direction.strip().lower()
+    base = arguments.get("base")
+    if base is not None:
+        # Only the two change tools declare the key, so a base anywhere else is
+        # already an unknown argument.
+        base = base.strip()
+        if not base or len(base) > 512 or any(item in base for item in "\x00\r\n"):
+            raise InvalidArguments("base must be a Git ref or commit")
     try:
         languages = normalize_filter_values(
             arguments.get("languages", []), "languages", FILTER_LANGUAGES
@@ -357,6 +422,7 @@ def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArgument
         query=query.strip() if isinstance(query, str) else None,
         result_identities=identities,
         direction=direction,
+        base=base,
         path_prefixes=sorted(set(arguments.get("path_prefixes", []))),
         languages=languages,
         symbol_kinds=symbol_kinds,

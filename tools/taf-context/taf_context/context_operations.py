@@ -15,8 +15,15 @@ import time
 from typing import Callable, Mapping
 
 from . import refresh
+from .change_ranges import (
+    ChangedPath,
+    WARNING_PATHS_LIMIT,
+    WARNING_RANGES_COLLAPSED,
+    changed_ranges,
+    resolve_change_base,
+)
 from .git_snapshot import collect_snapshot
-from .level1_models import Level1Result, parse_level1_result
+from .level1_models import Level1Finding, Level1Result, parse_level1_result
 from .native_transport import NativeTransport, NativeTransportError
 from .refresh import (
     Binding,
@@ -186,6 +193,7 @@ def _invoke_native(
     maximum_output_characters: int = 4000,
     allow_inferred: bool = False,
     changed_paths_document: str | None = None,
+    changed_selector: tuple[ChangedPath, ...] | None = None,
 ) -> Level1Result:
     request_filters = filters or {
         "path_prefixes": [],
@@ -211,11 +219,15 @@ def _invoke_native(
         # Appended only where it exists, so every schema-1 request identity
         # stays exactly what it was before the relationship operation.
         material.append(direction)
+    selector = None if changed_selector is None else _selector_payload(changed_selector)
+    if selector is not None:
+        material.append(json.dumps(selector, separators=(",", ":")))
     request_material = "\0".join(material).encode("utf-8")
     request_identity = "taf.prepare." + hashlib.sha256(request_material).hexdigest()[:24]
-    # Schema 2 exists for the one operation that carries a direction; every
-    # other request stays byte-identical to the frozen schema-1 envelope.
-    schema_version = "2" if direction is not None else "1"
+    # Schema 2 exists for the one operation that carries a direction and
+    # schema 3 for the one that carries a change selector; every other request
+    # stays byte-identical to the frozen schema-1 envelope.
+    schema_version = "3" if selector is not None else "2" if direction is not None else "1"
     envelope = {
         "phase": {
             "build": "build",
@@ -247,8 +259,12 @@ def _invoke_native(
             "allow_inferred": allow_inferred,
         },
     }
-    if schema_version == "2":
+    if schema_version in {"2", "3"}:
+        # Schema 3 spells both added keys out, direction included, because the
+        # engine requires the whole key set of the schema it is given.
         envelope["request"]["direction"] = direction
+    if schema_version == "3":
+        envelope["request"]["changed_ranges"] = selector
     wire = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
     try:
         raw = transport.exchange(wire, idempotent=operation not in {"build", "update"})
@@ -610,6 +626,7 @@ class QueryArguments:
     maximum_output_characters: int
     allow_inferred: bool
     direction: str | None = None
+    base: str | None = None
 
 
 QUERY_DIRECTIONS = ("callers", "callees", "importers", "imports")
@@ -617,6 +634,26 @@ QUERY_DIRECTIONS = ("callers", "callees", "importers", "imports")
 IDENTITY_QUERY_OPERATIONS = ("source-snippets", "related-symbols")
 # One relationship request stays cheap to resolve, so it carries few anchors.
 MAXIMUM_RELATED_ANCHORS = 16
+# The two operations that answer from a Git difference instead of from a query
+# string or a result identity, and the only ones that accept a base.
+CHANGE_QUERY_OPERATIONS = ("changed-symbols", "impact-candidates")
+# The composed operation asks the engine for the widest change set and the
+# widest relationship answer it will give, then trims what it composed to the
+# caller's own budget.
+IMPACT_CHANGED_MAXIMUM_RESULTS = 64
+IMPACT_CHANGED_OUTPUT_CHARACTERS = 12000
+# Which changed record kinds anchor which relationship question.
+_CALLER_ANCHOR_KINDS = ("definition", "entry-point")
+_IMPORTER_ANCHOR_KINDS = ("module", "definition")
+_EVIDENCE_TIERS = {"verified": 0, "inferred": 1}
+# The engine refuses a request frame above 256 KiB (wire.MaximumWireBytes).
+MAXIMUM_REQUEST_BYTES = 256 * 1024
+# Everything in the frame but the selector: the two absolute roots, the
+# identities, the budgets, and the filters. Only the filters can grow, and the
+# wire caps them at 64 path prefixes of 512 characters, so 48 KiB covers the
+# worst frame the engine would still accept.
+_SELECTOR_RESERVE_BYTES = 48 * 1024
+MAXIMUM_CHANGED_SELECTOR_BYTES = MAXIMUM_REQUEST_BYTES - _SELECTOR_RESERVE_BYTES
 
 
 def validate_query_request(
@@ -624,6 +661,7 @@ def validate_query_request(
     query: str | None,
     result_identities: tuple[str, ...],
     direction: str | None = None,
+    base: str | None = None,
 ) -> tuple[str | None, tuple[str, ...]]:
     """Apply the query/result-identity rules shared by the CLI and the MCP server."""
     query_operations = {"search-symbols", "search-docs"}
@@ -651,6 +689,15 @@ def validate_query_request(
         raise PrepareCLIError("selected query operation does not accept --direction")
     if direction is not None and direction not in QUERY_DIRECTIONS:
         raise PrepareCLIError("selected query direction is invalid")
+    if base is not None:
+        if operation not in CHANGE_QUERY_OPERATIONS:
+            raise PrepareCLIError("selected query operation does not accept --base")
+        if (
+            not base
+            or len(base) > 512
+            or any(character in base for character in "\x00\r\n")
+        ):
+            raise PrepareCLIError("selected change base is invalid")
     return query_text, identities
 
 
@@ -664,6 +711,365 @@ def _resolve_repository(repository: Path, environment: Mapping[str, str]):
         paths.root, snapshot.repository_identity, snapshot.worktree_identity
     )
     return repository, snapshot, paths, state_root, binding_path
+
+
+def _selector_payload(changed: tuple[ChangedPath, ...]) -> list[dict[str, object]]:
+    """The wire shape of a change selector: sorted paths, ascending spans."""
+    return [
+        {"path": item.path, "ranges": [[start, end] for start, end in item.ranges]}
+        for item in changed
+    ]
+
+
+def _selector_bytes(entries: list[ChangedPath]) -> int:
+    return len(
+        json.dumps(_selector_payload(tuple(entries)), separators=(",", ":")).encode("utf-8")
+    )
+
+
+def bound_changed_selector(
+    changed: tuple[ChangedPath, ...],
+    *,
+    available_bytes: int = MAXIMUM_CHANGED_SELECTOR_BYTES,
+) -> tuple[tuple[ChangedPath, ...], list[str]]:
+    """Shrink a change selector until the request frame can carry it.
+
+    The path and span counts are already bounded (200 paths, 64 spans each),
+    but a selector of long paths and high line numbers reaches about 340 KB,
+    and the engine refuses any frame above 256 KiB as invalid. Collapsing the
+    path with the most spans to a whole-file entry costs precision on that one
+    path and nothing else, and a whole-file entry is at most 512 bytes of path
+    plus its keys, so 200 of them are about 108 KB and the loop always reaches
+    the budget. Dropping a path from the tail is the last resort for a budget
+    too small for even that.
+    """
+    entries = list(changed)
+    warnings: set[str] = set()
+    while entries and _selector_bytes(entries) > available_bytes:
+        widest = _widest_selector_entry(entries)
+        if widest is None:
+            entries.pop()
+            warnings.add(WARNING_PATHS_LIMIT)
+            continue
+        entries[widest] = ChangedPath(entries[widest].path, ())
+        warnings.add(WARNING_RANGES_COLLAPSED)
+    return tuple(entries), sorted(warnings)
+
+
+def _widest_selector_entry(entries: list[ChangedPath]) -> int | None:
+    """The entry with the most spans; None when every entry is whole-file."""
+    widest: int | None = None
+    for index, entry in enumerate(entries):
+        if not entry.ranges:
+            continue
+        if widest is None or (len(entry.ranges), entry.path) > (
+            len(entries[widest].ranges),
+            entries[widest].path,
+        ):
+            widest = index
+    return widest
+
+
+def _changed_entry(finding: Level1Finding) -> dict[str, object]:
+    """The compact record of one changed symbol."""
+    return {
+        "result_identity": finding.result_identity,
+        "path": finding.path,
+        "start_line": finding.start_line,
+        "end_line": finding.end_line,
+        "record_kind": finding.record_kind.value,
+        "qualified_name": finding.qualified_name,
+    }
+
+
+def _anchor_entry(anchor: Level1Finding, edge: Level1Finding) -> dict[str, object]:
+    """One changed symbol a candidate depends on, with the edge that reached it."""
+    return {
+        "result_identity": anchor.result_identity,
+        "path": anchor.path,
+        "qualified_name": anchor.qualified_name,
+        "relation": edge.relation,
+        "edge_evidence": None if edge.edge_evidence is None else edge.edge_evidence.value,
+        "reference_line": edge.reference_line,
+        "reference_count": edge.reference_count,
+    }
+
+
+def _evidence_tier(evidence: object) -> int:
+    return _EVIDENCE_TIERS.get(str(evidence), len(_EVIDENCE_TIERS))
+
+
+def compose_impact_candidates(
+    changed: Level1Result,
+    related: Callable[[tuple[str, ...], str], Level1Result],
+    *,
+    allow_inferred: bool,
+    maximum_results: int,
+) -> dict[str, object]:
+    """Compose the one-hop dependents of a change set from relationship calls.
+
+    `related` answers one `related-symbols` question about the anchors it is
+    given. Anchors are asked for one at a time, because the engine returns one
+    edge per candidate record without naming the anchor it came from and this
+    operation exists to name it. Callers answer for changed definitions and
+    entry points, importers for changed modules and definitions; a changed
+    symbol is never its own candidate, and every candidate keeps the changed
+    symbols it depends on with the edge that reached it.
+    """
+    anchors = {
+        "callers": [
+            item for item in changed.findings
+            if item.record_kind.value in _CALLER_ANCHOR_KINDS
+        ],
+        "importers": [
+            item for item in changed.findings
+            if item.record_kind.value in _IMPORTER_ANCHOR_KINDS
+        ],
+    }
+    changed_identities = {item.result_identity for item in changed.findings}
+    warnings = set(changed.warnings)
+    omitted = changed.omitted_count
+    truncated = changed.truncated
+    status, next_action = changed.status.value, changed.next_safe_action
+    candidates: dict[str, dict[str, object]] = {}
+    for direction in ("callers", "importers"):
+        for anchor in anchors[direction]:
+            answer = related((anchor.result_identity,), direction)
+            warnings |= set(answer.warnings)
+            omitted += answer.omitted_count
+            truncated = truncated or answer.truncated
+            if answer.status.value != "ready" and status == "ready":
+                status, next_action = "partial", answer.next_safe_action
+            for edge in answer.findings:
+                if edge.result_identity in changed_identities:
+                    continue  # a changed symbol is never its own candidate
+                evidence = None if edge.edge_evidence is None else edge.edge_evidence.value
+                if evidence is None or (evidence == "inferred" and not allow_inferred):
+                    continue  # the broker never widens the engine's evidence
+                candidate = candidates.setdefault(
+                    edge.result_identity, {"finding": edge, "anchors": {}}
+                )
+                kept = candidate["anchors"]
+                assert isinstance(kept, dict)
+                entry = _anchor_entry(anchor, edge)
+                previous = kept.get(anchor.result_identity)
+                if previous is None or _evidence_tier(entry["edge_evidence"]) < _evidence_tier(
+                    previous["edge_evidence"]
+                ):
+                    # One entry per changed symbol, keeping its strongest edge.
+                    kept[anchor.result_identity] = entry
+    findings: list[dict[str, object]] = []
+    for candidate in candidates.values():
+        finding = candidate["finding"]
+        assert isinstance(finding, Level1Finding)
+        kept = candidate["anchors"]
+        assert isinstance(kept, dict)
+        attribution = sorted(
+            kept.values(),
+            key=lambda item: (
+                _evidence_tier(item["edge_evidence"]),
+                item["path"],
+                item["qualified_name"],
+                item["result_identity"],
+            ),
+        )
+        strongest = attribution[0]
+        entry = finding.to_dict("2")
+        entry.update(
+            {
+                "relation": strongest["relation"],
+                "edge_evidence": strongest["edge_evidence"],
+                "reference_line": strongest["reference_line"],
+                "reference_count": strongest["reference_count"],
+                "anchors": attribution,
+            }
+        )
+        findings.append(entry)
+    findings.sort(
+        key=lambda item: (
+            _evidence_tier(item["edge_evidence"]),
+            -len(item["anchors"]),
+            item["path"],
+            item["start_line"],
+            item["result_identity"],
+        )
+    )
+    if len(findings) > maximum_results:
+        omitted += len(findings) - maximum_results
+        truncated = True
+        findings = findings[:maximum_results]
+    for rank, item in enumerate(findings, start=1):
+        item["rank"] = rank
+    return {
+        "schema_version": "1",
+        "mode": "query",
+        "operation": "impact-candidates",
+        "status": status,
+        "freshness": changed.freshness.value,
+        "index_identity": changed.index_identity,
+        "changed": [_changed_entry(item) for item in changed.findings],
+        "changed_count": len(changed.findings),
+        "findings": findings,
+        "returned_count": len(findings),
+        "omitted_count": omitted,
+        "truncated": truncated,
+        "output_characters": 0,
+        "warnings": sorted(warnings),
+        "required_authorizations": [],
+        "next_safe_action": next_action,
+    }
+
+
+def _canonical_length(value: dict[str, object]) -> int:
+    return len(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+
+
+def _output_characters(value: dict[str, object]) -> int:
+    """The serialized length of the object, counting the field that reports it."""
+    length = 0
+    for _attempt in range(8):
+        measured = _canonical_length(dict(value, output_characters=length))
+        if measured == length:
+            return length
+        length = measured
+    return length
+
+
+def trim_to_budget(
+    result: dict[str, object], maximum_output_characters: int
+) -> dict[str, object]:
+    """Fit a composed result into its output budget, cheapest loss first.
+
+    The changed list shrinks to identities before any candidate is dropped,
+    and candidates go from the tail, so the strongest evidence survives
+    longest. Anchors of a kept candidate are never trimmed.
+    """
+    trimmed = dict(result)
+    trimmed["output_characters"] = _output_characters(trimmed)
+    if int(trimmed["output_characters"]) <= maximum_output_characters:
+        return trimmed
+    changed = trimmed["changed"]
+    assert isinstance(changed, list)
+    trimmed["changed"] = [{"result_identity": item["result_identity"]} for item in changed]
+    trimmed["output_characters"] = _output_characters(trimmed)
+    findings = list(trimmed["findings"])  # type: ignore[arg-type]
+    while findings and int(trimmed["output_characters"]) > maximum_output_characters:
+        findings.pop()
+        trimmed["findings"] = findings
+        trimmed["returned_count"] = len(findings)
+        trimmed["omitted_count"] = int(trimmed["omitted_count"]) + 1
+        trimmed["truncated"] = True
+        trimmed["output_characters"] = _output_characters(trimmed)
+    return trimmed
+
+
+def _resolve_change_base(repository: Path, requested: str | None):
+    try:
+        return resolve_change_base(repository, requested)
+    except ValueError as exc:
+        raise PrepareCLIError("selected change base could not be resolved") from exc
+
+
+def _run_change_query(
+    transport: NativeTransport,
+    repository: Path,
+    state_root: Path,
+    binding: Binding,
+    snapshot: object,
+    arguments: QueryArguments,
+    refresh_summary: dict[str, object],
+) -> dict[str, object]:
+    """Answer `changed-symbols` or `impact-candidates` for one resolved base."""
+    base = _resolve_change_base(repository, arguments.base)
+    changed, warnings = changed_ranges(repository, base, snapshot)
+    selector, guard_warnings = bound_changed_selector(changed)
+    change_warnings = set(warnings) | set(guard_warnings)
+    base_block = {
+        "requested": base.requested,
+        "ref": base.ref,
+        "sha": base.sha,
+        "source": base.source,
+        "warning": base.warning,
+    }
+    filters = {
+        "path_prefixes": arguments.path_prefixes,
+        "languages": arguments.languages,
+        "symbol_kinds": arguments.symbol_kinds,
+        "source_types": arguments.source_types,
+    }
+    composing = arguments.operation == "impact-candidates"
+
+    def changed_symbols(maximum_results: int, budget: int) -> Level1Result:
+        return _invoke_native(
+            transport,
+            "changed-symbols",
+            repository,
+            state_root,
+            snapshot,
+            index_identity=binding.index_identity,
+            filters=filters,
+            maximum_results=maximum_results,
+            maximum_output_characters=budget,
+            allow_inferred=arguments.allow_inferred,
+            changed_selector=selector,
+        )
+
+    if not composing:
+        result = changed_symbols(
+            arguments.maximum_results, arguments.maximum_output_characters
+        )
+        _require_usable(result)
+        summary = _query_summary(result, refresh_summary)
+        summary["base"] = base_block
+        summary["warnings"] = sorted(set(summary["warnings"]) | change_warnings)
+        return summary
+
+    changed_result = changed_symbols(
+        IMPACT_CHANGED_MAXIMUM_RESULTS, IMPACT_CHANGED_OUTPUT_CHARACTERS
+    )
+    _require_usable(changed_result)
+
+    def related(anchors: tuple[str, ...], direction: str) -> Level1Result:
+        return _invoke_native(
+            transport,
+            "related-symbols",
+            repository,
+            state_root,
+            snapshot,
+            index_identity=binding.index_identity,
+            result_identities=anchors,
+            direction=direction,
+            maximum_results=IMPACT_CHANGED_MAXIMUM_RESULTS,
+            maximum_output_characters=IMPACT_CHANGED_OUTPUT_CHARACTERS,
+            allow_inferred=arguments.allow_inferred,
+        )
+
+    composed = compose_impact_candidates(
+        changed_result,
+        related,
+        allow_inferred=arguments.allow_inferred,
+        maximum_results=arguments.maximum_results,
+    )
+    refresh_block = dict(refresh_summary)
+    prune_warnings = refresh_block.pop("warnings", [])
+    composed["base"] = base_block
+    composed["refresh"] = refresh_block
+    composed["warnings"] = sorted(
+        set(composed["warnings"]) | change_warnings | set(prune_warnings)
+    )
+    return trim_to_budget(composed, arguments.maximum_output_characters)
+
+
+def _require_usable(result: Level1Result) -> None:
+    """Refuse a change query the index cannot answer, as a direct query does.
+
+    A change query names no result identity, so the identity refusal of
+    `run_query` cannot apply; a stale index is the only refusal left.
+    """
+    if result.status.value not in {"ready", "partial"}:
+        raise PrepareCLIError("ready context is required; run prepare inspect")
 
 
 def run_query(
@@ -687,6 +1093,16 @@ def run_query(
     binding, refresh_summary = _refresh_if_stale(
         transport, repository, state_root, binding_path, binding, snapshot, paths.root
     )
+    if arguments.operation in CHANGE_QUERY_OPERATIONS:
+        # A change query resolves its own base and sends the changed line
+        # ranges; the composed one then follows every changed symbol's
+        # relationships. Both refuse an unusable index exactly as the direct
+        # operations below do.
+        summary = _run_change_query(
+            transport, repository, state_root, binding, snapshot, arguments, refresh_summary
+        )
+        touch_binding(binding_path)
+        return summary
     # The engine evaluates the binding's freshness on every query, so the
     # query result carries exactly what a separate status call would have
     # reported. One native call per query, plus the one `update` call the

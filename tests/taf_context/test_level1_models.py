@@ -32,6 +32,13 @@ DIRTY_IDENTITY = "sha256:" + "3" * 64
 INDEX_IDENTITY = "sha256:" + "4" * 64
 RESULT_IDENTITY = "sha256:" + "5" * 64
 HEAD = "a" * 40
+CHANGED_RANGES: list[dict[str, object]] = [
+    {
+        "path": "tools/taf-context/taf_context/recovery.py",
+        "ranges": [[10, 14], [40, 40]],
+    },
+    {"path": "tools/taf-context/taf_context/refresh.py", "ranges": []},
+]
 
 
 def request_wire(operation: str = "search-symbols") -> dict[str, object]:
@@ -53,8 +60,9 @@ def request_wire(operation: str = "search-symbols") -> dict[str, object]:
             "symbol_kinds": [],
             "source_types": [],
         }
+    schema = {"related-symbols": "2", "changed-symbols": "3"}.get(operation, "1")
     wire: dict[str, object] = {
-        "schema_version": "2" if operation == "related-symbols" else "1",
+        "schema_version": schema,
         "request_identity": "request-0001",
         "consumer_identity": "taf.work-recovery",
         "operation": operation,
@@ -73,10 +81,15 @@ def request_wire(operation: str = "search-symbols") -> dict[str, object]:
         "maximum_model_output_characters": 4000,
         "allow_inferred": False,
     }
-    # The direction key exists only in schema 2, where it is non-null exactly
-    # for the one operation that resolves relationships.
-    if operation == "related-symbols":
-        wire["direction"] = "callers"
+    # The direction key exists from schema 2 on, where it is non-null exactly
+    # for the one operation that resolves relationships; the changed_ranges key
+    # exists only in schema 3, non-null exactly for the change operation.
+    if schema != "1":
+        wire["direction"] = "callers" if operation == "related-symbols" else None
+    if schema == "3":
+        wire["changed_ranges"] = (
+            copy.deepcopy(CHANGED_RANGES) if operation == "changed-symbols" else None
+        )
     return wire
 
 
@@ -284,7 +297,7 @@ class Level1VocabularyTests(unittest.TestCase):
             [
                 "estimate", "build", "update", "status", "metrics",
                 "repository-map", "search-symbols", "search-docs",
-                "source-snippets", "related-symbols",
+                "source-snippets", "related-symbols", "changed-symbols",
             ],
         )
         self.assertEqual(
@@ -773,13 +786,282 @@ class Level1RelationshipSchemaTests(unittest.TestCase):
         raw = json.dumps(related_result_wire()).encode("utf-8")
         self.assertEqual(parse_level1_result(raw).schema_version, "2")
 
-    def test_the_wire_schema_vocabulary_is_exactly_one_and_two(self) -> None:
-        for version in ("0", "3", "2.0", 2):
+    def test_the_wire_schema_vocabulary_is_exactly_one_two_and_three(self) -> None:
+        for version in ("0", "4", "2.0", 2):
             wire = result_wire()
             wire["schema_version"] = version
             with self.subTest(version=version):
                 with self.assertRaises(ValueError):
                     Level1Result.from_dict(wire)
+        accepted = result_wire()
+        accepted["schema_version"] = "3"
+        accepted["findings"] = [edge_finding_wire(
+            relation=None, edge_evidence=None, reference_line=0, reference_count=0
+        )]
+        self.assertEqual(Level1Result.from_dict(accepted).schema_version, "3")
+
+
+def schema3_request_wire(
+    operation: str = "changed-symbols", changed_ranges: object = "default"
+) -> dict[str, object]:
+    """A schema-3 request; every schema-3 request spells both added keys out."""
+    wire = request_wire(operation)
+    wire["schema_version"] = "3"
+    wire.setdefault("direction", None)
+    if changed_ranges != "default":
+        wire["changed_ranges"] = changed_ranges
+    elif "changed_ranges" not in wire:
+        wire["changed_ranges"] = None
+    return wire
+
+
+def changed_result_wire() -> dict[str, object]:
+    """A schema-3 result: the schema-2 finding field set with no edge at all."""
+    wire = result_wire()
+    wire.update(
+        {
+            "schema_version": "3",
+            "operation": "changed-symbols",
+            "findings": [
+                edge_finding_wire(
+                    relation=None,
+                    edge_evidence=None,
+                    reference_line=0,
+                    reference_count=0,
+                )
+            ],
+        }
+    )
+    return wire
+
+
+class Level1SchemaThreeContractTests(unittest.TestCase):
+    """Schema 3: the changed-range selector of the change-impact operation."""
+
+    def test_changed_symbols_request_round_trip_carries_its_selector(self) -> None:
+        wire = schema3_request_wire()
+        request = Level1Request.from_dict(wire)
+
+        self.assertEqual(request.to_dict(), wire)
+        self.assertEqual(request.schema_version, "3")
+        self.assertIs(request.operation, Level1Operation.CHANGED_SYMBOLS)
+        self.assertIsNone(request.direction)
+        self.assertIsNone(request.query)
+        self.assertEqual(request.result_identities, ())
+        assert request.changed_ranges is not None
+        self.assertEqual(
+            [(item.path, item.ranges) for item in request.changed_ranges],
+            [
+                (
+                    "tools/taf-context/taf_context/recovery.py",
+                    ((10, 14), (40, 40)),
+                ),
+                ("tools/taf-context/taf_context/refresh.py", ()),
+            ],
+        )
+
+    def test_schema_three_spells_a_null_selector_for_every_other_operation(self) -> None:
+        wire = schema3_request_wire("search-symbols")
+        request = Level1Request.from_dict(wire)
+
+        self.assertEqual(request.to_dict(), wire)
+        self.assertIsNone(request.changed_ranges)
+        self.assertIsNone(request.direction)
+
+    def test_an_empty_selector_is_a_change_set_with_no_paths(self) -> None:
+        wire = schema3_request_wire(changed_ranges=[])
+        self.assertEqual(Level1Request.from_dict(wire).changed_ranges, ())
+
+    def test_schemas_one_and_two_refuse_the_changed_range_key(self) -> None:
+        for schema in ("1", "2"):
+            wire = request_wire("search-symbols")
+            wire["schema_version"] = schema
+            if schema == "2":
+                wire["direction"] = None
+            wire["changed_ranges"] = None
+            with self.subTest(schema=schema):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+
+    def test_schema_three_requires_both_added_keys(self) -> None:
+        without_selector = schema3_request_wire()
+        del without_selector["changed_ranges"]
+        without_direction = schema3_request_wire()
+        del without_direction["direction"]
+
+        for wire in (without_selector, without_direction):
+            with self.subTest(wire=sorted(wire)):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+
+    def test_each_schema_gated_operation_belongs_to_exactly_one_schema(self) -> None:
+        changed_under_one = request_wire("changed-symbols")
+        changed_under_one["schema_version"] = "1"
+        del changed_under_one["direction"], changed_under_one["changed_ranges"]
+        changed_under_two = request_wire("changed-symbols")
+        changed_under_two["schema_version"] = "2"
+        del changed_under_two["changed_ranges"]
+        related_under_three = schema3_request_wire("related-symbols")
+
+        for wire in (changed_under_one, changed_under_two, related_under_three):
+            with self.subTest(operation=wire["operation"], schema=wire["schema_version"]):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+
+    def test_the_selector_is_non_null_exactly_for_changed_symbols(self) -> None:
+        null_selector = schema3_request_wire(changed_ranges=None)
+        selector_without_the_operation = schema3_request_wire(
+            "search-symbols", copy.deepcopy(CHANGED_RANGES)
+        )
+
+        for wire in (null_selector, selector_without_the_operation):
+            with self.subTest(operation=wire["operation"]):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+
+    def test_changed_symbols_accepts_neither_a_query_nor_anchors_nor_a_direction(self) -> None:
+        with_query = schema3_request_wire()
+        with_query["query"] = "RecoveryDossier"
+        with_anchors = schema3_request_wire()
+        with_anchors["result_identities"] = [RESULT_IDENTITY]
+        with_direction = schema3_request_wire()
+        with_direction["direction"] = "callers"
+
+        for wire in (with_query, with_anchors, with_direction):
+            with self.subTest(wire=sorted(wire.items(), key=lambda item: item[0])):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(wire)
+
+    def test_the_selector_is_bounded_sorted_and_non_overlapping(self) -> None:
+        cases: dict[str, object] = {
+            "too_many_paths": [
+                {"path": f"a/{index:04d}.py", "ranges": []} for index in range(201)
+            ],
+            "unsorted_paths": [
+                {"path": "b.py", "ranges": []},
+                {"path": "a.py", "ranges": []},
+            ],
+            "duplicate_paths": [
+                {"path": "a.py", "ranges": [[1, 1]]},
+                {"path": "a.py", "ranges": [[3, 3]]},
+            ],
+            "absolute_path": [{"path": "/a.py", "ranges": []}],
+            "escaping_path": [{"path": "../a.py", "ranges": []}],
+            "too_many_ranges": [
+                {
+                    "path": "a.py",
+                    "ranges": [[index * 2 + 1, index * 2 + 1] for index in range(65)],
+                }
+            ],
+            "descending_span": [{"path": "a.py", "ranges": [[5, 3]]}],
+            "zero_start": [{"path": "a.py", "ranges": [[0, 3]]}],
+            "unsorted_spans": [{"path": "a.py", "ranges": [[5, 6], [1, 2]]}],
+            "touching_spans": [{"path": "a.py", "ranges": [[1, 5], [5, 6]]}],
+            "short_span": [{"path": "a.py", "ranges": [[3]]}],
+            "long_span": [{"path": "a.py", "ranges": [[3, 4, 5]]}],
+            "boolean_span": [{"path": "a.py", "ranges": [[True, 4]]}],
+            "text_span": [{"path": "a.py", "ranges": [["3", "4"]]}],
+            "object_span": [{"path": "a.py", "ranges": [{"start": 3, "end": 4}]}],
+            "missing_ranges_key": [{"path": "a.py"}],
+            "extra_entry_key": [{"path": "a.py", "ranges": [], "language": "Python"}],
+            "null_ranges": [{"path": "a.py", "ranges": None}],
+            "object_selector": {"a.py": []},
+        }
+        for name, selector in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    Level1Request.from_dict(schema3_request_wire(changed_ranges=selector))
+
+        bounded = schema3_request_wire(
+            changed_ranges=[
+                {
+                    "path": "a.py",
+                    "ranges": [[index * 2 + 1, index * 2 + 1] for index in range(64)],
+                }
+            ]
+        )
+        request = Level1Request.from_dict(bounded)
+        assert request.changed_ranges is not None
+        self.assertEqual(len(request.changed_ranges[0].ranges), 64)
+        self.assertEqual(request.to_dict(), bounded)
+
+    def test_a_span_may_reach_the_counter_ceiling_but_not_pass_it(self) -> None:
+        ceiling = schema3_request_wire(
+            changed_ranges=[{"path": "a.py", "ranges": [[1, 2**31 - 1]]}]
+        )
+        self.assertEqual(
+            Level1Request.from_dict(ceiling).changed_ranges[0].ranges, ((1, 2**31 - 1),)
+        )
+        beyond = schema3_request_wire(
+            changed_ranges=[{"path": "a.py", "ranges": [[1, 2**31]]}]
+        )
+        with self.assertRaises(ValueError):
+            Level1Request.from_dict(beyond)
+
+    def test_changed_result_round_trip_carries_the_edge_field_set_with_no_edge(self) -> None:
+        wire = changed_result_wire()
+        result = Level1Result.from_dict(wire)
+
+        self.assertEqual(result.to_dict(), wire)
+        self.assertEqual(result.schema_version, "3")
+        self.assertIs(result.operation, Level1Operation.CHANGED_SYMBOLS)
+        finding = result.findings[0]
+        self.assertIsNone(finding.relation)
+        self.assertIsNone(finding.edge_evidence)
+        self.assertEqual((finding.reference_line, finding.reference_count), (0, 0))
+
+    def test_a_schema_three_finding_reads_an_absent_edge_as_empty_or_null(self) -> None:
+        wire = changed_result_wire()
+        wire["findings"] = [
+            edge_finding_wire(
+                relation="", edge_evidence="", reference_line=0, reference_count=0
+            )
+        ]
+        finding = Level1Result.from_dict(wire).findings[0]
+        self.assertEqual((finding.relation, finding.edge_evidence), (None, None))
+
+    def test_a_schema_three_finding_must_spell_every_edge_field(self) -> None:
+        for field in ("relation", "edge_evidence", "reference_line", "reference_count"):
+            wire = changed_result_wire()
+            finding = edge_finding_wire(
+                relation=None, edge_evidence=None, reference_line=0, reference_count=0
+            )
+            del finding[field]
+            wire["findings"] = [finding]
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    Level1Result.from_dict(wire)
+
+    def test_a_changed_result_may_carry_no_edge_and_no_other_schema(self) -> None:
+        with_edge = changed_result_wire()
+        with_edge["findings"] = [edge_finding_wire()]
+        under_schema_two = changed_result_wire()
+        under_schema_two["schema_version"] = "2"
+        under_schema_one = changed_result_wire()
+        under_schema_one["schema_version"] = "1"
+        under_schema_one["findings"] = [finding_wire()]
+        related_under_schema_three = related_result_wire()
+        related_under_schema_three["schema_version"] = "3"
+
+        for wire in (
+            with_edge,
+            under_schema_two,
+            under_schema_one,
+            related_under_schema_three,
+        ):
+            with self.subTest(schema=wire["schema_version"], operation=wire["operation"]):
+                with self.assertRaises(ValueError):
+                    Level1Result.from_dict(wire)
+
+    def test_the_parser_accepts_a_schema_three_frame(self) -> None:
+        raw = json.dumps(schema3_request_wire()).encode("utf-8")
+        self.assertIs(
+            parse_level1_request(raw).operation, Level1Operation.CHANGED_SYMBOLS
+        )
+        self.assertEqual(
+            parse_level1_result(json.dumps(changed_result_wire()).encode("utf-8")).schema_version,
+            "3",
+        )
 
 
 class ContractSchemaTests(unittest.TestCase):
@@ -802,8 +1084,12 @@ class ContractSchemaTests(unittest.TestCase):
             set(result_schema["$defs"]["finding"]["properties"]),
             set(Level1Finding.__dataclass_fields__),
         )
-        self.assertEqual(request_schema["properties"]["schema_version"]["enum"], ["1", "2"])
-        self.assertEqual(result_schema["properties"]["schema_version"]["enum"], ["1", "2"])
+        self.assertEqual(
+            request_schema["properties"]["schema_version"]["enum"], ["1", "2", "3"]
+        )
+        self.assertEqual(
+            result_schema["properties"]["schema_version"]["enum"], ["1", "2", "3"]
+        )
         self.assertEqual(
             request_schema["properties"]["operation"]["enum"],
             [item.value for item in Level1Operation],

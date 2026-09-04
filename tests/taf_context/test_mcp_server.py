@@ -115,6 +115,8 @@ class HandshakeTests(unittest.TestCase):
                 "search_docs",
                 "source_snippets",
                 "related_symbols",
+                "changed_symbols",
+                "impact_candidates",
             ],
         )
         self.assertTrue(operations.closed)
@@ -162,9 +164,10 @@ class ToolListTests(unittest.TestCase):
     def test_tool_definitions_match_the_checked_in_fixture(self) -> None:
         self.assertEqual(tool_definitions(), json.loads(FIXTURE.read_text(encoding="utf-8")))
 
-    def test_the_seven_tools_are_listed_in_a_stable_order(self) -> None:
+    def test_the_nine_tools_are_listed_in_a_stable_order(self) -> None:
+        names = [tool["name"] for tool in tool_definitions()]
         self.assertEqual(
-            [tool["name"] for tool in tool_definitions()],
+            names,
             [
                 "inspect",
                 "build",
@@ -173,14 +176,28 @@ class ToolListTests(unittest.TestCase):
                 "search_docs",
                 "source_snippets",
                 "related_symbols",
+                "changed_symbols",
+                "impact_candidates",
             ],
         )
-        self.assertEqual(SERVER_VERSION, "1.1.0")
-        related = tool_definitions()[-1]["inputSchema"]
+        self.assertEqual(SERVER_VERSION, "1.2.0")
+        tools = {tool["name"]: tool for tool in tool_definitions()}
+        related = tools["related_symbols"]["inputSchema"]
         self.assertEqual(related["required"], ["repo", "result_ids", "direction"])
         self.assertEqual(
             related["properties"]["direction"]["enum"],
             ["callers", "callees", "importers", "imports"],
+        )
+        for name in ("changed_symbols", "impact_candidates"):
+            schema = tools[name]["inputSchema"]
+            self.assertEqual(schema["required"], ["repo"])
+            self.assertEqual(schema["properties"]["base"]["type"], "string")
+        # Filters narrow the change set; the composed operation takes only the
+        # candidate budgets and the evidence switch.
+        self.assertIn("path_prefixes", tools["changed_symbols"]["inputSchema"]["properties"])
+        self.assertEqual(
+            sorted(tools["impact_candidates"]["inputSchema"]["properties"]),
+            ["allow_inferred", "base", "maximum_output_characters", "maximum_results", "repo"],
         )
 
     def test_build_is_the_only_writing_tool_and_requires_user_interaction(self) -> None:
@@ -271,6 +288,61 @@ class ToolCallTests(unittest.TestCase):
         self.assertEqual(
             (snippets.operation, snippets.result_identities), ("source-snippets", (sha,))
         )
+
+    def test_the_change_tools_route_their_base_and_their_budgets(self) -> None:
+        responses, _, _, operations = run_server(
+            [
+                call(
+                    1,
+                    "changed_symbols",
+                    {"repo": REPO, "base": " origin/main ", "languages": ["Go"]},
+                ),
+                call(
+                    2,
+                    "impact_candidates",
+                    {
+                        "repo": REPO,
+                        "base": "9bce09b",
+                        "allow_inferred": True,
+                        "maximum_results": 24,
+                        "maximum_output_characters": 12000,
+                    },
+                ),
+                call(3, "changed_symbols", {"repo": REPO}),
+            ]
+        )
+        for response in responses:
+            self.assertNotIn("error", response)
+        _, _, changed = operations.calls[0]
+        self.assertEqual(
+            (changed.operation, changed.base, changed.languages, changed.query),
+            ("changed-symbols", "origin/main", ["go"], None),
+        )
+        _, _, impact = operations.calls[1]
+        self.assertEqual(
+            (
+                impact.operation,
+                impact.base,
+                impact.allow_inferred,
+                impact.maximum_results,
+                impact.maximum_output_characters,
+            ),
+            ("impact-candidates", "9bce09b", True, 24, 12000),
+        )
+        _, _, without_base = operations.calls[2]
+        self.assertIsNone(without_base.base)
+
+    def test_an_unusable_base_is_an_invalid_argument(self) -> None:
+        responses, _, _, operations = run_server(
+            [
+                call(1, "changed_symbols", {"repo": REPO, "base": "   "}),
+                call(2, "impact_candidates", {"repo": REPO, "base": "bad\nref"}),
+                call(3, "changed_symbols", {"repo": REPO, "base": 7}),
+                call(4, "search_symbols", {"repo": REPO, "query": "x", "base": "HEAD"}),
+            ]
+        )
+        self.assertEqual([response["error"]["code"] for response in responses], [-32602] * 4)
+        self.assertEqual(operations.calls, [])
 
     def test_related_symbols_routes_its_anchors_and_direction(self) -> None:
         sha = "sha256:" + "c" * 64

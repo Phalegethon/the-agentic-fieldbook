@@ -514,5 +514,152 @@
     },
     "name": "related_symbols",
     "title": "Related symbols"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Answer 'what did I change on this branch': the definitions, entry points, and modules whose lines a changed hunk touches, between a base ref and the working tree (committed, staged, unstaged, and untracked changes). The result carries the resolved base; the warning changed-path-not-indexed means the change set reached files the index does not carry. A query on a bound index behind the working tree refreshes it incrementally first.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_inferred": {
+          "default": false,
+          "description": "Include findings whose evidence class is inferred.",
+          "type": "boolean"
+        },
+        "base": {
+          "description": "Git ref or commit the change set is measured against. Defaults to the branch's upstream main, then origin/HEAD, then a local main/master; uncommitted changes are always included.",
+          "type": "string"
+        },
+        "languages": {
+          "items": {
+            "enum": [
+              "go",
+              "javascript",
+              "json",
+              "markdown",
+              "python",
+              "rust",
+              "toml",
+              "typescript"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "maximum_output_characters": {
+          "default": 4000,
+          "enum": [
+            2000,
+            4000,
+            8000,
+            12000
+          ],
+          "type": "integer"
+        },
+        "maximum_results": {
+          "default": 8,
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path_prefixes": {
+          "description": "Repository-relative path prefixes (case-sensitive).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repo": {
+          "description": "Absolute path of the Git repository or worktree.",
+          "type": "string"
+        },
+        "source_types": {
+          "items": {
+            "enum": [
+              "source",
+              "document",
+              "configuration"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "symbol_kinds": {
+          "items": {
+            "enum": [
+              "configuration",
+              "definition",
+              "document-chunk",
+              "entry-point",
+              "heading",
+              "import",
+              "module"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "repo"
+      ],
+      "type": "object"
+    },
+    "name": "changed_symbols",
+    "title": "Changed symbols"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Answer 'what could my change break': the one-hop callers of the changed definitions and the importers of the changed modules, each candidate attributed to the changed symbols it depends on in `anchors`. Every candidate's edge is the strongest of its anchors; edge_evidence inferred is a name match, never proof, and is returned only with allow_inferred. Read `changed` for the change set itself. A query on a bound index behind the working tree refreshes it incrementally first.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_inferred": {
+          "default": false,
+          "description": "Include findings whose evidence class is inferred.",
+          "type": "boolean"
+        },
+        "base": {
+          "description": "Git ref or commit the change set is measured against. Defaults to the branch's upstream main, then origin/HEAD, then a local main/master; uncommitted changes are always included.",
+          "type": "string"
+        },
+        "maximum_output_characters": {
+          "default": 4000,
+          "enum": [
+            2000,
+            4000,
+            8000,
+            12000
+          ],
+          "type": "integer"
+        },
+        "maximum_results": {
+          "default": 8,
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "repo": {
+          "description": "Absolute path of the Git repository or worktree.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo"
+      ],
+      "type": "object"
+    },
+    "name": "impact_candidates",
+    "title": "Impact candidates"
   }
 ]

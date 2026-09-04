@@ -24,7 +24,7 @@
     "allow_inferred"
   ],
   "properties": {
-    "schema_version": {"enum": ["1", "2"]},
+    "schema_version": {"enum": ["1", "2", "3"]},
     "request_identity": {"$ref": "#/$defs/canonical_id"},
     "consumer_identity": {"$ref": "#/$defs/canonical_id"},
     "operation": {
@@ -38,7 +38,8 @@
         "search-symbols",
         "search-docs",
         "source-snippets",
-        "related-symbols"
+        "related-symbols",
+        "changed-symbols"
       ]
     },
     "repository_identity": {"$ref": "#/$defs/sha256"},
@@ -67,6 +68,9 @@
         {"enum": ["callers", "callees", "importers", "imports"]},
         {"type": "null"}
       ]
+    },
+    "changed_ranges": {
+      "oneOf": [{"$ref": "#/$defs/changed_ranges"}, {"type": "null"}]
     },
     "result_identities": {
       "type": "array",
@@ -186,11 +190,38 @@
     },
     {
       "if": {
+        "properties": {"operation": {"const": "changed-symbols"}},
+        "required": ["operation"]
+      },
+      "then": {
+        "properties": {
+          "schema_version": {"const": "3"},
+          "index_identity": {"$ref": "#/$defs/sha256"},
+          "query": {"type": "null"},
+          "result_identities": {"maxItems": 0},
+          "changed_ranges": {"$ref": "#/$defs/changed_ranges"}
+        },
+        "required": ["changed_ranges"]
+      },
+      "else": {
+        "properties": {"changed_ranges": {"type": "null"}}
+      }
+    },
+    {
+      "if": {
         "properties": {"schema_version": {"const": "1"}},
         "required": ["schema_version"]
       },
       "then": {"not": {"required": ["direction"]}},
       "else": {"required": ["direction"]}
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "3"}},
+        "required": ["schema_version"]
+      },
+      "then": {"required": ["changed_ranges"]},
+      "else": {"not": {"required": ["changed_ranges"]}}
     }
   ],
   "$defs": {
@@ -207,6 +238,29 @@
       "minLength": 1,
       "maxLength": 512,
       "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "changed_ranges": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "ranges"],
+        "properties": {
+          "path": {"$ref": "#/$defs/relative_path"},
+          "ranges": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {"type": "integer", "minimum": 1, "maximum": 2147483647}
+            }
+          }
+        }
+      },
+      "$comment": "Paths are sorted and unique and every path's spans ascend without touching; JSON Schema cannot express either, so the wire validators enforce both."
     },
     "filters": {
       "type": "object",

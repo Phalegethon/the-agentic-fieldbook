@@ -27,7 +27,7 @@
     "next_safe_action"
   ],
   "properties": {
-    "schema_version": {"enum": ["1", "2"]},
+    "schema_version": {"enum": ["1", "2", "3"]},
     "request_identity": {"$ref": "#/$defs/canonical_id"},
     "operation": {
       "enum": [
@@ -40,7 +40,8 @@
         "search-symbols",
         "search-docs",
         "source-snippets",
-        "related-symbols"
+        "related-symbols",
+        "changed-symbols"
       ]
     },
     "status": {"enum": ["ready", "partial", "stale", "unsupported", "error"]},
@@ -121,6 +122,20 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {"operation": {"const": "related-symbols"}},
+        "required": ["operation"]
+      },
+      "then": {"properties": {"schema_version": {"const": "2"}}}
+    },
+    {
+      "if": {
+        "properties": {"operation": {"const": "changed-symbols"}},
+        "required": ["operation"]
+      },
+      "then": {"properties": {"schema_version": {"const": "3"}}}
     },
     {
       "if": {

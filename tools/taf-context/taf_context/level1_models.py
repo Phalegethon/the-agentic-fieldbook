@@ -32,6 +32,7 @@ class Level1Operation(str, Enum):
     SEARCH_DOCS = "search-docs"
     SOURCE_SNIPPETS = "source-snippets"
     RELATED_SYMBOLS = "related-symbols"
+    CHANGED_SYMBOLS = "changed-symbols"
 
 
 class Level1RecordKind(str, Enum):
@@ -79,6 +80,7 @@ _READ_OPERATIONS = {
     Level1Operation.SEARCH_DOCS,
     Level1Operation.SOURCE_SNIPPETS,
     Level1Operation.RELATED_SYMBOLS,
+    Level1Operation.CHANGED_SYMBOLS,
 }
 _CONTROL_OPERATIONS = set(Level1Operation) - _READ_OPERATIONS
 _QUERY_OPERATIONS = {
@@ -91,17 +93,30 @@ _IDENTITY_OPERATIONS = {
     Level1Operation.RELATED_SYMBOLS,
 }
 _ALLOWED_BUDGETS = {2000, 4000, 8000, 12000}
-_WIRE_SCHEMAS = ("1", "2")
+_WIRE_SCHEMAS = ("1", "2", "3")
 _DIRECTIONS = ("callers", "callees", "importers", "imports")
 # One relationship request stays cheap to resolve, so it carries few anchors.
 _MAXIMUM_RELATED_ANCHORS = 16
 _RELATIONS = ("call", "import")
 _EDGE_EVIDENCE = (Confidence.VERIFIED.value, Confidence.INFERRED.value)
-# Keys that exist only in wire schema 2.
+# Keys that exist only from wire schema 2 on.
 _SCHEMA_TWO_REQUEST_FIELDS = frozenset({"direction"})
 _SCHEMA_TWO_FINDING_FIELDS = frozenset(
     {"relation", "edge_evidence", "reference_line", "reference_count"}
 )
+# Keys that exist only in wire schema 3.
+_SCHEMA_THREE_REQUEST_FIELDS = frozenset({"changed_ranges"})
+# Each schema-gated operation belongs to exactly the schema that introduced
+# it, so neither can appear under the frozen schema 1 nor leak into the
+# other's schema.
+_SCHEMA_GATED_OPERATIONS = {
+    Level1Operation.RELATED_SYMBOLS: "2",
+    Level1Operation.CHANGED_SYMBOLS: "3",
+}
+# The change selector is bounded independently of the collection limit: a
+# change set names many more paths than a result may return.
+_MAX_CHANGED_PATHS = 200
+_MAX_CHANGED_RANGES = 64
 
 
 @dataclass(frozen=True)
@@ -139,6 +154,43 @@ class Level1Filters:
 
 
 @dataclass(frozen=True)
+class Level1ChangedRange:
+    """One changed path and the changed line spans inside it.
+
+    An empty ``ranges`` tuple means the whole file changed; every span is an
+    inclusive ``(start, end)`` line pair.
+    """
+
+    path: str
+    ranges: tuple[tuple[int, int], ...]
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "Level1ChangedRange":
+        _exact(value, cls.__dataclass_fields__, "changed_ranges")
+        raw = value["ranges"]
+        if type(raw) is not list or len(raw) > _MAX_CHANGED_RANGES:
+            raise Level1ModelError("changed_ranges")
+        spans: list[tuple[int, int]] = []
+        for span in raw:
+            if type(span) is not list or len(span) != 2:
+                raise Level1ModelError("changed_ranges")
+            start = _counter({"changed_ranges": span[0]}, "changed_ranges")
+            end = _counter({"changed_ranges": span[1]}, "changed_ranges")
+            # Spans are ascending and never touch, so the engine can intersect
+            # them by a single scan and a merge is never needed twice.
+            if start < 1 or end < start or (spans and spans[-1][1] >= start):
+                raise Level1ModelError("changed_ranges")
+            spans.append((start, end))
+        return cls(_relative_path(value, "path"), tuple(spans))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "ranges": [[start, end] for start, end in self.ranges],
+        }
+
+
+@dataclass(frozen=True)
 class Level1Request:
     schema_version: str
     request_identity: str
@@ -161,6 +213,9 @@ class Level1Request:
     # Schema 2 only: the relationship direction, non-null exactly for
     # `related-symbols`. A schema-1 request carries no direction key at all.
     direction: str | None = None
+    # Schema 3 only: the change selector, non-null exactly for
+    # `changed-symbols`. Schemas 1 and 2 carry no changed_ranges key at all.
+    changed_ranges: tuple[Level1ChangedRange, ...] | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> "Level1Request":
@@ -169,12 +224,17 @@ class Level1Request:
         _exact(
             value,
             _schema_fields(
-                cls.__dataclass_fields__, schema, _SCHEMA_TWO_REQUEST_FIELDS
+                cls.__dataclass_fields__,
+                schema,
+                _SCHEMA_TWO_REQUEST_FIELDS,
+                _SCHEMA_THREE_REQUEST_FIELDS,
             ),
             "request",
         )
         operation = _enum(value, "operation", Level1Operation)
+        _schema_operation(schema, operation)
         direction = _direction(value, schema, operation)
+        changed_ranges = _changed_ranges(value, schema, operation)
         index_identity = _optional_sha256(value, "index_identity")
         query = _optional_text(value, "query")
         result_identities = _sorted_sha256s(value, "result_identities")
@@ -234,6 +294,7 @@ class Level1Request:
             maximum_characters,
             _boolean(value, "allow_inferred"),
             direction,
+            changed_ranges,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -259,8 +320,14 @@ class Level1Request:
             ),
             "allow_inferred": self.allow_inferred,
         }
-        if self.schema_version == "2":
+        if self.schema_version in {"2", "3"}:
             wire["direction"] = self.direction
+        if self.schema_version == "3":
+            wire["changed_ranges"] = (
+                None
+                if self.changed_ranges is None
+                else [item.to_dict() for item in self.changed_ranges]
+            )
         return wire
 
 
@@ -335,7 +402,7 @@ class Level1Finding:
             "evidence_class": self.evidence_class.value,
             "preview": self.preview,
         }
-        if schema == "2":
+        if schema != "1":
             wire["relation"] = self.relation
             wire["edge_evidence"] = (
                 None if self.edge_evidence is None else self.edge_evidence.value
@@ -446,11 +513,10 @@ class Level1Result:
             item.relation is not None for item in findings
         ):
             raise Level1ModelError("relation")
-        # A result echoes the schema its request asked for, and schema 1 has
-        # no relationship operation to ask for; the request side refuses the
-        # mirror pairing in _direction.
-        if schema == "1" and operation is Level1Operation.RELATED_SYMBOLS:
-            raise Level1ModelError("operation")
+        # A result echoes the schema its request asked for, so a schema-gated
+        # operation may only appear under its own schema; the request side
+        # refuses the mirror pairing.
+        _schema_operation(schema, operation)
         if index_identity is None and not (
             operation is Level1Operation.ESTIMATE
             or (
@@ -671,23 +737,33 @@ def _wire_schema(value: object, field: str) -> str:
 
 
 def _schema_fields(
-    fields: object, schema: str, schema_two_only: frozenset[str]
+    fields: object,
+    schema: str,
+    schema_two_only: frozenset[str],
+    schema_three_only: frozenset[str] = frozenset(),
 ) -> set[str]:
     """The exact key set a wire object must carry under ``schema``."""
     names = set(fields)
     if schema == "1":
         names -= schema_two_only
+    if schema != "3":
+        names -= schema_three_only
     return names
+
+
+def _schema_operation(schema: str, operation: Level1Operation) -> None:
+    """Refuse a schema-gated operation outside the schema that introduced it."""
+    required = _SCHEMA_GATED_OPERATIONS.get(operation)
+    if required is not None and schema != required:
+        raise Level1ModelError("operation")
 
 
 def _direction(
     value: dict[str, object], schema: str, operation: Level1Operation
 ) -> str | None:
     if schema == "1":
-        # Schema 1 has no direction key at all, so it cannot name the one
-        # operation that needs one.
-        if operation is Level1Operation.RELATED_SYMBOLS:
-            raise Level1ModelError("operation")
+        # Schema 1 has no direction key at all; the schema binding above has
+        # already refused the one operation that needs one.
         return None
     direction = _optional_text(value, "direction")
     if (direction is not None) != (
@@ -697,6 +773,34 @@ def _direction(
     if direction is not None and direction not in _DIRECTIONS:
         raise Level1ModelError("direction")
     return direction
+
+
+def _changed_ranges(
+    value: dict[str, object], schema: str, operation: Level1Operation
+) -> tuple[Level1ChangedRange, ...] | None:
+    """Read the schema-3 change selector; only changed-symbols carries one."""
+    if schema != "3":
+        return None
+    raw = value["changed_ranges"]
+    if (raw is not None) != (operation is Level1Operation.CHANGED_SYMBOLS):
+        raise Level1ModelError("changed_ranges")
+    if raw is None:
+        return None
+    if type(raw) is not list or len(raw) > _MAX_CHANGED_PATHS:
+        raise Level1ModelError("changed_ranges")
+    entries = tuple(
+        Level1ChangedRange.from_dict(item) if isinstance(item, dict) else _reject_entry()
+        for item in raw
+    )
+    paths = tuple(item.path for item in entries)
+    # UTF-8 byte order equals code-point order, so this is the engine's order.
+    if paths != tuple(sorted(paths)) or len(set(paths)) != len(paths):
+        raise Level1ModelError("changed_ranges")
+    return entries
+
+
+def _reject_entry() -> "Level1ChangedRange":
+    raise Level1ModelError("changed_ranges")
 
 
 def _edge_label(
@@ -716,7 +820,9 @@ def _edge_label(
 def _edge(
     value: dict[str, object], schema: str
 ) -> tuple[str | None, Confidence | None, int, int]:
-    if schema != "2":
+    # Schema 3 reuses the schema-2 finding field set; only schema 1 has no
+    # edge keys at all.
+    if schema == "1":
         return None, None, 0, 0
     relation = _edge_label(value, "relation", _RELATIONS)
     evidence = _edge_label(value, "edge_evidence", _EDGE_EVIDENCE)

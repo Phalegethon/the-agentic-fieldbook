@@ -97,9 +97,48 @@ def write_fake_native_engine(
                     "search-docs",
                     "source-snippets",
                     "related-symbols",
+                    "changed-symbols",
                 }
                 and (state / "fake-index").is_file()
             )
+            CHANGED_TABLE = {
+                "app.py": [
+                    ("module", "app", 1, 40),
+                    ("definition", "app.first", 3, 9),
+                    ("definition", "app.second", 11, 20),
+                ],
+                "web.py": [("definition", "web.handle", 5, 12)],
+            }
+            CALLERS = {"app.first": [("definition", "web.py", "web.handle", 5, 12, "call")]}
+            IMPORTERS = {"app": [("import", "other.py", "app", 1, 1, "import")]}
+
+            def fixture_identity(path, name):
+                return "sha256:" + hashlib.sha256((path + "\\x00" + name).encode("utf-8")).hexdigest()
+
+            NAMES = {}
+            for fixture_path, fixture_records in CHANGED_TABLE.items():
+                for _kind, _name, _start, _end in fixture_records:
+                    NAMES[fixture_identity(fixture_path, _name)] = _name
+
+            def fixture_finding(kind, path, name, start, end, relation=""):
+                return {
+                    "rank": 0,
+                    "result_identity": fixture_identity(path, name),
+                    "path": path,
+                    "start_line": start,
+                    "end_line": end,
+                    "language": "Python",
+                    "record_kind": kind,
+                    "source_type": "source",
+                    "qualified_name": name,
+                    "extraction_method": "fake-engine",
+                    "evidence_class": "verified",
+                    "preview": "",
+                    "relation": relation,
+                    "edge_evidence": "verified" if relation else "",
+                    "reference_line": 12 if relation else 0,
+                    "reference_count": 2 if relation else 0,
+                }
             if operation == "update":
                 document_path = state / envelope["changed_paths_document"]
                 document = json.loads(document_path.read_bytes().decode("utf-8"))
@@ -172,6 +211,7 @@ def write_fake_native_engine(
                 "search-docs",
                 "source-snippets",
                 "related-symbols",
+                "changed-symbols",
             }:
                 payload["status"] = "stale"
                 payload["freshness"] = "incrementally-stale"
@@ -186,33 +226,57 @@ def write_fake_native_engine(
                 payload["status"] = "stale"
                 payload["freshness"] = "structurally-stale"
                 payload["next_safe_action"] = "update-index"
+            def fixture_answer(found):
+                found.sort(key=lambda item: (item["path"], item["start_line"], item["qualified_name"]))
+                for rank, item in enumerate(found, start=1):
+                    item["rank"] = rank
+                payload["findings"] = found
+                payload["returned_count"] = len(found)
+                payload["output_characters"] = 200 if found else 0
+
             if (
                 operation == "related-symbols"
                 and request["schema_version"] == "2"
+                and ready
                 and payload["status"] in {"ready", "partial"}
             ):
                 # One resolved edge, so the broker and the CLI carry the four
-                # schema-2 finding fields end to end.
-                payload["findings"] = [{
-                    "rank": 1,
-                    "result_identity": "sha256:" + "e" * 64,
-                    "path": "tools/example/caller.py",
-                    "start_line": 10,
-                    "end_line": 14,
-                    "language": "Python",
-                    "record_kind": "definition",
-                    "source_type": "source",
-                    "qualified_name": "caller.run",
-                    "extraction_method": "fake-engine",
-                    "evidence_class": "verified",
-                    "preview": "",
-                    "relation": "call",
-                    "edge_evidence": "verified",
-                    "reference_line": 12,
-                    "reference_count": 2,
-                }]
-                payload["returned_count"] = 1
-                payload["output_characters"] = 200
+                # schema-2 finding fields end to end. An anchor the change
+                # fixture knows answers from its own table instead, so the
+                # composition can be followed end to end.
+                direction = request["direction"]
+                table = {"callers": CALLERS, "importers": IMPORTERS}.get(direction, {})
+                related_found = {}
+                for identity in request["result_identities"]:
+                    name = NAMES.get(identity)
+                    if name is None:
+                        if direction == "callers":
+                            legacy = fixture_finding(
+                                "definition", "tools/example/caller.py", "caller.run", 10, 14, "call"
+                            )
+                            legacy["result_identity"] = "sha256:" + "e" * 64
+                            related_found[legacy["result_identity"]] = legacy
+                        continue
+                    for kind, path, related_name, start, end, relation in table.get(name, []):
+                        item = fixture_finding(kind, path, related_name, start, end, relation)
+                        related_found[item["result_identity"]] = item
+                fixture_answer(list(related_found.values()))
+            if (
+                operation == "changed-symbols"
+                and request["schema_version"] == "3"
+                and ready
+                and payload["status"] in {"ready", "partial"}
+            ):
+                changed_found = []
+                for entry in request["changed_ranges"]:
+                    for kind, name, start, end in CHANGED_TABLE.get(entry["path"], []):
+                        spans = entry["ranges"]
+                        if spans and not any(start <= high and end >= low for low, high in spans):
+                            continue
+                        changed_found.append(
+                            fixture_finding(kind, entry["path"], name, start, end)
+                        )
+                fixture_answer(changed_found)
             sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\\n")
             """
         ).replace("__INVOCATION_LOG__", repr(None if invocation_log is None else str(invocation_log))).replace(
@@ -222,6 +286,18 @@ def write_fake_native_engine(
         )
     path.write_text(source, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def change_fixture(root: Path) -> tuple[Path, str]:
+    """A repository whose last commit edits line 5 of a 40-line `app.py`."""
+    repository = init_committed_repo(root / "repo")
+    lines = [f"line {number}" for number in range(1, 41)]
+    write(repository / "app.py", "\n".join(lines) + "\n")
+    base = commit_all(repository, "base")
+    lines[4] = "line 5 changed"
+    write(repository / "app.py", "\n".join(lines) + "\n")
+    commit_all(repository, "edit")
+    return repository, base
 
 
 class PrepareRepoContextCommandTests(unittest.TestCase):
@@ -418,6 +494,168 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
                 invocation_log.read_text(encoding="utf-8").splitlines(),
                 ["build", "related-symbols"],
             )
+
+    def test_changed_symbols_query_reports_its_base_and_the_touched_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, base = change_fixture(root)
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+
+            code, stdout, stderr = invoke(
+                environment,
+                "prepare", "query", "--repo", str(repo),
+                "--operation", "changed-symbols", "--base", base,
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["operation"], "changed-symbols")
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(
+                result["base"],
+                {"requested": base, "ref": base, "sha": base, "source": "explicit", "warning": None},
+            )
+            findings = result["findings"]
+            assert isinstance(findings, list)
+            self.assertEqual(
+                [(item["qualified_name"], item["start_line"]) for item in findings],
+                [("app", 1), ("app.first", 3)],
+            )
+            self.assertEqual(result["warnings"], [])
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["build", "changed-symbols"],
+            )
+
+    def test_impact_candidates_query_attributes_every_candidate_to_its_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, base = change_fixture(root)
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+
+            code, stdout, stderr = invoke(
+                environment,
+                "prepare", "query", "--repo", str(repo),
+                "--operation", "impact-candidates", "--base", base,
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["operation"], "impact-candidates")
+            self.assertEqual((result["status"], result["next_safe_action"]), ("ready", "use-index"))
+            self.assertEqual(result["changed_count"], 2)
+            self.assertEqual(
+                [item["qualified_name"] for item in result["changed"]], ["app", "app.first"]
+            )
+            findings = result["findings"]
+            assert isinstance(findings, list)
+            self.assertEqual(
+                [
+                    (
+                        item["qualified_name"],
+                        item["record_kind"],
+                        item["edge_evidence"],
+                        [anchor["qualified_name"] for anchor in item["anchors"]],
+                    )
+                    for item in findings
+                ],
+                [
+                    ("app", "import", "verified", ["app"]),
+                    ("web.handle", "definition", "verified", ["app.first"]),
+                ],
+            )
+            self.assertEqual(result["returned_count"], 2)
+            self.assertEqual((result["omitted_count"], result["truncated"]), (0, False))
+            self.assertEqual(
+                int(result["output_characters"]), len(json.dumps(
+                    result, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ))
+            )
+            # One changed-symbols call, then one relationship call per anchor:
+            # callers for the definition, importers for the module and the
+            # definition.
+            self.assertEqual(
+                invocation_log.read_text(encoding="utf-8").splitlines(),
+                ["build", "changed-symbols", "related-symbols", "related-symbols", "related-symbols"],
+            )
+
+    def test_change_operation_argument_rules_are_reported_before_the_engine_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            anchor = "sha256:" + "a" * 64
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+
+            cases = (
+                (
+                    ("--operation", "search-symbols", "--query", "Widget", "--base", "HEAD"),
+                    "selected query operation does not accept --base",
+                ),
+                (
+                    ("--operation", "changed-symbols", "--query", "Widget"),
+                    "selected query operation does not accept --query",
+                ),
+                (
+                    ("--operation", "changed-symbols", "--result-id", anchor),
+                    "selected query operation does not accept --result-id",
+                ),
+                (
+                    ("--operation", "impact-candidates", "--direction", "callers"),
+                    "selected query operation does not accept --direction",
+                ),
+            )
+            for arguments, message in cases:
+                with self.subTest(arguments=arguments):
+                    code, _stdout, stderr = invoke(
+                        environment, "prepare", "query", "--repo", str(repo), *arguments
+                    )
+                    self.assertEqual(code, 2)
+                    self.assertIn(message, stderr)
+            self.assertEqual(invocation_log.read_text(encoding="utf-8").splitlines(), ["build"])
+
+    def test_an_unresolvable_change_base_is_refused_without_a_query(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+
+            code, _stdout, stderr = invoke(
+                environment,
+                "prepare", "query", "--repo", str(repo),
+                "--operation", "changed-symbols", "--base", "no-such-ref",
+            )
+
+            self.assertEqual(code, 2)
+            self.assertIn("selected change base could not be resolved", stderr)
+            self.assertEqual(invocation_log.read_text(encoding="utf-8").splitlines(), ["build"])
 
     def test_direction_and_anchor_rules_are_reported_before_the_engine_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -83,11 +83,14 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
             "search-docs",
             "source-snippets",
             "related-symbols",
+            "changed-symbols",
+            "impact-candidates",
         ),
     )
     query.add_argument("--query")
     query.add_argument("--result-id", action="append", default=[])
     query.add_argument("--direction", choices=QUERY_DIRECTIONS)
+    query.add_argument("--base")
     query.add_argument("--path-prefix", action="append", default=[])
     query.add_argument("--language", action="append", default=[])
     query.add_argument("--symbol-kind", action="append", default=[])
@@ -148,6 +151,7 @@ def run_prepare_command(
             query=query_text,
             result_identities=result_identities,
             direction=args.direction,
+            base=args.base,
             path_prefixes=sorted(set(args.path_prefix)),
             languages=normalize_filter_values(args.language, "--language", FILTER_LANGUAGES),
             symbol_kinds=normalize_filter_values(args.symbol_kind, "--symbol-kind", FILTER_SYMBOL_KINDS),
@@ -249,7 +253,7 @@ def _download(url: str, maximum_bytes: int) -> bytes:
 
 def _validate_query_arguments(args: argparse.Namespace) -> tuple[str | None, tuple[str, ...]]:
     return validate_query_request(
-        args.operation, args.query, tuple(args.result_id), args.direction
+        args.operation, args.query, tuple(args.result_id), args.direction, args.base
     )
 
 

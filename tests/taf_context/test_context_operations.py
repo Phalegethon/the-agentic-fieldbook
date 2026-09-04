@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import stat
@@ -9,17 +10,23 @@ import tempfile
 import textwrap
 import unittest
 
+from taf_context.change_ranges import ChangedPath
 from taf_context.context_operations import (
+    MAXIMUM_REQUEST_BYTES,
     PrepareCLIError,
     QueryArguments,
+    bound_changed_selector,
+    compose_impact_candidates,
     run_build,
     run_inspect,
     run_query,
+    trim_to_budget,
     validate_query_request,
 )
+from taf_context.level1_models import Level1Result
 from taf_context.native_transport import NativeTransportError, OneShotTransport
 
-from .repo_factory import init_committed_repo, write
+from .repo_factory import commit_all, init_committed_repo, run, write
 from .test_prepare_cli import write_fake_native_engine
 
 
@@ -77,6 +84,18 @@ class RecordingTransport:
         self.frames.append((request["operation"], idempotent))
         self.requests.append(request)
         return self.inner.exchange(wire, idempotent=idempotent)
+
+
+def change_fixture(root: Path) -> tuple[Path, str]:
+    """A repository whose last commit edits line 5 of a 40-line `app.py`."""
+    repository = init_committed_repo(root / "repo")
+    lines = [f"line {number}" for number in range(1, 41)]
+    write(repository / "app.py", "\n".join(lines) + "\n")
+    base = commit_all(repository, "base")
+    lines[4] = "line 5 changed"
+    write(repository / "app.py", "\n".join(lines) + "\n")
+    commit_all(repository, "edit")
+    return repository, base
 
 
 class OperationTests(unittest.TestCase):
@@ -190,6 +209,132 @@ class OperationTests(unittest.TestCase):
             )
             self.assertEqual(related["findings"][0]["edge_evidence"], "verified")
 
+    def test_the_change_query_crosses_the_seam_as_schema_three(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, base = change_fixture(root)
+            binary = root / "engine"
+            write_fake_native_engine(binary)
+            environment = self._environment(directory, binary)
+            transports: list[RecordingTransport] = []
+
+            def transport_for(path: Path) -> RecordingTransport:
+                transports.append(RecordingTransport(path))
+                return transports[-1]
+
+            run_build(repository, environment=environment, transport_for=transport_for)
+            changed = run_query(
+                repository,
+                QueryArguments(
+                    "changed-symbols", None, (), [], [], [], [], 8, 4000, False, None, base
+                ),
+                environment=environment,
+                transport_for=transport_for,
+            )
+
+            requests = [request for transport in transports for request in transport.requests]
+            sent = [item for item in requests if item["operation"] == "changed-symbols"][0]
+            self.assertEqual(sent["schema_version"], "3")
+            self.assertIsNone(sent["direction"])
+            self.assertIsNone(sent["query"])
+            self.assertEqual(sent["result_identities"], [])
+            self.assertEqual(sent["changed_ranges"], [{"path": "app.py", "ranges": [[5, 5]]}])
+            self.assertEqual(
+                changed["base"],
+                {
+                    "requested": base,
+                    "ref": base,
+                    "sha": base,
+                    "source": "explicit",
+                    "warning": None,
+                },
+            )
+            self.assertEqual(
+                [(item["qualified_name"], item["record_kind"]) for item in changed["findings"]],
+                [("app", "module"), ("app.first", "definition")],
+            )
+
+    def test_impact_candidates_composes_one_related_call_per_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, base = change_fixture(root)
+            binary = root / "engine"
+            write_fake_native_engine(binary)
+            environment = self._environment(directory, binary)
+            transports: list[RecordingTransport] = []
+
+            def transport_for(path: Path) -> RecordingTransport:
+                transports.append(RecordingTransport(path))
+                return transports[-1]
+
+            run_build(repository, environment=environment, transport_for=transport_for)
+            impact = run_query(
+                repository,
+                QueryArguments(
+                    "impact-candidates", None, (), [], [], [], [], 8, 4000, False, None, base
+                ),
+                environment=environment,
+                transport_for=transport_for,
+            )
+
+            requests = [request for transport in transports for request in transport.requests]
+            related = [item for item in requests if item["operation"] == "related-symbols"]
+            self.assertEqual(
+                [(item["schema_version"], item["direction"], len(item["result_identities"]))
+                 for item in related],
+                [("2", "callers", 1), ("2", "importers", 1), ("2", "importers", 1)],
+            )
+            self.assertEqual(impact["operation"], "impact-candidates")
+            self.assertEqual(impact["status"], "ready")
+            self.assertEqual(impact["changed_count"], 2)
+            self.assertEqual(
+                [item["qualified_name"] for item in impact["changed"]], ["app", "app.first"]
+            )
+            self.assertEqual(
+                [(item["qualified_name"], [anchor["qualified_name"] for anchor in item["anchors"]])
+                 for item in impact["findings"]],
+                [("app", ["app"]), ("web.handle", ["app.first"])],
+            )
+            self.assertEqual(impact["findings"][1]["relation"], "call")
+            self.assertLessEqual(int(impact["output_characters"]), 4000)
+            self.assertEqual(impact["refresh"]["performed"], False)
+
+    def test_an_unresolved_base_is_reported_and_covers_uncommitted_work_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, _base = change_fixture(root)
+            # No upstream, no origin/HEAD, and no local main or master left.
+            run(repository, "git", "branch", "-m", "main", "work")
+            lines = [f"line {number}" for number in range(1, 41)]
+            lines[6] = "line 7 edited in the worktree"
+            write(repository / "app.py", "\n".join(lines) + "\n")
+            binary = root / "engine"
+            write_fake_native_engine(binary)
+            environment = self._environment(directory, binary)
+
+            run_build(repository, environment=environment, transport_for=OneShotTransport)
+            changed = run_query(
+                repository,
+                QueryArguments("changed-symbols", None, (), [], [], [], [], 8, 4000, False),
+                environment=environment,
+                transport_for=OneShotTransport,
+            )
+
+            self.assertEqual(
+                changed["base"],
+                {
+                    "requested": None,
+                    "ref": None,
+                    "sha": None,
+                    "source": "unknown",
+                    "warning": "base-unresolved",
+                },
+            )
+            self.assertEqual(changed["warnings"], ["base-unresolved"])
+            self.assertEqual(
+                [item["qualified_name"] for item in changed["findings"]], ["app", "app.first"]
+            )
+
     def test_transport_failures_keep_the_cli_messages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repository = init_committed_repo(Path(directory) / "repo")
@@ -231,6 +376,409 @@ class OperationTests(unittest.TestCase):
             self.assertEqual(str(caught.exception), "native engine is unavailable")
 
 
+REPOSITORY_IDENTITY = "sha256:" + "1" * 64
+WORKTREE_IDENTITY = "sha256:" + "2" * 64
+DIRTY_IDENTITY = "sha256:" + "3" * 64
+INDEX_IDENTITY = "sha256:" + "4" * 64
+HEAD = "a" * 40
+
+
+def identity(path: str, name: str) -> str:
+    """A stable result identity; two files may carry the same symbol name."""
+    return "sha256:" + hashlib.sha256((path + "\x00" + name).encode("utf-8")).hexdigest()
+
+
+def finding_wire(
+    rank: int,
+    name: str,
+    *,
+    path: str,
+    kind: str = "definition",
+    start: int = 10,
+    end: int = 14,
+    relation: str | None = None,
+    edge_evidence: str | None = None,
+    reference_line: int = 0,
+    reference_count: int = 0,
+) -> dict[str, object]:
+    return {
+        "rank": rank,
+        "result_identity": identity(path, name),
+        "path": path,
+        "start_line": start,
+        "end_line": end,
+        "language": "Python",
+        "record_kind": kind,
+        "source_type": "source",
+        "qualified_name": name,
+        "extraction_method": "fixture",
+        "evidence_class": "verified",
+        "preview": "",
+        "relation": relation,
+        "edge_evidence": edge_evidence,
+        "reference_line": reference_line,
+        "reference_count": reference_count,
+    }
+
+
+def engine_result(
+    operation: str,
+    schema: str,
+    findings: list[dict[str, object]],
+    *,
+    status: str = "ready",
+    warnings: tuple[str, ...] = (),
+    omitted: int = 0,
+    truncated: bool = False,
+    next_safe_action: str = "use-index",
+) -> Level1Result:
+    return Level1Result.from_dict(
+        {
+            "schema_version": schema,
+            "request_identity": "request-0001",
+            "operation": operation,
+            "status": status,
+            "provider_identity": "taf-context",
+            "provider_version": "0.4.0",
+            "index_identity": INDEX_IDENTITY,
+            "repository_identity": REPOSITORY_IDENTITY,
+            "worktree_identity": WORKTREE_IDENTITY,
+            "committed_head": HEAD,
+            "dirty_overlay_fingerprint": DIRTY_IDENTITY,
+            "freshness": "exact",
+            "parser_versions": {},
+            "coverage": {
+                "path_coverage": 1.0,
+                "language_coverage": 1.0,
+                "indexed_path_count": 1,
+                "excluded_path_count": 0,
+                "unsupported_language_count": 0,
+                "parse_failure_count": 0,
+                "exclusion_reason_counts": {},
+            },
+            "findings": findings,
+            "returned_count": len(findings),
+            "omitted_count": omitted,
+            "truncated": truncated,
+            "output_characters": 100,
+            "warnings": list(warnings),
+            "next_safe_action": next_safe_action,
+        }
+    )
+
+
+CHANGED = engine_result(
+    "changed-symbols",
+    "3",
+    [
+        finding_wire(1, "app", path="app.py", kind="module", start=1, end=40),
+        finding_wire(2, "app.first", path="app.py", start=3, end=9),
+        finding_wire(3, "app.second", path="app.py", start=11, end=20),
+    ],
+)
+
+
+class FakeRelated:
+    """Answers `related-symbols` from a canned per-anchor table."""
+
+    def __init__(self, table: dict[tuple[str, str], list[dict[str, object]]], **outcomes: object) -> None:
+        self.table = table
+        self.outcomes = outcomes
+        self.calls: list[tuple[tuple[str, ...], str]] = []
+
+    def __call__(self, anchors: tuple[str, ...], direction: str) -> Level1Result:
+        self.calls.append((anchors, direction))
+        findings: list[dict[str, object]] = []
+        for anchor in anchors:
+            for entry in self.table.get((anchor, direction), []):
+                findings.append(dict(entry, rank=len(findings) + 1))
+        outcome = self.outcomes.get(",".join(anchors) + "/" + direction, {})
+        assert isinstance(outcome, dict)
+        return engine_result("related-symbols", "2", findings, **outcome)
+
+
+def caller_of(name: str, *, path: str, evidence: str = "verified", count: int = 2) -> dict[str, object]:
+    return finding_wire(
+        1,
+        name,
+        path=path,
+        relation="call",
+        edge_evidence=evidence,
+        reference_line=12,
+        reference_count=count,
+    )
+
+
+class ComposeImpactCandidatesTests(unittest.TestCase):
+    def _compose(self, related: FakeRelated, **overrides: object) -> dict[str, object]:
+        arguments: dict[str, object] = {"allow_inferred": False, "maximum_results": 8}
+        arguments.update(overrides)
+        return compose_impact_candidates(CHANGED, related, **arguments)
+
+    def test_every_anchor_is_asked_for_on_its_own_so_attribution_is_exact(self) -> None:
+        # A multi-anchor related-symbols call merges every anchor's edges into
+        # one edge per candidate record, so the broker asks per anchor.
+        related = FakeRelated(
+            {
+                (identity("app.py", "app.first"), "callers"): [caller_of("web.handle", path="web.py")],
+                (identity("app.py", "app.second"), "callers"): [caller_of("web.handle", path="web.py")],
+                (identity("app.py", "app"), "importers"): [
+                    finding_wire(
+                        1,
+                        "app",
+                        path="other.py",
+                        kind="import",
+                        start=1,
+                        end=1,
+                        relation="import",
+                        edge_evidence="verified",
+                        reference_line=1,
+                        reference_count=1,
+                    )
+                ],
+            }
+        )
+        composed = self._compose(related)
+
+        self.assertEqual(
+            related.calls,
+            [
+                ((identity("app.py", "app.first"),), "callers"),
+                ((identity("app.py", "app.second"),), "callers"),
+                ((identity("app.py", "app"),), "importers"),
+                ((identity("app.py", "app.first"),), "importers"),
+                ((identity("app.py", "app.second"),), "importers"),
+            ],
+        )
+        self.assertEqual(composed["changed_count"], 3)
+        findings = composed["findings"]
+        assert isinstance(findings, list)
+        self.assertEqual(
+            [(item["qualified_name"], [anchor["qualified_name"] for anchor in item["anchors"]])
+             for item in findings],
+            [
+                ("web.handle", ["app.first", "app.second"]),
+                ("app", ["app"]),
+            ],
+        )
+        self.assertEqual([item["rank"] for item in findings], [1, 2])
+        self.assertEqual(composed["returned_count"], 2)
+        self.assertEqual((composed["status"], composed["omitted_count"]), ("ready", 0))
+        self.assertEqual(findings[0]["anchors"][0]["reference_line"], 12)
+
+    def test_a_changed_symbol_is_never_its_own_candidate(self) -> None:
+        related = FakeRelated(
+            {
+                (identity("app.py", "app.first"), "callers"): [
+                    caller_of("app.second", path="app.py"),
+                    caller_of("web.handle", path="web.py"),
+                ],
+                # A module record reached from its own file is dropped too.
+                (identity("app.py", "app"), "importers"): [
+                    finding_wire(1, "app", path="app.py", kind="module", start=1, end=40,
+                                 relation="import", edge_evidence="verified",
+                                 reference_line=1, reference_count=1)
+                ],
+            }
+        )
+        composed = self._compose(related)
+        findings = composed["findings"]
+        assert isinstance(findings, list)
+        self.assertEqual([item["qualified_name"] for item in findings], ["web.handle"])
+
+    def test_the_strongest_anchor_gives_the_candidate_its_edge(self) -> None:
+        related = FakeRelated(
+            {
+                (identity("app.py", "app.first"), "callers"): [
+                    caller_of("web.handle", path="web.py", evidence="inferred", count=1)
+                ],
+                (identity("app.py", "app.second"), "callers"): [
+                    caller_of("web.handle", path="web.py", evidence="verified", count=7)
+                ],
+            }
+        )
+        composed = self._compose(related, allow_inferred=True)
+        candidate = composed["findings"][0]
+
+        self.assertEqual(
+            (candidate["edge_evidence"], candidate["reference_count"]), ("verified", 7)
+        )
+        self.assertEqual(
+            [(anchor["qualified_name"], anchor["edge_evidence"]) for anchor in candidate["anchors"]],
+            [("app.second", "verified"), ("app.first", "inferred")],
+        )
+
+    def test_inferred_edges_stay_hidden_unless_they_were_asked_for(self) -> None:
+        related = FakeRelated(
+            {
+                (identity("app.py", "app.first"), "callers"): [
+                    caller_of("web.handle", path="web.py", evidence="inferred")
+                ]
+            }
+        )
+        self.assertEqual(self._compose(related)["findings"], [])
+        self.assertEqual(len(self._compose(related, allow_inferred=True)["findings"]), 1)
+
+    def test_verified_candidates_lead_then_the_ones_with_more_anchors(self) -> None:
+        related = FakeRelated(
+            {
+                (identity("app.py", "app.first"), "callers"): [
+                    caller_of("a.one", path="a.py", evidence="inferred"),
+                    caller_of("z.many", path="z.py"),
+                    caller_of("b.single", path="b.py"),
+                ],
+                (identity("app.py", "app.second"), "callers"): [caller_of("z.many", path="z.py")],
+            }
+        )
+        composed = self._compose(related, allow_inferred=True)
+        self.assertEqual(
+            [item["qualified_name"] for item in composed["findings"]],
+            ["z.many", "b.single", "a.one"],
+        )
+
+    def test_status_next_action_warnings_and_omissions_aggregate(self) -> None:
+        related = FakeRelated(
+            {(identity("app.py", "app.first"), "callers"): [caller_of("web.handle", path="web.py")]},
+            **{
+                identity("app.py", "app.second") + "/callers": {
+                    "status": "partial",
+                    "warnings": ("work-budget-exhausted",),
+                    "omitted": 3,
+                    "truncated": True,
+                    "next_safe_action": "refine-query",
+                }
+            },
+        )
+        composed = self._compose(related)
+
+        self.assertEqual(composed["status"], "partial")
+        self.assertEqual(composed["next_safe_action"], "refine-query")
+        self.assertEqual(composed["warnings"], ["work-budget-exhausted"])
+        self.assertEqual(composed["omitted_count"], 3)
+        self.assertIs(composed["truncated"], True)
+
+    def test_maximum_results_bounds_the_candidates_and_counts_the_rest(self) -> None:
+        related = FakeRelated(
+            {
+                (identity("app.py", "app.first"), "callers"): [
+                    caller_of(f"web.handle{index}", path=f"web{index}.py") for index in range(5)
+                ]
+            }
+        )
+        composed = self._compose(related, maximum_results=2)
+
+        self.assertEqual(composed["returned_count"], 2)
+        self.assertEqual(composed["omitted_count"], 3)
+        self.assertIs(composed["truncated"], True)
+        self.assertEqual([item["rank"] for item in composed["findings"]], [1, 2])
+
+
+class TrimToBudgetTests(unittest.TestCase):
+    def _object(self) -> dict[str, object]:
+        related = FakeRelated(
+            {
+                (identity("app.py", "app.first"), "callers"): [
+                    caller_of(f"web.handle{index}", path=f"web{index}.py") for index in range(6)
+                ]
+            }
+        )
+        return compose_impact_candidates(
+            CHANGED, related, allow_inferred=False, maximum_results=8
+        )
+
+    def test_an_object_inside_the_budget_only_reports_its_length(self) -> None:
+        composed = self._object()
+        trimmed = trim_to_budget(composed, 12000)
+
+        self.assertEqual(trimmed["findings"], composed["findings"])
+        self.assertEqual(trimmed["changed"], composed["changed"])
+        self.assertLessEqual(int(trimmed["output_characters"]), 12000)
+        self.assertEqual(
+            int(trimmed["output_characters"]),
+            len(json.dumps(trimmed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),
+        )
+
+    def test_the_changed_list_shrinks_to_identities_before_a_candidate_is_dropped(self) -> None:
+        composed = self._object()
+        full = int(trim_to_budget(composed, 12000)["output_characters"])
+        trimmed = trim_to_budget(composed, full - 40)
+
+        self.assertEqual(len(trimmed["findings"]), len(composed["findings"]))
+        self.assertEqual(
+            trimmed["changed"],
+            [{"result_identity": item["result_identity"]} for item in composed["changed"]],
+        )
+        self.assertIs(trimmed["truncated"], False)
+
+    def test_candidates_are_dropped_from_the_tail_once_the_changed_list_is_bare(self) -> None:
+        composed = self._object()
+        trimmed = trim_to_budget(composed, 2000)
+
+        self.assertLessEqual(int(trimmed["output_characters"]), 2000)
+        self.assertLess(len(trimmed["findings"]), len(composed["findings"]))
+        self.assertIs(trimmed["truncated"], True)
+        self.assertEqual(
+            int(trimmed["omitted_count"]),
+            int(composed["omitted_count"])
+            + len(composed["findings"])
+            - len(trimmed["findings"]),
+        )
+        self.assertEqual(
+            [item["rank"] for item in trimmed["findings"]],
+            list(range(1, len(trimmed["findings"]) + 1)),
+        )
+
+
+class ChangedSelectorGuardTests(unittest.TestCase):
+    def test_a_selector_inside_the_frame_is_returned_unchanged(self) -> None:
+        changed = (ChangedPath("a.py", ((3, 4), (9, 9))), ChangedPath("b.py", ()))
+        self.assertEqual(bound_changed_selector(changed), (changed, []))
+
+    def test_range_heavy_paths_collapse_to_whole_file_entries_until_it_fits(self) -> None:
+        # 200 long paths with 64 spans each is about 220 KB of selector before
+        # the paths are counted; the engine refuses the frame above 256 KiB.
+        changed = tuple(
+            ChangedPath(
+                f"{'d' * 240}/{'n' * 240}-{index:03d}.py",
+                tuple(
+                    (line * 20000 + 1, line * 20000 + 9)
+                    for line in range(64)
+                ),
+            )
+            for index in range(200)
+        )
+        bounded, warnings = bound_changed_selector(changed)
+
+        self.assertEqual(warnings, ["changed-ranges-collapsed"])
+        self.assertEqual(len(bounded), 200)
+        self.assertEqual([item.path for item in bounded], [item.path for item in changed])
+        self.assertTrue(any(item.ranges == () for item in bounded))
+        payload = [
+            {"path": item.path, "ranges": [[start, end] for start, end in item.ranges]}
+            for item in bounded
+        ]
+        self.assertLess(len(json.dumps(payload, separators=(",", ":")).encode("utf-8")),
+                        MAXIMUM_REQUEST_BYTES)
+
+    def test_the_widest_path_is_collapsed_first(self) -> None:
+        wide = ChangedPath("wide.py", tuple((line * 2 + 1, line * 2 + 1) for line in range(64)))
+        narrow = ChangedPath("narrow.py", ((1, 2),))
+        bounded, warnings = bound_changed_selector(
+            (narrow, wide), available_bytes=len(b'[{"path":"narrow.py","ranges":[[1,2]]},') + 40
+        )
+
+        self.assertEqual(warnings, ["changed-ranges-collapsed"])
+        self.assertEqual(bounded, (narrow, ChangedPath("wide.py", ())))
+
+    def test_a_selector_that_cannot_fit_at_all_drops_paths_from_the_tail(self) -> None:
+        changed = tuple(ChangedPath(f"{'p' * 200}-{index:03d}.py", ()) for index in range(200))
+        bounded, warnings = bound_changed_selector(changed, available_bytes=1000)
+
+        self.assertEqual(warnings, ["changed-paths-limit"])
+        self.assertLess(len(bounded), 200)
+        self.assertEqual(bounded, changed[: len(bounded)])
+
+
 class ValidateQueryRequestTests(unittest.TestCase):
     def test_rules_match_the_cli(self) -> None:
         sha = "sha256:" + "a" * 64
@@ -267,6 +815,37 @@ class ValidateQueryRequestTests(unittest.TestCase):
                 query = "main" if operation == "search-symbols" else None
                 with self.assertRaises(PrepareCLIError) as caught:
                     validate_query_request(operation, query, ids, direction)
+                self.assertEqual(str(caught.exception), message)
+
+    def test_only_the_change_operations_accept_a_base(self) -> None:
+        for operation in ("changed-symbols", "impact-candidates"):
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    validate_query_request(operation, None, (), None, "origin/main"),
+                    (None, ()),
+                )
+                self.assertEqual(validate_query_request(operation, None, ()), (None, ()))
+        sha = "sha256:" + "a" * 64
+        for operation, query, ids, direction, base, message in (
+            ("search-symbols", "main", (), None, "origin/main",
+             "selected query operation does not accept --base"),
+            ("related-symbols", None, (sha,), "callers", "origin/main",
+             "selected query operation does not accept --base"),
+            ("changed-symbols", "main", (), None, None,
+             "selected query operation does not accept --query"),
+            ("changed-symbols", None, (sha,), None, None,
+             "selected query operation does not accept --result-id"),
+            ("changed-symbols", None, (), "callers", None,
+             "selected query operation does not accept --direction"),
+            ("impact-candidates", None, (), "importers", None,
+             "selected query operation does not accept --direction"),
+            ("changed-symbols", None, (), None, "", "selected change base is invalid"),
+            ("changed-symbols", None, (), None, "a" * 513, "selected change base is invalid"),
+            ("impact-candidates", None, (), None, "bad\nref", "selected change base is invalid"),
+        ):
+            with self.subTest(operation=operation, base=base):
+                with self.assertRaises(PrepareCLIError) as caught:
+                    validate_query_request(operation, query, ids, direction, base)
                 self.assertEqual(str(caught.exception), message)
 
 
