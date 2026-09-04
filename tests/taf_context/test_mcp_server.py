@@ -222,6 +222,20 @@ class ToolListTests(unittest.TestCase):
         for warning in ("overview-root-first-prefix", "output-budget-exceeded"):
             self.assertIn(warning, tools["repository_overview"]["description"])
 
+    def test_the_overview_tool_defaults_to_a_larger_output_budget(self) -> None:
+        tools = {tool["name"]: tool for tool in tool_definitions()}
+        overview_budget = tools["repository_overview"]["inputSchema"]["properties"][
+            "maximum_output_characters"
+        ]
+        self.assertEqual(overview_budget["default"], 8000)
+        self.assertIn("8000", tools["repository_overview"]["description"])
+        for name, tool in tools.items():
+            if name in {"inspect", "build"}:
+                continue
+            budget = tool["inputSchema"]["properties"]["maximum_output_characters"]
+            expected_default = 8000 if name == "repository_overview" else 4000
+            self.assertEqual(budget["default"], expected_default, name)
+
     def test_build_is_the_only_writing_tool_and_requires_user_interaction(self) -> None:
         tools = {tool["name"]: tool for tool in tool_definitions()}
         self.assertEqual(tools["build"]["_meta"], {"anthropic/requiresUserInteraction": True})
@@ -282,8 +296,13 @@ class ToolCallTests(unittest.TestCase):
         self.assertEqual(operations.calls[0][1], Path(REPO))
         _, _, repository_map = operations.calls[2]
         self.assertEqual(
-            (repository_map.operation, repository_map.path_prefixes, repository_map.query),
-            ("repository-map", ["a/", "b/"], None),
+            (
+                repository_map.operation,
+                repository_map.path_prefixes,
+                repository_map.query,
+                repository_map.maximum_output_characters,
+            ),
+            ("repository-map", ["a/", "b/"], None, 4000),
         )
         _, _, symbols = operations.calls[3]
         self.assertEqual(
@@ -362,7 +381,10 @@ class ToolCallTests(unittest.TestCase):
         _, _, plain = operations.calls[1]
         self.assertEqual(
             (plain.operation, plain.maximum_results, plain.maximum_output_characters),
-            ("repository-overview", 8, 4000),
+            # repository_overview's group table alone is about 3700 characters of
+            # canonical JSON, so it gets a tool-specific default of 8000 (not the
+            # other tools' 4000) to leave room for the ranked file layer.
+            ("repository-overview", 8, 8000),
         )
         for response in responses:
             self.assertNotIn("error", response)

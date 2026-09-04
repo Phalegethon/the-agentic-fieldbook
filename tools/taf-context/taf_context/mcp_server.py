@@ -92,6 +92,14 @@ def _base_property() -> dict[str, Any]:
     }
 
 
+def _maximum_output_characters_property(default: int = 4000) -> dict[str, Any]:
+    return {
+        "type": "integer",
+        "enum": list(_OUTPUT_BUDGETS),
+        "default": default,
+    }
+
+
 def _filter_properties() -> dict[str, Any]:
     return {
         "path_prefixes": {
@@ -112,11 +120,7 @@ def _filter_properties() -> dict[str, Any]:
             "items": {"type": "string", "enum": list(_SOURCE_TYPES)},
         },
         "maximum_results": {"type": "integer", "minimum": 1, "maximum": 64, "default": 8},
-        "maximum_output_characters": {
-            "type": "integer",
-            "enum": list(_OUTPUT_BUDGETS),
-            "default": 4000,
-        },
+        "maximum_output_characters": _maximum_output_characters_property(),
         "allow_inferred": {
             "type": "boolean",
             "default": False,
@@ -347,7 +351,10 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "warning overview-root-first-prefix says so. The group table is never "
                 "trimmed: when the serialized answer is longer than "
                 "maximum_output_characters the warning output-budget-exceeded says so, and "
-                "a larger budget or fewer maximum_results is the way to fit it."
+                "a larger budget or fewer maximum_results is the way to fit it. "
+                "maximum_output_characters defaults to 8000 here, not the other tools' "
+                "4000, because the group table alone is about 3700 characters of "
+                "canonical JSON, leaving room for the ranked file layer."
                 + query_description_suffix
             ),
             "inputSchema": _schema(
@@ -356,7 +363,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "path_prefixes": _filter_properties()["path_prefixes"],
                     "languages": _filter_properties()["languages"],
                     "maximum_results": _filter_properties()["maximum_results"],
-                    "maximum_output_characters": _filter_properties()["maximum_output_characters"],
+                    "maximum_output_characters": _maximum_output_characters_property(8000),
                     "allow_inferred": _filter_properties()["allow_inferred"],
                 },
                 ["repo"],
@@ -416,6 +423,13 @@ def _in_enum(allowed: list[Any], value: Any) -> bool:
     return value in allowed
 
 
+# repository-overview's group table alone is about 3700 characters of
+# canonical JSON, so it gets a tool-specific default output budget of 8000;
+# every other operation keeps the shared default of 4000.
+_DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION: dict[str, int] = {"repository-overview": 8000}
+_DEFAULT_OUTPUT_CHARACTERS = 4000
+
+
 def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArguments:
     query = arguments.get("query")
     if operation in {"search-symbols", "search-docs"} and (
@@ -464,7 +478,14 @@ def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArgument
         symbol_kinds=symbol_kinds,
         source_types=source_types,
         maximum_results=int(arguments.get("maximum_results", 8)),
-        maximum_output_characters=int(arguments.get("maximum_output_characters", 4000)),
+        maximum_output_characters=int(
+            arguments.get(
+                "maximum_output_characters",
+                _DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION.get(
+                    operation, _DEFAULT_OUTPUT_CHARACTERS
+                ),
+            )
+        ),
         allow_inferred=bool(arguments.get("allow_inferred", False)),
     )
 
