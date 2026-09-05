@@ -5,6 +5,14 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+### Changed
+
+- `impact-candidates` now defaults `maximum_results` to 16 on both the CLI
+  and the MCP tool, not the shared 8: the candidates are what this operation
+  was asked for, not context alongside them, and the output budget already
+  bounds what the answer carries. On a small change set the shared 8 bound
+  the answer while its 8000-character output budget went unused.
+
 ## [2.7.2] - 2026-09-05
 
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.7.4.

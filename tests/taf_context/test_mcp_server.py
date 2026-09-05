@@ -271,8 +271,14 @@ class ToolListTests(unittest.TestCase):
         overview = tools["repository_overview"]["inputSchema"]["properties"]["maximum_results"]
         self.assertEqual(overview["default"], 24)
         self.assertIn("24", tools["repository_overview"]["description"])
+        # impact-candidates answers with the candidates the operation was
+        # asked for, and the output budget already bounds them, so it too
+        # defaults higher than the shared 8.
+        impact = tools["impact_candidates"]["inputSchema"]["properties"]["maximum_results"]
+        self.assertEqual(impact["default"], 16)
+        self.assertIn("16", tools["impact_candidates"]["description"])
         for name, tool in tools.items():
-            if name in {"inspect", "build", "repository_overview"}:
+            if name in {"inspect", "build", "repository_overview", "impact_candidates"}:
                 continue
             if "maximum_results" not in tool["inputSchema"]["properties"]:
                 continue

@@ -329,7 +329,9 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "candidate attributed to the changed symbols it depends on in `anchors`. Every "
                 "candidate's edge is the strongest of its anchors; edge_evidence inferred is "
                 "a name match, never proof, and is returned only with allow_inferred. Read "
-                "`changed` for the change set itself. maximum_output_characters defaults to "
+                "`changed` for the change set itself. maximum_results defaults to 16 here, not "
+                "the other tools' 8, because the candidates are what this operation answers "
+                "and the output budget already bounds them. maximum_output_characters defaults to "
                 "8000 here, not the other tools' 4000, because the answer carries the change "
                 "set as well as the candidates. The two layers share that budget and neither "
                 "pays for the other, cheapest loss first: an answer over budget takes the "
@@ -348,7 +350,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                 {
                     "repo": _repo_property(),
                     "base": _base_property(),
-                    "maximum_results": _filter_properties()["maximum_results"],
+                    "maximum_results": _maximum_results_property(16),
                     "maximum_output_characters": _maximum_output_characters_property(8000),
                     "allow_inferred": _filter_properties()["allow_inferred"],
                 },

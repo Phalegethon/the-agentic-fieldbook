@@ -841,6 +841,12 @@ DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION: dict[str, int] = {
 DEFAULT_MAXIMUM_RESULTS = 8
 DEFAULT_MAXIMUM_RESULTS_BY_OPERATION: dict[str, int] = {
     OVERVIEW_QUERY_OPERATION: 24,
+    # The candidates are what this operation was asked for, not context
+    # alongside them, and the output budget already bounds what fits; on a
+    # small change set the shared 8 bound the answer before the budget's
+    # 8000 characters were anywhere near spent. 16 keeps the same budget
+    # bounding the answer whenever the change set is wider.
+    "impact-candidates": 16,
 }
 # The overview is fitted entirely by the broker, so it asks the engine for the
 # widest answer the wire allows - the largest of the budgets the request

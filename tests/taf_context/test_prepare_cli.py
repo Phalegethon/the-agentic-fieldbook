@@ -2349,7 +2349,7 @@ class ChangeQuerySessionTests(unittest.TestCase):
                 languages=[],
                 symbol_kinds=[],
                 source_types=[],
-                maximum_results=8,
+                maximum_results=16,
                 maximum_output_characters=4000,
                 allow_inferred=False,
             )
@@ -2554,12 +2554,16 @@ class QueryArgumentInvariantTests(unittest.TestCase):
                 self.assertEqual(cli, mcp)
 
     def test_both_surfaces_default_the_maximum_results_by_operation(self) -> None:
-        """The overview lists directories as well as files, so it defaults to 24."""
+        """The overview lists directories as well as files, so it defaults to 24.
+
+        impact-candidates answers with the candidates the operation was asked
+        for, and the output budget already bounds them, so it defaults to 16.
+        """
         parser = argparse.ArgumentParser()
         register_prepare_command(parser.add_subparsers(dest="command", required=True))
         for operation, expected in (
             ("repository-overview", 24),
-            ("impact-candidates", 8),
+            ("impact-candidates", 16),
             ("repository-map", 8),
             ("changed-symbols", 8),
         ):

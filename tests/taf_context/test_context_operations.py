@@ -342,12 +342,15 @@ class OperationTests(unittest.TestCase):
     def test_default_maximum_results_is_per_operation(self) -> None:
         # repository-overview lists directories as well as files, so an
         # unbudgeted request wants more than the shared 8's worth of files to
-        # get a feel for a whole repository; every other operation is
-        # unaffected.
+        # get a feel for a whole repository; impact-candidates answers with
+        # the candidates the operation was asked for, and the output budget
+        # already bounds them, so it too defaults higher than the shared 8;
+        # every other operation is unaffected.
         self.assertEqual(default_maximum_results("repository-overview"), 24)
+        self.assertEqual(default_maximum_results("impact-candidates"), 16)
         for operation in (
             "repository-map", "search-symbols", "search-docs", "source-snippets",
-            "related-symbols", "changed-symbols", "impact-candidates",
+            "related-symbols", "changed-symbols",
         ):
             self.assertEqual(default_maximum_results(operation), 8)
         # The output-budget table this mirrors is untouched by this change.
