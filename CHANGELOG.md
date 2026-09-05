@@ -22,13 +22,17 @@ Skill: `prepare-repo-context` 1.9.0.
 
 ### Added
 
-- `hook install --mode confirm` writes a launcher that asks
-  `Continue with this commit? [Y/n]` on the controlling terminal after a
-  warning. Everything fails open - no terminal, `CI`/`CLAUDECODE`/`AI_AGENT`,
-  `TAF_HOOK_CONFIRM=0`, or no answer within 15 seconds
-  (`TAF_HOOK_CONFIRM_TIMEOUT`) all continue the commit - and only an explicit
-  `n` aborts it. `hook status` reports the installed launcher's mode as
-  `hook_mode`.
+- `hook install --mode confirm` writes a launcher that asks, on its own marked
+  line on the controlling terminal, whether to continue after a warning. Only
+  `y` commits; Enter, `n`, an unrecognised answer, end of input, and no answer
+  within 60 seconds (`TAF_HOOK_CONFIRM_TIMEOUT`) all abort. Where nobody can be
+  asked - no terminal, `CI`/`CLAUDECODE`/`AI_AGENT`, `TAF_HOOK_CONFIRM=0` - the
+  question is skipped and the commit proceeds. `hook status` reports the
+  installed launcher's mode as `hook_mode`.
+- On a terminal the report is painted (red-and-bold `TAF impact:`, cyan
+  locations, yellow symbols, dim trailer, green for a clean check) and carries
+  one dim line naming how many changed symbols were checked against how many
+  references. A non-TTY stderr keeps the same pure-ASCII bytes.
 
 ## [2.8.6] - 2026-09-05
 

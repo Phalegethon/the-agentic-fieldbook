@@ -1593,17 +1593,22 @@ class HookConfirmTests(unittest.TestCase):
                 )
         return code, stderr.getvalue(), terminal.written
 
-    def test_an_empty_answer_continues(self) -> None:
+    def test_an_empty_answer_aborts(self) -> None:
         code, stderr, written = self._ask("\n", {})
-        self.assertEqual(code, 0)
+        self.assertEqual(code, impact_hook.HOOK_DECLINE_EXIT_CODE)
         self.assertIn("TAF impact:", stderr)
-        self.assertEqual(written, "Continue with this commit? [Y/n] ")
+        self.assertIn(impact_hook.HOOK_CONFIRM_QUESTION, written)
+        self.assertIn(impact_hook.HOOK_CONFIRM_MARK, written)
+        self.assertIn(impact_hook.HOOK_CONFIRM_HINT, written)
+
+    def test_an_unrecognised_answer_aborts(self) -> None:
+        self.assertEqual(self._ask("maybe\n", {})[0], impact_hook.HOOK_DECLINE_EXIT_CODE)
 
     def test_y_continues(self) -> None:
         self.assertEqual(self._ask("y\n", {})[0], 0)
 
-    def test_eof_continues(self) -> None:
-        self.assertEqual(self._ask("", {})[0], 0)
+    def test_eof_aborts(self) -> None:
+        self.assertEqual(self._ask("", {})[0], impact_hook.HOOK_DECLINE_EXIT_CODE)
 
     def test_n_aborts_the_commit(self) -> None:
         self.assertEqual(self._ask("n\n", {})[0], impact_hook.HOOK_DECLINE_EXIT_CODE)
@@ -1643,7 +1648,7 @@ class HookConfirmTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("TAF impact:", stderr.getvalue())
 
-    def test_a_timeout_continues_and_says_so(self) -> None:
+    def test_a_timeout_aborts_and_says_so(self) -> None:
         terminal = _FakeTerminal("n\n")  # an answer that would abort, never read
         stderr = io.StringIO()
         with mock.patch.object(impact_hook, "_open_terminal", return_value=(terminal, terminal)), \
@@ -1658,9 +1663,9 @@ class HookConfirmTests(unittest.TestCase):
                     verbose=False,
                     confirm=True,
                 )
-        self.assertEqual(code, 0)
+        self.assertEqual(code, impact_hook.HOOK_DECLINE_EXIT_CODE)
         self.assertTrue(
-            stderr.getvalue().endswith("TAF impact: no answer; the commit continues\n"),
+            stderr.getvalue().endswith("TAF impact: no answer; the commit was aborted\n"),
             stderr.getvalue(),
         )
 
@@ -1733,11 +1738,12 @@ class ConfirmPromptOnARealTerminalTests(unittest.TestCase):
             os.close(slave)
         return code, stderr.getvalue(), shown
 
-    def test_the_question_reaches_the_terminal_and_an_empty_answer_continues(self) -> None:
+    def test_the_question_reaches_the_terminal_and_an_empty_answer_aborts(self) -> None:
         code, stderr, shown = self._ask_on_a_pty("\n", {})
 
-        self.assertEqual(code, 0)
-        self.assertIn(impact_hook.HOOK_CONFIRM_QUESTION.strip(), shown)
+        self.assertEqual(code, impact_hook.HOOK_DECLINE_EXIT_CODE)
+        self.assertIn(impact_hook.HOOK_CONFIRM_QUESTION, shown)
+        self.assertIn(impact_hook.HOOK_CONFIRM_MARK, shown)
         self.assertEqual(stderr, "")
 
     def test_typing_n_on_a_real_terminal_aborts_the_commit(self) -> None:
@@ -1750,12 +1756,12 @@ class ConfirmPromptOnARealTerminalTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
 
-    def test_no_answer_times_out_and_continues(self) -> None:
+    def test_no_answer_times_out_and_aborts(self) -> None:
         code, stderr, _shown = self._ask_on_a_pty(
             "", {"TAF_HOOK_CONFIRM_TIMEOUT": "0.2"}
         )
 
-        self.assertEqual(code, 0)
+        self.assertEqual(code, impact_hook.HOOK_DECLINE_EXIT_CODE)
         self.assertEqual(stderr, impact_hook.HOOK_CONFIRM_TIMEOUT_LINE + "\n")
 
 

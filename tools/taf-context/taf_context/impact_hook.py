@@ -85,10 +85,15 @@ HOOK_NOTHING_CHANGED_SUMMARY = "no indexed symbols changed"
 # commit is never held up by a question nobody can see.
 HOOK_CONFIRM_DISABLE_VARIABLE = "TAF_HOOK_CONFIRM"  # exactly "0" skips the prompt
 HOOK_CONFIRM_TIMEOUT_VARIABLE = "TAF_HOOK_CONFIRM_TIMEOUT"
-HOOK_CONFIRM_TIMEOUT_SECONDS = 15.0
-HOOK_CONFIRM_QUESTION = "Continue with this commit? [Y/n] "
-HOOK_CONFIRM_TIMEOUT_LINE = HOOK_HEADER_PREFIX + "no answer; the commit continues"
-HOOK_CONFIRM_DECLINE_ANSWERS = frozenset({"n", "no"})
+HOOK_CONFIRM_TIMEOUT_SECONDS = 60.0
+HOOK_CONFIRM_QUESTION = "Continue with this commit?"
+HOOK_CONFIRM_HINT = "[y = commit, Enter or n = abort]"
+HOOK_CONFIRM_MARK = "\u26a0"  # a warning sign, so the question is not one grey line among many
+HOOK_CONFIRM_TIMEOUT_LINE = HOOK_HEADER_PREFIX + "no answer; the commit was aborted"
+# Only an explicit yes continues. Silence, `n`, and anything unrecognised all
+# abort: when the hook has to act for the person, the safe action is to stop a
+# commit that leaves dependents behind, not to wave it through.
+HOOK_CONFIRM_ACCEPT_ANSWERS = frozenset({"y", "yes"})
 # Set by an agent harness or a CI runner: there is no person at a terminal,
 # even where a controlling terminal happens to be reachable.
 HOOK_NON_INTERACTIVE_VARIABLES = ("CI", "CLAUDECODE", "AI_AGENT")
@@ -792,9 +797,12 @@ def _ask_to_continue(
 ) -> int:
     """0 to let the commit proceed, 1 only for an explicit refusal (D4).
 
-    Every uncertainty resolves to 0: the disable variable, an agent or CI
-    environment, no controlling terminal, an unreadable answer, or no answer
-    at all. The single path to 1 is a person typing `n`.
+    Two different uncertainties, two different answers. Where nobody can be
+    asked at all - the disable variable, an agent or CI environment, no
+    controlling terminal - the commit proceeds, because a question nobody
+    sees must never block a commit. Where a person *was* asked and did not
+    answer, the commit is aborted: acting on someone's behalf means taking
+    the safe action, and the person can simply commit again.
     """
     if environment.get(HOOK_CONFIRM_DISABLE_VARIABLE) == "0":
         _explain(
@@ -811,7 +819,7 @@ def _ask_to_continue(
         _explain(stderr, verbose, _exception_reason(exc))
         return 0
     try:
-        writer.write(HOOK_CONFIRM_QUESTION)
+        writer.write(_format_question(_prompt_colour_enabled(environment)))
         writer.flush()
         if not _wait_for_input(reader, _confirm_timeout(environment)):
             with contextlib.suppress(Exception):
@@ -819,16 +827,33 @@ def _ask_to_continue(
                 writer.flush()
             with contextlib.suppress(Exception):
                 stderr.write(HOOK_CONFIRM_TIMEOUT_LINE + "\n")
-            return 0
+            return HOOK_DECLINE_EXIT_CODE
         answer = reader.readline()
     finally:
         for handle in (reader, writer):
             with contextlib.suppress(Exception):
                 handle.close()
+    return 0 if answer.strip().lower() in HOOK_CONFIRM_ACCEPT_ANSWERS else HOOK_DECLINE_EXIT_CODE
+
+
+def _prompt_colour_enabled(environment: Mapping[str, str]) -> bool:
+    """The question is written to a terminal by construction, so only the
+    conventional opt-outs decide whether it is painted."""
+    return "NO_COLOR" not in environment and environment.get("TERM") != "dumb"
+
+
+def _format_question(colour: bool) -> str:
+    """The question as it appears on the terminal: its own line, marked, and loud.
+
+    It has to compete with a formatter's progress output right above it, so it
+    is separated by a blank line, carries a warning sign, and states which
+    answer is the default rather than hiding it in `[Y/n]` casing.
+    """
+    if not colour:
+        return f"\n{HOOK_CONFIRM_MARK}  {HOOK_CONFIRM_QUESTION} {HOOK_CONFIRM_HINT} "
     return (
-        HOOK_DECLINE_EXIT_CODE
-        if answer.strip().lower() in HOOK_CONFIRM_DECLINE_ANSWERS
-        else 0
+        f"\n{_ANSI_BOLD}{_ANSI_YELLOW}{HOOK_CONFIRM_MARK}  {HOOK_CONFIRM_QUESTION}"
+        f"{_ANSI_RESET} {_ANSI_DIM}{HOOK_CONFIRM_HINT}{_ANSI_RESET} "
     )
 
 

@@ -76,20 +76,28 @@ the bound index not ready, the staged change set unreadable, no `HEAD`, the
 `hook install --mode=confirm` writes a launcher that asks after a warning:
 
 ```text
-Continue with this commit? [Y/n]
+⚠  Continue with this commit? [y = commit, Enter or n = abort]
 ```
 
 The question is written to the controlling terminal, not to stderr, so a
-piped stderr cannot swallow it. Everything about it fails open - the commit
-proceeds - except one answer:
+piped stderr cannot swallow it, and it is separated by a blank line and
+marked so it does not read as one more line of a formatter's progress
+output.
 
-- Enter, `y`, or end of input continues; only `n` aborts the commit.
-- No answer within 15 seconds continues, and one line says so.
-  `TAF_HOOK_CONFIRM_TIMEOUT` sets a different number of seconds.
-- The question is skipped entirely when `/dev/tty` cannot be opened (GUI
-  clients, CI, an agent's own commit), when `CI`, `CLAUDECODE` or `AI_AGENT`
-  is set, or when `TAF_HOOK_CONFIRM=0`.
-- The clean line is never followed by a question.
+Two different uncertainties get two different answers:
+
+- **Nobody can be asked** - `/dev/tty` cannot be opened (GUI clients, CI, an
+  agent's own commit), `CI`, `CLAUDECODE` or `AI_AGENT` is set, or
+  `TAF_HOOK_CONFIRM=0`. The question is skipped and the commit proceeds: a
+  question nobody sees must never block a commit.
+- **A person was asked and did not answer** - Enter, `n`, anything
+  unrecognised, end of input, or no answer within 60 seconds
+  (`TAF_HOOK_CONFIRM_TIMEOUT` sets a different number). The commit is
+  aborted. Acting on someone's behalf means taking the safe action, and they
+  can simply commit again.
+
+Only `y` (or `yes`) continues. The clean line is never followed by a
+question.
 
 The 3-second cap stays what it always was, a bound on the query; the
 question's own timeout starts once the report is already on the screen.
