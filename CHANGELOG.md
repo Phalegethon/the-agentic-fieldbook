@@ -5,6 +5,8 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-09-05
+
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.0.
 
 ### Added
@@ -29,7 +31,9 @@ Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo
 
 ## [2.7.3] - 2026-09-05
 
-Native runtime `0.6.0` (unchanged; no new engine download). ### Changed
+Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.7.5.
+
+### Changed
 
 - `impact-candidates` now defaults `maximum_results` to 16 on both the CLI
   and the MCP tool, not the shared 8: the candidates are what this operation
