@@ -960,6 +960,11 @@ def _render_launcher(
 ) -> str:
     """The POSIX `sh` launcher body; every embedded path is `shlex.quote`d.
 
+    The chained hook, when present, runs first and is called (never `exec`ed);
+    its exit code ends the launcher immediately on failure, and only once it
+    passes does the TAF block run, so TAF's report is the last thing on the
+    screen (D1).
+
     `state_root` locates the self-healing pointer file
     (`refresh_launcher_target`'s `launcher_target_path(state_root)`); the
     launcher reads it first and falls back to the embedded `interpreter` and
@@ -975,6 +980,20 @@ def _render_launcher(
         "#!/bin/sh",
         LAUNCHER_MARKER,
         '# Advisory: prints a short "TAF impact:" report on stderr and never blocks a commit.',
+    ]
+    if chained_hook_path is not None:
+        # The chained hook runs first so TAF's report is the last thing the
+        # commit writes, and so the staged content TAF reads already carries
+        # whatever that hook re-staged (D1). It is called, never `exec`ed: a
+        # backup that was deleted or lost its executable bit is treated as
+        # absent rather than terminating the shell (D10), and a non-zero exit
+        # ends the launcher with that same code, so a failing chained hook
+        # still blocks the commit.
+        quoted_chained = shlex.quote(str(chained_hook_path))
+        lines.append("if [ -x " + quoted_chained + " ]; then")
+        lines.append("  " + quoted_chained + ' "$@" || exit $?')
+        lines.append("fi")
+    lines.extend([
         "# Follows the TAF broker that last ran on this machine (a pointer under TAF's own",
         "# state); the embedded paths below are the fallback when that pointer is missing.",
         "taf_interpreter=" + quoted_interpreter,
@@ -992,17 +1011,7 @@ def _render_launcher(
         'if [ "${TAF_HOOK:-}" != "0" ] && [ -n "$taf_interpreter" ] && [ -f "$taf_script" ]; then',
         '  "$taf_interpreter" "$taf_script" hook run --repo "$PWD" || :',
         "fi",
-    ]
-    if chained_hook_path is not None:
-        # `exec` terminates a non-interactive shell when its target cannot be
-        # executed (126/127), which would make a deleted or no-longer-executable
-        # backup block every commit in the repository. A chained hook that runs
-        # decides the commit with its own exit code; one that cannot be run is
-        # treated as absent, so the launcher stays advisory (D10).
-        quoted_chained = shlex.quote(str(chained_hook_path))
-        lines.append("if [ -x " + quoted_chained + " ]; then")
-        lines.append("  exec " + quoted_chained + ' "$@"')
-        lines.append("fi")
+    ])
     return "\n".join(lines) + "\n"
 
 

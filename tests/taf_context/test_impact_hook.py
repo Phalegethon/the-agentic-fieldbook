@@ -1239,7 +1239,7 @@ class HookRefusalTests(unittest.TestCase):
 class HookChainTests(unittest.TestCase):
     """Chaining a foreign hook, and `remove` restoring it byte-for-byte."""
 
-    def test_chaining_a_foreign_hook_runs_it_after_taf_and_remove_restores_it(
+    def test_chaining_a_foreign_hook_runs_it_before_taf_and_remove_restores_it(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1268,11 +1268,12 @@ class HookChainTests(unittest.TestCase):
             launcher_lines = (hooks_dir / HOOK_FILE_NAME).read_text(
                 encoding="utf-8"
             ).splitlines()
+            quoted_chained = shlex.quote(str(chained_path))
             self.assertEqual(
-                launcher_lines[-3:],
+                launcher_lines[3:6],
                 [
-                    f"if [ -x {shlex.quote(str(chained_path))} ]; then",
-                    f'  exec {shlex.quote(str(chained_path))} "$@"',
+                    f"if [ -x {quoted_chained} ]; then",
+                    f'  {quoted_chained} "$@" || exit $?',
                     "fi",
                 ],
             )
@@ -1334,11 +1335,12 @@ class HookOrphanedChainTests(unittest.TestCase):
             launcher_lines = (hooks_dir / HOOK_FILE_NAME).read_text(
                 encoding="utf-8"
             ).splitlines()
+            quoted_chained = shlex.quote(str(chained_path))
             self.assertEqual(
-                launcher_lines[-3:],
+                launcher_lines[3:6],
                 [
-                    f"if [ -x {shlex.quote(str(chained_path))} ]; then",
-                    f'  exec {shlex.quote(str(chained_path))} "$@"',
+                    f"if [ -x {quoted_chained} ]; then",
+                    f'  {quoted_chained} "$@" || exit $?',
                     "fi",
                 ],
             )
@@ -1839,10 +1841,70 @@ class HookEndToEndTests(unittest.TestCase):
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("TAF impact:", result.stderr)
-            self.assertIn("foreign", result.stderr)
+            self.assertEqual(result.stderr, "foreign\n")
             after_log = run(repository, "git", "log", "--format=%H")
             self.assertEqual(before_log, after_log)
+
+    def test_a_passing_chained_hook_runs_before_the_taf_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign = hooks_dir / HOOK_FILE_NAME
+            foreign.write_text("#!/bin/sh\necho foreign >&2\nexit 0\n", encoding="utf-8")
+            foreign.chmod(0o755)
+            install_code, _stdout, _stderr = invoke(
+                environment, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write", "--chain",
+            )
+            self.assertEqual(install_code, 0)
+
+            result = subprocess.run(
+                ["git", "commit", "-m", "x"],
+                cwd=repository,
+                env=commit_environment(environment),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, "foreign\n" + TWO_FILE_REPORT)
+
+    def test_the_report_reflects_what_the_chained_hook_re_staged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign = hooks_dir / HOOK_FILE_NAME
+            # A formatter-shaped hook: it stages the two dependent files, so a
+            # report composed after it must find nothing untouched (D1).
+            foreign.write_text(
+                "#!/bin/sh\ngit add web.py other.py\nexit 0\n", encoding="utf-8"
+            )
+            foreign.chmod(0o755)
+            stage_edit(repository, "web.py", 5, "web 5 changed")
+            stage_edit(repository, "other.py", 5, "other 5 changed")
+            run(repository, "git", "reset", "web.py", "other.py")
+            install_code, _stdout, _stderr = invoke(
+                environment, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write", "--chain",
+            )
+            self.assertEqual(install_code, 0)
+
+            result = subprocess.run(
+                ["git", "commit", "-m", "x"],
+                cwd=repository,
+                env=commit_environment(environment),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("depend on this change", result.stderr)
 
 
 class _RaisingStderr:
@@ -2300,7 +2362,7 @@ class RenderLauncherTemplateTests(unittest.TestCase):
         self.assertNotIn("After a TAF plugin update", source)
         self.assertNotIn("\nexec ", source)
 
-    def test_the_chain_block_is_unchanged_and_follows_the_pointer_logic(self) -> None:
+    def test_the_chain_block_runs_before_the_taf_block_and_never_execs(self) -> None:
         interpreter = Path("/usr/bin/python3")
         script = Path("/plugin/prepare_repo_context.py")
         state_root = Path("/home/user/state")
@@ -2314,14 +2376,22 @@ class RenderLauncherTemplateTests(unittest.TestCase):
         )
 
         lines = source.splitlines()
+        quoted = shlex.quote(str(chained))
         self.assertEqual(
-            lines[-3:],
+            lines[lines.index(f"if [ -x {quoted} ]; then") : ][:3],
             [
-                f"if [ -x {shlex.quote(str(chained))} ]; then",
-                f'  exec {shlex.quote(str(chained))} "$@"',
+                f"if [ -x {quoted} ]; then",
+                f'  {quoted} "$@" || exit $?',
                 "fi",
             ],
         )
+        # The chained hook decides the commit first; only then does TAF speak,
+        # so its report is the last thing on the screen (D1).
+        self.assertLess(
+            lines.index(f"if [ -x {quoted} ]; then"),
+            lines.index("taf_interpreter=" + shlex.quote(str(interpreter))),
+        )
+        self.assertNotIn("\nexec ", source)
         self.assertIn(f"taf_target={shlex.quote(str(launcher_target_path(state_root)))}", lines)
 
     def test_the_read_variables_are_reset_before_the_pointer_read(self) -> None:
