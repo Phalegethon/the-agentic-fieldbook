@@ -1593,6 +1593,48 @@ class HookStatusTests(unittest.TestCase):
             self.assertEqual(summary["launcher_generation"], "pointer")
             self.assertFalse(summary["launcher_current"])
 
+    def test_status_with_a_nul_byte_in_the_pointer_reports_false_not_a_crash(self) -> None:
+        """Minor 1 (review): a pointer hand-corrupted with an embedded NUL
+        byte cannot be turned into a path at all - `Path.resolve()` raises
+        `ValueError` for it. `_pointer_runs_this_plugin`'s docstring promises
+        `False` "on any error", so `hook status` must still exit 0 with an
+        honest report, not bubble a raw `ValueError` up into a generic
+        CLI failure."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            state_root = root / "state"
+            state_root.mkdir(parents=True)
+            environment = {"TAF_STATE_HOME": str(state_root)}
+            invoke(
+                environment, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            target = launcher_target_path(state_root)
+            target.write_bytes(b"/usr/bin/python3\n/tmp/x\x00y\n")
+
+            # The embedded fallback is also stale, so `launcher_current` can
+            # only come out true through the (now-corrupted) pointer check.
+            hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            stale = hook_path.read_text(encoding="utf-8").replace(
+                f"taf_script={shlex.quote(str(_entry_point_script()))}",
+                f"taf_script={shlex.quote(str(root / 'old-script.py'))}",
+            )
+            self.assertNotEqual(stale, hook_path.read_text(encoding="utf-8"))
+            hook_path.write_text(stale, encoding="utf-8")
+            hook_path.chmod(0o755)
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "installed")
+            self.assertEqual(summary["launcher_generation"], "pointer")
+            self.assertFalse(summary["launcher_text_current"])
+            self.assertFalse(summary["launcher_current"])
+
     def test_status_reports_an_embedded_generation_launcher_as_not_current(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

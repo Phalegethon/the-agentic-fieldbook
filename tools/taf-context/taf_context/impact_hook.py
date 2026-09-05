@@ -833,12 +833,12 @@ def _pointer_runs_this_plugin(state_root: Path) -> bool:
         target = launcher_target_path(state_root)
         content = target.read_text(encoding="utf-8", errors="surrogateescape")
         interpreter_line, script_line = content.splitlines()[:2]
+        return (
+            Path(script_line).resolve() == _entry_point_script().resolve()
+            and os.access(interpreter_line, os.X_OK)
+        )
     except Exception:
         return False
-    return (
-        Path(script_line).resolve() == _entry_point_script().resolve()
-        and os.access(interpreter_line, os.X_OK)
-    )
 
 
 def refresh_launcher_target(
