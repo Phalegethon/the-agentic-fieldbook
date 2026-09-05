@@ -872,17 +872,17 @@
       "anchor_query": "_invoke_native",
       "anchor_path": "tools/taf-context/taf_context/context_operations.py",
       "anchor_qualified_name": "context_operations._invoke_native",
-      "expected_candidates": [],
+      "expected_candidates": [
+        {
+          "path": "tools/taf-context/taf_context/context_operations.py",
+          "qualified_name": "context_operations._refresh_if_stale"
+        }
+      ],
       "absent_callers": [
         {
           "path": "tests/taf_context/benchmark_query_latency.py",
           "qualified_name": "benchmark_query_latency.main",
           "reason": "related-symbols-miss"
-        },
-        {
-          "path": "tools/taf-context/taf_context/context_operations.py",
-          "qualified_name": "context_operations._refresh_if_stale",
-          "reason": "output-budget"
         },
         {
           "path": "tools/taf-context/taf_context/context_operations.py",
@@ -1007,6 +1007,10 @@
         {
           "path": "tools/taf-context-native/internal/wire/wire_test.go",
           "qualified_name": "wire.TestValidateResultBindsEdgeFieldsToRelatedSymbols"
+        },
+        {
+          "path": "tools/taf-context-native/internal/wire/wire_test.go",
+          "qualified_name": "wire.TestValidateResultRejectsInconsistentEdgeFields"
         }
       ],
       "absent_callers": [
@@ -1034,11 +1038,6 @@
           "path": "tools/taf-context-native/internal/render/render_test.go",
           "qualified_name": "render.TestFitReducesInitiallyOversizedJSONAndCharacterResults",
           "reason": "related-symbols-miss"
-        },
-        {
-          "path": "tools/taf-context-native/internal/wire/wire_test.go",
-          "qualified_name": "wire.TestValidateResultRejectsInconsistentEdgeFields",
-          "reason": "output-budget"
         }
       ]
     },

@@ -24,15 +24,19 @@ Skill: `prepare-repo-context` 1.7.2.
   `search-*`. The wire object and the models are unchanged; only the
   broker's compacted output changes.
 - `impact-candidates` gives its change set a share of the output budget
-  instead of spending it on candidates first. The `changed` list is carried
-  in full while it fits a third of the budget; over that third every entry
-  takes the compact form (`result_identity`, `path`, `qualified_name`), and a
-  compact list still over its third drops entries from the tail. The
-  candidates are only then dropped from the tail until the answer fits, so a
-  46-symbol change set at the default 8000 characters keeps a readable change
-  set as well as its candidates instead of reporting `changed: []`. The
-  candidates pay for that share: a budget-bound answer can now carry one
-  candidate fewer than 2.6.0 returned, and its tail is the weakest evidence.
+  instead of spending it on candidates first, cheapest loss first: an answer
+  over budget takes the compact `path`, `qualified_name` form for every
+  `changed` entry right away, not only once the list itself is over its
+  third of the budget - losing entry detail is cheaper than losing a
+  candidate, and the identity is still available from `changed-symbols` and
+  from every candidate's `anchors`. Only a compact list still over its third
+  of the budget drops entries from the tail, and the candidates are only
+  then dropped from the tail until the answer fits, so a 46-symbol change
+  set at the default 8000 characters keeps every changed entry (compact)
+  as well as its candidates instead of reporting `changed: []`. The
+  candidates pay for what the changed layer still cannot fit in its share:
+  a budget-bound answer can now carry one candidate fewer than 2.6.0
+  returned, and its tail is the weakest evidence.
 
 ### Added
 

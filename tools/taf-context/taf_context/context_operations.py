@@ -783,9 +783,12 @@ OVERVIEW_BUDGET_SHARES = 2
 # more than a changed entry: a third at the default budget carries a compact
 # change set of a size a real diff produces, and the candidates keep the rest.
 CHANGED_BUDGET_SHARES = 3
-# The three fields a changed entry keeps when its layer is over its share:
-# what it is, where it lives, and the identity another query is asked with.
-CHANGED_COMPACT_KEYS = ("result_identity", "path", "qualified_name")
+# The two fields a changed entry keeps when its layer is over its share: where
+# it lives and what it is. The identity is not one of them - it is available
+# from `changed-symbols` and from every candidate's `anchors`, and a real
+# 71-character `sha256:` identity by itself would halve what the share can
+# carry.
+CHANGED_COMPACT_KEYS = ("path", "qualified_name")
 # The five counters every group row sums when two rows become one.
 _OVERVIEW_COUNTERS = (
     "file_count",
@@ -1199,9 +1202,9 @@ def _compact_changed_entry(entry: dict[str, object]) -> dict[str, object]:
     """One changed symbol at its cheapest still-usable shape.
 
     The line range and the record kind are what a reader can ask
-    `changed-symbols` for again; the path and the qualified name are what
-    makes the entry readable at all, and the identity is what another query
-    is asked with, so those three stay.
+    `changed-symbols` for again, and the identity is what `changed-symbols`
+    and every candidate's `anchors` already carry, so only the path and the
+    qualified name stay - what makes the entry readable at all.
     """
     return {key: entry[key] for key in CHANGED_COMPACT_KEYS}
 
@@ -1223,15 +1226,17 @@ def _drop_changed_tail(result: dict[str, object], changed: list[dict[str, object
 def _fit_changed_to_share(result: dict[str, object], share: int) -> None:
     """Fit the changed layer into its share of the budget, cheapest loss first.
 
-    A list already inside its share is handed on with every field the engine
-    gave it. Over it, the whole list takes the compact shape first - which is
-    the cheap loss, since the lines and the kind of a changed symbol are one
-    `changed-symbols` query away - and only a compact list still over its
-    share loses entries from the tail.
+    This only runs once the whole object is already over budget, and the
+    whole list takes the compact shape right away - not only when the list
+    itself is over its share - because losing entry detail is cheaper than
+    losing a candidate: an answer only slightly over budget should not pay
+    for it with a dropped candidate when compacting the changed list is
+    enough on its own. Only a compact list still over its share loses entries
+    from the tail.
     """
     changed = result["changed"]
     assert isinstance(changed, list)
-    if not changed or _canonical_length(changed) <= share:
+    if not changed:
         return
     changed = [_compact_changed_entry(entry) for entry in changed]
     result["changed"] = changed
@@ -1245,11 +1250,13 @@ def trim_to_budget(
     """Fit a composed result into its output budget, both layers sharing it.
 
     The change set and the candidates are both what this operation is asked
-    for, so neither pays for the other: the changed layer's share is a third
-    of the budget, and it is over that share alone that its entries shrink to
-    the compact form and then drop from the tail with `changed-list-trimmed`,
-    counted in `changed_trimmed_count`. Whatever the changed layer did not
-    spend is the candidates', and they drop from the tail - strongest
+    for, so neither pays for the other, and the cheapest loss goes first: an
+    object over budget compacts every changed entry right away, whether or
+    not the list itself is over its third of the budget - losing entry detail
+    is cheaper than losing a candidate. Only a compact list still over its
+    share drops entries from the tail, counted in `changed_trimmed_count`
+    with the warning `changed-list-trimmed`. Whatever the changed layer did
+    not spend is the candidates', and they drop from the tail - strongest
     evidence surviving longest - until the whole object fits; the anchors of a
     kept candidate are never trimmed, so a changed symbol trimmed off the list
     is still named by every candidate that depends on it. Only when no
