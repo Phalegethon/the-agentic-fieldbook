@@ -532,7 +532,7 @@
           "type": "boolean"
         },
         "base": {
-          "description": "Git ref or commit the change set is measured against. Defaults to the branch's upstream main, then origin/HEAD, then a local main/master; uncommitted changes are always included.",
+          "description": "Git ref or commit the change set is measured against. Defaults to the branch's upstream main, then origin/HEAD, then a local main/master; without staged, uncommitted changes are always included. Exclusive with staged.",
           "type": "string"
         },
         "languages": {
@@ -589,6 +589,11 @@
           },
           "type": "array"
         },
+        "staged": {
+          "default": false,
+          "description": "Measure the change set as the index against HEAD - what git commit would record - instead of a base ref. Untracked and unstaged edits are excluded. Exclusive with base.",
+          "type": "boolean"
+        },
         "symbol_kinds": {
           "items": {
             "enum": [
@@ -630,7 +635,7 @@
           "type": "boolean"
         },
         "base": {
-          "description": "Git ref or commit the change set is measured against. Defaults to the branch's upstream main, then origin/HEAD, then a local main/master; uncommitted changes are always included.",
+          "description": "Git ref or commit the change set is measured against. Defaults to the branch's upstream main, then origin/HEAD, then a local main/master; without staged, uncommitted changes are always included. Exclusive with staged.",
           "type": "string"
         },
         "maximum_output_characters": {
@@ -652,6 +657,11 @@
         "repo": {
           "description": "Absolute path of the Git repository or worktree.",
           "type": "string"
+        },
+        "staged": {
+          "default": false,
+          "description": "Measure the change set as the index against HEAD - what git commit would record - instead of a base ref. Untracked and unstaged edits are excluded. Exclusive with base.",
+          "type": "boolean"
         }
       },
       "required": [

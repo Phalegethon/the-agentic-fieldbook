@@ -98,6 +98,18 @@ class RecordingTransport:
         return self.inner.exchange(wire, idempotent=idempotent)
 
 
+def staged_change_fixture(root: Path) -> Path:
+    """A repository whose index (not HEAD) edits line 5 of a 40-line `app.py`."""
+    repository = init_committed_repo(root / "repo")
+    lines = [f"line {number}" for number in range(1, 41)]
+    write(repository / "app.py", "\n".join(lines) + "\n")
+    commit_all(repository, "base")
+    lines[4] = "line 5 changed"
+    write(repository / "app.py", "\n".join(lines) + "\n")
+    run(repository, "git", "add", "app.py")
+    return repository
+
+
 def change_fixture(root: Path) -> tuple[Path, str]:
     """A repository whose last commit edits line 5 of a 40-line `app.py`."""
     repository = init_committed_repo(root / "repo")
@@ -273,6 +285,51 @@ class OperationTests(unittest.TestCase):
                 self.assertIn("edge_evidence", finding)
                 self.assertIn("reference_line", finding)
                 self.assertIn("reference_count", finding)
+
+    def test_a_staged_query_measures_the_index_against_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = staged_change_fixture(root)
+            binary = root / "engine"
+            write_fake_native_engine(binary)
+            environment = self._environment(directory, binary)
+            transports: list[RecordingTransport] = []
+
+            def transport_for(path: Path) -> RecordingTransport:
+                transports.append(RecordingTransport(path))
+                return transports[-1]
+
+            run_build(repository, environment=environment, transport_for=transport_for)
+            changed = run_query(
+                repository,
+                QueryArguments(
+                    "changed-symbols", None, (), [], [], [], [], 8, 4000, False, staged=True
+                ),
+                environment=environment,
+                transport_for=transport_for,
+            )
+
+            head = run(repository, "git", "rev-parse", "HEAD")
+            requests = [request for transport in transports for request in transport.requests]
+            sent = [item for item in requests if item["operation"] == "changed-symbols"][0]
+            # Only the staged content reached the engine: the fake table's
+            # widest hit (a whole-module entry spanning every line) would
+            # answer regardless, so the exact span sent is what proves it.
+            self.assertEqual(sent["changed_ranges"], [{"path": "app.py", "ranges": [[5, 5]]}])
+            self.assertEqual(
+                changed["base"],
+                {
+                    "requested": None,
+                    "ref": "HEAD",
+                    "sha": head,
+                    "source": "staged",
+                    "warning": None,
+                },
+            )
+            self.assertEqual(
+                [item["qualified_name"] for item in changed["findings"]],
+                ["app", "app.first"],
+            )
 
     def test_the_overview_query_crosses_the_seam_as_schema_four(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1631,6 +1688,32 @@ class ValidateQueryRequestTests(unittest.TestCase):
                 with self.assertRaises(PrepareCLIError) as caught:
                     validate_query_request(operation, query, ids, direction, base)
                 self.assertEqual(str(caught.exception), message)
+
+    def test_only_the_change_operations_accept_staged(self) -> None:
+        for operation in ("changed-symbols", "impact-candidates"):
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    validate_query_request(operation, None, (), None, None, staged=True),
+                    (None, ()),
+                )
+        for operation, query in (("search-symbols", "main"), ("repository-overview", None)):
+            with self.subTest(operation=operation):
+                with self.assertRaises(PrepareCLIError) as caught:
+                    validate_query_request(operation, query, (), staged=True)
+                self.assertEqual(
+                    str(caught.exception), "selected query operation does not accept --staged"
+                )
+
+    def test_staged_and_base_are_mutually_exclusive(self) -> None:
+        for operation in ("changed-symbols", "impact-candidates"):
+            with self.subTest(operation=operation):
+                with self.assertRaises(PrepareCLIError) as caught:
+                    validate_query_request(
+                        operation, None, (), None, "origin/main", staged=True
+                    )
+                self.assertEqual(
+                    str(caught.exception), "--staged and --base are mutually exclusive"
+                )
 
 
 class OverviewQueryRequestTests(unittest.TestCase):

@@ -5,6 +5,11 @@ The base is the one work recovery resolves (explicit request, upstream main,
 base to the working tree carries committed, staged, and unstaged changes; the
 untracked paths of the Level 0 snapshot are added as whole-file entries. The
 result is bounded and deterministic so it can be sent to the engine as is.
+
+A second, additive mode measures the staged content instead: `changed_ranges`
+with `staged=True` runs `git diff --cached` against `HEAD` - the index as
+`git commit` would record it - and never adds untracked or unstaged paths,
+since neither is part of a commit.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from .refresh import _safe_update_path
 MAXIMUM_CHANGED_PATHS = 200
 MAXIMUM_RANGES_PER_PATH = 64
 
+WARNING_NO_HEAD = "no-head"
 WARNING_BASE_UNRESOLVED = "base-unresolved"
 WARNING_PATH_UNSAFE = "changed-path-unsafe"
 WARNING_PATHS_LIMIT = "changed-paths-limit"
@@ -29,6 +35,7 @@ WARNING_DIFF_UNAVAILABLE = "changed-diff-unavailable"
 
 # Emission order of the warnings; the caller must see a stable list.
 _WARNING_ORDER = (
+    WARNING_NO_HEAD,
     WARNING_BASE_UNRESOLVED,
     WARNING_DIFF_UNAVAILABLE,
     WARNING_PATH_UNSAFE,
@@ -41,6 +48,7 @@ _MAXIMUM_LINE = (1 << 31) - 1
 _MAXIMUM_DIFF_BYTES = 16 * 1024 * 1024
 
 _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 _QUOTED_ESCAPES = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, '"': 34, "\\": 92}
 _OCTAL_DIGITS = "01234567"
 
@@ -81,6 +89,25 @@ def resolve_change_base(
         resolution.source,
         resolution.warning,
     )
+
+
+def staged_change_base(repo: Path, *, root: Path | None = None) -> ChangeBase:
+    """The staged base: `HEAD` itself, never the work-recovery priority.
+
+    `git commit` records the index against `HEAD`, so the staged change set
+    is always measured there instead of an upstream or a local main/master.
+    On the very first commit of a repository `HEAD` is unborn and `sha` is
+    `None`; `changed_ranges` turns that into the `no-head` warning instead of
+    running a diff no `HEAD` could anchor.
+    """
+    resolved_root = root if root is not None else _repository_root(Path(repo))
+    raw = _git(resolved_root, "rev-parse", "--verify", "HEAD", allow_failure=True)
+    sha = None
+    if raw is not None:
+        text = raw.decode("ascii", "replace").strip()
+        if _COMMIT_SHA.fullmatch(text):
+            sha = text.lower()
+    return ChangeBase(None, "HEAD", sha, "staged", None)
 
 
 @dataclass
@@ -170,44 +197,59 @@ def parse_unified_diff_ranges(text: str) -> dict[str, list[tuple[int, int]] | No
 
 
 def changed_ranges(
-    repo: Path, base: ChangeBase, snapshot, *, root: Path | None = None
+    repo: Path,
+    base: ChangeBase,
+    snapshot,
+    *,
+    root: Path | None = None,
+    staged: bool = False,
 ) -> tuple[tuple[ChangedPath, ...], list[str]]:
     """Return the bounded changed paths of `repo` against `base`, plus warnings.
 
     `root` is the already-resolved repository root (H2): when the caller has
     one, passing it here skips a second `git rev-parse --show-toplevel`.
+    `staged` measures the index against `HEAD` instead of the working tree -
+    what `git commit` would record - and never adds the snapshot's untracked
+    paths, since they are not part of a commit either.
     """
     warnings: set[str] = set()
     if base.warning:
         warnings.add(base.warning)
     root = root if root is not None else _repository_root(Path(repo))
-    # An unresolved base still reports the uncommitted work of the worktree.
-    target = base.sha if base.sha is not None else "HEAD"
+    if staged and base.sha is None:
+        # The very first commit of a repository has no HEAD to measure the
+        # index against; there is nothing to diff, so the hook stays silent.
+        warnings.add(WARNING_NO_HEAD)
+        return (), _ordered_warnings(warnings)
+    diff_arguments = ["diff"]
+    if staged:
+        diff_arguments.append("--cached")
+    diff_arguments += [
+        "-U0",
+        "--no-color",
+        "--no-renames",
+        "--ignore-submodules=all",
+        # Pin the path prefixes the parser assumes: a repo-local
+        # diff.mnemonicPrefix or diff.noprefix would otherwise silently
+        # corrupt every parsed path. Command-line flags override config.
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        # An unresolved base still reports the uncommitted work of the
+        # worktree; staged mode always measures the index against HEAD.
+        "HEAD" if staged or base.sha is None else base.sha,
+        "--",
+    ]
     try:
-        raw = _git(
-            root,
-            "diff",
-            "-U0",
-            "--no-color",
-            "--no-renames",
-            "--ignore-submodules=all",
-            # Pin the path prefixes the parser assumes: a repo-local
-            # diff.mnemonicPrefix or diff.noprefix would otherwise silently
-            # corrupt every parsed path. Command-line flags override config.
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            target,
-            "--",
-            allow_failure=True,
-        )
+        raw = _git(root, *diff_arguments, allow_failure=True)
     except SnapshotError:
         raw = None
     if raw is None or len(raw) > _MAXIMUM_DIFF_BYTES:
         warnings.add(WARNING_DIFF_UNAVAILABLE)
         return (), _ordered_warnings(warnings)
     parsed = parse_unified_diff_ranges(raw.decode("utf-8", "surrogateescape"))
-    for path in snapshot.untracked_paths:
-        parsed[path] = None  # untracked files contribute every definition
+    if not staged:
+        for path in snapshot.untracked_paths:
+            parsed[path] = None  # untracked files contribute every definition
 
     kept: list[str] = []
     for path in sorted(parsed):  # code-point order equals the engine's byte order

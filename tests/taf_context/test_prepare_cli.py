@@ -37,7 +37,7 @@ from taf_context.prepare_cli import (
 )
 from taf_context.refresh import CHANGE_DOCUMENT_NAME
 
-from .repo_factory import commit_all, init_committed_repo, write
+from .repo_factory import commit_all, init_committed_repo, run, write
 
 
 ROOT = Path(__file__).parents[2]
@@ -475,6 +475,18 @@ def change_fixture(root: Path) -> tuple[Path, str]:
     return repository, base
 
 
+def staged_change_fixture(root: Path) -> Path:
+    """A repository whose index (not HEAD) edits line 5 of a 40-line `app.py`."""
+    repository = init_committed_repo(root / "repo")
+    lines = [f"line {number}" for number in range(1, 41)]
+    write(repository / "app.py", "\n".join(lines) + "\n")
+    commit_all(repository, "base")
+    lines[4] = "line 5 changed"
+    write(repository / "app.py", "\n".join(lines) + "\n")
+    run(repository, "git", "add", "app.py")
+    return repository
+
+
 class PrepareRepoContextCommandTests(unittest.TestCase):
     def test_explicit_state_home_does_not_require_posix_home_variable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -791,6 +803,44 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
                 ["build", "serve", "changed-symbols"],
             )
 
+    def test_staged_query_reports_the_staged_base_and_only_the_staged_ranges(self) -> None:
+        for operation in ("changed-symbols", "impact-candidates"):
+            with self.subTest(operation=operation):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    repo = staged_change_fixture(root)
+                    native = root / "taf-level1"
+                    invocation_log = root / "native-invocations.log"
+                    write_fake_native_engine(native, invocation_log)
+                    environment = {
+                        "TAF_LEVEL1_BINARY": str(native),
+                        "TAF_STATE_HOME": str(root / "state"),
+                    }
+                    invoke(
+                        environment, "prepare", "build", "--repo", str(repo),
+                        "--confirm-state-write",
+                    )
+                    head = run(repo, "git", "rev-parse", "HEAD")
+
+                    code, stdout, stderr = invoke(
+                        environment,
+                        "prepare", "query", "--repo", str(repo),
+                        "--operation", operation, "--staged",
+                    )
+
+                    self.assertEqual((code, stderr), (0, ""))
+                    result = decoded(stdout)
+                    self.assertEqual(
+                        result["base"],
+                        {
+                            "requested": None,
+                            "ref": "HEAD",
+                            "sha": head,
+                            "source": "staged",
+                            "warning": None,
+                        },
+                    )
+
     def test_a_stale_index_refuses_the_change_operations(self) -> None:
         # A change query names no result identity, so the identity refusal
         # cannot apply and a stale index is the only refusal left; both
@@ -968,6 +1018,22 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
                 (
                     ("--operation", "impact-candidates", "--direction", "callers"),
                     "selected query operation does not accept --direction",
+                ),
+                (
+                    ("--operation", "search-symbols", "--query", "Widget", "--staged"),
+                    "selected query operation does not accept --staged",
+                ),
+                (
+                    ("--operation", "repository-overview", "--staged"),
+                    "selected query operation does not accept --staged",
+                ),
+                (
+                    ("--operation", "changed-symbols", "--base", "HEAD", "--staged"),
+                    "--staged and --base are mutually exclusive",
+                ),
+                (
+                    ("--operation", "impact-candidates", "--staged", "--base", "HEAD"),
+                    "--staged and --base are mutually exclusive",
                 ),
             )
             for arguments, message in cases:
@@ -2452,6 +2518,7 @@ class QueryArgumentInvariantTests(unittest.TestCase):
             maximum_results=maximum_results,
             maximum_output_characters=output_characters,
             allow_inferred=args.allow_inferred,
+            staged=args.staged,
         )
 
     def test_both_surfaces_answer_an_overview_query_identically(self) -> None:
@@ -2620,6 +2687,42 @@ class QueryArgumentInvariantTests(unittest.TestCase):
                             "changed_trimmed_count",
                         )
                         self.assertEqual(answered["changed_trimmed_count"], 0)
+
+    def test_both_surfaces_answer_a_staged_change_query_identically(self) -> None:
+        parser = argparse.ArgumentParser()
+        register_prepare_command(parser.add_subparsers(dest="command", required=True))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = staged_change_fixture(root)
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            invoke(environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write")
+
+            for operation in ("changed-symbols", "impact-candidates"):
+                with self.subTest(operation=operation):
+                    cli = self._cli_arguments(
+                        parser,
+                        "prepare", "query", "--repo", str(repo),
+                        "--operation", operation, "--staged",
+                    )
+                    mcp = _query_arguments(operation, {"repo": str(repo), "staged": True})
+
+                    self.assertEqual(cli, mcp)
+                    self.assertTrue(cli.staged)
+                    answered = run_query(
+                        repo, cli, environment=environment, transport_for=OneShotTransport
+                    )
+                    self.assertEqual(
+                        answered,
+                        run_query(
+                            repo, mcp, environment=environment, transport_for=OneShotTransport
+                        ),
+                    )
+                    self.assertEqual(answered["base"]["source"], "staged")
 
 
 class QueryPathImportTests(unittest.TestCase):

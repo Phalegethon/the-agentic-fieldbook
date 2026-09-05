@@ -205,12 +205,21 @@ class ToolListTests(unittest.TestCase):
             schema = tools[name]["inputSchema"]
             self.assertEqual(schema["required"], ["repo"])
             self.assertEqual(schema["properties"]["base"]["type"], "string")
+            self.assertEqual(schema["properties"]["staged"]["type"], "boolean")
+            self.assertEqual(schema["properties"]["staged"]["default"], False)
         # Filters narrow the change set; the composed operation takes only the
         # candidate budgets and the evidence switch.
         self.assertIn("path_prefixes", tools["changed_symbols"]["inputSchema"]["properties"])
         self.assertEqual(
             sorted(tools["impact_candidates"]["inputSchema"]["properties"]),
-            ["allow_inferred", "base", "maximum_output_characters", "maximum_results", "repo"],
+            [
+                "allow_inferred",
+                "base",
+                "maximum_output_characters",
+                "maximum_results",
+                "repo",
+                "staged",
+            ],
         )
 
     def test_the_overview_tool_takes_only_the_path_shaped_filters(self) -> None:
@@ -508,6 +517,44 @@ class ToolCallTests(unittest.TestCase):
             ]
         )
         self.assertEqual([response["error"]["code"] for response in responses], [-32602] * 4)
+        self.assertEqual(operations.calls, [])
+
+    def test_the_change_tools_route_staged(self) -> None:
+        responses, _, _, operations = run_server(
+            [
+                call(1, "changed_symbols", {"repo": REPO, "staged": True}),
+                call(
+                    2,
+                    "impact_candidates",
+                    {"repo": REPO, "staged": True, "allow_inferred": True},
+                ),
+                call(3, "changed_symbols", {"repo": REPO, "staged": False, "base": "origin/main"}),
+            ]
+        )
+        for response in responses:
+            self.assertNotIn("error", response)
+        _, _, changed = operations.calls[0]
+        self.assertEqual(
+            (changed.operation, changed.staged, changed.base),
+            ("changed-symbols", True, None),
+        )
+        _, _, impact = operations.calls[1]
+        self.assertEqual(
+            (impact.operation, impact.staged, impact.allow_inferred),
+            ("impact-candidates", True, True),
+        )
+        _, _, based = operations.calls[2]
+        self.assertEqual((based.staged, based.base), (False, "origin/main"))
+
+    def test_staged_and_base_together_are_an_invalid_argument(self) -> None:
+        responses, _, _, operations = run_server(
+            [
+                call(1, "changed_symbols", {"repo": REPO, "staged": True, "base": "origin/main"}),
+                call(2, "impact_candidates", {"repo": REPO, "base": "HEAD", "staged": True}),
+                call(3, "changed_symbols", {"repo": REPO, "staged": "yes"}),
+            ]
+        )
+        self.assertEqual([response["error"]["code"] for response in responses], [-32602] * 3)
         self.assertEqual(operations.calls, [])
 
     def test_related_symbols_routes_its_anchors_and_direction(self) -> None:

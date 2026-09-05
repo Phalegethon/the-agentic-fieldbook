@@ -17,6 +17,7 @@ from taf_context.change_ranges import (
     changed_ranges,
     parse_unified_diff_ranges,
     resolve_change_base,
+    staged_change_base,
 )
 from taf_context.git_snapshot import collect_snapshot
 from taf_context.recovery import resolve_recovery_base
@@ -497,6 +498,89 @@ class ChangedRangesTests(unittest.TestCase):
             changed_ranges(repo, base, snapshot, root=repo)
 
         lookup.assert_not_called()
+
+
+class StagedChangeRangesTests(unittest.TestCase):
+    """`changed_ranges(..., staged=True)` measures the index against HEAD."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _fixture(self) -> Path:
+        """Base commit; a staged edit, a staged deletion, and a staged new
+        file, then an unstaged edit to the already-staged file and an
+        untracked file, neither of which is part of the staged content."""
+        repo = init_repo(self.root / "repo")
+        write(repo / "a.py", _numbered("a", 10))
+        write(repo / "c.py", _numbered("c", 10))
+        commit_all(repo, "first")
+
+        lines = (repo / "a.py").read_text(encoding="utf-8").splitlines(True)
+        lines[2], lines[3] = "A3\n", "A4\n"
+        write(repo / "a.py", "".join(lines))
+        lines = (repo / "c.py").read_text(encoding="utf-8").splitlines(True)
+        del lines[5:7]
+        write(repo / "c.py", "".join(lines))
+        write(repo / "b.py", _numbered("b", 2))
+        run(repo, "git", "add", "a.py", "c.py", "b.py")
+
+        # Staged and committed here; the working tree still moves on, but
+        # only the index matters to the staged change set.
+        lines = (repo / "a.py").read_text(encoding="utf-8").splitlines(True)
+        lines[8] = "A9\n"
+        write(repo / "a.py", "".join(lines))
+        write(repo / "untracked.py", _numbered("u", 2))
+        return repo
+
+    def test_staged_content_ignores_the_unstaged_edit_and_the_untracked_file(self) -> None:
+        repo = self._fixture()
+        base = staged_change_base(repo)
+        snapshot = collect_snapshot(repo)
+
+        paths, warnings = changed_ranges(repo, base, snapshot, staged=True)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            paths,
+            (
+                # The staged edit, not the later unstaged one at line 9.
+                ChangedPath("a.py", ((3, 4),)),
+                # A staged new file is a whole-file entry.
+                ChangedPath("b.py", ()),
+                # A staged deletion is the adjacent new-side line.
+                ChangedPath("c.py", ((5, 5),)),
+            ),
+        )
+
+    def test_an_unborn_repository_reports_no_head_and_an_empty_change_set(self) -> None:
+        repo = init_repo(self.root / "repo")
+
+        base = staged_change_base(repo)
+        paths, warnings = changed_ranges(repo, base, _snapshot_stub(), staged=True)
+
+        self.assertIsNone(base.sha)
+        self.assertEqual(paths, ())
+        self.assertEqual(warnings, ["no-head"])
+
+    def test_the_staged_base_is_head_itself_not_the_recovery_priority(self) -> None:
+        repo = init_repo(self.root / "repo")
+        write(repo / "a.py", "a\n")
+        commit_all(repo, "first")
+        head = run(repo, "git", "rev-parse", "HEAD")
+        # No upstream, no origin/HEAD, and the branch is not named main or
+        # master either, so the recovery priority would resolve to nothing.
+        run(repo, "git", "branch", "-m", "work")
+
+        base = staged_change_base(repo)
+
+        self.assertEqual(
+            (base.requested, base.ref, base.sha, base.source, base.warning),
+            (None, "HEAD", head, "staged", None),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover - manual execution

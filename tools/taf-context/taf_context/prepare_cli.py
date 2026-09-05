@@ -96,6 +96,7 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
     query.add_argument("--result-id", action="append", default=[])
     query.add_argument("--direction", choices=QUERY_DIRECTIONS)
     query.add_argument("--base")
+    query.add_argument("--staged", action="store_true")
     query.add_argument("--path-prefix", action="append", default=[])
     query.add_argument("--language", action="append", default=[])
     query.add_argument("--symbol-kind", action="append", default=[])
@@ -170,6 +171,7 @@ def run_prepare_command(
             maximum_results=maximum_results,
             maximum_output_characters=output_characters,
             allow_inferred=args.allow_inferred,
+            staged=args.staged,
         )
         if args.operation in CHANGE_QUERY_OPERATIONS:
             return _run_change_query_over_a_session(
@@ -311,6 +313,7 @@ def _validate_query_arguments(
         args.base,
         symbol_kinds=args.symbol_kind,
         source_types=args.source_type,
+        staged=args.staged,
     )
     maximum_results = args.maximum_results
     if maximum_results is None:

@@ -19,6 +19,7 @@ from .change_ranges import (
     ChangedPath,
     changed_ranges,
     resolve_change_base,
+    staged_change_base,
 )
 from .git_snapshot import collect_snapshot
 from .level1_models import (
@@ -773,6 +774,7 @@ class QueryArguments:
     allow_inferred: bool
     direction: str | None = None
     base: str | None = None
+    staged: bool = False
 
 
 QUERY_DIRECTIONS = ("callers", "callees", "importers", "imports")
@@ -781,7 +783,7 @@ IDENTITY_QUERY_OPERATIONS = ("source-snippets", "related-symbols")
 # One relationship request stays cheap to resolve, so it carries few anchors.
 MAXIMUM_RELATED_ANCHORS = 16
 # The two operations that answer from a Git difference instead of from a query
-# string or a result identity, and the only ones that accept a base.
+# string or a result identity, and the only ones that accept a base or --staged.
 CHANGE_QUERY_OPERATIONS = ("changed-symbols", "impact-candidates")
 # The operation that answers with a directory table instead of a ranked
 # search: it names no query, no anchor, no direction, and no base.
@@ -928,6 +930,7 @@ def validate_query_request(
     *,
     symbol_kinds: list[str] | tuple[str, ...] = (),
     source_types: list[str] | tuple[str, ...] = (),
+    staged: bool = False,
 ) -> tuple[str | None, tuple[str, ...]]:
     """Apply the query/result-identity rules shared by the CLI and the MCP server."""
     query_operations = {"search-symbols", "search-docs"}
@@ -959,6 +962,11 @@ def validate_query_request(
         if operation not in CHANGE_QUERY_OPERATIONS:
             raise PrepareCLIError("selected query operation does not accept --base")
         normalize_change_base(base)
+    if staged:
+        if operation not in CHANGE_QUERY_OPERATIONS:
+            raise PrepareCLIError("selected query operation does not accept --staged")
+        if base is not None:
+            raise PrepareCLIError("--staged and --base are mutually exclusive")
     if operation == OVERVIEW_QUERY_OPERATION:
         # The overview describes whole directories, so it narrows by path and
         # by language and never by a symbol-shaped filter. The engine refuses
@@ -1770,8 +1778,16 @@ def _run_change_query(
     # `git rev-parse --show-toplevel` once to produce `canonical_root`; reuse
     # it here instead of resolving the same root twice more (H2).
     root = Path(snapshot.canonical_root)
-    base = _resolve_change_base(repository, arguments.base, root=root)
-    changed, warnings = changed_ranges(repository, base, snapshot, root=root)
+    if arguments.staged:
+        # `_resolve_repository` already refused a repository with no commit
+        # before any query runs, so the staged base never needs the
+        # work-recovery priority: it is always HEAD itself.
+        base = staged_change_base(repository, root=root)
+    else:
+        base = _resolve_change_base(repository, arguments.base, root=root)
+    changed, warnings = changed_ranges(
+        repository, base, snapshot, root=root, staged=arguments.staged
+    )
     selector, guard_warnings = bound_changed_selector(changed)
     change_warnings = set(warnings) | set(guard_warnings)
     base_block = {

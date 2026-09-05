@@ -89,7 +89,20 @@ def _base_property() -> dict[str, Any]:
         "description": (
             "Git ref or commit the change set is measured against. Defaults to "
             "the branch's upstream main, then origin/HEAD, then a local "
-            "main/master; uncommitted changes are always included."
+            "main/master; without staged, uncommitted changes are always "
+            "included. Exclusive with staged."
+        ),
+    }
+
+
+def _staged_property() -> dict[str, Any]:
+    return {
+        "type": "boolean",
+        "default": False,
+        "description": (
+            "Measure the change set as the index against HEAD - what git commit "
+            "would record - instead of a base ref. Untracked and unstaged edits "
+            "are excluded. Exclusive with base."
         ),
     }
 
@@ -314,6 +327,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                 {
                     "repo": _repo_property(),
                     "base": _base_property(),
+                    "staged": _staged_property(),
                     **_filter_properties(),
                 },
                 ["repo"],
@@ -350,6 +364,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                 {
                     "repo": _repo_property(),
                     "base": _base_property(),
+                    "staged": _staged_property(),
                     "maximum_results": _maximum_results_property(16),
                     "maximum_output_characters": _maximum_output_characters_property(8000),
                     "allow_inferred": _filter_properties()["allow_inferred"],
@@ -481,6 +496,12 @@ def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArgument
             base = normalize_change_base(base)
         except PrepareCLIError as exc:
             raise InvalidArguments("base must be a Git ref or commit") from exc
+    staged = bool(arguments.get("staged", False))
+    if staged and base is not None:
+        # Only the two change tools declare the key, so an operation that
+        # cannot accept staged is already an unknown argument; the only rule
+        # left to enforce here is the same mutual exclusion the CLI refuses.
+        raise InvalidArguments("staged and base are mutually exclusive")
     try:
         languages = normalize_filter_values(
             arguments.get("languages", []), "languages", FILTER_LANGUAGES
@@ -499,6 +520,7 @@ def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArgument
         result_identities=identities,
         direction=direction,
         base=base,
+        staged=staged,
         path_prefixes=sorted(set(arguments.get("path_prefixes", []))),
         languages=languages,
         symbol_kinds=symbol_kinds,
