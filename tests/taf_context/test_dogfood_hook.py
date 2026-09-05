@@ -5,25 +5,31 @@ built with the released native engine, and given an installed `pre-commit`
 launcher. Test A edits a library helper (`normalize_change_base`) whose real
 callers - production code and its own unit tests alike - stay untouched and
 commits: `git commit` must succeed and the installed launcher's stderr must
-name the untouched dependents, in candidate order, up to the five-line cap
-plus one summary line for the rest. Test B edits the same helper again but
-this time also touches every file that carries an untouched dependent, so
-none is left out of the commit: the launcher must then stay silent. The two
-tests share one clone and one built index, and rely on running in that
-order - the second commit builds on the first commit the first test made.
+name the untouched dependent files, one line each, up to the five-line cap,
+with a summary line only when more files remain. Test B edits the same
+helper again but this time also touches every file that carries an
+untouched dependent, so none is left out of the commit: the launcher must
+then stay silent. The two tests share one clone and one built index, and
+rely on running in that order - the second commit builds on the first
+commit the first test made.
 
 The exact dependent set turned out wider than a first reading of the source
 suggests: `normalize_change_base` is called from `mcp_server.py` and
 `prepare_cli.py` (the two production callers), from its own file at the
 excluded same-file call site (`validate_query_request`, part of this very
-commit and therefore never a candidate), and from three call sites inside
-its own unit test module, `tests/taf_context/test_context_operations.py`.
-Each of `mcp_server.py` and `prepare_cli.py` also contributes a second,
-distinct candidate: a `from .context_operations import (` multi-line import
-statement resolves every name in the list to one reference anchored at the
-`from` line itself, not the name's own line inside the parenthesized list -
-so the engine's `reference_line` for that candidate is the import
-statement's line, exactly the case this module's brief flagged as possible.
+commit and therefore never a candidate), and from two call sites inside its
+own unit test module, `tests/taf_context/test_context_operations.py`, plus
+one import-line reference there (`:18`, the
+`from taf_context.context_operations import (` statement). Each of
+`mcp_server.py` and `prepare_cli.py` also contributes a second, distinct
+candidate: that same multi-line import statement resolves every name in the
+list to one reference anchored at the `from` line itself, not the name's own
+line inside the parenthesized list - so the engine's `reference_line` for
+that candidate is the import statement's line, exactly the case this
+module's brief flagged as possible. Untouched dependents are now counted per
+file (addendum D9): a file that carries both an import-line reference and a
+call site collapses to its one call representative, and production files
+print before test files.
 """
 
 from __future__ import annotations
@@ -57,29 +63,23 @@ _EDITED_MESSAGE_AGAIN = '"selected change base is invalid (dogfood again)"'
 
 # The exact `TAF:` lines the released 0.6.0 engine produced for Test A,
 # pinned from a real run of this test (see the task report for the verbatim
-# captured stderr of both commits). Candidate order is the composition's own
-# order (edge evidence, then anchor count, then path and start line), and the
-# five-line cap leaves two of the seven untouched dependents for the summary
-# line: the same seven identities a direct
-# `impact-candidates --staged --maximum-results 64` call returns minus the
-# one same-file candidate the commit itself carries.
+# captured stderr). Untouched dependents are counted per file (addendum D9):
+# the seven candidates the pre-D9 query returned collapse to three
+# representative files - `mcp_server.py` and `prepare_cli.py` each keep only
+# their call-site candidate over their import-line one, and
+# `test_context_operations.py`'s two call sites collapse to the earlier one -
+# printed non-test files first, so all three fit under the five-line cap and
+# no summary line is needed.
 EXPECTED_STDERR_TEST_A = (
     "TAF: context_operations.normalize_change_base changed; "
-    "tests/taf_context/test_context_operations.py:18 "
+    "tools/taf-context/taf_context/mcp_server.py:481 "
+    "depends on it and is not in this commit\n"
+    "TAF: context_operations.normalize_change_base changed; "
+    "tools/taf-context/taf_context/prepare_cli.py:324 "
     "depends on it and is not in this commit\n"
     "TAF: context_operations.normalize_change_base changed; "
     "tests/taf_context/test_context_operations.py:2147 "
     "depends on it and is not in this commit\n"
-    "TAF: context_operations.normalize_change_base changed; "
-    "tests/taf_context/test_context_operations.py:2155 "
-    "depends on it and is not in this commit\n"
-    "TAF: context_operations.normalize_change_base changed; "
-    "tools/taf-context/taf_context/mcp_server.py:13 "
-    "depends on it and is not in this commit\n"
-    "TAF: context_operations.normalize_change_base changed; "
-    "tools/taf-context/taf_context/mcp_server.py:481 "
-    "depends on it and is not in this commit\n"
-    "TAF: … and 2 more (run: prepare query --operation impact-candidates --staged)\n"
 )
 
 

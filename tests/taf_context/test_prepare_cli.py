@@ -77,6 +77,7 @@ def write_fake_native_engine(
     wide_overview: bool = False,
     build_error: bool = False,
     extra_callers: int = 0,
+    duplicate_caller_path_import: bool = False,
     request_log: Path | None = None,
     pid_file: Path | None = None,
     serve_delay_seconds: float = 0.0,
@@ -144,7 +145,20 @@ def write_fake_native_engine(
                         for index in range(__EXTRA_CALLERS__)
                     ]
                 }
-                IMPORTERS = {"app": [("import", "other.py", "app", 1, 1, "import")]}
+                IMPORTERS = {
+                    "app": [("import", "other.py", "app", 1, 1, "import")]
+                    + (
+                        # A second, distinct identity (a different
+                        # qualified_name keeps the result_identity distinct)
+                        # that resolves to the same path as the first caller
+                        # below, so one path carries two candidates - the
+                        # scenario the untouched-dependents grouping must
+                        # collapse to its call representative.
+                        [("import", "web.py", "app_via_web", 1, 1, "import")]
+                        if __DUPLICATE_CALLER_PATH_IMPORT__
+                        else []
+                    )
+                }
 
                 def fixture_identity(path, name):
                     return "sha256:" + hashlib.sha256((path + "\\x00" + name).encode("utf-8")).hexdigest()
@@ -437,6 +451,8 @@ def write_fake_native_engine(
         ).replace("__WIDE_OVERVIEW__", repr(wide_overview)).replace(
             "__BUILD_ERROR__", repr(build_error)
         ).replace("__EXTRA_CALLERS__", repr(extra_callers)).replace(
+            "__DUPLICATE_CALLER_PATH_IMPORT__", repr(duplicate_caller_path_import)
+        ).replace(
             "__REQUEST_LOG__", repr(None if request_log is None else str(request_log))
         ).replace("__PID_FILE__", repr(None if pid_file is None else str(pid_file))).replace(
             "__SERVE_DELAY_SECONDS__", repr(serve_delay_seconds)

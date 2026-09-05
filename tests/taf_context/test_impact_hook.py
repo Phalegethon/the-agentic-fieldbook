@@ -261,9 +261,16 @@ class ImpactHookWarningTests(unittest.TestCase):
             )
 
     def test_exactly_the_cap_many_dependents_end_without_a_summary_line(self) -> None:
+        # Five distinct paths, six candidates: web.py contributes both a call
+        # (from the callers query) and an import (from the importers query),
+        # and the untouched-dependents grouping must collapse that pair to
+        # its one call representative for the count to land exactly on the
+        # cap with no summary line.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            environment, repository = self._ready_repository(root, extra_callers=3)
+            environment, repository = self._ready_repository(
+                root, extra_callers=3, duplicate_caller_path_import=True
+            )
 
             code, stdout, stderr = hook(environment, repository)
 
@@ -271,6 +278,15 @@ class ImpactHookWarningTests(unittest.TestCase):
             lines = stderr.splitlines()
             self.assertEqual(len(lines), HOOK_MAXIMUM_LINES)
             self.assertNotIn("more (run:", stderr)
+            self.assertEqual(
+                lines,
+                [
+                    f"TAF: app.first changed; dep{index:02d}.py:12 depends on it"
+                    " and is not in this commit"
+                    for index in range(3)
+                ]
+                + [OTHER_LINE.rstrip("\n"), WEB_LINE.rstrip("\n")],
+            )
 
     def test_the_query_asks_the_engine_for_verified_edges_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -296,11 +312,19 @@ class ImpactHookWarningTests(unittest.TestCase):
 class UntouchedDependentTests(unittest.TestCase):
     """The pure filter and the two pure line formats."""
 
-    def _candidate(self, path: str, evidence: str) -> dict[str, object]:
+    def _candidate(
+        self,
+        path: str,
+        evidence: str,
+        *,
+        relation: str = "",
+        reference_line: int = 12,
+    ) -> dict[str, object]:
         return {
             "path": path,
-            "reference_line": 12,
+            "reference_line": reference_line,
             "edge_evidence": evidence,
+            "relation": relation,
             "anchors": [{"qualified_name": "app.first", "path": "app.py"}],
         }
 
@@ -317,6 +341,76 @@ class UntouchedDependentTests(unittest.TestCase):
         kept = untouched_dependents(result, {"app.py"})
 
         self.assertEqual([item["path"] for item in kept], ["web.py", "other.py"])
+
+    def test_two_candidates_of_one_path_import_then_call_keeps_the_call(self) -> None:
+        result = {
+            "findings": [
+                self._candidate("web.py", "verified", relation="import", reference_line=1),
+                self._candidate("web.py", "verified", relation="call", reference_line=12),
+            ]
+        }
+
+        kept = untouched_dependents(result, set())
+
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["relation"], "call")
+        self.assertEqual(kept[0]["reference_line"], 12)
+
+    def test_two_candidates_of_one_path_both_import_keeps_the_first(self) -> None:
+        result = {
+            "findings": [
+                self._candidate("web.py", "verified", relation="import", reference_line=1),
+                self._candidate("web.py", "verified", relation="import", reference_line=7),
+            ]
+        }
+
+        kept = untouched_dependents(result, set())
+
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["reference_line"], 1)
+
+    def test_non_test_paths_print_before_test_paths_each_group_in_input_order(
+        self,
+    ) -> None:
+        result = {
+            "findings": [
+                self._candidate("tests/test_a.py", "verified", relation="call"),
+                self._candidate("src/a.py", "verified", relation="call"),
+                self._candidate("foo_test.py", "verified", relation="call"),
+                self._candidate("src/b.py", "verified", relation="call"),
+            ]
+        }
+
+        kept = untouched_dependents(result, set())
+
+        self.assertEqual(
+            [item["path"] for item in kept],
+            ["src/a.py", "src/b.py", "tests/test_a.py", "foo_test.py"],
+        )
+
+    def test_a_test_only_input_keeps_its_order(self) -> None:
+        result = {
+            "findings": [
+                self._candidate("tests/test_a.py", "verified", relation="call"),
+                self._candidate("foo_test.py", "verified", relation="call"),
+            ]
+        }
+
+        kept = untouched_dependents(result, set())
+
+        self.assertEqual([item["path"] for item in kept], ["tests/test_a.py", "foo_test.py"])
+
+    def test_seven_distinct_paths_keep_seven_representatives(self) -> None:
+        result = {
+            "findings": [
+                self._candidate(f"dep{index:02d}.py", "verified", relation="call")
+                for index in range(7)
+            ]
+        }
+
+        kept = untouched_dependents(result, set())
+
+        self.assertEqual(len(kept), 7)
 
     def test_a_result_without_findings_keeps_nothing(self) -> None:
         self.assertEqual(untouched_dependents({}, set()), [])

@@ -25,7 +25,14 @@ import threading
 import time
 from typing import Collection, Mapping, TextIO
 
-from .context_operations import PrepareCLIError, QueryArguments, TransportFactory, run_inspect, run_query
+from .context_operations import (
+    PrepareCLIError,
+    QueryArguments,
+    TransportFactory,
+    _is_test_path,
+    run_inspect,
+    run_query,
+)
 from .git_snapshot import SnapshotError, _git
 from .native_transport import NativeTransport, NativeTransportError
 
@@ -110,22 +117,49 @@ def run_hook(
 def untouched_dependents(
     result: Mapping[str, object], staged_paths: Collection[str]
 ) -> list[dict]:
-    """The result's verified candidates whose file is not part of the commit.
+    """One representative candidate per untouched file the change set depends on.
 
     A dependent inside the commit is by definition already handled, and an
-    inferred edge is a guess a hook must never make; what is left keeps the
-    result's own candidate order. An anchorless candidate is dropped here too,
-    so `format_warning_line`'s `anchors[0]` can never index an empty list.
+    inferred edge is a guess a hook must never make, so those candidates are
+    dropped first, along with an anchorless one (so `format_warning_line`'s
+    `anchors[0]` can never index an empty list). What is left is grouped by
+    `path`, keeping each path's first-seen position: a warning names the
+    *file*, not every candidate inside it, so a file that turns up as both an
+    import and a call site gets one line, not two. Within a path the call
+    representative wins over an import - a call is the stronger evidence that
+    the file actually depends on the changed symbol at run time - falling
+    back to the first candidate of that path (the composition's own order:
+    evidence, anchor count, path, start line) when no call is present.
+    Finally, the representatives are stable-partitioned so every non-test
+    path prints before every test path, each group keeping its own order;
+    this is the same `_is_test_path` rule the composition already applies to
+    its `changed` list, not a second copy of it. A test that references the
+    changed symbol is still a legitimate warning - it only yields to the
+    production dependents once the five-line cap bites.
     """
     touched = set(staged_paths)
     findings = result.get("findings") or []
-    return [
+    filtered = [
         candidate
         for candidate in findings
         if candidate.get("path") not in touched
         and candidate.get("edge_evidence") == "verified"
         and candidate.get("anchors")
     ]
+    by_path: dict[object, list[dict]] = {}
+    for candidate in filtered:
+        by_path.setdefault(candidate.get("path"), []).append(candidate)
+    representatives = [
+        next((item for item in group if item.get("relation") == "call"), group[0])
+        for group in by_path.values()
+    ]
+    non_test = [
+        item for item in representatives if not _is_test_path(str(item.get("path")))
+    ]
+    test = [
+        item for item in representatives if _is_test_path(str(item.get("path")))
+    ]
+    return non_test + test
 
 
 def format_warning_line(candidate: Mapping[str, object]) -> str:

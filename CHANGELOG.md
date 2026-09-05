@@ -15,9 +15,11 @@ Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo
   with `--base`; the result's `base.source` reports `staged`.
 - `prepare hook install/remove/status --repo <repo>` manages an optional
   `pre-commit` launcher, and the launcher's `hook run` warns about
-  dependents a commit leaves behind: one line per verified, untouched
-  dependent (`TAF: <symbol> changed; <path>:<line> depends on it and is not
-  in this commit`), at most five plus a summary line for the rest. It is
+  dependent files a commit leaves behind: one line per verified, untouched
+  dependent file (`TAF: <symbol> changed; <path>:<line> depends on it and is
+  not in this commit`) - a file that is both a call site and an import
+  reference keeps its call line, and production files print before test
+  files - at most five plus a summary line counting the rest. It is
   advisory only - stderr only, exit 0 always, silent whenever the index is
   not ready, `TAF_HOOK=0` is set, or its 3-second wall-clock budget is
   exceeded - and only `install`/`remove` write, under `--confirm-hook-write`

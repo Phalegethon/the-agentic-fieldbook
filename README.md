@@ -285,24 +285,25 @@ Windows on amd64.
 
 ### Commit-time impact warning
 
-An optional `pre-commit` launcher warns about dependents a commit leaves
-behind. It asks one bounded `impact-candidates --staged` query and, for
-every verified dependent whose file is not part of the commit, writes one
-line to stderr:
+An optional `pre-commit` launcher warns about dependent files a commit
+leaves behind. It asks one bounded `impact-candidates --staged` query and,
+for every untouched file with a verified dependent, writes one line to
+stderr - a file that is both a call site and an import reference keeps only
+its call line, and production files print before test files:
 
 ```text
 TAF: galoplarColumns changed; src/features/at-detay/at-detay-skeleton.tsx:139 depends on it and is not in this commit
 ```
 
-At most five such lines print, followed by a summary line for the rest. It
-is advisory only: stderr only, never stdout, exit code 0 always, and it
-gives itself a 3-second wall-clock budget so a slow or cold engine can never
-hold up a commit. It stays completely silent whenever the bound index is
-not ready, the staged change has no untouched dependents, or that budget is
-exceeded. The hook's own query performs the same standing-consent
-incremental refresh and superseded-generation prune as every other query;
-it never builds, activates, downloads, or removes state, and `build` stays
-its own separate consent.
+At most five such lines print, followed by a summary line counting the
+remaining files. It is advisory only: stderr only, never stdout, exit code
+0 always, and it gives itself a 3-second wall-clock budget so a slow or
+cold engine can never hold up a commit. It stays completely silent whenever
+the bound index is not ready, the staged change has no untouched
+dependents, or that budget is exceeded. The hook's own query performs the
+same standing-consent incremental refresh and superseded-generation prune
+as every query; it never builds, activates, downloads, or removes state,
+and `build` stays its own separate consent.
 
 ```bash
 <python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook status --repo <repo>
