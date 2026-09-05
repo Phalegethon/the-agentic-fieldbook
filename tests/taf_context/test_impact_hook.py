@@ -257,8 +257,8 @@ class ImpactHookWarningTests(unittest.TestCase):
                     for index in range(HOOK_MAXIMUM_LINES)
                 ]
                 + [
-                    "TAF: … and 2 more "
-                    "(run: prepare query --operation impact-candidates --staged)"
+                    "TAF: ... and 2 more "
+                    "(query impact-candidates --staged for the full list)"
                 ],
             )
 
@@ -279,7 +279,7 @@ class ImpactHookWarningTests(unittest.TestCase):
             self.assertEqual((code, stdout), (0, ""))
             lines = stderr.splitlines()
             self.assertEqual(len(lines), HOOK_MAXIMUM_LINES)
-            self.assertNotIn("more (run:", stderr)
+            self.assertNotIn("more (query", stderr)
             self.assertEqual(
                 lines,
                 [
@@ -449,8 +449,8 @@ class UntouchedDependentTests(unittest.TestCase):
     def test_the_summary_line_names_the_query_that_shows_the_rest(self) -> None:
         self.assertEqual(
             format_summary_line(2),
-            "TAF: … and 2 more "
-            "(run: prepare query --operation impact-candidates --staged)",
+            "TAF: ... and 2 more "
+            "(query impact-candidates --staged for the full list)",
         )
 
 
@@ -1286,16 +1286,16 @@ class RunHookNeverRaisesTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
 
-    def test_an_encoding_failure_on_the_summary_line_does_not_drop_the_warnings(
+    def test_an_ascii_stderr_accepts_all_six_lines_including_the_summary(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment, repository = ready_repository(root, extra_callers=5)
-            # ASCII-only encoding accepts the warning lines but rejects the
-            # summary line's U+2026; write_through makes every accepted write
-            # land in the buffer immediately, so it can be inspected below
-            # without an explicit flush.
+            # The summary line is pure ASCII, so an ASCII-only stderr accepts
+            # every line the hook writes, the summary included; write_through
+            # makes every accepted write land in the buffer immediately, so it
+            # can be inspected below without an explicit flush.
             stderr = io.TextIOWrapper(
                 io.BytesIO(), encoding="ascii", write_through=True
             )
@@ -1315,6 +1315,10 @@ class RunHookNeverRaisesTests(unittest.TestCase):
                     f"TAF: app.first changed; dep{index:02d}.py:12 depends on it"
                     " and is not in this commit"
                     for index in range(HOOK_MAXIMUM_LINES)
+                ]
+                + [
+                    "TAF: ... and 2 more "
+                    "(query impact-candidates --staged for the full list)"
                 ],
             )
 

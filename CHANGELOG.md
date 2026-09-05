@@ -5,6 +5,23 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.1.
+
+### Changed
+
+- The commit-time hook's trailing summary line is now pure ASCII and names
+  no command: `TAF: ... and <n> more (query impact-candidates --staged for
+  the full list)`, not `TAF: … and <n> more (run: prepare query --operation
+  impact-candidates --staged)`. A field re-test found `prepare query …` is
+  not runnable in a plugin installation (no `prepare` on PATH), and an
+  ASCII stderr can garble or drop the Unicode ellipsis.
+- The `prepare-repo-context` skill now states, like the README has since
+  2.8.0, that `--confirm-hook-write` records the user's approval given in
+  this conversation and that a request to set up the warning is not that
+  approval; `hook install --help` carries the same description, so an
+  agent that reads the script's own help instead of the skill meets the
+  rule too.
+
 ## [2.8.0] - 2026-09-05
 
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.0.

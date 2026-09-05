@@ -83,7 +83,17 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
     hook_run.add_argument("--repo", required=True)
     hook_run.add_argument("--verbose", action="store_true")
 
-    hook_install = hook_commands.add_parser("install")
+    hook_install = hook_commands.add_parser(
+        "install",
+        description=(
+            "Write the TAF pre-commit launcher into this repository's own "
+            "hooks directory. --confirm-hook-write records the user's "
+            "approval of that write: ask first and pass it only after the "
+            "user agreed; a request to set up the warning is not that "
+            "approval. Add --chain to keep an existing foreign pre-commit "
+            "hook running after TAF's line."
+        ),
+    )
     hook_install.add_argument("--repo", required=True)
     hook_install.add_argument("--confirm-hook-write", action="store_true")
     hook_install.add_argument("--chain", action="store_true")

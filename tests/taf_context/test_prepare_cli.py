@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from datetime import datetime, timezone
 from io import StringIO
 import json
@@ -2794,6 +2795,19 @@ class QueryPathImportTests(unittest.TestCase):
             check=True,
         )
         self.assertEqual(completed.stdout.strip(), "[]")
+
+
+class HookInstallHelpTests(unittest.TestCase):
+    """An agent that reads the script's `--help` meets the consent rule too."""
+
+    def test_hook_install_help_names_the_consent_rule(self) -> None:
+        captured = StringIO()
+        with contextlib.redirect_stdout(captured):
+            with self.assertRaises(SystemExit) as raised:
+                main(["prepare", "hook", "install", "--help"], environment={})
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("records the user's approval", captured.getvalue())
 
 
 if __name__ == "__main__":

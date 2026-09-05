@@ -189,10 +189,17 @@ def format_warning_line(candidate: Mapping[str, object]) -> str:
 
 
 def format_summary_line(remaining: int) -> str:
-    """The line that speaks for the dependents beyond the five-line cap."""
+    """The line that speaks for the dependents beyond the five-line cap.
+
+    Pure ASCII and names no command: an ASCII stderr can garble or drop a
+    Unicode ellipsis, and `prepare query …` is not runnable in a plugin
+    installation (no `prepare` on PATH). `query` and `impact-candidates
+    --staged` are the CLI's own words and the MCP tool's name, so the
+    pointer stays true on both surfaces.
+    """
     return (
-        f"{HOOK_LINE_PREFIX}… and {remaining} more "
-        "(run: prepare query --operation impact-candidates --staged)"
+        f"{HOOK_LINE_PREFIX}... and {remaining} more "
+        "(query impact-candidates --staged for the full list)"
     )
 
 
