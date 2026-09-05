@@ -99,6 +99,9 @@ HOOK_MODES = ("advisory", "confirm")
 # fail-open rule is that a broken broker never blocks a commit; this code
 # cannot be produced by anything but the refusal below.
 HOOK_DECLINE_EXIT_CODE = 97
+# The controlling terminal the question is asked on, named so a test can point
+# `_open_terminal` at a pty instead.
+TERMINAL_DEVICE = "/dev/tty"
 
 HOOK_FILE_NAME = "pre-commit"
 CHAINED_HOOK_NAME = "pre-commit.taf-chained"
@@ -634,16 +637,27 @@ def _explain(stderr: TextIO, verbose: bool, reason: str) -> None:
         stderr.write(f"TAF hook: {reason}\n")
 
 
-def _open_terminal() -> TextIO:
-    """The controlling terminal, opened for reading and writing.
+def _open_terminal(path: str = TERMINAL_DEVICE) -> tuple[TextIO, TextIO]:
+    """A reader and a writer for the controlling terminal.
+
+    Two unidirectional handles rather than one `"r+"`: a terminal is not
+    seekable, and Python's buffered read-write mode is backed by a random
+    access buffer, so `open(path, "r+")` raises `io.UnsupportedOperation` on a
+    real tty - silently turning every question into a skip.
 
     A seam, for two reasons: the question must reach the person even when the
-    hook's own stderr is a pipe, and tests replace this with a double. It
-    raises `OSError` wherever there is no controlling terminal at all - an
-    agent's own commit, CI, a GUI client - which is exactly the case the
-    caller treats as "do not ask".
+    hook's own stderr is a pipe, and a test can point it at a pty. It raises
+    `OSError` wherever there is no controlling terminal at all - an agent's
+    own commit, CI, a GUI client - which is exactly the case the caller treats
+    as "do not ask".
     """
-    return open("/dev/tty", "r+", encoding="utf-8", errors="replace")
+    writer = open(path, "w", encoding="utf-8", errors="replace")
+    try:
+        reader = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        writer.close()
+        raise
+    return reader, writer
 
 
 def _wait_for_input(terminal: TextIO, timeout: float) -> bool:
@@ -688,24 +702,25 @@ def _ask_to_continue(
             _explain(stderr, verbose, f"no interactive terminal ({name} is set)")
             return 0
     try:
-        terminal = _open_terminal()
+        reader, writer = _open_terminal()
     except OSError as exc:
         _explain(stderr, verbose, _exception_reason(exc))
         return 0
     try:
-        terminal.write(HOOK_CONFIRM_QUESTION)
-        terminal.flush()
-        if not _wait_for_input(terminal, _confirm_timeout(environment)):
+        writer.write(HOOK_CONFIRM_QUESTION)
+        writer.flush()
+        if not _wait_for_input(reader, _confirm_timeout(environment)):
             with contextlib.suppress(Exception):
-                terminal.write("\n")
-                terminal.flush()
+                writer.write("\n")
+                writer.flush()
             with contextlib.suppress(Exception):
                 stderr.write(HOOK_CONFIRM_TIMEOUT_LINE + "\n")
             return 0
-        answer = terminal.readline()
+        answer = reader.readline()
     finally:
-        with contextlib.suppress(Exception):
-            terminal.close()
+        for handle in (reader, writer):
+            with contextlib.suppress(Exception):
+                handle.close()
     return (
         HOOK_DECLINE_EXIT_CODE
         if answer.strip().lower() in HOOK_CONFIRM_DECLINE_ANSWERS
@@ -1230,10 +1245,19 @@ def _render_launcher(
         # Only the refusal code blocks the commit. Any other non-zero status
         # is a broken broker, and a broken broker must never stop a commit,
         # so it is swallowed exactly as the advisory launcher swallows it.
-        # `if` with a false condition and no `else` leaves status 0, so the
-        # block itself can never become the script's exit status.
-        lines.append('  "$taf_interpreter" "$taf_script" ' + run_command)
-        lines.append(f"  if [ $? -eq {HOOK_DECLINE_EXIT_CODE} ]; then exit 1; fi")
+        # The status is captured with `|| taf_status=$?` rather than read from
+        # `$?` on the next line, because a hook manager may run this script
+        # under `sh -e` (husky does), where a bare command's non-zero status
+        # ends the shell before the test can run. `if` with a false condition
+        # and no `else` leaves status 0, so the block itself can never become
+        # the script's exit status.
+        lines.append("  taf_status=0")
+        lines.append(
+            '  "$taf_interpreter" "$taf_script" ' + run_command + " || taf_status=$?"
+        )
+        lines.append(
+            f'  if [ "$taf_status" -eq {HOOK_DECLINE_EXIT_CODE} ]; then exit 1; fi'
+        )
     else:
         lines.append('  "$taf_interpreter" "$taf_script" ' + run_command + " || :")
     lines.append("fi")

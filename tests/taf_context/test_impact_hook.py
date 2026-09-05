@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import pty
 import shlex
 import subprocess
 import sys
@@ -1531,7 +1532,7 @@ class HookConfirmTests(unittest.TestCase):
     def _ask(self, answer: str, environment: dict[str, str]) -> tuple[int, str, str]:
         terminal = _FakeTerminal(answer)
         stderr = io.StringIO()
-        with mock.patch.object(impact_hook, "_open_terminal", return_value=terminal), \
+        with mock.patch.object(impact_hook, "_open_terminal", return_value=(terminal, terminal)), \
              mock.patch.object(impact_hook, "_wait_for_input", return_value=True):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -1598,7 +1599,7 @@ class HookConfirmTests(unittest.TestCase):
     def test_a_timeout_continues_and_says_so(self) -> None:
         terminal = _FakeTerminal("n\n")  # an answer that would abort, never read
         stderr = io.StringIO()
-        with mock.patch.object(impact_hook, "_open_terminal", return_value=terminal), \
+        with mock.patch.object(impact_hook, "_open_terminal", return_value=(terminal, terminal)), \
              mock.patch.object(impact_hook, "_wait_for_input", return_value=False):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -1625,7 +1626,7 @@ class HookConfirmTests(unittest.TestCase):
             stage_edit(repository, "other.py", 5, "other 5 changed")
             terminal = _FakeTerminal("n\n")
             stderr = io.StringIO()
-            with mock.patch.object(impact_hook, "_open_terminal", return_value=terminal):
+            with mock.patch.object(impact_hook, "_open_terminal", return_value=(terminal, terminal)):
                 code = run_hook(
                     repository,
                     environment=environment,
@@ -1651,6 +1652,66 @@ class HookConfirmTests(unittest.TestCase):
         )
 
 
+class ConfirmPromptOnARealTerminalTests(unittest.TestCase):
+    """The question and the answer on an actual tty, not on a stream double.
+
+    `_open_terminal` was first written as a single `open(path, "r+")`, which
+    raises `io.UnsupportedOperation` on a real terminal - a terminal is not
+    seekable and buffered read-write mode needs a seekable stream - so every
+    question silently became a skip and every commit went through. A double
+    cannot catch that; only a real tty can.
+    """
+
+    def _ask_on_a_pty(self, typed: str, environment: dict) -> tuple[int, str, str]:
+        master, slave = pty.openpty()
+        try:
+            device = os.ttyname(slave)
+            if typed:
+                os.write(master, typed.encode("utf-8"))
+            stderr = io.StringIO()
+            # The real opener, bound to the pty: patching the name and then
+            # calling it through the module would recurse into the patch.
+            open_terminal = impact_hook._open_terminal
+            with mock.patch.object(
+                impact_hook, "_open_terminal", lambda: open_terminal(device)
+            ):
+                code = impact_hook._ask_to_continue(environment, stderr, False)
+            os.set_blocking(master, False)
+            try:
+                shown = os.read(master, 4096).decode("utf-8", "replace")
+            except BlockingIOError:  # pragma: no cover - nothing left to read
+                shown = ""
+        finally:
+            os.close(master)
+            os.close(slave)
+        return code, stderr.getvalue(), shown
+
+    def test_the_question_reaches_the_terminal_and_an_empty_answer_continues(self) -> None:
+        code, stderr, shown = self._ask_on_a_pty("\n", {})
+
+        self.assertEqual(code, 0)
+        self.assertIn(impact_hook.HOOK_CONFIRM_QUESTION.strip(), shown)
+        self.assertEqual(stderr, "")
+
+    def test_typing_n_on_a_real_terminal_aborts_the_commit(self) -> None:
+        code, _stderr, _shown = self._ask_on_a_pty("n\n", {})
+
+        self.assertEqual(code, impact_hook.HOOK_DECLINE_EXIT_CODE)
+
+    def test_typing_y_on_a_real_terminal_continues(self) -> None:
+        code, _stderr, _shown = self._ask_on_a_pty("y\n", {})
+
+        self.assertEqual(code, 0)
+
+    def test_no_answer_times_out_and_continues(self) -> None:
+        code, stderr, _shown = self._ask_on_a_pty(
+            "", {"TAF_HOOK_CONFIRM_TIMEOUT": "0.2"}
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, impact_hook.HOOK_CONFIRM_TIMEOUT_LINE + "\n")
+
+
 class ConfirmLauncherExitCodeTests(unittest.TestCase):
     """Only the refusal code blocks a commit; a broken broker never does.
 
@@ -1673,8 +1734,10 @@ class ConfirmLauncherExitCodeTests(unittest.TestCase):
             ),
         )
         launcher.chmod(0o755)
+        # `-e` is how husky runs a hook script, and a bare non-zero command
+        # under it ends the shell before the launcher's own test can run.
         return subprocess.run(
-            ["/bin/sh", str(launcher)], capture_output=True, text=True, timeout=30
+            ["/bin/sh", "-e", str(launcher)], capture_output=True, text=True, timeout=30
         )
 
     def test_the_decline_code_blocks_the_commit(self) -> None:
