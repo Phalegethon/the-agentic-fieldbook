@@ -1918,6 +1918,95 @@ class HookConfirmLauncherTests(unittest.TestCase):
             self.assertNotEqual(before_log, run(repository, "git", "log", "--format=%H"))
 
 
+class HookPrintTests(unittest.TestCase):
+    """`hook print` emits the launcher and writes nothing (2.9.1)."""
+
+    def test_print_writes_the_launcher_to_stdout_and_nothing_to_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            environment = {"TAF_STATE_HOME": str(root / "state")}
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "hook", "print", "--repo", str(repository)
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(stdout.splitlines()[0], "#!/bin/sh")
+            self.assertEqual(stdout.splitlines()[1], LAUNCHER_MARKER)
+            self.assertNotIn("--confirm", stdout)
+            self.assertFalse((repository / ".git" / "hooks" / HOOK_FILE_NAME).exists())
+
+    def test_print_honours_the_confirm_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            environment = {"TAF_STATE_HOME": str(root / "state")}
+
+            code, stdout, _stderr = invoke(
+                environment, "prepare", "hook", "print",
+                "--repo", str(repository), "--mode", "confirm",
+            )
+
+            self.assertEqual(code, 0)
+            self.assertIn(impact_hook.LAUNCHER_CONFIRM_MARKER, stdout)
+
+    def test_print_works_where_install_refuses_because_hooks_are_redirected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            managed = repository / ".husky"
+            managed.mkdir()
+            run(repository, "git", "config", "core.hooksPath", ".husky")
+            environment = {"TAF_STATE_HOME": str(root / "state")}
+
+            install_code, _stdout, install_stderr = invoke(
+                environment, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            self.assertEqual(install_code, 2)
+            self.assertIn("core.hooksPath", install_stderr)
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "hook", "print", "--repo", str(repository)
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertIn(LAUNCHER_MARKER, stdout)
+            # Nothing was written into the manager's directory either.
+            self.assertEqual(list(managed.iterdir()), [])
+
+    def test_status_on_a_redirected_repository_says_what_to_do(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            (repository / ".husky").mkdir()
+            run(repository, "git", "config", "core.hooksPath", ".husky")
+            environment = {"TAF_STATE_HOME": str(root / "state")}
+
+            code, stdout, _stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository)
+            )
+
+            self.assertEqual(code, 0)
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "redirected")
+            self.assertEqual(summary["guidance"], impact_hook.HOOK_REDIRECTED_GUIDANCE)
+
+    def test_status_elsewhere_carries_no_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            environment = {"TAF_STATE_HOME": str(root / "state")}
+
+            code, stdout, _stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository)
+            )
+
+            self.assertEqual(code, 0)
+            self.assertIsNone(decoded(stdout)["guidance"])
+
+
 class HookStatusTests(unittest.TestCase):
     """`status`'s four hook states, `launcher_current`, and its readiness field."""
 

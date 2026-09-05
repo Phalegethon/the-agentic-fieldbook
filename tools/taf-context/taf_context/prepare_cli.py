@@ -40,6 +40,7 @@ from .impact_hook import (
     HOOK_MODES,
     hook_status,
     install_hook,
+    print_launcher,
     refresh_launcher_target,
     remove_hook,
 )
@@ -49,7 +50,7 @@ from .state_paths import StateError
 
 
 _CHECKSUM = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)\n\Z")
-_TAF_RELEASE_VERSION = "2.9.0"
+_TAF_RELEASE_VERSION = "2.9.1"
 _NATIVE_RELEASE_BASE_URL = (
     "https://github.com/Phalegethon/the-agentic-fieldbook/releases/download/"
     f"v{_TAF_RELEASE_VERSION}"
@@ -111,6 +112,19 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
     hook_remove = hook_commands.add_parser("remove")
     hook_remove.add_argument("--repo", required=True)
     hook_remove.add_argument("--confirm-hook-write", action="store_true")
+
+    hook_print = hook_commands.add_parser(
+        "print",
+        description=(
+            "Write the pre-commit launcher for this repository to stdout and "
+            "nothing to disk. For repositories whose hooks are owned by a hook "
+            "manager (husky, Lefthook, pre-commit), where TAF refuses to "
+            "install: save this output as an executable file under .git/hooks/, "
+            "which git never tracks, and call it from the manager's own hook."
+        ),
+    )
+    hook_print.add_argument("--repo", required=True)
+    hook_print.add_argument("--mode", choices=HOOK_MODES, default="advisory")
 
     hook_status_parser = hook_commands.add_parser("status")
     hook_status_parser.add_argument("--repo", required=True)

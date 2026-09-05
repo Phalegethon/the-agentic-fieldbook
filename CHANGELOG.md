@@ -5,6 +5,24 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+## [2.9.1] - 2026-09-06
+
+Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.9.1.
+
+### Added
+
+- `hook print` writes the pre-commit launcher to stdout and nothing to disk,
+  so it needs no hook-write confirmation. It is the supported route for a
+  repository whose hooks a manager owns (husky, Lefthook, the pre-commit
+  framework): `core.hooksPath` points at a tracked, shared directory, TAF
+  refuses to install a launcher full of machine-specific absolute paths there,
+  and until now said only that it refused. Save the printed launcher under
+  `.git/hooks/`, which git never tracks, and call it from the manager's own
+  hook behind an `if [ -x ... ]` guard - four shared lines that name no
+  machine and run nothing for a teammate who has not created that file.
+- `hook status` gains `guidance`: the recipe above when `core.hooksPath` is
+  redirected, null otherwise.
+
 ## [2.9.0] - 2026-09-06
 
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.9.0.

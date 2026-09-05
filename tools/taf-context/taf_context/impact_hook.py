@@ -98,6 +98,19 @@ HOOK_CONFIRM_ACCEPT_ANSWERS = frozenset({"y", "yes"})
 # even where a controlling terminal happens to be reachable.
 HOOK_NON_INTERACTIVE_VARIABLES = ("CI", "CLAUDECODE", "AI_AGENT")
 HOOK_MODES = ("advisory", "confirm")
+# What `hook status` says when a hook manager owns the hooks directory. The
+# recipe keeps every absolute path in an untracked file: `hook print` emits the
+# launcher, the person saves it under `.git/hooks/` (never tracked) and calls
+# it from the manager's own hook with a guard, so a teammate who has not
+# created that file runs nothing at all.
+HOOK_REDIRECTED_GUIDANCE = (
+    "core.hooksPath points elsewhere, so TAF will not install here: that "
+    "directory is usually tracked and a launcher carries machine-specific "
+    "paths. Run `hook print` instead, save its output as an executable file "
+    "under .git/hooks/ (git never tracks it), and call that file from the "
+    "manager's own hook behind an `if [ -x ... ]` guard. See "
+    "docs/commit-time-impact-hook.md."
+)
 # The exit code `hook run --confirm` uses for "the person said no", and the
 # only one the confirm launcher turns into a blocked commit. A plain `1` would
 # collide with an unhandled interpreter failure, and the whole point of the
@@ -857,6 +870,50 @@ def _format_question(colour: bool) -> str:
     )
 
 
+def print_launcher(
+    repository: Path, *, environment: Mapping[str, str], hook_mode: str = "advisory"
+) -> str:
+    """The launcher text for this repository, written nowhere.
+
+    A repository driven by a hook manager (husky, Lefthook, the pre-commit
+    framework) sets `core.hooksPath`, and `install_hook` refuses to write
+    there by design: that directory is usually tracked and shared, and a
+    launcher carries absolute paths that belong to one machine. Printing the
+    text is the supported way through - the person chains it from their own
+    untracked hook file, keeping the machine paths out of the shared tree.
+
+    `repository` is validated the same way `install` validates it, so a path
+    that is not a work tree still fails loudly, but nothing about the
+    repository's hooks directory has to be writable, or even TAF's to use.
+    """
+    _require_posix()
+    if hook_mode not in HOOK_MODES:
+        raise PrepareCLIError(
+            f"unsupported hook mode {hook_mode!r}; expected one of {', '.join(HOOK_MODES)}"
+        )
+    # Resolves the repository and raises when it is not a work tree; the
+    # returned hooks directory is deliberately unused, since printing never
+    # needs a writable one.
+    _resolve_hooks_directory(repository)
+    script = _entry_point_script()
+    if not script.is_file():
+        raise PrepareCLIError(
+            "the TAF plugin entry point prepare_repo_context.py could not be located"
+        )
+    source = _render_launcher(
+        interpreter=Path(sys.executable).resolve(),
+        script=script,
+        chained_hook_path=None,
+        state_root=_state_paths(environment).root,
+        confirm=hook_mode == "confirm",
+    )
+    # The printed launcher reads the pointer first, so refresh it here for the
+    # same reason `install` does: what is printed should already name the
+    # broker that printed it.
+    refresh_launcher_target(environment)
+    return source
+
+
 def install_hook(
     repository: Path,
     *,
@@ -1056,9 +1113,14 @@ def hook_status(
     launcher_text_current: bool | None = None
     launcher_generation: str | None = None
     hook_mode: str | None = None
+    guidance: str | None = None
     hook_path_value: str | None = None
     if state == "redirected":
         hook_field = "redirected"
+        # A hook manager owns this repository's hooks. TAF will not write into
+        # a directory that is usually tracked and shared, so the supported way
+        # through is to print the launcher and chain it from an untracked file.
+        guidance = HOOK_REDIRECTED_GUIDANCE
     else:
         hook_path = hooks_dir / HOOK_FILE_NAME
         chained_path = hooks_dir / CHAINED_HOOK_NAME
@@ -1130,6 +1192,8 @@ def hook_status(
         # The launcher's mode (`mode` above is this result's operation name):
         # "advisory", "confirm", or null when no TAF launcher is installed.
         "hook_mode": hook_mode,
+        # What to do when TAF cannot install here itself; null otherwise.
+        "guidance": guidance,
         # `status` reports everywhere; only `install` and `remove` refuse off
         # POSIX, and this field is how a caller learns that before asking.
         "posix": os.name == "posix",

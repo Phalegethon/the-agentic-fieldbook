@@ -85,6 +85,17 @@ def main(
                 repo=Path(args.repo), manifest_path=Path(args.manifest)
             )
         elif args.command == "prepare":
+            if args.prepare_command == "hook" and args.hook_command == "print":
+                # The launcher is a shell script, not a result object: it goes
+                # to stdout as text so it can be redirected into a file.
+                from .impact_hook import print_launcher
+
+                stdout.write(
+                    print_launcher(
+                        Path(args.repo), environment=environment, hook_mode=args.mode
+                    )
+                )
+                return 0
             if args.prepare_command == "hook" and args.hook_command == "run":
                 # The hook is advisory: it writes its own lines to stderr,
                 # never answers with JSON, and always exits 0, so it returns

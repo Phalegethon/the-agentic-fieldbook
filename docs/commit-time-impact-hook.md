@@ -130,12 +130,47 @@ The hook is available on macOS and Linux, the platforms whose `pre-commit` is
 a POSIX `sh` script; `install` and `remove` refuse elsewhere, and `--staged`
 and the queries themselves are unaffected.
 
+## Repositories owned by a hook manager
+
+husky, Lefthook and the pre-commit framework all set `core.hooksPath` to a
+directory that is tracked and shared with the team. TAF refuses to install
+there: a launcher carries absolute paths belonging to one machine, and those
+must never land in a shared file. `status` reports `redirected` and says so.
+
+The supported way through keeps every machine-specific path in a file git
+never tracks:
+
+```bash
+<python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook print --repo <repo> --mode confirm > .git/hooks/pre-commit.local
+chmod +x .git/hooks/pre-commit.local
+```
+
+`hook print` writes the launcher to stdout and nothing to disk, so it needs no
+hook-write confirmation. Then call that file from the manager's own hook - for
+husky, at the end of `.husky/pre-commit`:
+
+```sh
+if [ -x .git/hooks/pre-commit.local ]; then
+  .git/hooks/pre-commit.local "$@" || exit $?
+fi
+```
+
+Those four lines are the only shared change, they name no machine and no tool,
+and a teammate who never creates `.git/hooks/pre-commit.local` runs nothing at
+all. Write them as an `if` rather than `[ -x ... ] && ...`: hook managers run
+their hooks under `sh -e`, where a failing test would end the shell and block
+the commit of everyone without the file.
+
+Put TAF's block after the manager's own tasks, so the report is the last thing
+the commit writes and describes whatever a formatter re-staged.
+
 ## Commands
 
 ```bash
 <python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook status --repo <repo>
 <python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook install --repo <repo> --confirm-hook-write [--mode advisory|confirm]
 <python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook remove --repo <repo> --confirm-hook-write
+<python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook print --repo <repo> [--mode advisory|confirm]
 ```
 
 `install` and `remove` write only under `--confirm-hook-write` and only inside
@@ -156,7 +191,7 @@ index.
   the commit proceeds. `install --chain` refuses a foreign hook that is not
   executable, because git was not running it either.
 - `status` reports `redirected` when `core.hooksPath` points elsewhere; TAF
-  never installs there.
+  never installs there, and its `guidance` field names the recipe below.
 - `TAF_HOOK=0 git commit` silences one commit without touching the launcher;
   `TAF_HOOK_CONFIRM=0 git commit` keeps the report but skips the question.
 
