@@ -52,6 +52,16 @@ LAUNCHER_MARKER = "# TAF commit-time impact warning (managed by: prepare hook in
 
 _HOOK_GIT_TIMEOUT_SECONDS = 20  # wall clock for the small git calls hook management makes
 
+# Environment variables that locate a repository and override `-C <path>`;
+# hook management drops them so it can only ever act on the named repository.
+_GIT_LOCATION_VARIABLES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+)
+
 # How long the watchdog waits for an abandoned worker to unwind after its
 # engine child was killed. The worker only has to see EOF, close its streams
 # and return, so this is a courtesy for tidy shutdown, not a second deadline.
@@ -122,10 +132,12 @@ def untouched_dependents(
     A dependent inside the commit is by definition already handled, and an
     inferred edge is a guess a hook must never make, so those candidates are
     dropped first, along with an anchorless one (so `format_warning_line`'s
-    `anchors[0]` can never index an empty list). What is left is grouped by
-    `path`, keeping each path's first-seen position: a warning names the
-    *file*, not every candidate inside it, so a file that turns up as both an
-    import and a call site gets one line, not two. Within a path the call
+    `anchors[0]` can never index an empty list) and one carrying no usable
+    `path` (a warning line names a path and a line, so there would be nothing
+    to print). What is left is grouped by `path`, keeping each path's
+    first-seen position: a warning names the *file*, not every candidate
+    inside it, so a file that turns up as both an import and a call site gets
+    one line, not two. Within a path the call
     representative wins over an import - a call is the stronger evidence that
     the file actually depends on the changed symbol at run time - falling
     back to the first candidate of that path (the composition's own order:
@@ -142,23 +154,24 @@ def untouched_dependents(
     filtered = [
         candidate
         for candidate in findings
-        if candidate.get("path") not in touched
+        # A warning line reads `<path>:<line>`, so a candidate the engine
+        # somehow left without a usable path has nothing to name. Defensive:
+        # the engine always sets one.
+        if isinstance(candidate.get("path"), str)
+        and candidate.get("path")
+        and candidate.get("path") not in touched
         and candidate.get("edge_evidence") == "verified"
         and candidate.get("anchors")
     ]
-    by_path: dict[object, list[dict]] = {}
+    by_path: dict[str, list[dict]] = {}
     for candidate in filtered:
-        by_path.setdefault(candidate.get("path"), []).append(candidate)
+        by_path.setdefault(candidate["path"], []).append(candidate)
     representatives = [
         next((item for item in group if item.get("relation") == "call"), group[0])
         for group in by_path.values()
     ]
-    non_test = [
-        item for item in representatives if not _is_test_path(str(item.get("path")))
-    ]
-    test = [
-        item for item in representatives if _is_test_path(str(item.get("path")))
-    ]
+    non_test = [item for item in representatives if not _is_test_path(item["path"])]
+    test = [item for item in representatives if _is_test_path(item["path"])]
     return non_test + test
 
 
@@ -240,7 +253,11 @@ class _HookRun:
         except Exception as exc:  # the hook is advisory: nothing may escape it
             self.reason = _exception_reason(exc)
         finally:
-            self._close()
+            # A raise from the teardown would escape `collect` itself, reach
+            # `threading.excepthook`, and print a Python traceback onto the
+            # commit's stderr - the one thing the hook must never do.
+            with contextlib.suppress(Exception):
+                self._close()
 
     def abandon(self) -> None:
         """Refuse any further engine call and kill the child, from any thread."""
@@ -384,6 +401,7 @@ def install_hook(
     it as the default, which resolves `sys.executable` exactly the way the
     launcher's own embedded interpreter path must be resolved.
     """
+    _require_posix()
     state, hooks_dir, hooks_path_value = _resolve_hooks_directory(repository)
     if state == "redirected":
         raise PrepareCLIError(
@@ -402,30 +420,54 @@ def install_hook(
     chained_path = hooks_dir / CHAINED_HOOK_NAME
     kind = _classify_pre_commit(hook_path)
     chained_hook_path: Path | None = None
+    moved_aside = False
     if kind == "foreign":
         if not chain:
             raise PrepareCLIError(
                 "a foreign pre-commit hook exists; pass --chain to run it after TAF, "
                 "or remove it first"
             )
-        if chained_path.exists():
+        if not os.access(hook_path, os.X_OK):
+            # Git skips a pre-commit file without the executable bit, so
+            # chaining it would start running a hook the user's commits never
+            # ran - a behaviour change they did not ask for (D10).
+            raise PrepareCLIError(
+                "the foreign pre-commit hook is not executable, so git was not "
+                "running it; chmod +x it before chaining, or remove it"
+            )
+        # `lexists`, not `exists`: a dangling symlink is a backup that is in
+        # the way just as much as a regular file, and overwriting it would
+        # lose whatever the user put there.
+        if os.path.lexists(chained_path):
             raise PrepareCLIError(
                 f"{CHAINED_HOOK_NAME} already exists; remove it before chaining another hook"
             )
         os.replace(hook_path, chained_path)  # mode is preserved by the rename
         chained_hook_path = chained_path
+        moved_aside = True
     else:
         # `kind` is "taf" (a re-install never drops a chained hook, regardless
         # of `--chain`) or "absent" (a `pre-commit.taf-chained` backup can be
         # left behind by hand or by a crash between the foreign->chained
         # rename and the launcher write below; either way, an existing
         # backup is adopted rather than orphaned).
-        if chained_path.exists():
+        if os.path.lexists(chained_path):
             chained_hook_path = chained_path
-    source = _render_launcher(
-        interpreter=resolved_interpreter, script=script, chained_hook_path=chained_hook_path
-    )
-    _write_launcher_atomically(hooks_dir, hook_path, source)
+    try:
+        source = _render_launcher(
+            interpreter=resolved_interpreter,
+            script=script,
+            chained_hook_path=chained_hook_path,
+        )
+        _write_launcher_atomically(hooks_dir, hook_path, source)
+    except BaseException:
+        # The foreign hook was moved aside for a launcher that never landed:
+        # git would now look at nothing at all. Put it back before the error
+        # is reported, so a failed install leaves the repository as it was.
+        if moved_aside:
+            with contextlib.suppress(OSError):
+                os.replace(chained_path, hook_path)
+        raise
     return {
         "schema_version": "1",
         "mode": "hook-install",
@@ -443,6 +485,7 @@ def install_hook(
 
 def remove_hook(repository: Path) -> dict[str, object]:
     """Remove the TAF launcher and restore a chained hook if one was moved aside."""
+    _require_posix()
     state, hooks_dir, hooks_path_value = _resolve_hooks_directory(repository)
     if state == "redirected":
         raise PrepareCLIError(
@@ -460,9 +503,10 @@ def remove_hook(repository: Path) -> dict[str, object]:
     # A `pre-commit.taf-chained` backup is restored whenever it exists, not
     # only when `pre-commit` itself was a TAF launcher: the backup can be
     # left behind (by hand, or by a crash) while `pre-commit` is absent, and
-    # `remove` must not leave it stranded.
+    # `remove` must not leave it stranded. `lexists` so a backup that is a
+    # dangling symlink is restored too, rather than left behind for good.
     restored = False
-    if chained_path.exists():
+    if os.path.lexists(chained_path):
         os.replace(chained_path, hook_path)
         restored = True
     return {
@@ -504,7 +548,8 @@ def hook_status(
     else:
         hook_path = hooks_dir / HOOK_FILE_NAME
         chained_path = hooks_dir / CHAINED_HOOK_NAME
-        chained = chained_path.exists()
+        # `lexists` so a dangling symlink backup is reported, not hidden.
+        chained = os.path.lexists(chained_path)
         hook_path_value = str(hook_path)
         kind = _classify_pre_commit(hook_path)
         if kind == "taf":
@@ -536,8 +581,22 @@ def hook_status(
         "hook_path": hook_path_value,
         "chained": chained,
         "launcher_current": launcher_current,
+        # `status` reports everywhere; only `install` and `remove` refuse off
+        # POSIX, and this field is how a caller learns that before asking.
+        "posix": os.name == "posix",
         "readiness": {"next_safe_action": next_action, "error": error},
     }
+
+
+def _require_posix() -> None:
+    """The launcher is POSIX `sh` and its write path needs `fchmod`.
+
+    `hook run` and the queries are unaffected; only the two verbs that write
+    a launcher refuse, and they refuse cleanly rather than raising the
+    `AttributeError` an absent `os.fchmod` would.
+    """
+    if os.name != "posix":
+        raise PrepareCLIError("the commit-time hook is available on macOS and Linux only")
 
 
 def _entry_point_script() -> Path:
@@ -557,9 +616,18 @@ def _run_repository_git(repository: Path, *args: str) -> subprocess.CompletedPro
     Unlike `git_snapshot._git`, this must see the caller's actual effective
     Git configuration - including a real `core.hooksPath` - so it copies
     `os.environ` rather than pinning the `GIT_CONFIG_*` overrides that would
-    mask it.
+    mask it. The variables that *locate* a repository are dropped from that
+    copy: they take precedence over `-C <repo>`, so an install run under an
+    exported `GIT_DIR` (from inside another hook, a `git rebase -i` shell, or
+    a wrapper) would otherwise resolve the hooks directory of a repository
+    the user never named and write there. `core.hooksPath` is configuration,
+    not environment, so nothing of D2 is lost. `hook run`'s own git calls go
+    through `git_snapshot._git`, which keeps inheriting `GIT_INDEX_FILE` on
+    purpose: inside `git commit` it is the exact index being recorded.
     """
     environment = os.environ.copy()
+    for name in _GIT_LOCATION_VARIABLES:
+        environment.pop(name, None)
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     try:
@@ -625,7 +693,15 @@ def _render_launcher(
         "fi",
     ]
     if chained_hook_path is not None:
-        lines.append("exec " + shlex.quote(str(chained_hook_path)) + ' "$@"')
+        # `exec` terminates a non-interactive shell when its target cannot be
+        # executed (126/127), which would make a deleted or no-longer-executable
+        # backup block every commit in the repository. A chained hook that runs
+        # decides the commit with its own exit code; one that cannot be run is
+        # treated as absent, so the launcher stays advisory (D10).
+        quoted_chained = shlex.quote(str(chained_hook_path))
+        lines.append("if [ -x " + quoted_chained + " ]; then")
+        lines.append("  exec " + quoted_chained + ' "$@"')
+        lines.append("fi")
     return "\n".join(lines) + "\n"
 
 

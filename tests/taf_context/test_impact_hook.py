@@ -12,7 +12,9 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
+from taf_context import impact_hook
 from taf_context.cli import main
 from taf_context.context_operations import QueryArguments
 from taf_context.impact_hook import (
@@ -414,6 +416,22 @@ class UntouchedDependentTests(unittest.TestCase):
 
     def test_a_result_without_findings_keeps_nothing(self) -> None:
         self.assertEqual(untouched_dependents({}, set()), [])
+
+    def test_a_candidate_without_a_usable_path_is_dropped(self) -> None:
+        # A warning line is `<path>:<line>`, so a candidate the engine somehow
+        # left without a path could only print `None:12`. Defensive: the
+        # engine always sets one.
+        pathless = self._candidate("web.py", "verified")
+        del pathless["path"]
+        empty = self._candidate("", "verified")
+        numeric = dict(self._candidate("other.py", "verified"), path=7)
+        result = {
+            "findings": [pathless, empty, numeric, self._candidate("web.py", "verified")]
+        }
+
+        kept = untouched_dependents(result, {"app.py"})
+
+        self.assertEqual([item["path"] for item in kept], ["web.py"])
 
     def test_a_candidate_without_anchors_is_dropped(self) -> None:
         candidate = self._candidate("web.py", "verified")
@@ -860,7 +878,12 @@ class HookChainTests(unittest.TestCase):
                 encoding="utf-8"
             ).splitlines()
             self.assertEqual(
-                launcher_lines[-1], f'exec {shlex.quote(str(chained_path))} "$@"'
+                launcher_lines[-3:],
+                [
+                    f"if [ -x {shlex.quote(str(chained_path))} ]; then",
+                    f'  exec {shlex.quote(str(chained_path))} "$@"',
+                    "fi",
+                ],
             )
 
             # A re-install without --chain keeps the launcher chained.
@@ -921,7 +944,12 @@ class HookOrphanedChainTests(unittest.TestCase):
                 encoding="utf-8"
             ).splitlines()
             self.assertEqual(
-                launcher_lines[-1], f'exec {shlex.quote(str(chained_path))} "$@"'
+                launcher_lines[-3:],
+                [
+                    f"if [ -x {shlex.quote(str(chained_path))} ]; then",
+                    f'  exec {shlex.quote(str(chained_path))} "$@"',
+                    "fi",
+                ],
             )
 
     def test_remove_over_an_absent_hook_with_a_backup_restores_it(self) -> None:
@@ -1303,6 +1331,218 @@ class RunHookNeverRaisesTests(unittest.TestCase):
             )
 
             self.assertEqual(code, 0)
+
+
+class HookChainSafetyTests(unittest.TestCase):
+    """A chained hook that cannot be run is skipped, never `exec`'d (D10).
+
+    `exec` in POSIX `sh` terminates the shell when its target cannot be
+    executed, so an unguarded chained `exec` would turn the launcher into a
+    repository-wide commit block the moment the backup went missing or lost
+    its executable bit - the one outcome this feature promises can never
+    happen.
+    """
+
+    def test_a_deleted_chained_backup_leaves_the_commit_working(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign = hooks_dir / HOOK_FILE_NAME
+            foreign.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            foreign.chmod(0o755)
+            install_code, _stdout, _stderr = invoke(
+                environment, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write", "--chain",
+            )
+            self.assertEqual(install_code, 0)
+            # The backup carries an unfamiliar name; a user or a cleanup
+            # script deleting it must not cost the repository its commits.
+            (hooks_dir / CHAINED_HOOK_NAME).unlink()
+            before_log = run(repository, "git", "log", "--format=%H")
+
+            result = subprocess.run(
+                ["git", "commit", "-m", "x"],
+                cwd=repository,
+                env=commit_environment(environment),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0)
+            # Exact equality: the TAF warnings and nothing else, so a shell
+            # error about the missing backup would fail this test.
+            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+            after_log = run(repository, "git", "log", "--format=%H")
+            self.assertNotEqual(before_log, after_log)
+
+    def test_chaining_refuses_a_foreign_hook_that_is_not_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign = hooks_dir / HOOK_FILE_NAME
+            foreign_bytes = b"#!/bin/sh\necho foreign >&2\nexit 3\n"
+            foreign.write_bytes(foreign_bytes)
+            # Git ignores a pre-commit hook without the executable bit and
+            # says so; chaining it would be a behaviour change the user did
+            # not ask for.
+            foreign.chmod(0o644)
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write", "--chain",
+            )
+
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertEqual(
+                stderr,
+                "error: the foreign pre-commit hook is not executable, so git was not "
+                "running it; chmod +x it before chaining, or remove it\n",
+            )
+            self.assertEqual(foreign.read_bytes(), foreign_bytes)
+            self.assertFalse((hooks_dir / CHAINED_HOOK_NAME).exists())
+
+    def test_a_failed_launcher_write_puts_the_foreign_hook_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign = hooks_dir / HOOK_FILE_NAME
+            foreign_bytes = b"#!/bin/sh\necho foreign >&2\nexit 3\n"
+            foreign.write_bytes(foreign_bytes)
+            foreign.chmod(0o755)
+            foreign_mode = foreign.stat().st_mode
+
+            def explode(*_args: object, **_options: object) -> None:
+                raise OSError("no space left on device")
+
+            with mock.patch.object(impact_hook, "_write_launcher_atomically", explode):
+                with self.assertRaises(OSError):
+                    install_hook(repository, chain=True)
+
+            self.assertEqual(foreign.read_bytes(), foreign_bytes)
+            self.assertEqual(foreign.stat().st_mode, foreign_mode)
+            self.assertFalse((hooks_dir / CHAINED_HOOK_NAME).exists())
+
+    def test_a_dangling_backup_symlink_is_adopted_reported_and_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            chained_path = hooks_dir / CHAINED_HOOK_NAME
+            chained_path.symlink_to(root / "gone" / "pre-commit")
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertTrue(decoded(stdout)["chained"])
+
+            code, stdout, stderr = invoke(
+                {"TAF_STATE_HOME": str(root / "state")},
+                "prepare", "hook", "status", "--repo", str(repository),
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertTrue(decoded(stdout)["chained"])
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "remove",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertTrue(decoded(stdout)["restored"])
+            self.assertFalse(os.path.lexists(chained_path))
+            self.assertTrue((hooks_dir / HOOK_FILE_NAME).is_symlink())
+
+
+class HookEnvironmentTests(unittest.TestCase):
+    """The hooks directory is the named repository's, never the ambient one."""
+
+    def test_an_exported_git_dir_does_not_redirect_the_install(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            named = init_committed_repo(root / "named")
+            other = init_committed_repo(root / "other")
+
+            # `GIT_DIR` takes precedence over `-C <repo>` discovery, so an
+            # install run from inside another hook or a `git rebase` shell
+            # would otherwise write into a repository the user never named.
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(other / ".git")}):
+                code, _stdout, stderr = invoke(
+                    {}, "prepare", "hook", "install",
+                    "--repo", str(named), "--confirm-hook-write",
+                )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertTrue((named / ".git" / "hooks" / HOOK_FILE_NAME).is_file())
+            self.assertFalse((other / ".git" / "hooks" / HOOK_FILE_NAME).exists())
+
+
+class _NonPosixOs:
+    """`impact_hook`'s view of `os` on a platform whose `os.name` is not posix.
+
+    Patching the real `os.name` is not an option: `pathlib` reads it when a
+    `Path` is instantiated and would hand every caller a `WindowsPath` this
+    interpreter refuses to build. Only the module under test sees the
+    substitute, and everything but `name` is the real `os`.
+    """
+
+    name = "nt"
+
+    def __getattr__(self, attribute: str) -> object:
+        return getattr(os, attribute)
+
+
+class HookPlatformTests(unittest.TestCase):
+    """The launcher is POSIX `sh`; the management verbs refuse elsewhere."""
+
+    def test_install_and_remove_refuse_off_posix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+
+            with mock.patch.object(impact_hook, "os", _NonPosixOs()):
+                install_code, _install_stdout, install_stderr = invoke(
+                    {}, "prepare", "hook", "install",
+                    "--repo", str(repository), "--confirm-hook-write",
+                )
+                remove_code, _remove_stdout, remove_stderr = invoke(
+                    {}, "prepare", "hook", "remove",
+                    "--repo", str(repository), "--confirm-hook-write",
+                )
+
+            refusal = "error: the commit-time hook is available on macOS and Linux only\n"
+            self.assertEqual((install_code, install_stderr), (2, refusal))
+            self.assertEqual((remove_code, remove_stderr), (2, refusal))
+            self.assertFalse((repository / ".git" / "hooks" / HOOK_FILE_NAME).exists())
+
+    def test_status_reports_the_platform_and_never_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            environment = {"TAF_STATE_HOME": str(root / "state")}
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository)
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertIs(decoded(stdout)["posix"], True)
+
+            with mock.patch.object(impact_hook, "os", _NonPosixOs()):
+                code, stdout, stderr = invoke(
+                    environment, "prepare", "hook", "status", "--repo", str(repository)
+                )
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertIs(summary["posix"], False)
+            self.assertEqual(summary["hook"], "absent")
 
 
 if __name__ == "__main__":

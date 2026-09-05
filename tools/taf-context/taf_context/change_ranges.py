@@ -219,6 +219,13 @@ def changed_ranges(
     if staged and base.sha is None:
         # The very first commit of a repository has no HEAD to measure the
         # index against; there is nothing to diff, so the hook stays silent.
+        # This branch is this module's own contract, not a result warning a
+        # caller can observe: every query path resolves the repository first,
+        # and that step refuses a repository without a commit before any
+        # change query runs. It is therefore deliberately undocumented in
+        # `result-contract.md` - documenting a warning that cannot reach a
+        # result would be worse than not documenting it - and kept here so
+        # the function stays correct for any future caller of its own.
         warnings.add(WARNING_NO_HEAD)
         return (), _ordered_warnings(warnings)
     diff_arguments = ["diff"]

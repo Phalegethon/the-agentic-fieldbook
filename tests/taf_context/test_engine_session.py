@@ -225,6 +225,24 @@ class Level1SessionTests(unittest.TestCase):
         self.assertFalse(_alive(pid))
         self.assertIsNone(session.child_pid)
 
+    def test_interrupt_on_an_idle_session_leaves_it_able_to_start_again(self) -> None:
+        # A watchdog can also fire between two engine calls, with no exchange
+        # in flight to unwind. ``interrupt`` kills the child then as well,
+        # and the session stays respawn-capable by design: the next
+        # ``exchange`` simply starts a fresh child. A caller that must not
+        # get a replacement - the commit-time hook after its deadline - is
+        # therefore the one that has to remember it cancelled.
+        session = self._session("echo")
+        first = json.loads(session.exchange(frame("r1")))
+
+        session.interrupt()
+
+        self.assertIsNone(session.child_pid)
+        self.assertFalse(_alive(first["pid"]))
+        second = json.loads(session.exchange(frame("r2")))
+        self.assertNotEqual(second["pid"], first["pid"])
+        self.assertEqual((second["request_identity"], second["sequence"]), ("r2", 1))
+
     def test_interrupt_without_a_child_is_harmless(self) -> None:
         session = self._session("echo")
         session.interrupt()
