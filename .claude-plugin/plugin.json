@@ -2,7 +2,7 @@
   "name": "taf",
   "displayName": "The Agentic Fieldbook (TAF)",
   "description": "Evidence-backed recovery, handoff, and bounded repository context for reliable software delivery.",
-  "version": "2.8.1",
+  "version": "2.8.2",
   "author": {
     "name": "Gürkan Süerdem",
     "url": "https://github.com/Phalegethon"

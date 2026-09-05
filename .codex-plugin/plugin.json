@@ -1,6 +1,6 @@
 {
   "name": "taf",
-  "version": "2.8.1",
+  "version": "2.8.2",
   "description": "Evidence-backed recovery, handoff, and bounded repository context for reliable software delivery.",
   "author": {
     "name": "Gürkan Süerdem",
