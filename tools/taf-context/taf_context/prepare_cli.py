@@ -36,7 +36,13 @@ from .context_operations import (  # noqa: F401 - re-exported for callers and te
     validate_query_request,
 )
 from .git_snapshot import collect_snapshot
-from .impact_hook import hook_status, install_hook, refresh_launcher_target, remove_hook
+from .impact_hook import (
+    HOOK_MODES,
+    hook_status,
+    install_hook,
+    refresh_launcher_target,
+    remove_hook,
+)
 from .native_transport import OneShotTransport
 from .state_lifecycle import Candidate, apply_plan, plan_gc, plan_remove
 from .state_paths import StateError
@@ -82,6 +88,7 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
     hook_run = hook_commands.add_parser("run")
     hook_run.add_argument("--repo", required=True)
     hook_run.add_argument("--verbose", action="store_true")
+    hook_run.add_argument("--confirm", action="store_true")
 
     hook_install = hook_commands.add_parser(
         "install",
@@ -91,12 +98,15 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
             "approval of that write: ask first and pass it only after the "
             "user agreed; a request to set up the warning is not that "
             "approval. Add --chain to keep an existing foreign pre-commit "
-            "hook running after TAF's line."
+            "hook running after TAF's line. --mode=confirm asks on the "
+            "terminal whether to continue when the warning fires, and falls "
+            "back to advisory wherever no terminal can be opened."
         ),
     )
     hook_install.add_argument("--repo", required=True)
     hook_install.add_argument("--confirm-hook-write", action="store_true")
     hook_install.add_argument("--chain", action="store_true")
+    hook_install.add_argument("--mode", choices=HOOK_MODES, default="advisory")
 
     hook_remove = hook_commands.add_parser("remove")
     hook_remove.add_argument("--repo", required=True)
@@ -247,7 +257,12 @@ def _run_hook_command(
     if args.hook_command == "install":
         if not args.confirm_hook_write:
             raise PrepareCLIError("explicit hook-write confirmation required")
-        return install_hook(repository, chain=args.chain, environment=environment)
+        return install_hook(
+            repository,
+            chain=args.chain,
+            environment=environment,
+            hook_mode=args.mode,
+        )
     if args.hook_command == "remove":
         if not args.confirm_hook_write:
             raise PrepareCLIError("explicit hook-write confirmation required")

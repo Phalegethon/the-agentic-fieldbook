@@ -383,14 +383,25 @@ class HookCleanLineTests(unittest.TestCase):
             # so a malformed `changed_count` (the engine sending a string,
             # or a bool riding in on the int check) is exercised by patching
             # the query result directly rather than inventing a new fixture.
-            malformed_result = {"findings": [], "changed_count": "3"}
-            stderr = io.StringIO()
+            # `True` is the interesting one: `isinstance(True, int)` is true
+            # and `True == 1`, so a guard that only checked `int` would print
+            # "(True changed symbol)".
+            for malformed in ("3", True):
+                with self.subTest(changed_count=malformed):
+                    malformed_result = {"findings": [], "changed_count": malformed}
+                    stderr = io.StringIO()
 
-            with mock.patch.object(impact_hook, "run_query", return_value=malformed_result):
-                code = run_hook(repository, environment=environment, stderr=stderr, verbose=False)
+                    with mock.patch.object(
+                        impact_hook, "run_query", return_value=malformed_result
+                    ):
+                        code = run_hook(
+                            repository, environment=environment, stderr=stderr, verbose=False
+                        )
 
-            self.assertEqual(code, 0)
-            self.assertEqual(stderr.getvalue(), format_clean_line(None) + "\n")
+                    self.assertEqual(code, 0)
+                    self.assertEqual(
+                        stderr.getvalue(), "TAF impact: no untouched dependents\n"
+                    )
 
     def test_a_commit_that_carries_every_dependent_prints_the_clean_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1136,6 +1147,7 @@ class HookInstallTests(unittest.TestCase):
                     "mode": "hook-install",
                     "hook_path": str(hook_path),
                     "written": True,
+                    "hook_mode": "advisory",
                     "chained": False,
                     "chained_hook_path": None,
                     "launcher_current": True,
@@ -1499,6 +1511,253 @@ class HookOrphanedChainTests(unittest.TestCase):
             self.assertIsNone(summary["launcher_current"])
             self.assertIsNone(summary["launcher_text_current"])
             self.assertIsNone(summary["launcher_generation"])
+
+
+class _FakeTerminal(io.StringIO):
+    """A `/dev/tty` double: readable, writable, and selectable-by-fake."""
+
+    def __init__(self, answer: str) -> None:
+        super().__init__(answer)
+        self.written = ""
+
+    def write(self, text: str) -> int:  # the question goes to the terminal, not stderr
+        self.written += text
+        return len(text)
+
+
+class HookConfirmTests(unittest.TestCase):
+    """`--confirm` asks only after a warning, and only where a person can answer."""
+
+    def _ask(self, answer: str, environment: dict[str, str]) -> tuple[int, str, str]:
+        terminal = _FakeTerminal(answer)
+        stderr = io.StringIO()
+        with mock.patch.object(impact_hook, "_open_terminal", return_value=terminal), \
+             mock.patch.object(impact_hook, "_wait_for_input", return_value=True):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run_environment, repository = ready_repository(root)
+                code = run_hook(
+                    repository,
+                    environment={**run_environment, **environment},
+                    stderr=stderr,
+                    verbose=False,
+                    confirm=True,
+                )
+        return code, stderr.getvalue(), terminal.written
+
+    def test_an_empty_answer_continues(self) -> None:
+        code, stderr, written = self._ask("\n", {})
+        self.assertEqual(code, 0)
+        self.assertIn("TAF impact:", stderr)
+        self.assertEqual(written, "Continue with this commit? [Y/n] ")
+
+    def test_y_continues(self) -> None:
+        self.assertEqual(self._ask("y\n", {})[0], 0)
+
+    def test_eof_continues(self) -> None:
+        self.assertEqual(self._ask("", {})[0], 0)
+
+    def test_n_aborts_the_commit(self) -> None:
+        self.assertEqual(self._ask("n\n", {})[0], 1)
+
+    def test_upper_case_n_aborts_the_commit(self) -> None:
+        self.assertEqual(self._ask("N\n", {})[0], 1)
+
+    def test_the_disable_variable_skips_the_prompt(self) -> None:
+        code, _stderr, written = self._ask("n\n", {"TAF_HOOK_CONFIRM": "0"})
+        self.assertEqual((code, written), (0, ""))
+
+    def test_a_ci_environment_skips_the_prompt(self) -> None:
+        code, _stderr, written = self._ask("n\n", {"CI": "1"})
+        self.assertEqual((code, written), (0, ""))
+
+    def test_an_agent_environment_skips_the_prompt(self) -> None:
+        for name in ("CLAUDECODE", "AI_AGENT"):
+            with self.subTest(name=name):
+                code, _stderr, written = self._ask("n\n", {name: "1"})
+                self.assertEqual((code, written), (0, ""))
+
+    def test_no_terminal_skips_the_prompt(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(
+            impact_hook, "_open_terminal", side_effect=OSError(6, "Device not configured")
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                environment, repository = ready_repository(root)
+                code = run_hook(
+                    repository,
+                    environment=environment,
+                    stderr=stderr,
+                    verbose=False,
+                    confirm=True,
+                )
+        self.assertEqual(code, 0)
+        self.assertIn("TAF impact:", stderr.getvalue())
+
+    def test_a_timeout_continues_and_says_so(self) -> None:
+        terminal = _FakeTerminal("n\n")  # an answer that would abort, never read
+        stderr = io.StringIO()
+        with mock.patch.object(impact_hook, "_open_terminal", return_value=terminal), \
+             mock.patch.object(impact_hook, "_wait_for_input", return_value=False):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                environment, repository = ready_repository(root)
+                code = run_hook(
+                    repository,
+                    environment=environment,
+                    stderr=stderr,
+                    verbose=False,
+                    confirm=True,
+                )
+        self.assertEqual(code, 0)
+        self.assertTrue(
+            stderr.getvalue().endswith("TAF impact: no answer; the commit continues\n"),
+            stderr.getvalue(),
+        )
+
+    def test_a_clean_outcome_never_asks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root)
+            run(repository, "git", "add", "web.py", "other.py")
+            stage_edit(repository, "web.py", 5, "web 5 changed")
+            stage_edit(repository, "other.py", 5, "other 5 changed")
+            terminal = _FakeTerminal("n\n")
+            stderr = io.StringIO()
+            with mock.patch.object(impact_hook, "_open_terminal", return_value=terminal):
+                code = run_hook(
+                    repository,
+                    environment=environment,
+                    stderr=stderr,
+                    verbose=False,
+                    confirm=True,
+                )
+
+            self.assertEqual((code, terminal.written), (0, ""))
+
+    def test_the_timeout_falls_back_on_a_bad_value(self) -> None:
+        self.assertEqual(impact_hook._confirm_timeout({}), impact_hook.HOOK_CONFIRM_TIMEOUT_SECONDS)
+        self.assertEqual(
+            impact_hook._confirm_timeout({"TAF_HOOK_CONFIRM_TIMEOUT": "not a number"}),
+            impact_hook.HOOK_CONFIRM_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            impact_hook._confirm_timeout({"TAF_HOOK_CONFIRM_TIMEOUT": "0"}),
+            impact_hook.HOOK_CONFIRM_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            impact_hook._confirm_timeout({"TAF_HOOK_CONFIRM_TIMEOUT": "2.5"}), 2.5
+        )
+
+
+class HookConfirmLauncherTests(unittest.TestCase):
+    """`--mode=confirm` is recorded in the launcher and reported by `status`."""
+
+    def test_the_confirm_launcher_passes_the_flag(self) -> None:
+        source = _render_launcher(
+            interpreter=Path("/usr/bin/python3"),
+            script=Path("/plugin/prepare_repo_context.py"),
+            chained_hook_path=None,
+            state_root=Path("/home/user/state"),
+            confirm=True,
+        )
+
+        self.assertIn('hook run --repo "$PWD" --confirm', source)
+
+    def test_the_advisory_launcher_does_not(self) -> None:
+        source = _render_launcher(
+            interpreter=Path("/usr/bin/python3"),
+            script=Path("/plugin/prepare_repo_context.py"),
+            chained_hook_path=None,
+            state_root=Path("/home/user/state"),
+        )
+
+        self.assertNotIn("--confirm", source)
+
+    def test_install_records_the_mode_and_status_reports_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+
+            code, stdout, _stderr = invoke(
+                environment, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write", "--mode", "confirm",
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(decoded(stdout)["hook_mode"], "confirm")
+
+            code, stdout, _stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository)
+            )
+            self.assertEqual(code, 0)
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook_mode"], "confirm")
+            # A confirm launcher is current: `status` must render its
+            # comparison in the same mode, not against the advisory text.
+            self.assertTrue(summary["launcher_text_current"])
+            self.assertTrue(summary["launcher_current"])
+
+    def test_status_reports_advisory_for_a_default_install_and_null_for_none(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+
+            code, stdout, _stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository)
+            )
+            self.assertEqual(code, 0)
+            self.assertIsNone(decoded(stdout)["hook_mode"])
+
+            invoke(
+                environment, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            code, stdout, _stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository)
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(decoded(stdout)["hook_mode"], "advisory")
+
+            # A launcher written before this change carries no --confirm and
+            # must read as advisory, not as an unknown mode.
+            legacy = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            legacy.write_text(
+                "#!/bin/sh\n"
+                + LAUNCHER_MARKER
+                + '\nexec /usr/bin/python3 /plugin/prepare_repo_context.py hook run '
+                '--repo "$PWD"\n',
+                encoding="utf-8",
+            )
+            legacy.chmod(0o755)
+            code, stdout, _stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository)
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(decoded(stdout)["hook_mode"], "advisory")
+
+    def test_a_real_commit_under_confirm_aborts_on_n(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+            invoke(
+                environment, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write", "--mode", "confirm",
+            )
+            before_log = run(repository, "git", "log", "--format=%H")
+            # No `/dev/tty` is reachable from this subprocess, so the prompt is
+            # skipped and the commit proceeds: the fail-open guarantee (D4).
+            result = subprocess.run(
+                ["git", "commit", "-m", "x"],
+                cwd=repository,
+                env=commit_environment(environment),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual(before_log, run(repository, "git", "log", "--format=%H"))
 
 
 class HookStatusTests(unittest.TestCase):

@@ -94,6 +94,7 @@ def main(
                     environment=environment,
                     stderr=stderr,
                     verbose=args.verbose,
+                    confirm=args.confirm,
                 )
             result = run_prepare_command(
                 args,

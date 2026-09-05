@@ -3,10 +3,12 @@
 A pre-commit launcher runs `prepare hook run --repo <repo>`; the hook asks the
 already-built index which symbols the staged change set has dependents on,
 keeps the dependents whose file is not part of the commit, and writes at most
-five one-line warnings to stderr. It is advisory only: it never builds,
+five one-line warnings to stderr. It is advisory by default: it never builds,
 activates, downloads, removes, or garbage-collects, it never writes to stdout,
-it always exits 0, and it gives itself a hard wall-clock budget so a slow or
-cold engine can never hold up a commit.
+it exits 0, and it gives itself a hard wall-clock budget so a slow or cold
+engine can never hold up a commit. The one exception is opt-in: a launcher
+installed with `--mode=confirm` asks on the controlling terminal after a
+warning, and an explicit `n` there aborts the commit.
 
 `install_hook`, `remove_hook`, and `hook_status` manage the launcher itself:
 the only write this module ever makes to a repository, and only under
@@ -18,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import os
 from pathlib import Path
+import select
 import shlex
 import subprocess
 import sys
@@ -77,11 +80,30 @@ HOOK_CLEAN_SUMMARY = "no untouched dependents"
 # dependents" would read as a real all-clear over a vacuous one.
 HOOK_NOTHING_CHANGED_SUMMARY = "no indexed symbols changed"
 
+# Confirmation (D4). The prompt is opt-in per repository (`hook install
+# --mode=confirm`) and fails open everywhere a person cannot answer, so a
+# commit is never held up by a question nobody can see.
+HOOK_CONFIRM_DISABLE_VARIABLE = "TAF_HOOK_CONFIRM"  # exactly "0" skips the prompt
+HOOK_CONFIRM_TIMEOUT_VARIABLE = "TAF_HOOK_CONFIRM_TIMEOUT"
+HOOK_CONFIRM_TIMEOUT_SECONDS = 15.0
+HOOK_CONFIRM_QUESTION = "Continue with this commit? [Y/n] "
+HOOK_CONFIRM_TIMEOUT_LINE = HOOK_HEADER_PREFIX + "no answer; the commit continues"
+HOOK_CONFIRM_DECLINE_ANSWERS = frozenset({"n", "no"})
+# Set by an agent harness or a CI runner: there is no person at a terminal,
+# even where a controlling terminal happens to be reachable.
+HOOK_NON_INTERACTIVE_VARIABLES = ("CI", "CLAUDECODE", "AI_AGENT")
+HOOK_MODES = ("advisory", "confirm")
+
 HOOK_FILE_NAME = "pre-commit"
 CHAINED_HOOK_NAME = "pre-commit.taf-chained"
 # The second line of every launcher this module writes; a `pre-commit` file
 # containing this exact line is a TAF launcher, anything else is foreign.
 LAUNCHER_MARKER = "# TAF commit-time impact warning (managed by: prepare hook install)"
+# The launcher's own record of its mode: `hook status` reads the installed
+# text back rather than keeping a second copy of the mode anywhere else, so a
+# hand-edited or older launcher always reports what it will actually do.
+LAUNCHER_RUN_COMMAND = 'hook run --repo "$PWD"'
+LAUNCHER_CONFIRM_MARKER = LAUNCHER_RUN_COMMAND + " --confirm"
 
 # Where the launcher's self-healing pointer lives, under TAF's user-local
 # state root: `<state root>/hook/launcher-target`. The launcher reads it to
@@ -114,8 +136,9 @@ def run_hook(
     environment: Mapping[str, str],
     stderr: TextIO,
     verbose: bool = False,
+    confirm: bool = False,
 ) -> int:
-    """Warn about untouched dependents of the staged change set; always return 0.
+    """Warn about untouched dependents of the staged change set.
 
     Every step runs on one daemon worker thread, and the main thread waits for
     it for the remainder of `HOOK_TIME_LIMIT_SECONDS`. A worker that is still
@@ -129,6 +152,11 @@ def run_hook(
     none of those ran a query at all. A completed query that found no
     untouched dependents is different: it writes one line saying so (D3),
     because that is the one quiet outcome that actually checked something.
+
+    The return code is 0 for every outcome but one: under `confirm` (the
+    opt-in `--mode=confirm` launcher), a warning report is followed by a
+    question on the controlling terminal, and an explicit `n` there returns 1
+    and aborts the commit. Everything else about that path fails open (D4).
 
     The whole body is guarded: the hook is advisory, so thread start,
     `_explain`, and the writes below may never raise out to the caller and
@@ -173,7 +201,9 @@ def run_hook(
         for line in ["", *run.lines, ""]:
             with contextlib.suppress(Exception):
                 stderr.write(line + "\n")
-        return 0
+        # Only a warning is worth a question: the clean line returned above,
+        # and every silent outcome returned before it.
+        return _ask_to_continue(environment, stderr, verbose) if confirm else 0
     except Exception:  # the hook is advisory: nothing may escape it, ever
         return 0
 
@@ -597,12 +627,88 @@ def _explain(stderr: TextIO, verbose: bool, reason: str) -> None:
         stderr.write(f"TAF hook: {reason}\n")
 
 
+def _open_terminal() -> TextIO:
+    """The controlling terminal, opened for reading and writing.
+
+    A seam, for two reasons: the question must reach the person even when the
+    hook's own stderr is a pipe, and tests replace this with a double. It
+    raises `OSError` wherever there is no controlling terminal at all - an
+    agent's own commit, CI, a GUI client - which is exactly the case the
+    caller treats as "do not ask".
+    """
+    return open("/dev/tty", "r+", encoding="utf-8", errors="replace")
+
+
+def _wait_for_input(terminal: TextIO, timeout: float) -> bool:
+    """True when the terminal has something to read before `timeout` runs out."""
+    ready, _writable, _errored = select.select([terminal], [], [], timeout)
+    return bool(ready)
+
+
+def _confirm_timeout(environment: Mapping[str, str]) -> float:
+    """The question's own deadline; a bad or non-positive value falls back.
+
+    This is not the query's `HOOK_TIME_LIMIT_SECONDS`, which bounds how long
+    the engine may take. This one bounds how long a person is waited for, and
+    it only starts once the report is already on the screen.
+    """
+    raw = environment.get(HOOK_CONFIRM_TIMEOUT_VARIABLE)
+    if raw is None:
+        return HOOK_CONFIRM_TIMEOUT_SECONDS
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return HOOK_CONFIRM_TIMEOUT_SECONDS
+    return seconds if seconds > 0 else HOOK_CONFIRM_TIMEOUT_SECONDS
+
+
+def _ask_to_continue(
+    environment: Mapping[str, str], stderr: TextIO, verbose: bool
+) -> int:
+    """0 to let the commit proceed, 1 only for an explicit refusal (D4).
+
+    Every uncertainty resolves to 0: the disable variable, an agent or CI
+    environment, no controlling terminal, an unreadable answer, or no answer
+    at all. The single path to 1 is a person typing `n`.
+    """
+    if environment.get(HOOK_CONFIRM_DISABLE_VARIABLE) == "0":
+        _explain(
+            stderr, verbose, f"confirmation disabled by {HOOK_CONFIRM_DISABLE_VARIABLE}=0"
+        )
+        return 0
+    for name in HOOK_NON_INTERACTIVE_VARIABLES:
+        if name in environment:
+            _explain(stderr, verbose, f"no interactive terminal ({name} is set)")
+            return 0
+    try:
+        terminal = _open_terminal()
+    except OSError as exc:
+        _explain(stderr, verbose, _exception_reason(exc))
+        return 0
+    try:
+        terminal.write(HOOK_CONFIRM_QUESTION)
+        terminal.flush()
+        if not _wait_for_input(terminal, _confirm_timeout(environment)):
+            with contextlib.suppress(Exception):
+                terminal.write("\n")
+                terminal.flush()
+            with contextlib.suppress(Exception):
+                stderr.write(HOOK_CONFIRM_TIMEOUT_LINE + "\n")
+            return 0
+        answer = terminal.readline()
+    finally:
+        with contextlib.suppress(Exception):
+            terminal.close()
+    return 1 if answer.strip().lower() in HOOK_CONFIRM_DECLINE_ANSWERS else 0
+
+
 def install_hook(
     repository: Path,
     *,
     chain: bool,
     environment: Mapping[str, str],
     interpreter: Path | None = None,
+    hook_mode: str = "advisory",
 ) -> dict[str, object]:
     """Write the pre-commit launcher; idempotent, and the only write this module makes.
 
@@ -613,8 +719,17 @@ def install_hook(
     pointer file lives) and, once the launcher is written, is handed to
     `refresh_launcher_target` (best effort, with this same `interpreter`) so
     a fresh install starts with a pointer that already matches it.
+
+    `hook_mode` is `"advisory"` (the default, and what every launcher written
+    before D4 does) or `"confirm"`, which writes a launcher that asks before a
+    commit leaving dependents behind. It selects what the launcher does; the
+    consent for writing one at all is still `--confirm-hook-write` alone.
     """
     _require_posix()
+    if hook_mode not in HOOK_MODES:
+        raise PrepareCLIError(
+            f"unsupported hook mode {hook_mode!r}; expected one of {', '.join(HOOK_MODES)}"
+        )
     state, hooks_dir, hooks_path_value = _resolve_hooks_directory(repository)
     if state == "redirected":
         raise PrepareCLIError(
@@ -672,6 +787,7 @@ def install_hook(
             script=script,
             chained_hook_path=chained_hook_path,
             state_root=_state_paths(environment).root,
+            confirm=hook_mode == "confirm",
         )
         _write_launcher_atomically(hooks_dir, hook_path, source)
     except BaseException:
@@ -688,6 +804,9 @@ def install_hook(
         "mode": "hook-install",
         "hook_path": str(hook_path),
         "written": True,
+        # `mode` is already this result's operation name, so the launcher's
+        # own mode is reported as `hook_mode`.
+        "hook_mode": hook_mode,
         "chained": chained_hook_path is not None,
         "chained_hook_path": (
             str(chained_hook_path) if chained_hook_path is not None else None
@@ -781,6 +900,7 @@ def hook_status(
     launcher_current: bool | None = None
     launcher_text_current: bool | None = None
     launcher_generation: str | None = None
+    hook_mode: str | None = None
     hook_path_value: str | None = None
     if state == "redirected":
         hook_field = "redirected"
@@ -800,6 +920,13 @@ def hook_status(
             launcher_generation = (
                 "pointer" if actual is not None and "\ntaf_target=" in actual else "embedded"
             )
+            # The launcher's own text is the only record of its mode, so a
+            # hand-edited or pre-D4 launcher reports what it will actually do.
+            hook_mode = (
+                "confirm"
+                if actual is not None and LAUNCHER_CONFIRM_MARKER in actual
+                else "advisory"
+            )
             try:
                 state_root = _state_paths(environment).root
             except PrepareCLIError:
@@ -817,6 +944,9 @@ def hook_status(
                     script=_entry_point_script(),
                     chained_hook_path=chained_path if chained else None,
                     state_root=state_root,
+                    # Compare against the mode that is installed, or every
+                    # confirm launcher would read as out of date.
+                    confirm=hook_mode == "confirm",
                 )
                 launcher_text_current = None if actual is None else actual == expected
                 launcher_current = launcher_text_current or (
@@ -842,6 +972,9 @@ def hook_status(
         "launcher_current": launcher_current,
         "launcher_text_current": launcher_text_current,
         "launcher_generation": launcher_generation,
+        # The launcher's mode (`mode` above is this result's operation name):
+        # "advisory", "confirm", or null when no TAF launcher is installed.
+        "hook_mode": hook_mode,
         # `status` reports everywhere; only `install` and `remove` refuse off
         # POSIX, and this field is how a caller learns that before asking.
         "posix": os.name == "posix",
@@ -1013,7 +1146,12 @@ def _classify_pre_commit(hook_path: Path) -> str:
 
 
 def _render_launcher(
-    *, interpreter: Path, script: Path, chained_hook_path: Path | None, state_root: Path
+    *,
+    interpreter: Path,
+    script: Path,
+    chained_hook_path: Path | None,
+    state_root: Path,
+    confirm: bool = False,
 ) -> str:
     """The POSIX `sh` launcher body; every embedded path is `shlex.quote`d.
 
@@ -1029,14 +1167,24 @@ def _render_launcher(
     that no longer exists. When the chosen interpreter is not executable,
     `command -v python3` is tried as a last resort; when no interpreter or no
     script can be found, the launcher stays silent and the commit proceeds.
+
+    `confirm` selects the launcher's mode (D4): the confirm form passes
+    `--confirm` to `hook run`, and that flag in the launcher's own text is
+    what `hook_status` reads the mode back from.
     """
     quoted_script = shlex.quote(str(script))
     quoted_interpreter = shlex.quote(str(interpreter))
     quoted_target = shlex.quote(str(launcher_target_path(state_root)))
+    run_command = LAUNCHER_CONFIRM_MARKER if confirm else LAUNCHER_RUN_COMMAND
+    summary = (
+        '# Asks before a commit that leaves dependents behind; silent otherwise.'
+        if confirm
+        else '# Advisory: prints a short "TAF impact:" report on stderr and never blocks a commit.'
+    )
     lines = [
         "#!/bin/sh",
         LAUNCHER_MARKER,
-        '# Advisory: prints a short "TAF impact:" report on stderr and never blocks a commit.',
+        summary,
     ]
     if chained_hook_path is not None:
         # The chained hook runs first so TAF's report is the last thing the
@@ -1066,7 +1214,7 @@ def _render_launcher(
         "fi",
         '[ -x "$taf_interpreter" ] || taf_interpreter=$(command -v python3 || :)',
         'if [ "${TAF_HOOK:-}" != "0" ] && [ -n "$taf_interpreter" ] && [ -f "$taf_script" ]; then',
-        '  "$taf_interpreter" "$taf_script" hook run --repo "$PWD" || :',
+        '  "$taf_interpreter" "$taf_script" ' + run_command + " || :",
         "fi",
     ])
     return "\n".join(lines) + "\n"
