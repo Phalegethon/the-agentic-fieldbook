@@ -76,6 +76,12 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
     gc.add_argument("--unused-for", type=int, default=30)
     gc.add_argument("--confirm-state-write", action="store_true")
 
+    hook = commands.add_parser("hook")
+    hook_commands = hook.add_subparsers(dest="hook_command", required=True)
+    hook_run = hook_commands.add_parser("run")
+    hook_run.add_argument("--repo", required=True)
+    hook_run.add_argument("--verbose", action="store_true")
+
     query = commands.add_parser("query")
     query.add_argument("--repo", required=True)
     query.add_argument(

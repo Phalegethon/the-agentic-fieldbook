@@ -143,6 +143,21 @@ class Level1Session:
                     self._kill_process(process)
             self._forget()
 
+    def interrupt(self) -> None:
+        """Kill the current child from another thread, without taking the lock.
+
+        ``close`` cannot serve a watchdog: ``exchange`` holds the session lock
+        for the whole response wait, so closing from a second thread would
+        block until the request deadline - the very deadline the watchdog
+        exists to pre-empt. Killing the child's process group instead leaves
+        the blocked ``exchange`` to see EOF and raise, and it reaps the child
+        here so nothing outlives the caller. The session's own bookkeeping is
+        left to that ``exchange``, which owns the lock.
+        """
+        process = self._process
+        if process is not None:
+            self._kill_process(process)
+
     # -- internals -----------------------------------------------------------
 
     def _ensure_started(self) -> subprocess.Popen[bytes]:

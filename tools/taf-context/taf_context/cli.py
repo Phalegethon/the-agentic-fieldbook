@@ -35,6 +35,7 @@ from .models import (
     RepositorySnapshot,
     canonical_json,
 )
+from .impact_hook import run_hook
 from .prepare_cli import register_prepare_command, run_prepare_command
 from .recovery import RecoveryError
 from .recovery_cli import register_recovery_command, run_recovery_command
@@ -84,6 +85,16 @@ def main(
                 repo=Path(args.repo), manifest_path=Path(args.manifest)
             )
         elif args.command == "prepare":
+            if args.prepare_command == "hook" and args.hook_command == "run":
+                # The hook is advisory: it writes its own lines to stderr,
+                # never answers with JSON, and always exits 0, so it returns
+                # before the stdout writer below.
+                return run_hook(
+                    Path(args.repo),
+                    environment=environment,
+                    stderr=stderr,
+                    verbose=args.verbose,
+                )
             result = run_prepare_command(
                 args,
                 environment=environment,

@@ -1,0 +1,416 @@
+"""Tests for the one-line untouched-dependent warnings of a pre-commit hook run."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import tempfile
+import time
+import unittest
+
+from taf_context.impact_hook import (
+    HOOK_MAXIMUM_LINES,
+    HOOK_TIME_LIMIT_SECONDS,
+    format_summary_line,
+    format_warning_line,
+    untouched_dependents,
+)
+
+from .repo_factory import commit_all, init_repo, init_committed_repo, run, write
+from .test_prepare_cli import invoke, write_fake_native_engine
+
+
+def numbered(prefix: str, count: int) -> str:
+    return "\n".join(f"{prefix} {number}" for number in range(1, count + 1)) + "\n"
+
+
+def edit_line(path: Path, number: int, text: str) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lines[number - 1] = text
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def stage_edit(repository: Path, name: str, number: int, text: str) -> None:
+    edit_line(repository / name, number, text)
+    run(repository, "git", "add", name)
+
+
+def staged_impact_fixture(root: Path) -> Path:
+    """A repository whose index edits `app.py` inside the fake's `app.first`.
+
+    `web.py` and `other.py` exist and are untouched; the fake engine answers
+    with one candidate in each of them, so the untouched filter has something
+    to keep and something a later stage can take away.
+    """
+    repository = init_committed_repo(root / "repo")
+    write(repository / "app.py", numbered("line", 40))
+    write(repository / "web.py", numbered("web", 20))
+    write(repository / "other.py", numbered("other", 20))
+    commit_all(repository, "base")
+    stage_edit(repository, "app.py", 5, "line 5 changed")
+    return repository
+
+
+def build_index(environment: dict[str, str], repository: Path) -> None:
+    code, _stdout, stderr = invoke(
+        environment, "prepare", "build", "--repo", str(repository), "--confirm-state-write"
+    )
+    if (code, stderr) != (0, ""):  # pragma: no cover - a broken fixture, not a result
+        raise AssertionError(f"fixture build failed: {stderr}")
+
+
+def hook(environment: dict[str, str], repository: Path, *extra: str) -> tuple[int, str, str]:
+    return invoke(environment, "prepare", "hook", "run", "--repo", str(repository), *extra)
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def wait_until(predicate, seconds: float = 3.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+WEB_LINE = "TAF: app.first changed; web.py:12 depends on it and is not in this commit\n"
+OTHER_LINE = "TAF: app changed; other.py:12 depends on it and is not in this commit\n"
+
+
+class ImpactHookReadinessTests(unittest.TestCase):
+    """Anything but `use-index` makes the hook silent (spec section 2)."""
+
+    def test_a_missing_engine_is_silent_and_named_only_when_verbose(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = staged_impact_fixture(root)
+            environment = {"TAF_STATE_HOME": str(root / "state")}
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout, stderr), (0, "", ""))
+            code, stdout, stderr = hook(environment, repository, "--verbose")
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(stderr, "TAF hook: the native engine is not installed\n")
+
+    def test_an_unbuilt_index_is_silent_and_names_its_next_safe_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = staged_impact_fixture(root)
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout, stderr), (0, "", ""))
+            code, stdout, stderr = hook(environment, repository, "--verbose")
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(
+                stderr, "TAF hook: context is not ready (next safe action: build-index)\n"
+            )
+
+    def test_a_stale_index_is_silent_and_names_its_next_safe_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = staged_impact_fixture(root)
+            fresh = root / "taf-level1"
+            write_fake_native_engine(fresh)
+            stale = root / "taf-level1-stale"
+            write_fake_native_engine(stale, stale=True)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(fresh),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            build_index(environment, repository)
+            environment["TAF_LEVEL1_BINARY"] = str(stale)
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout, stderr), (0, "", ""))
+            code, stdout, stderr = hook(environment, repository, "--verbose")
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(
+                stderr, "TAF hook: context is not ready (next safe action: rebuild-index)\n"
+            )
+
+
+class ImpactHookWarningTests(unittest.TestCase):
+    """The untouched filter, the exact line format, and the five-line cap."""
+
+    def _ready_repository(self, root: Path, **options) -> tuple[dict[str, str], Path]:
+        repository = staged_impact_fixture(root)
+        native = root / "taf-level1"
+        write_fake_native_engine(native, **options)
+        environment = {
+            "TAF_LEVEL1_BINARY": str(native),
+            "TAF_STATE_HOME": str(root / "state"),
+        }
+        build_index(environment, repository)
+        return environment, repository
+
+    def test_every_untouched_dependent_is_warned_about_in_candidate_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = self._ready_repository(root)
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(stderr, OTHER_LINE + WEB_LINE)
+
+    def test_a_dependent_inside_the_commit_is_not_warned_about(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = self._ready_repository(root)
+            # Line 18 is outside the fake's `web.handle` (lines 5-12), so
+            # `web.py` joins the commit without becoming a changed symbol:
+            # the path filter is the only thing that can drop its candidate.
+            stage_edit(repository, "web.py", 18, "web 18 changed")
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(stderr, OTHER_LINE)
+
+    def test_a_commit_that_carries_every_dependent_warns_about_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = self._ready_repository(root)
+            stage_edit(repository, "web.py", 18, "web 18 changed")
+            stage_edit(repository, "other.py", 3, "other 3 changed")
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout, stderr), (0, "", ""))
+            code, stdout, stderr = hook(environment, repository, "--verbose")
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(stderr, "TAF hook: no untouched dependents\n")
+
+    def test_an_unstaged_edit_is_not_part_of_the_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = self._ready_repository(root)
+            run(repository, "git", "reset")
+            edit_line(repository / "app.py", 5, "line 5 changed again")
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout, stderr), (0, "", ""))
+
+    def test_more_dependents_than_the_cap_end_with_a_summary_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = self._ready_repository(root, extra_callers=5)
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(
+                stderr.splitlines(),
+                [
+                    f"TAF: app.first changed; dep{index:02d}.py:12 depends on it"
+                    " and is not in this commit"
+                    for index in range(HOOK_MAXIMUM_LINES)
+                ]
+                + [
+                    "TAF: … and 2 more "
+                    "(run: prepare query --operation impact-candidates --staged)"
+                ],
+            )
+
+    def test_exactly_the_cap_many_dependents_end_without_a_summary_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = self._ready_repository(root, extra_callers=3)
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout), (0, ""))
+            lines = stderr.splitlines()
+            self.assertEqual(len(lines), HOOK_MAXIMUM_LINES)
+            self.assertNotIn("more (run:", stderr)
+
+    def test_the_query_asks_the_engine_for_verified_edges_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_log = root / "requests.jsonl"
+            environment, repository = self._ready_repository(root, request_log=request_log)
+            request_log.unlink()  # the build's own requests are not the hook's
+
+            code, _stdout, _stderr = hook(environment, repository)
+
+            self.assertEqual(code, 0)
+            requests = [
+                json.loads(line)
+                for line in request_log.read_text(encoding="utf-8").splitlines()
+            ]
+            operations = {item["operation"] for item in requests}
+            self.assertEqual(operations, {"status", "changed-symbols", "related-symbols"})
+            # No request the hook makes ever widens the engine's evidence, so
+            # no inferred edge can reach a warning line in the first place.
+            self.assertEqual({item["allow_inferred"] for item in requests}, {False})
+
+
+class UntouchedDependentTests(unittest.TestCase):
+    """The pure filter and the two pure line formats."""
+
+    def _candidate(self, path: str, evidence: str) -> dict[str, object]:
+        return {
+            "path": path,
+            "reference_line": 12,
+            "edge_evidence": evidence,
+            "anchors": [{"qualified_name": "app.first", "path": "app.py"}],
+        }
+
+    def test_only_untouched_verified_candidates_survive_in_result_order(self) -> None:
+        result = {
+            "findings": [
+                self._candidate("guess.py", "inferred"),
+                self._candidate("web.py", "verified"),
+                self._candidate("app.py", "verified"),
+                self._candidate("other.py", "verified"),
+            ]
+        }
+
+        kept = untouched_dependents(result, {"app.py"})
+
+        self.assertEqual([item["path"] for item in kept], ["web.py", "other.py"])
+
+    def test_a_result_without_findings_keeps_nothing(self) -> None:
+        self.assertEqual(untouched_dependents({}, set()), [])
+
+    def test_a_warning_line_names_the_strongest_anchor_and_the_reference(self) -> None:
+        self.assertEqual(
+            format_warning_line(self._candidate("web.py", "verified")),
+            "TAF: app.first changed; web.py:12 depends on it and is not in this commit",
+        )
+
+    def test_the_summary_line_names_the_query_that_shows_the_rest(self) -> None:
+        self.assertEqual(
+            format_summary_line(2),
+            "TAF: … and 2 more "
+            "(run: prepare query --operation impact-candidates --staged)",
+        )
+
+
+class ImpactHookSafetyTests(unittest.TestCase):
+    """The disable switch, the wall-clock cap, and the always-zero exit."""
+
+    def test_the_disable_switch_stops_the_hook_before_any_engine_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = staged_impact_fixture(root)
+            native = root / "taf-level1"
+            invocation_log = root / "native-invocations.log"
+            write_fake_native_engine(native, invocation_log)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+                "TAF_HOOK": "0",
+            }
+            build_index(environment, repository)
+            after_build = invocation_log.read_text(encoding="utf-8")
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout, stderr), (0, "", ""))
+            self.assertEqual(invocation_log.read_text(encoding="utf-8"), after_build)
+            code, stdout, stderr = hook(environment, repository, "--verbose")
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(stderr, "TAF hook: disabled by TAF_HOOK=0\n")
+
+    def test_a_slow_engine_is_abandoned_inside_the_time_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = staged_impact_fixture(root)
+            native = root / "taf-level1"
+            pid_file = root / "served-pids"
+            write_fake_native_engine(
+                native,
+                pid_file=pid_file,
+                serve_delay_seconds=10.0,
+                serve_delay_operations=("related-symbols",),
+            )
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            build_index(environment, repository)
+
+            started = time.monotonic()
+            code, stdout, stderr = hook(environment, repository)
+            elapsed = time.monotonic() - started
+
+            self.assertEqual((code, stdout, stderr), (0, "", ""))
+            self.assertGreaterEqual(elapsed, HOOK_TIME_LIMIT_SECONDS)
+            self.assertLess(elapsed, HOOK_TIME_LIMIT_SECONDS + 0.5)
+            # One child was served and it is gone: the watchdog killed it and
+            # nothing retried the request onto a replacement.
+            pids = [int(value) for value in pid_file.read_text(encoding="utf-8").split()]
+            self.assertEqual(len(pids), 1)
+            self.assertTrue(wait_until(lambda: not alive(pids[0])))
+
+            code, stdout, stderr = hook(environment, repository, "--verbose")
+
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(stderr, "TAF hook: exceeded the 3.0 second limit\n")
+            self.assertEqual(len(pid_file.read_text(encoding="utf-8").split()), 2)
+
+    def test_a_directory_that_is_not_a_repository_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plain = root / "plain"
+            plain.mkdir()
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+
+            code, stdout, stderr = hook(environment, plain)
+
+            self.assertEqual((code, stdout, stderr), (0, "", ""))
+            code, stdout, stderr = hook(environment, plain, "--verbose")
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertTrue(stderr.startswith("TAF hook: SnapshotError: "))
+            self.assertEqual(len(stderr.splitlines()), 1)
+
+    def test_the_first_commit_of_a_repository_is_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = init_repo(root / "repo")
+            write(repository / "app.py", numbered("line", 40))
+            run(repository, "git", "add", "app.py")
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout, stderr), (0, "", ""))
+            code, stdout, stderr = hook(environment, repository, "--verbose")
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(
+                stderr,
+                "TAF hook: PrepareCLIError: repository must have at least one commit\n",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

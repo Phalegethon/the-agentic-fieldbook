@@ -76,16 +76,26 @@ def write_fake_native_engine(
     update_outcome: str = "ready",
     wide_overview: bool = False,
     build_error: bool = False,
+    extra_callers: int = 0,
+    request_log: Path | None = None,
+    pid_file: Path | None = None,
+    serve_delay_seconds: float = 0.0,
+    serve_delay_operations: tuple[str, ...] = (),
 ) -> None:
     source = textwrap.dedent(
             """\
             #!/usr/bin/env python3
             import hashlib
             import json
+            import os
             from pathlib import Path
             import sys
+            import time
 
             invocation_log = __INVOCATION_LOG__
+            request_log = __REQUEST_LOG__
+            pid_file = __PID_FILE__
+            serving = sys.argv[1:] == ["--serve"]
 
             def answer(envelope):
                 request = envelope["request"]
@@ -94,6 +104,15 @@ def write_fake_native_engine(
                 if invocation_log is not None:
                     with Path(invocation_log).open("a", encoding="utf-8") as stream:
                         stream.write(operation + "\\n")
+                if request_log is not None:
+                    with Path(request_log).open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(request, sort_keys=True) + "\\n")
+                if serving and __SERVE_DELAY_SECONDS__ and (
+                    not __SERVE_DELAY_OPERATIONS__ or operation in __SERVE_DELAY_OPERATIONS__
+                ):
+                    # A served answer slow enough for a caller's own deadline
+                    # to expire while the request is still in flight.
+                    time.sleep(__SERVE_DELAY_SECONDS__)
                 if operation == "build":
                     state.mkdir(parents=True, exist_ok=True)
                     (state / "fake-index").write_text("ready", encoding="utf-8")
@@ -118,7 +137,13 @@ def write_fake_native_engine(
                     ],
                     "web.py": [("definition", "web.handle", 5, 12)],
                 }
-                CALLERS = {"app.first": [("definition", "web.py", "web.handle", 5, 12, "call")]}
+                CALLERS = {
+                    "app.first": [("definition", "web.py", "web.handle", 5, 12, "call")]
+                    + [
+                        ("definition", "dep%02d.py" % index, "dep%02d.run" % index, 3, 8, "call")
+                        for index in range(__EXTRA_CALLERS__)
+                    ]
+                }
                 IMPORTERS = {"app": [("import", "other.py", "app", 1, 1, "import")]}
 
                 def fixture_identity(path, name):
@@ -383,12 +408,17 @@ def write_fake_native_engine(
                 )
                 sys.stdout.flush()
 
-            if sys.argv[1:] == ["--serve"]:
+            if serving:
                 # One `--serve` child answers many requests on one pair of
                 # pipes, exactly as the real engine's session mode does.
                 if invocation_log is not None:
                     with Path(invocation_log).open("a", encoding="utf-8") as stream:
                         stream.write("serve\\n")
+                if pid_file is not None:
+                    # One line per served child, so a caller can prove which
+                    # children ran and that none of them outlived the run.
+                    with Path(pid_file).open("a", encoding="utf-8") as stream:
+                        stream.write(str(os.getpid()) + "\\n")
                 sys.stderr.write("__TAF_LEVEL1_SERVER_READY_V1__\\n")
                 sys.stderr.flush()
                 for served in sys.stdin.buffer:
@@ -406,7 +436,11 @@ def write_fake_native_engine(
             "__UPDATE_OUTCOME__", repr(update_outcome)
         ).replace("__WIDE_OVERVIEW__", repr(wide_overview)).replace(
             "__BUILD_ERROR__", repr(build_error)
-        )
+        ).replace("__EXTRA_CALLERS__", repr(extra_callers)).replace(
+            "__REQUEST_LOG__", repr(None if request_log is None else str(request_log))
+        ).replace("__PID_FILE__", repr(None if pid_file is None else str(pid_file))).replace(
+            "__SERVE_DELAY_SECONDS__", repr(serve_delay_seconds)
+        ).replace("__SERVE_DELAY_OPERATIONS__", repr(tuple(serve_delay_operations)))
     path.write_text(source, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 

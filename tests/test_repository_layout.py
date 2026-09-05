@@ -23,6 +23,7 @@ EXPECTED_TAF_CONTEXT_FILES = {
     "engine_session.py",
     "freshness.py",
     "git_snapshot.py",
+    "impact_hook.py",
     "level1_models.py",
     "level1_render.py",
     "mcp_server.py",

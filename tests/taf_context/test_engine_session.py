@@ -194,6 +194,42 @@ class Level1SessionTests(unittest.TestCase):
             session.exchange(frame("r2"))
         self.assertEqual((caught.exception.reason, caught.exception.detail), ("rejected", ""))
 
+    def test_interrupt_kills_a_blocked_exchange_from_another_thread(self) -> None:
+        # A watchdog cannot use ``close``: the blocked exchange holds the
+        # session lock for the whole response wait, so the watchdog would
+        # wait with it. ``interrupt`` kills the child by pid instead, and the
+        # blocked exchange then sees EOF and raises.
+        session = self._session("slow-once")
+        reasons: list[str] = []
+
+        def blocked() -> None:
+            try:
+                session.exchange(frame("r1"))
+            except NativeTransportError as exc:
+                reasons.append(exc.reason)
+
+        worker = threading.Thread(target=blocked, daemon=True)
+        worker.start()
+        # The marker is written by the child once the request is in its hands,
+        # so waiting for it puts the interrupt inside the response wait rather
+        # than inside the start-up the session already has a deadline for.
+        self.assertTrue(_wait_until((self.root / "marker").exists))
+        pid = session.child_pid
+        assert pid is not None
+
+        session.interrupt()
+
+        worker.join(5.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(reasons, ["rejected"])
+        self.assertFalse(_alive(pid))
+        self.assertIsNone(session.child_pid)
+
+    def test_interrupt_without_a_child_is_harmless(self) -> None:
+        session = self._session("echo")
+        session.interrupt()
+        self.assertIsNone(session.child_pid)
+
     def test_each_child_generation_gets_its_own_stderr_ring(self) -> None:
         session = self._session("echo")
         session.exchange(frame("r1"))
