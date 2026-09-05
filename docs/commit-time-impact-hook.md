@@ -103,7 +103,9 @@ stays staged and is not undone.
 - It writes to stderr, never to stdout.
 - It is advisory unless the launcher was installed with `--mode=confirm`:
   exit code 0 always, and under `confirm` a non-zero exit only from an
-  explicit `n`.
+  explicit `n`. The refusal has its own exit code, and it is the only one the
+  launcher turns into a blocked commit, so a broker that crashes or cannot
+  start still lets the commit through.
 - It waits at most 3 seconds for the answer before giving up silently, so a
   slow or cold engine can never hold up a commit.
 - It stays completely silent whenever the bound index is not ready or that

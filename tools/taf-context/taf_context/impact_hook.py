@@ -93,6 +93,12 @@ HOOK_CONFIRM_DECLINE_ANSWERS = frozenset({"n", "no"})
 # even where a controlling terminal happens to be reachable.
 HOOK_NON_INTERACTIVE_VARIABLES = ("CI", "CLAUDECODE", "AI_AGENT")
 HOOK_MODES = ("advisory", "confirm")
+# The exit code `hook run --confirm` uses for "the person said no", and the
+# only one the confirm launcher turns into a blocked commit. A plain `1` would
+# collide with an unhandled interpreter failure, and the whole point of the
+# fail-open rule is that a broken broker never blocks a commit; this code
+# cannot be produced by anything but the refusal below.
+HOOK_DECLINE_EXIT_CODE = 97
 
 HOOK_FILE_NAME = "pre-commit"
 CHAINED_HOOK_NAME = "pre-commit.taf-chained"
@@ -155,8 +161,9 @@ def run_hook(
 
     The return code is 0 for every outcome but one: under `confirm` (the
     opt-in `--mode=confirm` launcher), a warning report is followed by a
-    question on the controlling terminal, and an explicit `n` there returns 1
-    and aborts the commit. Everything else about that path fails open (D4).
+    question on the controlling terminal, and an explicit `n` there returns
+    `HOOK_DECLINE_EXIT_CODE`, which is the only code the launcher turns into a
+    blocked commit. Everything else about that path fails open (D4).
 
     The whole body is guarded: the hook is advisory, so thread start,
     `_explain`, and the writes below may never raise out to the caller and
@@ -699,7 +706,11 @@ def _ask_to_continue(
     finally:
         with contextlib.suppress(Exception):
             terminal.close()
-    return 1 if answer.strip().lower() in HOOK_CONFIRM_DECLINE_ANSWERS else 0
+    return (
+        HOOK_DECLINE_EXIT_CODE
+        if answer.strip().lower() in HOOK_CONFIRM_DECLINE_ANSWERS
+        else 0
+    )
 
 
 def install_hook(
@@ -1214,9 +1225,18 @@ def _render_launcher(
         "fi",
         '[ -x "$taf_interpreter" ] || taf_interpreter=$(command -v python3 || :)',
         'if [ "${TAF_HOOK:-}" != "0" ] && [ -n "$taf_interpreter" ] && [ -f "$taf_script" ]; then',
-        '  "$taf_interpreter" "$taf_script" ' + run_command + " || :",
-        "fi",
     ])
+    if confirm:
+        # Only the refusal code blocks the commit. Any other non-zero status
+        # is a broken broker, and a broken broker must never stop a commit,
+        # so it is swallowed exactly as the advisory launcher swallows it.
+        # `if` with a false condition and no `else` leaves status 0, so the
+        # block itself can never become the script's exit status.
+        lines.append('  "$taf_interpreter" "$taf_script" ' + run_command)
+        lines.append(f"  if [ $? -eq {HOOK_DECLINE_EXIT_CODE} ]; then exit 1; fi")
+    else:
+        lines.append('  "$taf_interpreter" "$taf_script" ' + run_command + " || :")
+    lines.append("fi")
     return "\n".join(lines) + "\n"
 
 

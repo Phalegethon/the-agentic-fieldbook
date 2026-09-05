@@ -1558,10 +1558,10 @@ class HookConfirmTests(unittest.TestCase):
         self.assertEqual(self._ask("", {})[0], 0)
 
     def test_n_aborts_the_commit(self) -> None:
-        self.assertEqual(self._ask("n\n", {})[0], 1)
+        self.assertEqual(self._ask("n\n", {})[0], impact_hook.HOOK_DECLINE_EXIT_CODE)
 
     def test_upper_case_n_aborts_the_commit(self) -> None:
-        self.assertEqual(self._ask("N\n", {})[0], 1)
+        self.assertEqual(self._ask("N\n", {})[0], impact_hook.HOOK_DECLINE_EXIT_CODE)
 
     def test_the_disable_variable_skips_the_prompt(self) -> None:
         code, _stderr, written = self._ask("n\n", {"TAF_HOOK_CONFIRM": "0"})
@@ -1649,6 +1649,48 @@ class HookConfirmTests(unittest.TestCase):
         self.assertEqual(
             impact_hook._confirm_timeout({"TAF_HOOK_CONFIRM_TIMEOUT": "2.5"}), 2.5
         )
+
+
+class ConfirmLauncherExitCodeTests(unittest.TestCase):
+    """Only the refusal code blocks a commit; a broken broker never does.
+
+    The launcher's own shell logic is exercised directly with a stub broker,
+    because the real refusal needs a controlling terminal no test process has.
+    """
+
+    def _run_launcher(self, root: Path, broker_exit: int) -> subprocess.CompletedProcess:
+        script = root / "broker.py"
+        write(script, f"import sys\nsys.exit({broker_exit})\n")
+        launcher = root / "pre-commit"
+        write(
+            launcher,
+            _render_launcher(
+                interpreter=Path(sys.executable).resolve(),
+                script=script,
+                chained_hook_path=None,
+                state_root=root / "state",
+                confirm=True,
+            ),
+        )
+        launcher.chmod(0o755)
+        return subprocess.run(
+            ["/bin/sh", str(launcher)], capture_output=True, text=True, timeout=30
+        )
+
+    def test_the_decline_code_blocks_the_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._run_launcher(Path(directory), impact_hook.HOOK_DECLINE_EXIT_CODE)
+
+            self.assertEqual(result.returncode, 1)
+
+    def test_any_other_failure_lets_the_commit_through(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for broker_exit in (0, 1, 2, 127):
+                with self.subTest(broker_exit=broker_exit):
+                    result = self._run_launcher(root, broker_exit)
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class HookConfirmLauncherTests(unittest.TestCase):
