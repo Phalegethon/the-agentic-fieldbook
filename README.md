@@ -15,7 +15,7 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.7.5 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, and reclaim unused index state without loading the full repository into model context. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.8.0 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, warn at commit time about dependents left behind, and reclaim unused index state without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.1.0 | Recover interrupted work and the single best next step from bounded, read-only Git evidence, optionally naming the symbols the work touched. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
@@ -261,10 +261,13 @@ importers, each candidate attributed in `anchors` to the changed symbols it
 depends on. Both compare the working tree, including staged, unstaged, and
 untracked changes, with a base resolved as the branch's upstream main, then
 `origin/HEAD`, then a local `main`/`master`, and `--base <ref>` selects
-another one. Neither reopens a source file: the change set only selects
-records the index already carries. `impact-candidates` asks the engine one
-relationship question per changed symbol and direction, so its cost grows
-with the change set; narrow a large one with `--path-prefix` before raising
+another one. "What am I about to commit?" is `--staged` instead: it measures
+the index against `HEAD` exactly as `git commit` would record it, excludes
+unstaged and untracked edits, and is exclusive with `--base`. Neither
+reopens a source file: the change set only selects records the index
+already carries. `impact-candidates` asks the engine one relationship
+question per changed symbol and direction, so its cost grows with the
+change set; narrow a large one with `--path-prefix` before raising
 `--maximum-results`.
 
 Index state lives in the user-local TAF state directory, never in the
@@ -279,6 +282,43 @@ leave behind. Both commands only report what they would delete until
 Runtime requirements are Git and Python 3. Go is not required for normal use.
 The published native runtime supports macOS and Linux on amd64/arm64 and
 Windows on amd64.
+
+### Commit-time impact warning
+
+An optional `pre-commit` launcher warns about dependents a commit leaves
+behind. It asks one bounded `impact-candidates --staged` query and, for
+every verified dependent whose file is not part of the commit, writes one
+line to stderr:
+
+```text
+TAF: galoplarColumns changed; src/features/at-detay/at-detay-skeleton.tsx:139 depends on it and is not in this commit
+```
+
+At most five such lines print, followed by a summary line for the rest. It
+is advisory only: stderr only, never stdout, exit code 0 always, and it
+gives itself a 3-second wall-clock budget so a slow or cold engine can never
+hold up a commit. It stays completely silent whenever the bound index is
+not ready, the staged change has no untouched dependents, or that budget is
+exceeded. The hook's own query performs the same standing-consent
+incremental refresh and superseded-generation prune as every other query;
+it never builds, activates, downloads, or removes state, and `build` stays
+its own separate consent.
+
+```bash
+<python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook status --repo <repo>
+<python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook install --repo <repo> --confirm-hook-write
+<python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook remove --repo <repo> --confirm-hook-write
+```
+
+`install` and `remove` write only under `--confirm-hook-write` and only
+inside the repository's own hooks directory, never a tracked file. Add
+`--chain` to keep an existing foreign `pre-commit` hook: it is moved aside
+and still runs, after TAF's line, with its exit code still able to block the
+commit. `status` reports `redirected` when `core.hooksPath` points
+elsewhere; TAF never installs there. `TAF_HOOK=0 git commit` silences one
+commit without touching the launcher. After a TAF plugin update, `status`
+reporting `launcher_current: false` means re-run `hook install` to refresh
+the launcher's embedded interpreter and script path.
 
 ### The repo-context MCP server
 
@@ -359,7 +399,7 @@ TAF and its skills have separate versions:
 
 - TAF `2.7.3` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.7.5` versions its behavior contract.
+- `prepare-repo-context` `1.8.0` versions its behavior contract.
 - `work-recovery` `1.1.0` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with

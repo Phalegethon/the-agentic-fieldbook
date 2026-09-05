@@ -5,6 +5,24 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.0.
+
+### Added
+
+- `changed-symbols` and `impact-candidates` accept `--staged` (`staged: true`
+  over MCP), measuring the index against `HEAD` exactly as `git commit`
+  would record it and excluding unstaged and untracked edits. Exclusive
+  with `--base`; the result's `base.source` reports `staged`.
+- `prepare hook install/remove/status --repo <repo>` manages an optional
+  `pre-commit` launcher, and the launcher's `hook run` warns about
+  dependents a commit leaves behind: one line per verified, untouched
+  dependent (`TAF: <symbol> changed; <path>:<line> depends on it and is not
+  in this commit`), at most five plus a summary line for the rest. It is
+  advisory only - stderr only, exit 0 always, silent whenever the index is
+  not ready, `TAF_HOOK=0` is set, or its 3-second wall-clock budget is
+  exceeded - and only `install`/`remove` write, under `--confirm-hook-write`
+  and only inside the repository's own hooks directory.
+
 ## [2.7.3] - 2026-09-05
 
 Native runtime `0.6.0` (unchanged; no new engine download). ### Changed
