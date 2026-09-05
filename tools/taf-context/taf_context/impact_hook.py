@@ -103,6 +103,18 @@ HOOK_DECLINE_EXIT_CODE = 97
 # `_open_terminal` at a pty instead.
 TERMINAL_DEVICE = "/dev/tty"
 
+# The report's TTY dress. Every escape below is written only when
+# `_hook_colour_enabled` said yes, so a non-TTY stderr (GUI clients, CI,
+# pipes) keeps the pure-ASCII form the D16 rules promise and every pinned
+# non-TTY expectation stays byte-identical.
+_ANSI_RESET = "\x1b[0m"
+_ANSI_BOLD = "\x1b[1m"
+_ANSI_DIM = "\x1b[2m"
+_ANSI_RED = "\x1b[31m"
+_ANSI_GREEN = "\x1b[32m"
+_ANSI_YELLOW = "\x1b[33m"
+_ANSI_CYAN = "\x1b[36m"
+
 HOOK_FILE_NAME = "pre-commit"
 CHAINED_HOOK_NAME = "pre-commit.taf-chained"
 # The second line of every launcher this module writes; a `pre-commit` file
@@ -202,7 +214,14 @@ def run_hook(
             return 0
         if run.clean:
             with contextlib.suppress(Exception):
-                stderr.write(format_clean_line(run.clean_changed_count) + "\n")
+                stderr.write(
+                    _dress_clean_line(
+                        format_clean_line(run.clean_changed_count),
+                        changed_count=run.clean_changed_count,
+                        colour=_hook_colour_enabled(stderr, environment),
+                    )
+                    + "\n"
+                )
             return 0
         # One blank line above and below, so the block is separated from a
         # chained hook's output above and the commit summary below (D2). No
@@ -289,7 +308,14 @@ def untouched_dependents(
     return non_test + test
 
 
-def format_report(untouched: list[dict], *, truncated: bool, colour: bool) -> list[str]:
+def format_report(
+    untouched: list[dict],
+    *,
+    truncated: bool,
+    colour: bool,
+    changed_count: int | None = None,
+    candidate_count: int | None = None,
+) -> list[str]:
     """The header, at most five detail lines, and one trailer (addendum D16).
 
     Returns an empty list when there is nothing to report. `untouched` empty
@@ -327,13 +353,46 @@ def format_report(untouched: list[dict], *, truncated: bool, colour: bool) -> li
     printed = printed_group[:HOOK_MAXIMUM_LINES]
     remaining = len(printed_group) - len(printed)
     header = _format_header(len(printed_group), is_test=is_test_header, truncated=truncated)
-    if colour:
-        header = f"\x1b[1m{header}\x1b[0m"
-    lines = [header, *_format_detail_lines(printed)]
+    lines = [_dress_header(header, colour=colour)]
+    checked = _format_checked_line(changed_count, candidate_count)
+    # The "what was actually examined" line is TTY-only: it exists to make the
+    # check visible to a person watching a commit, and adding it to the
+    # non-TTY form would change output other tools already parse.
+    if colour and checked is not None:
+        lines.append(f"{_ANSI_DIM}{checked}{_ANSI_RESET}")
+    lines.extend(_format_detail_lines(printed, colour=colour))
     trailer = _format_trailer(remaining, other_test_count, truncated=truncated)
     if trailer is not None:
-        lines.append(trailer)
+        lines.append(f"{_ANSI_DIM}{trailer}{_ANSI_RESET}" if colour else trailer)
     return lines
+
+
+def _dress_header(header: str, *, colour: bool) -> str:
+    """Bold the whole header and paint its `TAF impact:` prefix (D16, extended)."""
+    if not colour:
+        return header
+    rest = header[len(HOOK_HEADER_PREFIX):]
+    return (
+        f"{_ANSI_BOLD}{_ANSI_RED}{HOOK_HEADER_PREFIX}{_ANSI_RESET}"
+        f"{_ANSI_BOLD}{rest}{_ANSI_RESET}"
+    )
+
+
+def _format_checked_line(changed_count: int | None, candidate_count: int | None) -> str | None:
+    """`  checked N changed symbols against M references`, or None when unknown.
+
+    Both counts come from the query result itself. The line says what the
+    hook actually examined, so a person watching a commit can tell a check
+    that ran wide from one that had almost nothing to look at.
+    """
+    if changed_count is None or candidate_count is None:
+        return None
+    symbols = "symbol" if changed_count == 1 else "symbols"
+    references = "reference" if candidate_count == 1 else "references"
+    return (
+        f"{HOOK_DETAIL_INDENT}checked {changed_count} changed {symbols} "
+        f"against {candidate_count} {references}"
+    )
 
 
 def format_clean_line(changed_count: int | None) -> str:
@@ -355,6 +414,24 @@ def format_clean_line(changed_count: int | None) -> str:
     return (
         HOOK_HEADER_PREFIX
         + f"{HOOK_CLEAN_SUMMARY} ({changed_count} changed {symbols})"
+    )
+
+
+def _dress_clean_line(line: str, *, changed_count: int | None, colour: bool) -> str:
+    """Green for a real all-clear, dim for the vacuous one; plain off a TTY.
+
+    A check that ran and found nothing is good news and reads as such; a
+    commit that changed no indexed symbol checked nothing, so it stays quiet
+    rather than borrowing the same green.
+    """
+    if not colour:
+        return line
+    if changed_count == 0:
+        return f"{_ANSI_DIM}{line}{_ANSI_RESET}"
+    rest = line[len(HOOK_HEADER_PREFIX):]
+    return (
+        f"{_ANSI_BOLD}{_ANSI_GREEN}{HOOK_HEADER_PREFIX}{_ANSI_RESET}"
+        f"{_ANSI_GREEN}{rest}{_ANSI_RESET}"
     )
 
 
@@ -380,19 +457,34 @@ def _format_header(count: int, *, is_test: bool, truncated: bool) -> str:
     )
 
 
-def _format_detail_lines(candidates: list[dict]) -> list[str]:
+def _format_detail_lines(candidates: list[dict], *, colour: bool = False) -> list[str]:
     """Two-space indent, `<path>:<line>` padded so every `<-` column aligns.
 
     The composition sorts a candidate's anchors strongest first and copies
     that anchor's reference line onto the candidate itself, so the two
     halves of a line always describe the same edge.
+
+    Padding is measured on the plain text and the colour is applied after,
+    so a coloured line and a plain one align to the same column.
     """
     locations = [f"{candidate['path']}:{candidate['reference_line']}" for candidate in candidates]
     width = max((len(location) for location in locations), default=0)
-    return [
-        f"{HOOK_DETAIL_INDENT}{location.ljust(width)}  <- {candidate['anchors'][0]['qualified_name']}"
-        for location, candidate in zip(locations, candidates)
-    ]
+    lines = []
+    for location, candidate in zip(locations, candidates):
+        symbol = candidate["anchors"][0]["qualified_name"]
+        padding = " " * (width - len(location))
+        if colour:
+            path, _, line_number = location.rpartition(":")
+            painted = (
+                f"{_ANSI_CYAN}{path}{_ANSI_RESET}{_ANSI_DIM}:{line_number}{_ANSI_RESET}"
+            )
+            lines.append(
+                f"{HOOK_DETAIL_INDENT}{painted}{padding}  {_ANSI_DIM}<-{_ANSI_RESET} "
+                f"{_ANSI_YELLOW}{symbol}{_ANSI_RESET}"
+            )
+        else:
+            lines.append(f"{HOOK_DETAIL_INDENT}{location}{padding}  <- {symbol}")
+    return lines
 
 
 def _format_trailer(remaining: int, other_test_count: int, *, truncated: bool) -> str | None:
@@ -486,7 +578,19 @@ class _HookRun:
                     else None
                 )
                 return
-            self.lines = format_report(untouched, truncated=truncated, colour=self._colour)
+            findings = result.get("findings")
+            changed_count = result.get("changed_count")
+            self.lines = format_report(
+                untouched,
+                truncated=truncated,
+                colour=self._colour,
+                changed_count=(
+                    changed_count
+                    if isinstance(changed_count, int) and not isinstance(changed_count, bool)
+                    else None
+                ),
+                candidate_count=len(findings) if isinstance(findings, list) else None,
+            )
         except Exception as exc:  # the hook is advisory: nothing may escape it
             self.reason = _exception_reason(exc)
         finally:

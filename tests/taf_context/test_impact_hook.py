@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import shlex
 import subprocess
 import sys
@@ -760,12 +761,58 @@ class FormatReportTests(unittest.TestCase):
         )
         self.assertEqual(lines[-1], f"  ... and 1+ more {HOOK_POINTER}")
 
-    def test_colour_bolds_only_the_header(self) -> None:
+    def test_colour_paints_the_header_the_location_and_the_symbol(self) -> None:
         lines = format_report(
             [_detail_candidate("app.py", "app.first")], truncated=False, colour=True
         )
-        self.assertEqual(lines[0], "\x1b[1mTAF impact: 1 file depends on this change and is not in this commit\x1b[0m")
-        self.assertNotIn("\x1b", lines[1])
+
+        self.assertEqual(
+            lines[0],
+            "\x1b[1m\x1b[31mTAF impact: \x1b[0m\x1b[1m1 file depends on this change "
+            "and is not in this commit\x1b[0m",
+        )
+        self.assertEqual(
+            lines[1],
+            "  \x1b[36mapp.py\x1b[0m\x1b[2m:12\x1b[0m  \x1b[2m<-\x1b[0m "
+            "\x1b[33mapp.first\x1b[0m",
+        )
+
+    def test_colour_never_changes_the_plain_text_underneath(self) -> None:
+        candidates = [
+            _detail_candidate("app.py", "app.first"),
+            _detail_candidate("a/much/longer/path.py", "app.second"),
+        ]
+        plain = format_report(candidates, truncated=True, colour=False)
+        painted = format_report(candidates, truncated=True, colour=True)
+
+        stripped = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in painted]
+        self.assertEqual(stripped, plain)
+
+    def test_the_checked_line_is_tty_only(self) -> None:
+        candidates = [_detail_candidate("app.py", "app.first")]
+
+        plain = format_report(
+            candidates, truncated=False, colour=False, changed_count=3, candidate_count=9
+        )
+        painted = format_report(
+            candidates, truncated=False, colour=True, changed_count=3, candidate_count=9
+        )
+
+        self.assertNotIn("checked", "\n".join(plain))
+        self.assertEqual(
+            painted[1], "\x1b[2m  checked 3 changed symbols against 9 references\x1b[0m"
+        )
+
+    def test_the_checked_line_is_dropped_when_a_count_is_unknown(self) -> None:
+        lines = format_report(
+            [_detail_candidate("app.py", "app.first")],
+            truncated=False,
+            colour=True,
+            changed_count=None,
+            candidate_count=9,
+        )
+
+        self.assertNotIn("checked", "\n".join(lines))
 
     def test_every_header_starts_with_taf_impact_and_every_other_line_with_two_spaces(
         self,
@@ -2469,12 +2516,25 @@ class HookColourTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             lines = stderr.getvalue().splitlines()
+            self.assertEqual(lines[0], "")
             self.assertEqual(
                 lines[1],
-                "\x1b[1mTAF impact: 2 files depend on this change and are not in this "
-                "commit\x1b[0m",
+                "\x1b[1m\x1b[31mTAF impact: \x1b[0m\x1b[1m2 files depend on this change "
+                "and are not in this commit\x1b[0m",
             )
-            self.assertNotIn("\x1b", "\n".join(lines[2:]))
+            # The checked line, then the two painted detail lines.
+            self.assertRegex(
+                lines[2], r"^\x1b\[2m  checked \d+ changed symbols? against \d+ references?\x1b\[0m$"
+            )
+            self.assertIn("\x1b[36mother.py\x1b[0m", lines[3])
+            self.assertIn("\x1b[33mapp\x1b[0m", lines[3])
+            # Stripping the escapes gives exactly the plain report.
+            stripped = "\n".join(
+                re.sub(r"\x1b\[[0-9;]*m", "", line)
+                for line in lines
+                if "checked" not in line
+            )
+            self.assertEqual(stripped + "\n", framed(TWO_FILE_REPORT))
 
     def test_no_color_disables_colour_on_a_tty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
