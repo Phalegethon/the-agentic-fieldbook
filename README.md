@@ -317,7 +317,10 @@ themselves are unaffected.
 ```
 
 `install` and `remove` write only under `--confirm-hook-write` and only
-inside the repository's own hooks directory, never a tracked file. `status`
+inside the repository's own hooks directory, never a tracked file. The flag
+records the user's approval of that write: an agent asks first and adds it
+only after the user agreed in the conversation; a request to set up the
+warning starts the procedure, it is not that approval. `status`
 writes no launcher, and like `inspect` it performs the standing-consent
 incremental refresh of the bound index. Add `--chain` to keep an existing
 foreign `pre-commit` hook: it is moved aside and still runs, after TAF's
