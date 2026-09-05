@@ -352,7 +352,9 @@ def _refresh_if_stale(
                 remove_change_document(state_root)
             if result.status.value in {"ready", "partial"} and result.index_identity is not None:
                 _write_binding(binding_path, snapshot, result.index_identity)
-                prune_warnings = _prune_generations(state_home, binding_path.parent, protected_generation)
+                pruned_count, prune_warnings = _prune_generations(
+                    state_home, binding_path.parent, protected_generation
+                )
                 duration = int((time.perf_counter() - started) * 1000)
                 dirty_paths = dirty_paths_of(snapshot)
                 refreshed = Binding(
@@ -365,6 +367,7 @@ def _refresh_if_stale(
                     "performed": True,
                     "changed_path_count": len(changed),
                     "duration_ms": duration,
+                    "pruned_generation_count": pruned_count,
                 }
                 if prune_warnings:
                     block["warnings"] = prune_warnings
@@ -386,12 +389,17 @@ def _refresh_if_stale(
     raise PrepareCLIError("incremental refresh failed; run prepare build --confirm-state-write")
 
 
-def _prune_generations(state_home: Path, entry: Path, protected: str | None = None) -> list[str]:
+def _prune_generations(
+    state_home: Path, entry: Path, protected: str | None = None
+) -> tuple[int, list[str]]:
     """Delete generations no reader can still be using; never raise.
 
     `protected` names the generation CURRENT pointed at immediately before
     this refresh's `update` call; it is excluded from the plan even if its
-    mtime alone would otherwise look aged and unreferenced.
+    mtime alone would otherwise look aged and unreferenced. Returns the count
+    of generations actually removed and any warnings; a failure midway leaves
+    whatever had already been removed in place but is reported as zero
+    removed here rather than guessed at.
     """
     try:
         # `entry` (binding_path.parent) is built from a symlink-resolved root
@@ -402,10 +410,63 @@ def _prune_generations(state_home: Path, entry: Path, protected: str | None = No
         plan = plan_prune_generations(root, entry, now=time.time())
         if protected:
             plan = [candidate for candidate in plan if not candidate.relative_path.endswith(protected)]
-        apply_plan(root, plan)
+        removed = apply_plan(root, plan)
     except (StateError, OSError, ValueError):
-        return ["retention-prune-incomplete"]
-    return []
+        return 0, ["retention-prune-incomplete"]
+    return len(removed), []
+
+
+def _run_convergence_prune(state_home: Path, state_root: Path) -> tuple[int, list[str]]:
+    """Prune superseded generations once more, protecting whatever CURRENT names now.
+
+    Used after a successful `build`/`activate` (which never call
+    `_refresh_if_stale` at all) and after an idle query (one whose refresh
+    performed no `update`, so nothing here was just superseded and reading
+    CURRENT now carries no race). `state_root` is the entry's `native`
+    directory; its parent is the entry `_prune_generations` expects.
+    """
+    protected = current_generation_token(state_root) or None
+    return _prune_generations(state_home, state_root.parent, protected)
+
+
+def _fold_prune_into_refresh(
+    refresh: dict[str, object], pruned_count: int, warnings: list[str]
+) -> dict[str, object]:
+    """Merge one more prune's outcome into a refresh block, before it is used.
+
+    The block already carries `pruned_generation_count` when the refresh path
+    itself pruned something; this adds to that total rather than replacing
+    it, and folds any new warning in the same way the refresh path's own
+    warnings already are, so the caller's existing pop-and-merge into the
+    top-level `warnings` list picks both up unchanged.
+    """
+    merged = dict(refresh)
+    merged["pruned_generation_count"] = int(merged.get("pruned_generation_count", 0)) + pruned_count
+    if warnings:
+        merged["warnings"] = sorted(set(merged.get("warnings", [])) | set(warnings))
+    return merged
+
+
+def _converge_retention_after_query(
+    refresh: dict[str, object], state_home: Path, state_root: Path
+) -> dict[str, object]:
+    """Fold in one more prune after this query's own engine call, when it did not itself refresh.
+
+    A performed refresh already ran `_prune_generations` for this entry
+    inside `_refresh_if_stale`, with the one exclusion a
+    generation-directory-reuse race needs: the
+    generation CURRENT named immediately before that `update`, read while
+    still holding the refresh lock. Running a second, independently-protected
+    prune right after would undo exactly that exclusion, since a fresh read
+    of CURRENT here would no longer name the one that call had to protect. An
+    idle refresh performed no `update`, so nothing was just superseded and
+    this is the first and only prune the operation gets - which is the point:
+    a repository that is only ever queried, never rebuilt, still converges.
+    """
+    if refresh.get("performed"):
+        return refresh
+    pruned_count, prune_warnings = _run_convergence_prune(state_home, state_root)
+    return _fold_prune_into_refresh(refresh, pruned_count, prune_warnings)
 
 
 def _remove_state_entry(state_home: Path, snapshot: object) -> None:
@@ -1436,6 +1497,7 @@ def _run_change_query(
     snapshot: object,
     arguments: QueryArguments,
     refresh_summary: dict[str, object],
+    state_home: Path,
 ) -> dict[str, object]:
     """Answer `changed-symbols` or `impact-candidates` for one resolved base."""
     # `collect_snapshot` (inside `_resolve_repository`) already ran
@@ -1481,7 +1543,10 @@ def _run_change_query(
             arguments.maximum_results, arguments.maximum_output_characters
         )
         _require_usable(result)
-        summary = _query_summary(result, refresh_summary)
+        summary = _query_summary(
+            result,
+            _converge_retention_after_query(refresh_summary, state_home, state_root),
+        )
         summary["base"] = base_block
         summary["warnings"] = sorted(set(summary["warnings"]) | change_warnings)
         return summary
@@ -1512,7 +1577,13 @@ def _run_change_query(
         allow_inferred=arguments.allow_inferred,
         maximum_results=arguments.maximum_results,
     )
-    refresh_block = dict(refresh_summary)
+    # Converge retention before the budget fit below: `trim_to_budget`
+    # remeasures `output_characters` over this whole object, so
+    # `pruned_generation_count` has to already be in `refresh` for that count
+    # to be honest.
+    refresh_block = dict(
+        _converge_retention_after_query(refresh_summary, state_home, state_root)
+    )
     prune_warnings = refresh_block.pop("warnings", [])
     composed["base"] = base_block
     composed["refresh"] = refresh_block
@@ -1559,7 +1630,8 @@ def run_query(
         # relationships. Both refuse an unusable index exactly as the direct
         # operations below do.
         summary = _run_change_query(
-            transport, repository, state_root, binding, snapshot, arguments, refresh_summary
+            transport, repository, state_root, binding, snapshot, arguments, refresh_summary,
+            paths.root,
         )
         touch_binding(binding_path)
         return summary
@@ -1611,7 +1683,14 @@ def run_query(
             )
         raise PrepareCLIError("ready context is required; run prepare inspect")
     touch_binding(binding_path)
-    summary = _query_summary(result, refresh_summary)
+    # Converge retention after this query's own engine call too, when it did
+    # not itself refresh: a repository that is only ever queried still
+    # reaches one referenced generation once the grace period passes. This
+    # runs before `_query_summary` so an overview's later budget fit measures
+    # `pruned_generation_count` as part of the object from the start.
+    summary = _query_summary(
+        result, _converge_retention_after_query(refresh_summary, paths.root, state_root)
+    )
     if arguments.operation == OVERVIEW_QUERY_OPERATION:
         # The engine returns the whole ordered table and the widest file layer
         # it was asked for; the caller's own output budget is what sizes both.
@@ -1680,6 +1759,19 @@ def run_build(
             f"(engine status: {result.status.value})"
         )
     _write_binding(binding_path, snapshot, result.index_identity)
+    # Converge retention here too: a successful build (or activate, which
+    # shares this function) is the other moment - besides a refresh - a
+    # repository's superseded generations can be cleared once they have aged
+    # past the grace period.
+    pruned_count, prune_warnings = _run_convergence_prune(paths.root, state_root)
+    refresh_block: dict[str, object] = {
+        "performed": False,
+        "changed_path_count": 0,
+        "duration_ms": 0,
+        "pruned_generation_count": pruned_count,
+    }
+    if prune_warnings:
+        refresh_block["warnings"] = prune_warnings
     return _summary(
         mode=mode,
         snapshot=snapshot,
@@ -1691,6 +1783,7 @@ def run_build(
         state=summarize_state(paths.root),
         replaced_generation_version=replaced,
         extra_warnings=warnings,
+        refresh=refresh_block,
     )
 
 

@@ -43,6 +43,15 @@ Skill: `prepare-repo-context` 1.7.2.
   a silent one - the 2.6.0 field report saw `changed_count 46` with ten
   entries and nothing to explain the difference.
 
+### Fixed
+
+- Generation retention now converges: the broker prunes superseded index
+  generations after a successful `build`, `activate`, or query, not only
+  after a refresh, so a repository reaches one referenced generation once
+  each superseded generation has aged past the 60-second grace period even
+  when nothing ever triggers another refresh. The result's `refresh` block
+  reports `pruned_generation_count`.
+
 ## [2.6.0] - 2026-09-05
 
 Native runtime `0.6.0` (no index format change, so existing indexes built by

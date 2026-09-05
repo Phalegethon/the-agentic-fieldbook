@@ -1750,7 +1750,13 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             result = decoded(stdout)
             self.assertEqual(result["status"], "ready")
             self.assertEqual(
-                result["refresh"], {"performed": False, "changed_path_count": 0, "duration_ms": 0}
+                result["refresh"],
+                {
+                    "performed": False,
+                    "changed_path_count": 0,
+                    "duration_ms": 0,
+                    "pruned_generation_count": 0,
+                },
             )
             self.assertEqual(
                 invocation_log.read_text(encoding="utf-8").splitlines(), ["build", "search-symbols"]
@@ -1772,11 +1778,18 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             result = decoded(stdout)
             self.assertEqual(result["status"], "ready")
             refresh = result["refresh"]
-            self.assertEqual(set(refresh), {"performed", "changed_path_count", "duration_ms"})
+            self.assertEqual(
+                set(refresh),
+                {"performed", "changed_path_count", "duration_ms", "pruned_generation_count"},
+            )
             self.assertTrue(refresh["performed"])
             self.assertEqual(refresh["changed_path_count"], 1)
             self.assertIsInstance(refresh["duration_ms"], int)
             self.assertGreaterEqual(refresh["duration_ms"], 0)
+            # Nothing was aged past the grace period by this fixture, so the
+            # convergence prune this operation runs after its own query finds
+            # nothing new to remove.
+            self.assertEqual(refresh["pruned_generation_count"], 0)
             self.assertEqual(
                 invocation_log.read_text(encoding="utf-8").splitlines(), ["build", "update", "search-symbols"]
             )
@@ -2006,6 +2019,130 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
 
             self.assertEqual((code, stderr), (0, ""))
             self.assertTrue(protected.exists())
+
+    def _fabricate_generations(
+        self, binding_path: Path
+    ) -> tuple[Path, Path, Path, Path]:
+        """An aged unreferenced generation, a recent one, and the current one.
+
+        Returns (state_root, aged, recent, current_generation): `aged` is old
+        enough that the 60-second grace period has passed, `recent` is not,
+        and CURRENT names `current_generation` directly, matching the
+        directory layout `state_lifecycle` defines.
+        """
+        state_root = binding_path.parent / "native"
+        generations = state_root / "generations"
+        aged = generations / ("0" * 64)
+        recent = generations / ("1" * 64)
+        current_generation = generations / ("c" * 64)
+        for path in (aged, recent, current_generation):
+            path.mkdir(parents=True)
+        (state_root / "CURRENT").write_text(("c" * 64) + "\n", encoding="utf-8")
+        now = time.time()
+        os.utime(aged, (now - 120, now - 120))
+        os.utime(recent, (now - 5, now - 5))
+        return state_root, aged, recent, current_generation
+
+    def test_build_prunes_aged_unreferenced_generations_after_a_successful_build(
+        self,
+    ) -> None:
+        # Retention converges after `build` too, not only after a refresh:
+        # generations left over from earlier activity that have now aged past
+        # the grace period are cleared the next time the repository is built.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, _invocation_log, binding_path = self._prepared(root)
+            _state_root, aged, recent, current_generation = self._fabricate_generations(
+                binding_path
+            )
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "build", "--repo", str(repo), "--confirm-state-write",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["mode"], "build")
+            self.assertFalse(aged.exists())
+            self.assertTrue(recent.exists())
+            self.assertTrue(current_generation.exists())
+            self.assertEqual(result["refresh"]["pruned_generation_count"], 1)
+
+    def test_activate_prunes_aged_unreferenced_generations_after_a_successful_activate(
+        self,
+    ) -> None:
+        # Same convergence for `activate`, the other operation that never ran
+        # the prune before this fix.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, _invocation_log, binding_path = self._prepared(root)
+            _state_root, aged, recent, current_generation = self._fabricate_generations(
+                binding_path
+            )
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "activate", "--repo", str(repo),
+                "--confirm-network", "--confirm-state-write",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertEqual(result["mode"], "activate")
+            self.assertFalse(aged.exists())
+            self.assertTrue(recent.exists())
+            self.assertTrue(current_generation.exists())
+            self.assertEqual(result["refresh"]["pruned_generation_count"], 1)
+
+    def test_query_prunes_aged_unreferenced_generations_even_without_a_refresh(
+        self,
+    ) -> None:
+        # The field bug: a repository only ever queried, never rebuilt or
+        # reactivated, used to keep every superseded generation forever once
+        # the refresh path stopped running (nothing changed, so no update was
+        # ever performed). The query itself now converges the state too.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, _invocation_log, binding_path = self._prepared(root)
+            _state_root, aged, recent, current_generation = self._fabricate_generations(
+                binding_path
+            )
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo),
+                "--operation", "search-symbols", "--query", "Widget",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertFalse(result["refresh"]["performed"])
+            self.assertEqual(result["refresh"]["pruned_generation_count"], 1)
+            self.assertFalse(aged.exists())
+            self.assertTrue(recent.exists())
+            self.assertTrue(current_generation.exists())
+
+    def test_a_prune_failure_warns_the_query_without_failing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, _invocation_log, binding_path = self._prepared(root)
+            state_root, aged, _recent, _current = self._fabricate_generations(binding_path)
+            generations = state_root / "generations"
+            # Remove write permission on the generations directory so the
+            # removal itself fails (it cannot unlink the aged entry), without
+            # touching the aged directory's own permissions.
+            generations.chmod(0o500)
+            try:
+                code, stdout, stderr = invoke(
+                    environment, "prepare", "query", "--repo", str(repo),
+                    "--operation", "search-symbols", "--query", "Widget",
+                )
+            finally:
+                generations.chmod(0o700)
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertIn("retention-prune-incomplete", result["warnings"])
+            self.assertEqual(result["refresh"]["pruned_generation_count"], 0)
+            self.assertTrue(aged.exists())
 
 
 class QueryArgumentTests(unittest.TestCase):
