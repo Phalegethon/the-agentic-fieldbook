@@ -5,6 +5,31 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Skill: `prepare-repo-context` 1.9.0.
+
+### Changed
+
+- The commit-time impact report is now the last thing a commit writes, not the
+  first: a chained `pre-commit` hook installed with `--chain` runs before TAF's
+  report (called, never `exec`ed, its exit code still deciding the commit), and
+  the report is framed by one blank line above and below. A staged change the
+  chained hook re-staged is therefore what TAF describes.
+- A commit whose staged change was checked and came back clean now says so in
+  one line - `TAF impact: no untouched dependents (N changed symbols)`, or
+  `TAF impact: no indexed symbols changed` when the change touched no indexed
+  symbol at all - instead of being indistinguishable from a hook that never
+  ran. Every outcome that did not check anything stays completely silent.
+
+### Added
+
+- `hook install --mode confirm` writes a launcher that asks
+  `Continue with this commit? [Y/n]` on the controlling terminal after a
+  warning. Everything fails open - no terminal, `CI`/`CLAUDECODE`/`AI_AGENT`,
+  `TAF_HOOK_CONFIRM=0`, or no answer within 15 seconds
+  (`TAF_HOOK_CONFIRM_TIMEOUT`) all continue the commit - and only an explicit
+  `n` aborts it. `hook status` reports the installed launcher's mode as
+  `hook_mode`.
+
 ## [2.8.6] - 2026-09-05
 
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.5.

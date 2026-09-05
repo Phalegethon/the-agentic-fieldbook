@@ -49,18 +49,69 @@ exact remains to name.
 
 The header is bold on a real TTY stderr with `NO_COLOR` unset and `TERM` not
 `dumb`; every other line, and every line on a non-TTY stderr (GUI clients, CI,
-pipes), is plain ASCII.
+pipes), is plain ASCII. The whole report is written with one blank line above
+and one below, and a chained hook runs before it, so the block is the last
+thing a commit writes rather than the first.
+
+## When nothing depends
+
+A commit whose staged change was checked and came back clean says so, in one
+line and without the surrounding blank lines:
+
+```text
+TAF impact: no untouched dependents (4 changed symbols)
+```
+
+A change that touches no indexed symbol at all - a docs-only, config-only or
+comment-only commit - reads `TAF impact: no indexed symbols changed` instead:
+there was nothing to check, and saying "no untouched dependents" there would
+present a vacuous check as a verified all-clear.
+
+The hook is still completely silent whenever it did not check: `TAF_HOOK=0`,
+the bound index not ready, the staged change set unreadable, no `HEAD`, the
+3-second wait running out, or no interpreter to start the broker with.
+
+## Asking before the commit
+
+`hook install --mode=confirm` writes a launcher that asks after a warning:
+
+```text
+Continue with this commit? [Y/n]
+```
+
+The question is written to the controlling terminal, not to stderr, so a
+piped stderr cannot swallow it. Everything about it fails open - the commit
+proceeds - except one answer:
+
+- Enter, `y`, or end of input continues; only `n` aborts the commit.
+- No answer within 15 seconds continues, and one line says so.
+  `TAF_HOOK_CONFIRM_TIMEOUT` sets a different number of seconds.
+- The question is skipped entirely when `/dev/tty` cannot be opened (GUI
+  clients, CI, an agent's own commit), when `CI`, `CLAUDECODE` or `AI_AGENT`
+  is set, or when `TAF_HOOK_CONFIRM=0`.
+- The clean line is never followed by a question.
+
+The 3-second cap stays what it always was, a bound on the query; the
+question's own timeout starts once the report is already on the screen.
+
+Under `--chain`, answering `n` aborts a commit whose chained hook has already
+run, so anything that hook re-staged - a formatter's changes, for example -
+stays staged and is not undone.
 
 ## What it never does
 
-- It is advisory only: stderr only, never stdout, exit code 0 always.
+- It writes to stderr, never to stdout.
+- It is advisory unless the launcher was installed with `--mode=confirm`:
+  exit code 0 always, and under `confirm` a non-zero exit only from an
+  explicit `n`.
 - It waits at most 3 seconds for the answer before giving up silently, so a
   slow or cold engine can never hold up a commit.
-- It stays completely silent whenever the bound index is not ready, the
-  staged change has no untouched dependents, or that wait runs out.
-- It is deliberately not interactive: a prompt inside `pre-commit` would hang
-  GUI clients, CI, and an agent's own commits, so questions about the full
-  list go to the agent afterwards.
+- It stays completely silent whenever the bound index is not ready or that
+  wait runs out; a completed check with nothing to report says so in one line.
+- It is not interactive by default. A prompt inside `pre-commit` would hang
+  GUI clients, CI, and an agent's own commits, so `--mode=confirm` is opt-in
+  per repository and falls back to advisory wherever no terminal can be
+  opened. Questions about the full list still go to the agent afterwards.
 - Its own query performs the same standing-consent incremental refresh and
   superseded-generation prune as every query; it never builds, activates,
   downloads, or removes state, and `build` stays its own separate consent.
@@ -73,7 +124,7 @@ and the queries themselves are unaffected.
 
 ```bash
 <python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook status --repo <repo>
-<python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook install --repo <repo> --confirm-hook-write
+<python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook install --repo <repo> --confirm-hook-write [--mode advisory|confirm]
 <python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook remove --repo <repo> --confirm-hook-write
 ```
 
@@ -85,15 +136,19 @@ the procedure, it is not that approval. `status` writes no launcher, and like
 `inspect` it performs the standing-consent incremental refresh of the bound
 index.
 
+- `--mode` selects what the launcher does; `--confirm-hook-write` stays the
+  only consent for writing one. `status` reports the installed launcher's mode
+  as `hook_mode` (`advisory`, `confirm`, or null when nothing is installed).
 - `--chain` keeps an existing foreign `pre-commit` hook: it is moved aside and
-  still runs, after TAF's line. A chained hook that runs decides the commit
+  still runs, before TAF's report. A chained hook that runs decides the commit
   with its own exit code, so a failing one still blocks it; a chained hook
   that cannot be run at all (deleted, or no longer executable) is skipped and
   the commit proceeds. `install --chain` refuses a foreign hook that is not
   executable, because git was not running it either.
 - `status` reports `redirected` when `core.hooksPath` points elsewhere; TAF
   never installs there.
-- `TAF_HOOK=0 git commit` silences one commit without touching the launcher.
+- `TAF_HOOK=0 git commit` silences one commit without touching the launcher;
+  `TAF_HOOK_CONFIRM=0 git commit` keeps the report but skips the question.
 
 ## The launcher follows the current broker
 
