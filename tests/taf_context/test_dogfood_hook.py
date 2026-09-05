@@ -82,6 +82,33 @@ EXPECTED_STDERR_TEST_A = (
     "depends on it and is not in this commit\n"
 )
 
+# The exact marker line the fixture edits for Test C: a comment inserted
+# right under the class statement, so the edit falls inside the class's own
+# line span and `PrepareCLIError` becomes the changed symbol.
+_PREPARE_CLI_ERROR_CLASS_LINE = "class PrepareCLIError(ValueError):\n"
+_PREPARE_CLI_ERROR_COMMENT = "    # dogfood: touch every module that raises this error\n"
+
+# The exact `TAF:` lines the released 0.6.0 engine produced for Test C,
+# pinned from a real run of this test (see the task report for the verbatim
+# captured stderr). `PrepareCLIError` is imported and raised by every broker
+# module, so its four real callers - two production, two test - all survive
+# composition and all print, production files first; four is under the
+# five-line cap, so no summary line follows.
+EXPECTED_STDERR_TEST_C = (
+    "TAF: context_operations.PrepareCLIError changed; "
+    "tools/taf-context/taf_context/mcp_server.py:13 "
+    "depends on it and is not in this commit\n"
+    "TAF: context_operations.PrepareCLIError changed; "
+    "tools/taf-context/taf_context/prepare_cli.py:132 "
+    "depends on it and is not in this commit\n"
+    "TAF: context_operations.PrepareCLIError changed; "
+    "tests/taf_context/test_context_operations.py:18 "
+    "depends on it and is not in this commit\n"
+    "TAF: context_operations.PrepareCLIError changed; "
+    "tests/taf_context/test_mcp_server.py:624 "
+    "depends on it and is not in this commit\n"
+)
+
 
 def _git_isolated_environment(base: dict[str, str]) -> dict[str, str]:
     """`repo_factory.run`'s isolation variables, layered on `base`.
@@ -277,6 +304,45 @@ class DogfoodHookTests(unittest.TestCase):
         self.assertNotEqual(before_head, self._head())
         self.assertEqual(result.stderr, "")
         self.assertNotIn("TAF:", result.stdout)
+
+    def test_c_a_widely_referenced_base_class_gets_the_full_candidate_set(self) -> None:
+        """The full-composition fix (D13): a base class every broker module raises.
+
+        `PrepareCLIError` is imported and raised by every broker module, so a
+        staged edit inside its own class body is exactly the coverage gap
+        that motivated this fix: a composed answer wide enough that the old
+        output-budget trim would have kept only a handful of candidates in
+        path order, discarding production dependents while test files and
+        same-file candidates survived. Composing the full candidate set
+        before the hook's own five-line cap means the launcher now prints
+        the two production callers, then test files, then a summary line.
+        """
+        before_head = self._head()
+        path = self.repository / CONTEXT_OPERATIONS_PATH
+        text = path.read_text(encoding="utf-8")
+        self.assertIn(_PREPARE_CLI_ERROR_CLASS_LINE, text)
+        text = text.replace(
+            _PREPARE_CLI_ERROR_CLASS_LINE,
+            _PREPARE_CLI_ERROR_CLASS_LINE + _PREPARE_CLI_ERROR_COMMENT,
+            1,
+        )
+        path.write_text(text, encoding="utf-8")
+        environment = self._commit_environment()
+        _run_git(self.repository, "add", CONTEXT_OPERATIONS_PATH, environment=environment)
+
+        result = subprocess.run(
+            ["git", "commit", "-q", "-m", "dogfood: touch PrepareCLIError"],
+            cwd=self.repository,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(before_head, self._head())
+        self.assertNotIn("TAF:", result.stdout)
+        self.assertEqual(result.stderr, EXPECTED_STDERR_TEST_C)
 
 
 if __name__ == "__main__":

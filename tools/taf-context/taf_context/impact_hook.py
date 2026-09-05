@@ -39,8 +39,20 @@ from .native_transport import NativeTransport, NativeTransportError
 
 HOOK_TIME_LIMIT_SECONDS = 3.0  # wall clock the whole run gets before it goes silent
 HOOK_MAXIMUM_LINES = 5  # warning lines written before the summary line takes over
-HOOK_MAXIMUM_RESULTS = 16  # candidates the one impact query asks the engine for
-HOOK_OUTPUT_CHARACTERS = 12000  # output budget of that query
+# The composition follows at most 64 changed symbols and asks the engine for
+# at most 64 results per relationship call (`IMPACT_CHANGED_MAXIMUM_RESULTS`
+# in context_operations.py), so 64 is the most the composed answer can ever
+# carry. The hook prints five lines, but it must choose them from that whole
+# set - not from whatever a caller-supplied result cap left standing.
+HOOK_MAXIMUM_RESULTS = 64
+# The shared composition path (`_run_change_query`, via `trim_to_budget`)
+# always takes an output-character budget, but the hook never serializes its
+# answer anywhere - stdout, a file, a wire reply - so no budget it could name
+# would ever be observed. This value exists only so that budget can never
+# bind: it is not exposed on the CLI or the MCP server (both keep their
+# 2000-12000 choices), and raising it is not "a bigger budget" so much as
+# turning the budget off for the one caller that never needed one.
+HOOK_OUTPUT_CHARACTERS = 10_000_000
 HOOK_DISABLE_VARIABLE = "TAF_HOOK"  # set to exactly "0" to disable the hook entirely
 HOOK_LINE_PREFIX = "TAF: "  # every warning the hook writes starts here
 
@@ -322,7 +334,15 @@ class _HookTransport:
 
 
 def _hook_query() -> QueryArguments:
-    """The one query the hook makes: the staged change set's dependents."""
+    """The one query the hook makes: the staged change set's dependents.
+
+    `maximum_results` and `maximum_output_characters` are `HOOK_MAXIMUM_RESULTS`
+    (64, the composition's own per-anchor engine bound) and
+    `HOOK_OUTPUT_CHARACTERS` (10,000,000, chosen so the shared trim can never
+    bind): the hook never serializes this answer, so it must compose the
+    full candidate set and choose its five lines from all of it, not from
+    whatever an output-budget trim left standing.
+    """
     return QueryArguments(
         operation="impact-candidates",
         query=None,

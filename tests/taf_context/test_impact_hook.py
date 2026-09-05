@@ -16,11 +16,13 @@ from unittest import mock
 
 from taf_context import impact_hook
 from taf_context.cli import main
-from taf_context.context_operations import QueryArguments
+from taf_context.context_operations import QueryArguments, run_query
 from taf_context.impact_hook import (
     CHAINED_HOOK_NAME,
     HOOK_FILE_NAME,
     HOOK_MAXIMUM_LINES,
+    HOOK_MAXIMUM_RESULTS,
+    HOOK_OUTPUT_CHARACTERS,
     HOOK_TIME_LIMIT_SECONDS,
     LAUNCHER_MARKER,
     _entry_point_script,
@@ -31,6 +33,7 @@ from taf_context.impact_hook import (
     run_hook,
     untouched_dependents,
 )
+from taf_context.native_transport import OneShotTransport
 
 from .repo_factory import commit_all, init_repo, init_committed_repo, run, write
 from .test_prepare_cli import decoded, invoke, write_fake_native_engine
@@ -575,14 +578,80 @@ class HookQueryTests(unittest.TestCase):
                 languages=[],
                 symbol_kinds=[],
                 source_types=[],
-                maximum_results=16,
-                maximum_output_characters=12000,
+                maximum_results=HOOK_MAXIMUM_RESULTS,
+                maximum_output_characters=HOOK_OUTPUT_CHARACTERS,
                 allow_inferred=False,
                 direction=None,
                 base=None,
                 staged=True,
             ),
         )
+        # Pinned literally too, so a typo in either constant still fails this
+        # test even if both sides of the equality above drifted together.
+        self.assertEqual(HOOK_MAXIMUM_RESULTS, 64)
+        self.assertEqual(HOOK_OUTPUT_CHARACTERS, 10_000_000)
+
+
+class HookFullCompositionTests(unittest.TestCase):
+    """The hook composes the full candidate set before its five-line cap (D13).
+
+    `run_query`'s output-budget trim (`trim_to_budget`) exists to keep a CLI
+    or MCP answer inside a size a model context can hold. The hook never
+    serializes its answer at all, so a budget trim ahead of its own
+    five-line cap can only ever do harm: it can drop a legitimate untouched
+    dependent whose path happens to sort late, before the hook ever gets to
+    choose its five lines from the whole set. This fixture makes forty
+    distinct callers of the same changed symbol - `dep00.py` through
+    `dep39.py`, verified in `write_fake_native_engine`'s own `CALLERS` table
+    to be forty genuinely distinct paths - wide enough that the old
+    16-result/12000-character budget cut before the fixture's other two
+    candidates, `web.py` (a caller) and `other.py` (an importer), which both
+    sort after every `depNN.py` and so are always last to be composed.
+    """
+
+    def test_a_late_sorting_path_survives_and_the_summary_counts_every_file(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root, extra_callers=40)
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout), (0, ""))
+            lines = stderr.splitlines()
+            self.assertEqual(len(lines), HOOK_MAXIMUM_LINES + 1)
+            self.assertEqual(
+                lines[:HOOK_MAXIMUM_LINES],
+                [
+                    f"TAF: app.first changed; dep{index:02d}.py:12 depends on it"
+                    " and is not in this commit"
+                    for index in range(HOOK_MAXIMUM_LINES)
+                ],
+            )
+            # 40 dep*.py callers + web.py (a caller) + other.py (an
+            # importer) = 42 untouched files; five print, 37 remain.
+            self.assertEqual(
+                lines[HOOK_MAXIMUM_LINES],
+                "TAF: ... and 37 more "
+                "(query impact-candidates --staged for the full list)",
+            )
+
+            # The point of the fix: the composed answer itself carries every
+            # candidate, not just the ones an output-budget trim would have
+            # left - so a path that sorts after the old trim tail is still
+            # in it, even though the hook's own five-line cap never prints
+            # it here.
+            result = run_query(
+                repository,
+                _hook_query(),
+                environment=environment,
+                transport_for=OneShotTransport,
+            )
+            kept = untouched_dependents(result, {"app.py"})
+            self.assertEqual(len(kept), 42)
+            self.assertIn("web.py", [item["path"] for item in kept])
+            self.assertIn("other.py", [item["path"] for item in kept])
 
 
 def commit_environment(extra: dict[str, str]) -> dict[str, str]:

@@ -5,6 +5,23 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.1 (unchanged).
+
+### Fixed
+
+- The commit-time hook now composes its full candidate set instead of
+  letting the shared output-budget trim drop dependents before its own
+  five-line cap ever saw them. A staged edit to a widely used symbol could
+  produce a composed answer wider than the trim's default 12000-character
+  budget; the trim kept 13 candidates in path order - the test files and
+  ten same-file candidates - and the hook's untouched-file filter discarded
+  the same-file ones, so the commit's own warning printed two test files
+  and nothing else, silently losing every production dependent. The hook's
+  query now asks for the composition's own 64-result ceiling and an
+  output-character budget the trim can never bind, since the hook never
+  serializes its answer; the only bounds left are the engine's per-
+  relationship-call limits.
+
 ## [2.8.1] - 2026-09-05
 
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.1.

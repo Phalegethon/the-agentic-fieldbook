@@ -297,7 +297,11 @@ TAF: context_operations.normalize_change_base changed; tools/taf-context/taf_con
 
 That is one of the lines a staged edit to that helper prints in this
 repository. At most five such lines print, followed by a summary line
-counting the remaining files. It is advisory only: stderr only, never
+counting the remaining files; the hook chooses its five lines from the
+complete candidate set, never trimming the answer for output, so the only
+remaining bounds are the engine's own per-relationship-call limits - a
+symbol with more than 64 references in one direction can still have
+dependents the hook does not see. It is advisory only: stderr only, never
 stdout, exit code 0 always, and it waits at most 3 seconds for the answer
 before giving up silently (process cleanup may add a moment), so a slow or
 cold engine can never hold up a commit. It stays completely silent whenever
