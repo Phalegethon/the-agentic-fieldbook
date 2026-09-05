@@ -136,6 +136,11 @@ ONE_FILE_REPORT = (
 )
 
 
+def framed(report: str) -> str:
+    """`run_hook`'s on-screen form: one blank line above and below (D2)."""
+    return "\n" + report + "\n"
+
+
 class ImpactHookReadinessTests(unittest.TestCase):
     """Anything but `use-index` makes the hook silent (spec section 2)."""
 
@@ -219,7 +224,7 @@ class ImpactHookWarningTests(unittest.TestCase):
             code, stdout, stderr = hook(environment, repository)
 
             self.assertEqual((code, stdout), (0, ""))
-            self.assertEqual(stderr, TWO_FILE_REPORT)
+            self.assertEqual(stderr, framed(TWO_FILE_REPORT))
 
     def test_a_dependent_inside_the_commit_is_not_warned_about(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -233,7 +238,7 @@ class ImpactHookWarningTests(unittest.TestCase):
             code, stdout, stderr = hook(environment, repository)
 
             self.assertEqual((code, stdout), (0, ""))
-            self.assertEqual(stderr, ONE_FILE_REPORT)
+            self.assertEqual(stderr, framed(ONE_FILE_REPORT))
 
     def test_a_commit_that_carries_every_dependent_warns_about_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -270,12 +275,13 @@ class ImpactHookWarningTests(unittest.TestCase):
             self.assertEqual((code, stdout), (0, ""))
             self.assertEqual(
                 stderr.splitlines(),
-                ["TAF impact: 7 files depend on this change and are not in this commit"]
+                [""]
+                + ["TAF impact: 7 files depend on this change and are not in this commit"]
                 + [
                     f"  dep{index:02d}.py:12  <- app.first"
                     for index in range(HOOK_MAXIMUM_LINES)
                 ]
-                + [f"  ... and 2 more {HOOK_POINTER}"],
+                + [f"  ... and 2 more {HOOK_POINTER}", ""],
             )
 
     def test_exactly_the_cap_many_dependents_end_without_a_summary_line(self) -> None:
@@ -294,14 +300,16 @@ class ImpactHookWarningTests(unittest.TestCase):
 
             self.assertEqual((code, stdout), (0, ""))
             lines = stderr.splitlines()
-            # Header plus the five detail lines; nothing was left out.
-            self.assertEqual(len(lines), 1 + HOOK_MAXIMUM_LINES)
+            # Header plus the five detail lines, plus the blank frame (D2);
+            # nothing was left out.
+            self.assertEqual(len(lines), 2 + 1 + HOOK_MAXIMUM_LINES)
             self.assertNotIn("more (", stderr)
             self.assertEqual(
                 lines,
-                ["TAF impact: 5 files depend on this change and are not in this commit"]
+                [""]
+                + ["TAF impact: 5 files depend on this change and are not in this commit"]
                 + [f"  dep{index:02d}.py:12  <- app.first" for index in range(3)]
-                + ["  other.py:12  <- app", "  web.py:12    <- app.first"],
+                + ["  other.py:12  <- app", "  web.py:12    <- app.first", ""],
             )
 
     def test_the_query_asks_the_engine_for_verified_edges_only(self) -> None:
@@ -830,13 +838,13 @@ class HookFullCompositionTests(unittest.TestCase):
 
             self.assertEqual((code, stdout), (0, ""))
             lines = stderr.splitlines()
-            # Header, five detail lines, one trailer.
-            self.assertEqual(len(lines), 1 + HOOK_MAXIMUM_LINES + 1)
+            # Blank frame, header, five detail lines, one trailer, blank frame (D2).
+            self.assertEqual(len(lines), 2 + 1 + HOOK_MAXIMUM_LINES + 1)
             self.assertEqual(
-                lines[0], "TAF impact: 42 files depend on this change and are not in this commit"
+                lines[1], "TAF impact: 42 files depend on this change and are not in this commit"
             )
             self.assertEqual(
-                lines[1 : 1 + HOOK_MAXIMUM_LINES],
+                lines[2 : 2 + HOOK_MAXIMUM_LINES],
                 [
                     f"  dep{index:02d}.py:12  <- app.first"
                     for index in range(HOOK_MAXIMUM_LINES)
@@ -844,7 +852,8 @@ class HookFullCompositionTests(unittest.TestCase):
             )
             # 40 dep*.py callers + web.py (a caller) + other.py (an
             # importer) = 42 untouched files; five print, 37 remain.
-            self.assertEqual(lines[-1], f"  ... and 37 more {HOOK_POINTER}")
+            self.assertEqual(lines[-2], f"  ... and 37 more {HOOK_POINTER}")
+            self.assertEqual(lines[-1], "")
 
             # The point of the fix: the composed answer itself carries every
             # candidate, not just the ones an output-budget trim would have
@@ -889,19 +898,20 @@ class HookFullCompositionTests(unittest.TestCase):
 
             self.assertEqual((code, stdout), (0, ""))
             lines = stderr.splitlines()
-            # Header, five detail lines, one trailer.
-            self.assertEqual(len(lines), 1 + HOOK_MAXIMUM_LINES + 1)
+            # Blank frame, header, five detail lines, one trailer, blank frame (D2).
+            self.assertEqual(len(lines), 2 + 1 + HOOK_MAXIMUM_LINES + 1)
             self.assertEqual(
-                lines[0], "TAF impact: 65 files depend on this change and are not in this commit"
+                lines[1], "TAF impact: 65 files depend on this change and are not in this commit"
             )
             self.assertEqual(
-                lines[1 : 1 + HOOK_MAXIMUM_LINES],
+                lines[2 : 2 + HOOK_MAXIMUM_LINES],
                 [
                     f"  dep{index:02d}.py:12  <- app.first"
                     for index in range(HOOK_MAXIMUM_LINES)
                 ],
             )
-            self.assertEqual(lines[-1], f"  ... and 60 more {HOOK_POINTER}")
+            self.assertEqual(lines[-2], f"  ... and 60 more {HOOK_POINTER}")
+            self.assertEqual(lines[-1], "")
 
 
 class HookTruncationMarkerTests(unittest.TestCase):
@@ -927,20 +937,21 @@ class HookTruncationMarkerTests(unittest.TestCase):
 
             self.assertEqual((code, stdout), (0, ""))
             lines = stderr.splitlines()
-            # Header, five detail lines, one trailer.
-            self.assertEqual(len(lines), 1 + HOOK_MAXIMUM_LINES + 1)
+            # Blank frame, header, five detail lines, one trailer, blank frame (D2).
+            self.assertEqual(len(lines), 2 + 1 + HOOK_MAXIMUM_LINES + 1)
             # 20 dep*.py callers + web.py (a caller) + other.py (an
             # importer) = 22 untouched files; the header count is marked a
             # lower bound because the engine reported its own omission; five
             # print, 17 remain, also marked with a `+`.
             self.assertEqual(
-                lines[0],
+                lines[1],
                 "TAF impact: 22+ files depend on this change and are not in this commit",
             )
             self.assertEqual(
-                lines[-1],
+                lines[-2],
                 f"  ... and 17+ more {HOOK_POINTER}",
             )
+            self.assertEqual(lines[-1], "")
 
     def test_five_or_fewer_files_remain_and_print_possibly_more(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -959,10 +970,12 @@ class HookTruncationMarkerTests(unittest.TestCase):
             # back to "possibly more" since nothing exact remains to name.
             self.assertEqual(
                 stderr,
-                "TAF impact: 2+ files depend on this change and are not in this commit\n"
-                "  other.py:12  <- app\n"
-                "  web.py:12    <- app.first\n"
-                f"  ... and possibly more {HOOK_POINTER}\n",
+                framed(
+                    "TAF impact: 2+ files depend on this change and are not in this commit\n"
+                    "  other.py:12  <- app\n"
+                    "  web.py:12    <- app.first\n"
+                    f"  ... and possibly more {HOOK_POINTER}\n"
+                ),
             )
 
 
@@ -1792,7 +1805,7 @@ class HookEndToEndTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, TWO_FILE_REPORT)
+            self.assertEqual(result.stderr, framed(TWO_FILE_REPORT))
             self.assertNotIn("TAF:", result.stdout)
             after_log = run(repository, "git", "log", "--format=%H")
             self.assertNotEqual(before_log, after_log)
@@ -1870,7 +1883,7 @@ class HookEndToEndTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, "foreign\n" + TWO_FILE_REPORT)
+            self.assertEqual(result.stderr, "foreign\n" + framed(TWO_FILE_REPORT))
 
     def test_the_report_reflects_what_the_chained_hook_re_staged(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1956,12 +1969,13 @@ class RunHookNeverRaisesTests(unittest.TestCase):
             written = stderr.buffer.getvalue().decode("ascii")
             self.assertEqual(
                 written.splitlines(),
-                ["TAF impact: 7 files depend on this change and are not in this commit"]
+                [""]
+                + ["TAF impact: 7 files depend on this change and are not in this commit"]
                 + [
                     f"  dep{index:02d}.py:12  <- app.first"
                     for index in range(HOOK_MAXIMUM_LINES)
                 ]
-                + [f"  ... and 2 more {HOOK_POINTER}"],
+                + [f"  ... and 2 more {HOOK_POINTER}", ""],
             )
 
     def test_a_raising_stderr_through_cli_main_still_exits_zero(self) -> None:
@@ -2000,11 +2014,11 @@ class HookColourTests(unittest.TestCase):
             self.assertEqual(code, 0)
             lines = stderr.getvalue().splitlines()
             self.assertEqual(
-                lines[0],
+                lines[1],
                 "\x1b[1mTAF impact: 2 files depend on this change and are not in this "
                 "commit\x1b[0m",
             )
-            self.assertNotIn("\x1b", "\n".join(lines[1:]))
+            self.assertNotIn("\x1b", "\n".join(lines[2:]))
 
     def test_no_color_disables_colour_on_a_tty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2019,7 +2033,7 @@ class HookColourTests(unittest.TestCase):
             self.assertNotIn("\x1b", stderr.getvalue())
             self.assertTrue(
                 stderr.getvalue().startswith(
-                    "TAF impact: 2 files depend on this change and are not in this commit"
+                    "\nTAF impact: 2 files depend on this change and are not in this commit"
                 )
             )
 
@@ -2045,7 +2059,7 @@ class HookColourTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertNotIn("\x1b", stderr.getvalue())
-            self.assertEqual(stderr.getvalue(), TWO_FILE_REPORT)
+            self.assertEqual(stderr.getvalue(), framed(TWO_FILE_REPORT))
 
 
 class HookChainSafetyTests(unittest.TestCase):
@@ -2089,7 +2103,7 @@ class HookChainSafetyTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             # Exact equality: the TAF warnings and nothing else, so a shell
             # error about the missing backup would fail this test.
-            self.assertEqual(result.stderr, TWO_FILE_REPORT)
+            self.assertEqual(result.stderr, framed(TWO_FILE_REPORT))
             after_log = run(repository, "git", "log", "--format=%H")
             self.assertNotEqual(before_log, after_log)
 
@@ -2551,7 +2565,7 @@ class LauncherSelfHealingEndToEndTests(unittest.TestCase):
             result = self._commit(environment, repository)
 
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, TWO_FILE_REPORT)
+            self.assertEqual(result.stderr, framed(TWO_FILE_REPORT))
 
     def test_a_pointer_absent_falls_back_to_the_embedded_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2565,7 +2579,7 @@ class LauncherSelfHealingEndToEndTests(unittest.TestCase):
             result = self._commit(environment, repository)
 
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, TWO_FILE_REPORT)
+            self.assertEqual(result.stderr, framed(TWO_FILE_REPORT))
 
     def test_a_pointer_naming_a_missing_script_falls_back_to_the_embedded_paths(
         self,
@@ -2585,7 +2599,7 @@ class LauncherSelfHealingEndToEndTests(unittest.TestCase):
             result = self._commit(environment, repository)
 
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, TWO_FILE_REPORT)
+            self.assertEqual(result.stderr, framed(TWO_FILE_REPORT))
 
     def test_a_bogus_embedded_interpreter_falls_back_to_command_v_python3(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2610,7 +2624,7 @@ class LauncherSelfHealingEndToEndTests(unittest.TestCase):
             result = self._commit(environment, repository)
 
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, TWO_FILE_REPORT)
+            self.assertEqual(result.stderr, framed(TWO_FILE_REPORT))
 
     def test_neither_interpreter_nor_script_resolvable_stays_silent(self) -> None:
         # Chosen implementation of the brief's scenario (e): the pointer is

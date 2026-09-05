@@ -145,7 +145,11 @@ def run_hook(
         if run.reason is not None:
             _explain(stderr, verbose, run.reason)
             return 0
-        for line in run.lines:
+        # One blank line above and below, so the block is separated from a
+        # chained hook's output above and the commit summary below (D2). No
+        # decoration characters: the separation is whitespace plus the header
+        # the report already carries, which keeps the non-TTY form pure ASCII.
+        for line in ["", *run.lines, ""]:
             with contextlib.suppress(Exception):
                 stderr.write(line + "\n")
         return 0

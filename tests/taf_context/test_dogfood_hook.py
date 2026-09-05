@@ -265,7 +265,7 @@ class DogfoodHookTests(unittest.TestCase):
         # `normalize_change_base` (context_operations.py:961); it is part of
         # this very commit and must not be named.
         self.assertNotIn("validate_query_request", result.stderr)
-        self.assertEqual(result.stderr, EXPECTED_STDERR_TEST_A)
+        self.assertEqual(result.stderr, "\n" + EXPECTED_STDERR_TEST_A + "\n")
 
     def test_b_editing_the_callers_too_silences_the_hook(self) -> None:
         """Staging every file with an untouched dependent leaves none untouched."""
@@ -337,7 +337,7 @@ class DogfoodHookTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotEqual(before_head, self._head())
         self.assertNotIn("TAF:", result.stdout)
-        self.assertEqual(result.stderr, EXPECTED_STDERR_TEST_C)
+        self.assertEqual(result.stderr, "\n" + EXPECTED_STDERR_TEST_C + "\n")
 
 
 if __name__ == "__main__":
