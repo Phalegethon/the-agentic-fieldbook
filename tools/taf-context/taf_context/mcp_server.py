@@ -331,7 +331,17 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "a name match, never proof, and is returned only with allow_inferred. Read "
                 "`changed` for the change set itself. maximum_output_characters defaults to "
                 "8000 here, not the other tools' 4000, because the answer carries the change "
-                "set as well as the candidates and the change set is what shrinks first."
+                "set as well as the candidates. The two layers share that budget and neither "
+                "pays for the other: the change set keeps up to a third of it, carrying full "
+                "entries while they fit that third and the compact form (result_identity, "
+                "path, qualified_name) when they do not; a compact list still over its third "
+                "loses entries from the tail, counted in changed_trimmed_count with the "
+                "warning changed-list-trimmed, so a short `changed` list is always a counted "
+                "one and changed_count still says how many symbols the change touched. The "
+                "candidates then drop from the tail until the answer fits, and only an answer "
+                "with no candidate and no changed entry left reports output-budget-exceeded. "
+                "A trimmed change set is one changed_symbols call away, and every kept "
+                "candidate names its changed symbols in `anchors` whatever the list lost."
                 + query_description_suffix
             ),
             "inputSchema": _schema(

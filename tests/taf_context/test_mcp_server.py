@@ -237,6 +237,16 @@ class ToolListTests(unittest.TestCase):
         ):
             self.assertIn(warning, tools["repository_overview"]["description"])
 
+    def test_the_impact_tool_says_what_the_budget_does_to_the_changed_layer(self) -> None:
+        # The changed layer keeps a share of the budget in a compact form, and
+        # what it could not carry is counted rather than silently gone; a
+        # model reading the answer must be told both.
+        description = {tool["name"]: tool for tool in tool_definitions()}["impact_candidates"][
+            "description"
+        ]
+        for phrase in ("changed_trimmed_count", "changed-list-trimmed"):
+            self.assertIn(phrase, description)
+
     def test_the_two_layered_tools_default_to_a_larger_output_budget(self) -> None:
         # Both of these answer with two layers - a table and a file layer, a
         # change set and its candidates - so 4000 characters buy almost none

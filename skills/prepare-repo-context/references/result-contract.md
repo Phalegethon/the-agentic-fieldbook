@@ -48,16 +48,17 @@ A `changed-symbols` finding is an ordinary finding of `record_kind` `definition`
 
 | Field | Meaning |
 |---|---|
-| `changed` | The change set itself, compactly: `result_identity`, `path`, `start_line`, `end_line`, `record_kind`, `qualified_name` per changed symbol. |
+| `changed` | The change set itself: `result_identity`, `path`, `start_line`, `end_line`, `record_kind`, `qualified_name` per changed symbol, or the compact `result_identity`, `path`, `qualified_name` when the budget made the layer shrink. |
 | `changed_count` | How many changed symbols the composition followed (at most 64). |
 | `changed_omitted_count` | Changed symbols the engine left out of that set, counted separately from `omitted_count`, which adds them to the omissions of the relationship calls and to the candidates dropped for the budget. |
+| `changed_trimmed_count` | Changed symbols the output budget dropped from the tail of `changed`, so the length of the list plus this count is always `changed_count`, the change set the engine returned. `0` when the list is whole. |
 | `findings` | The candidates: one entry per related record, never a changed symbol itself. |
 | `anchors` | On each candidate, the changed symbols it depends on: `result_identity`, `path`, `qualified_name`, `relation`, `edge_evidence`, `reference_line`, `reference_count`, strongest evidence first. The candidate's own four edge fields are copied from the first anchor. |
 
 - Candidates are ordered by `edge_evidence` (verified before inferred), then by number of anchors, then by path and start line, so a truncated list is the strongest prefix, not a sample. `inferred` edges appear only with `--allow-inferred`/`allow_inferred`, and the composition never upgrades an edge.
 - `status` is `ready` only when every underlying call was ready; otherwise it is `partial` with that call's `next_safe_action`. `warnings` is the union of every underlying answer's warnings plus the change-set warnings above.
 - `output_characters` is the serialized length of this object, which is a different measure from the engine's rendered-text count on the direct engine operations. `repository-overview` is measured the same way as this one; every other operation reports the engine's count.
-- Over the output budget the result sheds context before answers, in this order: the `changed` entries shrink to identities, then drop from the tail with the warning `changed-list-trimmed`, then candidates drop from the tail (`truncated`, `omitted_count`), and only if nothing is left to lose does the warning `output-budget-exceeded` appear. The anchors of a kept candidate are never trimmed, so every reported candidate keeps its full attribution.
+- The two layers share the output budget and neither pays for the other, in these five steps: (1) the `changed` entries are carried in full; (2) a `changed` list whose serialized length is over a third of the budget shrinks to the compact `result_identity`, `path`, `qualified_name` — the line range and the record kind are one `changed-symbols` query away; (3) a compact list still over that third drops entries from the tail, counted in `changed_trimmed_count` with the warning `changed-list-trimmed`; (4) candidates then drop from the tail (`truncated`, `omitted_count`) until the whole object fits; (5) only an object that does not fit with no candidate and no changed entry left carries the warning `output-budget-exceeded`. The anchors of a kept candidate are never trimmed, so every reported candidate keeps its full attribution and still names the changed symbols it depends on even when the `changed` list lost them.
 - A candidate is a symbol that references something you changed, not a defect. Report it with its anchors and the edge's evidence, and never state that it breaks.
 
 ## Overview (`repository-overview`)

@@ -888,8 +888,14 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             # The changed set's own omissions are reported next to its count;
             # this fixture returns every changed symbol, so it omits none.
             self.assertEqual(result["changed_omitted_count"], 0)
+            # This answer is far inside its budget, so nothing was trimmed off
+            # the changed list either, and the count says so next to it.
+            self.assertEqual(result["changed_trimmed_count"], 0)
             keys = list(result)
             self.assertEqual(keys[keys.index("changed_count") + 1], "changed_omitted_count")
+            self.assertEqual(
+                keys[keys.index("changed_omitted_count") + 1], "changed_trimmed_count"
+            )
             self.assertEqual(
                 [item["qualified_name"] for item in result["changed"]], ["app", "app.first"]
             )
@@ -2415,14 +2421,25 @@ class QueryArgumentInvariantTests(unittest.TestCase):
                     mcp = _query_arguments(operation, {"repo": str(repo), "base": f" {base}  "})
 
                     self.assertEqual(cli, mcp)
+                    answered = run_query(
+                        repo, cli, environment=environment, transport_for=OneShotTransport
+                    )
                     self.assertEqual(
-                        run_query(
-                            repo, cli, environment=environment, transport_for=OneShotTransport
-                        ),
+                        answered,
                         run_query(
                             repo, mcp, environment=environment, transport_for=OneShotTransport
                         ),
                     )
+                    if operation == "impact-candidates":
+                        # Both surfaces report the changed layer's budget
+                        # trimming the same way, next to the engine's own
+                        # omissions of that set.
+                        keys = list(answered)
+                        self.assertEqual(
+                            keys[keys.index("changed_omitted_count") + 1],
+                            "changed_trimmed_count",
+                        )
+                        self.assertEqual(answered["changed_trimmed_count"], 0)
 
 
 class QueryPathImportTests(unittest.TestCase):

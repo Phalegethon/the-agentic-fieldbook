@@ -762,6 +762,17 @@ CHANGED = engine_result(
     ],
 )
 
+# The two shapes a changed entry can have, sorted the way `sorted(entry)` is.
+FULL_CHANGED_KEYS = [
+    "end_line",
+    "path",
+    "qualified_name",
+    "record_kind",
+    "result_identity",
+    "start_line",
+]
+COMPACT_CHANGED_KEYS = ["path", "qualified_name", "result_identity"]
+
 
 class FakeRelated:
     """Answers `related-symbols` from a canned per-anchor table."""
@@ -968,6 +979,12 @@ class ComposeImpactCandidatesTests(unittest.TestCase):
         self.assertEqual(
             keys[keys.index("changed_count") + 1], "changed_omitted_count"
         )
+        # What the budget trimmed off the changed list is counted next to what
+        # the engine left out of it, and a composed answer has trimmed nothing.
+        self.assertEqual(
+            keys[keys.index("changed_omitted_count") + 1], "changed_trimmed_count"
+        )
+        self.assertEqual(composed["changed_trimmed_count"], 0)
         self.assertEqual(composed["changed_omitted_count"], 8)
         self.assertEqual(composed["changed_count"], 1)
         self.assertEqual(composed["omitted_count"], 9)
@@ -1007,25 +1024,31 @@ class TrimToBudgetTests(unittest.TestCase):
 
         self.assertEqual(trimmed["findings"], composed["findings"])
         self.assertEqual(trimmed["changed"], composed["changed"])
+        self.assertEqual(trimmed["changed_trimmed_count"], 0)
+        self.assertEqual(sorted(trimmed["changed"][0]), FULL_CHANGED_KEYS)
         self.assertLessEqual(int(trimmed["output_characters"]), 12000)
         self.assertEqual(
             int(trimmed["output_characters"]),
             len(json.dumps(trimmed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),
         )
 
-    def test_the_changed_list_shrinks_to_identities_before_a_candidate_is_dropped(self) -> None:
+    def test_a_changed_list_inside_its_share_is_kept_whole_while_candidates_pay(self) -> None:
+        # Three changed symbols are about 595 characters, well inside a third
+        # of this budget, so the changed layer pays nothing at all and the
+        # candidates - which are what a wider budget buys more of - are the
+        # ones that drop.
         composed = self._object()
         full = int(trim_to_budget(composed, 12000)["output_characters"])
         trimmed = trim_to_budget(composed, full - 40)
 
-        self.assertEqual(len(trimmed["findings"]), len(composed["findings"]))
-        self.assertEqual(
-            trimmed["changed"],
-            [{"result_identity": item["result_identity"]} for item in composed["changed"]],
-        )
-        self.assertIs(trimmed["truncated"], False)
+        self.assertEqual(trimmed["changed"], composed["changed"])
+        self.assertEqual(trimmed["changed_trimmed_count"], 0)
+        self.assertNotIn("changed-list-trimmed", trimmed["warnings"])
+        self.assertLess(len(trimmed["findings"]), len(composed["findings"]))
+        self.assertIs(trimmed["truncated"], True)
+        self.assertLessEqual(int(trimmed["output_characters"]), full - 40)
 
-    def test_candidates_are_dropped_from_the_tail_once_the_changed_list_is_bare(self) -> None:
+    def test_candidates_are_dropped_from_the_tail_with_their_ranks_intact(self) -> None:
         composed = self._object()
         trimmed = trim_to_budget(composed, 2000)
 
@@ -1066,10 +1089,30 @@ class TrimToBudgetTests(unittest.TestCase):
             changed, related, allow_inferred=False, maximum_results=8
         )
 
-    def test_the_changed_list_is_trimmed_before_the_last_candidate_goes(self) -> None:
-        # The identity-only changed list alone exceeds the default budget at
-        # the internal cap, so the candidates - the operation's answer - must
-        # survive it.
+    def test_a_changed_list_over_its_share_shrinks_to_the_compact_form(self) -> None:
+        # Ten changed symbols are about 1995 characters in full and 1431
+        # compact, so at 5000 (a third is 1666) the compact form is the whole
+        # of the fix: no entry is lost and nothing is warned about.
+        composed = self._wide_object(10, 8)
+        trimmed = trim_to_budget(composed, 5000)
+
+        self.assertLessEqual(int(trimmed["output_characters"]), 5000)
+        self.assertEqual(len(trimmed["changed"]), 10)
+        self.assertEqual(
+            [sorted(item) for item in trimmed["changed"]], [COMPACT_CHANGED_KEYS] * 10
+        )
+        self.assertEqual(
+            [item["qualified_name"] for item in trimmed["changed"]],
+            [item["qualified_name"] for item in composed["changed"]],
+        )
+        self.assertEqual(trimmed["changed_trimmed_count"], 0)
+        self.assertNotIn("changed-list-trimmed", trimmed["warnings"])
+        self.assertLess(len(trimmed["findings"]), len(composed["findings"]))
+
+    def test_a_compact_changed_list_over_its_share_loses_its_tail(self) -> None:
+        # A compact entry is about 143 characters, so a third of 2000 holds
+        # four of them and the other sixty are counted, not silently gone.
+        # The candidate - the operation's answer - survives that trimming.
         composed = self._wide_object(64, 1)
         trimmed = trim_to_budget(composed, 2000)
 
@@ -1078,24 +1121,30 @@ class TrimToBudgetTests(unittest.TestCase):
         self.assertEqual(trimmed["returned_count"], 1)
         self.assertIn("changed-list-trimmed", trimmed["warnings"])
         self.assertNotIn("output-budget-exceeded", trimmed["warnings"])
-        self.assertLess(len(trimmed["changed"]), 64)
         self.assertEqual(trimmed["changed_count"], 64)
+        self.assertEqual(
+            len(trimmed["changed"]) + int(trimmed["changed_trimmed_count"]), 64
+        )
         self.assertEqual(
             trimmed["changed"],
             [
-                {"result_identity": item["result_identity"]}
+                {
+                    "result_identity": item["result_identity"],
+                    "path": item["path"],
+                    "qualified_name": item["qualified_name"],
+                }
                 for item in composed["changed"][: len(trimmed["changed"])]
             ],
         )
         self.assertIs(trimmed["truncated"], False)
         self.assertEqual(trimmed["omitted_count"], composed["omitted_count"])
 
-    def test_candidates_go_only_after_the_changed_list_is_empty(self) -> None:
+    def test_candidates_pay_before_the_changed_lists_share_does(self) -> None:
         composed = self._wide_object(64, 4)
         trimmed = trim_to_budget(composed, 2000)
 
         self.assertLessEqual(int(trimmed["output_characters"]), 2000)
-        self.assertEqual(trimmed["changed"], [])
+        self.assertGreater(len(trimmed["changed"]), 0)
         self.assertLess(len(trimmed["findings"]), 4)
         self.assertGreater(len(trimmed["findings"]), 0)
         self.assertIs(trimmed["truncated"], True)
@@ -1108,11 +1157,37 @@ class TrimToBudgetTests(unittest.TestCase):
             list(range(1, len(trimmed["findings"]) + 1)),
         )
 
+    def test_a_field_sized_change_set_keeps_a_readable_changed_list(self) -> None:
+        # The 2.6.0 field case: 46 changed symbols and more candidates than
+        # `maximum_results` keeps, at the operation's default budget. The
+        # changed list used to empty completely; now a third of 8000 carries
+        # eighteen compact entries (18 x 143 = 2574 characters, a nineteenth
+        # would not fit) and the twenty-eight it could not carry are counted.
+        composed = self._wide_object(46, 24)
+        trimmed = trim_to_budget(composed, 8000)
+
+        self.assertLessEqual(int(trimmed["output_characters"]), 8000)
+        self.assertEqual(trimmed["changed_count"], 46)
+        self.assertEqual(trimmed["changed_omitted_count"], 0)
+        self.assertEqual(len(trimmed["changed"]), 18)
+        self.assertEqual(trimmed["changed_trimmed_count"], 28)
+        self.assertEqual(
+            int(trimmed["changed_count"]),
+            len(trimmed["changed"]) + int(trimmed["changed_trimmed_count"]),
+        )
+        self.assertEqual(
+            [sorted(item) for item in trimmed["changed"]], [COMPACT_CHANGED_KEYS] * 18
+        )
+        self.assertIn("changed-list-trimmed", trimmed["warnings"])
+        self.assertNotIn("output-budget-exceeded", trimmed["warnings"])
+        self.assertGreater(len(trimmed["findings"]), 0)
+
     def test_a_budget_nothing_fits_in_is_reported_instead_of_looping(self) -> None:
         composed = self._wide_object(8, 2)
         trimmed = trim_to_budget(composed, 1)
 
         self.assertEqual(trimmed["changed"], [])
+        self.assertEqual(trimmed["changed_trimmed_count"], 8)
         self.assertEqual(trimmed["findings"], [])
         self.assertEqual(trimmed["returned_count"], 0)
         self.assertIn("output-budget-exceeded", trimmed["warnings"])
@@ -1124,16 +1199,36 @@ class TrimToBudgetTests(unittest.TestCase):
             len(json.dumps(trimmed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),
         )
 
+    def test_the_changed_list_goes_only_when_no_candidate_is_left_to_drop(self) -> None:
+        # A budget barely over the envelope leaves nothing else to give, so
+        # the changed layer's share goes too rather than overrunning silently.
+        # It goes last: the candidates are already gone by then.
+        composed = self._wide_object(64, 4)
+        trimmed = trim_to_budget(composed, 500)
+
+        self.assertEqual(trimmed["findings"], [])
+        self.assertEqual(trimmed["changed"], [])
+        self.assertEqual(trimmed["changed_trimmed_count"], 64)
+        self.assertEqual(trimmed["changed_count"], 64)
+        self.assertLessEqual(int(trimmed["output_characters"]), 500)
+        self.assertNotIn("output-budget-exceeded", trimmed["warnings"])
+
     def test_the_budget_holds_whenever_it_is_not_reported_as_exceeded(self) -> None:
-        for changed_symbols, candidates in ((0, 0), (3, 2), (64, 1), (64, 8)):
+        for changed_symbols, candidates in ((0, 0), (3, 2), (10, 8), (46, 24), (64, 1), (64, 8)):
             composed = self._wide_object(changed_symbols, candidates)
-            for budget in (1, 300, 900, 2000, 4000, 12000):
+            for budget in (1, 300, 900, 2000, 4000, 8000, 12000):
                 with self.subTest(changed=changed_symbols, candidates=candidates, budget=budget):
                     trimmed = trim_to_budget(composed, budget)
                     measured = len(json.dumps(
                         trimmed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                     ))
                     self.assertEqual(int(trimmed["output_characters"]), measured)
+                    # The engine omitted nothing here, so every changed symbol
+                    # is either in the list or counted as trimmed.
+                    self.assertEqual(
+                        int(trimmed["changed_count"]),
+                        len(trimmed["changed"]) + int(trimmed["changed_trimmed_count"]),
+                    )
                     if "output-budget-exceeded" not in trimmed["warnings"]:
                         self.assertLessEqual(measured, budget)
 

@@ -23,6 +23,25 @@ Skill: `prepare-repo-context` 1.7.2.
   dropped from the broker's summary, matching `repository-map` and
   `search-*`. The wire object and the models are unchanged; only the
   broker's compacted output changes.
+- `impact-candidates` gives its change set a share of the output budget
+  instead of spending it on candidates first. The `changed` list is carried
+  in full while it fits a third of the budget; over that third every entry
+  takes the compact form (`result_identity`, `path`, `qualified_name`), and a
+  compact list still over its third drops entries from the tail. The
+  candidates are only then dropped from the tail until the answer fits, so a
+  46-symbol change set at the default 8000 characters keeps a readable change
+  set as well as its candidates instead of reporting `changed: []`. The
+  candidates pay for that share: a budget-bound answer can now carry one
+  candidate fewer than 2.6.0 returned, and its tail is the weakest evidence.
+
+### Added
+
+- `impact-candidates` results carry `changed_trimmed_count`, next to
+  `changed_omitted_count`: how many changed symbols the output budget dropped
+  from the tail of `changed`. The length of the list plus that count is
+  always `changed_count`, so a short change set is a counted one rather than
+  a silent one - the 2.6.0 field report saw `changed_count 46` with ten
+  entries and nothing to explain the difference.
 
 ## [2.6.0] - 2026-09-05
 

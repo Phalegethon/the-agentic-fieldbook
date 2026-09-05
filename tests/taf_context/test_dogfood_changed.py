@@ -328,8 +328,8 @@ class DogfoodChangedTests(unittest.TestCase):
                     # candidate. This checks against a direct changed-symbols
                     # query rather than `impact["changed"]`: the output-budget
                     # trimming this same call is subject to can legitimately
-                    # empty that list before candidates are dropped (Task 4's
-                    # fix wave), which would make the display list an
+                    # shorten that list - the changed layer keeps only a share
+                    # of the budget - which would make the display list an
                     # unreliable witness for a fact the exclusion itself does
                     # not lose. `_changed_identity` already fails the case
                     # where the call site is not a changed symbol of its path

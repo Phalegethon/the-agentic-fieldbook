@@ -715,6 +715,16 @@ OVERVIEW_OTHER_PREFIX = "*"
 # four files. Halving is what makes a wider budget buy a wider table and more
 # files at the same time.
 OVERVIEW_BUDGET_SHARES = 2
+# An impact answer has two layers too - the change set in `changed` and the
+# candidates in `findings` - and the same reasoning gives the change set a
+# guaranteed share of the budget. It is a third rather than a half because the
+# candidates are what the operation was asked for and each of them costs far
+# more than a changed entry: a third at the default budget carries a compact
+# change set of a size a real diff produces, and the candidates keep the rest.
+CHANGED_BUDGET_SHARES = 3
+# The three fields a changed entry keeps when its layer is over its share:
+# what it is, where it lives, and the identity another query is asked with.
+CHANGED_COMPACT_KEYS = ("result_identity", "path", "qualified_name")
 # The five counters every group row sums when two rows become one.
 _OVERVIEW_COUNTERS = (
     "file_count",
@@ -1085,6 +1095,9 @@ def compose_impact_candidates(
         # candidates `maximum_results` dropped; `omitted_count` keeps counting
         # both together.
         "changed_omitted_count": changed.omitted_count,
+        # What the output budget took off the tail of the changed list, which
+        # `trim_to_budget` fills in; a composed answer has trimmed nothing yet.
+        "changed_trimmed_count": 0,
         "findings": findings,
         "returned_count": len(findings),
         "omitted_count": omitted,
@@ -1096,7 +1109,8 @@ def compose_impact_candidates(
     }
 
 
-def _canonical_length(value: dict[str, object]) -> int:
+def _canonical_length(value: object) -> int:
+    """The canonical serialized length of a whole result or of one layer."""
     return len(
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
@@ -1120,38 +1134,85 @@ def _add_warning(trimmed: dict[str, object], warning: str) -> None:
     trimmed["warnings"] = sorted(set(warnings) | {warning})
 
 
+def _compact_changed_entry(entry: dict[str, object]) -> dict[str, object]:
+    """One changed symbol at its cheapest still-usable shape.
+
+    The line range and the record kind are what a reader can ask
+    `changed-symbols` for again; the path and the qualified name are what
+    makes the entry readable at all, and the identity is what another query
+    is asked with, so those three stay.
+    """
+    return {key: entry[key] for key in CHANGED_COMPACT_KEYS}
+
+
+def _drop_changed_tail(result: dict[str, object], changed: list[dict[str, object]]) -> None:
+    """Drop the last changed entry, counting it and warning about it once.
+
+    The drop is counted in `changed_trimmed_count` rather than in
+    `omitted_count`, which counts what the engine left out and the candidates
+    the budget dropped; a reader adding `changed_trimmed_count` to the length
+    of the list gets back what the engine returned.
+    """
+    changed.pop()
+    result["changed"] = changed
+    result["changed_trimmed_count"] = int(result["changed_trimmed_count"]) + 1
+    _add_warning(result, WARNING_CHANGED_LIST_TRIMMED)
+
+
+def _fit_changed_to_share(result: dict[str, object], share: int) -> None:
+    """Fit the changed layer into its share of the budget, cheapest loss first.
+
+    A list already inside its share is handed on with every field the engine
+    gave it. Over it, the whole list takes the compact shape first - which is
+    the cheap loss, since the lines and the kind of a changed symbol are one
+    `changed-symbols` query away - and only a compact list still over its
+    share loses entries from the tail.
+    """
+    changed = result["changed"]
+    assert isinstance(changed, list)
+    if not changed or _canonical_length(changed) <= share:
+        return
+    changed = [_compact_changed_entry(entry) for entry in changed]
+    result["changed"] = changed
+    while changed and _canonical_length(changed) > share:
+        _drop_changed_tail(result, changed)
+
+
 def trim_to_budget(
     result: dict[str, object], maximum_output_characters: int
 ) -> dict[str, object]:
-    """Fit a composed result into its output budget, cheapest loss first.
+    """Fit a composed result into its output budget, both layers sharing it.
 
-    The candidates are the answer, and each one already carries its anchors'
-    path and qualified name, so the changed list is the context that shrinks
-    first: it becomes identity-only, then loses entries from the tail with
-    `changed-list-trimmed`, and only then do candidates go from the tail so
-    that the strongest evidence survives longest. `changed_count` keeps
-    counting the changed findings the engine returned, and the anchors of a
-    kept candidate are never trimmed. A budget that not even an empty answer
-    fits in is reported with `output-budget-exceeded` instead of trimming
-    forever.
+    The change set and the candidates are both what this operation is asked
+    for, so neither pays for the other: the changed layer's share is a third
+    of the budget, and it is over that share alone that its entries shrink to
+    the compact form and then drop from the tail with `changed-list-trimmed`,
+    counted in `changed_trimmed_count`. Whatever the changed layer did not
+    spend is the candidates', and they drop from the tail - strongest
+    evidence surviving longest - until the whole object fits; the anchors of a
+    kept candidate are never trimmed, so a changed symbol trimmed off the list
+    is still named by every candidate that depends on it. Only when no
+    candidate and no changed entry is left to give does
+    `output-budget-exceeded` report the overrun instead of trimming forever.
+    `changed_count` keeps counting the changed findings the engine returned,
+    and `output_characters` is always the final canonical length.
     """
     trimmed = dict(result)
     trimmed["output_characters"] = _output_characters(trimmed)
     if int(trimmed["output_characters"]) <= maximum_output_characters:
         return trimmed
-    changed = trimmed["changed"]
-    assert isinstance(changed, list)
-    identities = [{"result_identity": item["result_identity"]} for item in changed]
-    trimmed["changed"] = identities
+    changed = list(trimmed["changed"])  # type: ignore[arg-type]
+    trimmed["changed"] = changed
+    _fit_changed_to_share(trimmed, maximum_output_characters // CHANGED_BUDGET_SHARES)
     trimmed["output_characters"] = _output_characters(trimmed)
-    dropped_changed = False
-    while identities and int(trimmed["output_characters"]) > maximum_output_characters:
-        identities.pop()
-        if not dropped_changed:
-            dropped_changed = True
-            _add_warning(trimmed, WARNING_CHANGED_LIST_TRIMMED)
-        trimmed["output_characters"] = _output_characters(trimmed)
     trimmed = _drop_findings_to_budget(trimmed, maximum_output_characters)
+    changed = trimmed["changed"]  # type: ignore[assignment]
+    assert isinstance(changed, list)
+    while changed and int(trimmed["output_characters"]) > maximum_output_characters:
+        # The candidates are gone and the object is still over the budget, so
+        # the changed layer gives up its share too rather than overrun.
+        _drop_changed_tail(trimmed, changed)
+        trimmed["output_characters"] = _output_characters(trimmed)
     if int(trimmed["output_characters"]) > maximum_output_characters:
         # Nothing left to lose: the envelope alone is over the budget, and the
         # reader is told rather than handed a silent overrun.
