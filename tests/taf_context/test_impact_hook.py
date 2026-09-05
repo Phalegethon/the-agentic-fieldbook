@@ -790,6 +790,95 @@ class HookChainTests(unittest.TestCase):
             self.assertEqual(restored_path.stat().st_mode, foreign_mode)
 
 
+class HookOrphanedChainTests(unittest.TestCase):
+    """A `pre-commit.taf-chained` backup with no `pre-commit` alongside it.
+
+    This state is reachable without any crash: an external actor, or the user
+    themselves, can delete `.git/hooks/pre-commit` by hand while a backup from
+    an earlier `--chain` install still sits next to it. `install` and `remove`
+    must adopt or restore that backup rather than silently orphaning it.
+    """
+
+    def test_install_over_an_absent_hook_with_a_backup_adopts_it_as_chained(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            chained_path = hooks_dir / CHAINED_HOOK_NAME
+            backup_bytes = b"#!/bin/sh\necho backup >&2\nexit 3\n"
+            chained_path.write_bytes(backup_bytes)
+            chained_path.chmod(0o755)
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertTrue(summary["chained"])
+            self.assertEqual(summary["chained_hook_path"], str(chained_path))
+            # The backup itself is untouched: install only writes the launcher.
+            self.assertEqual(chained_path.read_bytes(), backup_bytes)
+            launcher_lines = (hooks_dir / HOOK_FILE_NAME).read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertEqual(
+                launcher_lines[-1], f'exec {shlex.quote(str(chained_path))} "$@"'
+            )
+
+    def test_remove_over_an_absent_hook_with_a_backup_restores_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            chained_path = hooks_dir / CHAINED_HOOK_NAME
+            backup_bytes = b"#!/bin/sh\necho backup >&2\nexit 3\n"
+            chained_path.write_bytes(backup_bytes)
+            chained_path.chmod(0o755)
+            backup_mode = chained_path.stat().st_mode
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "remove",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual((summary["removed"], summary["restored"]), (False, True))
+            self.assertFalse(chained_path.exists())
+            restored_path = hooks_dir / HOOK_FILE_NAME
+            self.assertEqual(restored_path.read_bytes(), backup_bytes)
+            self.assertEqual(restored_path.stat().st_mode, backup_mode)
+
+    def test_status_on_an_absent_hook_with_a_backup_reports_it_as_chained(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            (hooks_dir / CHAINED_HOOK_NAME).write_text(
+                "#!/bin/sh\nexit 0\n", encoding="utf-8"
+            )
+
+            code, stdout, stderr = invoke(
+                {"TAF_STATE_HOME": str(root / "state")},
+                "prepare", "hook", "status", "--repo", str(repository),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "absent")
+            self.assertTrue(summary["chained"])
+            self.assertIsNone(summary["launcher_current"])
+
+
 class HookStatusTests(unittest.TestCase):
     """`status`'s four hook states, `launcher_current`, and its readiness field."""
 

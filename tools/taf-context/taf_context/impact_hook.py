@@ -368,11 +368,7 @@ def install_hook(
     chained_path = hooks_dir / CHAINED_HOOK_NAME
     kind = _classify_pre_commit(hook_path)
     chained_hook_path: Path | None = None
-    if kind == "taf":
-        # A re-install never drops a chained hook, regardless of `--chain`.
-        if chained_path.exists():
-            chained_hook_path = chained_path
-    elif kind == "foreign":
+    if kind == "foreign":
         if not chain:
             raise PrepareCLIError(
                 "a foreign pre-commit hook exists; pass --chain to run it after TAF, "
@@ -384,6 +380,14 @@ def install_hook(
             )
         os.replace(hook_path, chained_path)  # mode is preserved by the rename
         chained_hook_path = chained_path
+    else:
+        # `kind` is "taf" (a re-install never drops a chained hook, regardless
+        # of `--chain`) or "absent" (a `pre-commit.taf-chained` backup can be
+        # left behind by hand or by a crash between the foreign->chained
+        # rename and the launcher write below; either way, an existing
+        # backup is adopted rather than orphaned).
+        if chained_path.exists():
+            chained_hook_path = chained_path
     source = _render_launcher(
         interpreter=resolved_interpreter, script=script, chained_hook_path=chained_hook_path
     )
@@ -416,13 +420,17 @@ def remove_hook(repository: Path) -> dict[str, object]:
     if kind == "foreign":
         raise PrepareCLIError("pre-commit is not a TAF launcher; nothing removed")
     removed = False
-    restored = False
     if kind == "taf":
         hook_path.unlink()
         removed = True
-        if chained_path.exists():
-            os.replace(chained_path, hook_path)
-            restored = True
+    # A `pre-commit.taf-chained` backup is restored whenever it exists, not
+    # only when `pre-commit` itself was a TAF launcher: the backup can be
+    # left behind (by hand, or by a crash) while `pre-commit` is absent, and
+    # `remove` must not leave it stranded.
+    restored = False
+    if chained_path.exists():
+        os.replace(chained_path, hook_path)
+        restored = True
     return {
         "schema_version": "1",
         "mode": "hook-remove",
@@ -445,6 +453,13 @@ def hook_status(
     first and independently of the index: a broken or unborn index still gets
     an honest `hook` field, with the readiness failure folded into its own
     `readiness.error` instead of aborting the whole report.
+
+    `hook: "absent"` together with `chained: true` is a legitimate state, not
+    a contradiction: a `pre-commit.taf-chained` backup can be left on disk
+    with no `pre-commit` beside it (deleted by hand, or by a crash between
+    the foreign->chained rename and the launcher write), and it simply means
+    a chained backup awaits the next `install` or `remove` to adopt or
+    restore it.
     """
     state, hooks_dir, hooks_path_value = _resolve_hooks_directory(repository)
     chained = False
