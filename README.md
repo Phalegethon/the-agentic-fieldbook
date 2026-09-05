@@ -452,7 +452,7 @@ only `python` exists, register the server manually with that name.
 
 TAF and its skills have separate versions:
 
-- TAF `2.8.4` versions the collection, manifests, namespaces, and release.
+- TAF `2.8.5` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
 - `prepare-repo-context` `1.8.4` versions its behavior contract.
 - `work-recovery` `1.1.0` versions its behavior contract.
