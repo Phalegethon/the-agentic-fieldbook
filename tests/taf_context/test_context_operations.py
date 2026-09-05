@@ -1004,6 +1004,85 @@ class ComposeImpactCandidatesTests(unittest.TestCase):
         self.assertIs(composed["truncated"], True)
         self.assertEqual([item["rank"] for item in composed["findings"]], [1, 2])
 
+    def test_changed_orders_the_anchor_first_then_by_kind_ahead_of_module(self) -> None:
+        # 2.7.1 decision 1: `app.first` anchors the one returned candidate, so
+        # it leads even though the engine returned it second; the remaining
+        # two are neither test files, so they order by kind - `app.second`
+        # (a definition) ahead of `app` (a module) - not by their own lines,
+        # which would otherwise put `app` (line 1) first.
+        related = FakeRelated(
+            {(identity("app.py", "app.first"), "callers"): [caller_of("web.handle", path="web.py")]}
+        )
+        composed = self._compose(related)
+
+        self.assertEqual(
+            [item["qualified_name"] for item in composed["changed"]],
+            ["app.first", "app.second", "app"],
+        )
+
+    def test_changed_group_a_ranks_by_how_many_candidates_an_anchor_reaches(self) -> None:
+        # 2.7.1 decision 1(a): the anchor reaching more returned candidates
+        # sorts first even when its own line comes later in the file - the
+        # count is the primary key, not the path or the start line.
+        changed = engine_result(
+            "changed-symbols",
+            "3",
+            [
+                finding_wire(1, "early", path="app.py", start=3, end=4),
+                finding_wire(2, "late", path="app.py", start=20, end=21),
+            ],
+        )
+        related = FakeRelated(
+            {
+                (identity("app.py", "early"), "callers"): [caller_of("web.one", path="web.py")],
+                (identity("app.py", "late"), "callers"): [
+                    caller_of("web.one", path="web.py"),
+                    caller_of("web.two", path="web.py"),
+                ],
+            }
+        )
+        composed = compose_impact_candidates(
+            changed, related, allow_inferred=False, maximum_results=8
+        )
+
+        self.assertEqual(
+            [item["qualified_name"] for item in composed["changed"]], ["late", "early"]
+        )
+
+    def test_changed_group_b_orders_non_test_paths_and_definitions_first(self) -> None:
+        # 2.7.1 decision 1(b): with no anchor at all (no related answer
+        # reaches any of these), the changed set orders non-test paths before
+        # test paths, and within each a caller-anchor kind (`definition`)
+        # before `module`, ahead of path and start line - `mod.fn` (line 5)
+        # sorts before `mod` (line 1) in the same non-test file for exactly
+        # that reason, and a `tests/` directory segment marks a test path
+        # the same way a `_test.` suffix does.
+        changed = engine_result(
+            "changed-symbols",
+            "3",
+            [
+                finding_wire(1, "mod", path="lib/mod.py", kind="module", start=1, end=40),
+                finding_wire(2, "mod.fn", path="lib/mod.py", start=5, end=9),
+                finding_wire(3, "mod_test.fn", path="lib/mod_test.py", start=2, end=4),
+                finding_wire(4, "other", path="tests/other.py", kind="module", start=1, end=20),
+            ],
+        )
+        related = FakeRelated({})
+        composed = compose_impact_candidates(
+            changed, related, allow_inferred=False, maximum_results=8
+        )
+
+        self.assertEqual(composed["findings"], [])
+        self.assertEqual(
+            [(item["path"], item["qualified_name"]) for item in composed["changed"]],
+            [
+                ("lib/mod.py", "mod.fn"),
+                ("lib/mod.py", "mod"),
+                ("lib/mod_test.py", "mod_test.fn"),
+                ("tests/other.py", "other"),
+            ],
+        )
+
 
 class TrimToBudgetTests(unittest.TestCase):
     def _object(self) -> dict[str, object]:
@@ -1235,6 +1314,99 @@ class TrimToBudgetTests(unittest.TestCase):
                     )
                     if "output-budget-exceeded" not in trimmed["warnings"]:
                         self.assertLessEqual(measured, budget)
+
+    def test_anchor_retention_keeps_every_anchor_and_trims_test_files_first(self) -> None:
+        # The 2.7.0 re-test's finding E: the anchor `zzz_service.handler`
+        # sorts last in the engine's own answer (it comes after every library
+        # and test entry), and a tight budget forces a tail trim. Decision 1
+        # hoists it to the front of `changed` regardless, and decision 2
+        # guarantees the tail trim never removes it: every anchor a returned
+        # candidate names must still be in `changed` afterwards. The ten
+        # library entries and the ten test entries are otherwise identical,
+        # so whichever of the two groups loses entries first is decided by
+        # decision 1(b) alone (non-test before test) - not by size or count.
+        library = [
+            finding_wire(
+                index + 1, f"lib.symbol{index:03d}", path="lib.py", start=index * 3 + 1, end=index * 3 + 2
+            )
+            for index in range(10)
+        ]
+        tests = [
+            finding_wire(
+                index + 11,
+                f"lib.symbol{index:03d}",
+                path="tests/lib.py",
+                start=index * 3 + 1,
+                end=index * 3 + 2,
+            )
+            for index in range(10)
+        ]
+        anchor = finding_wire(21, "zzz_service.handler", path="zzz_service.py", start=5, end=9)
+        changed = engine_result("changed-symbols", "3", library + tests + [anchor])
+        related = FakeRelated(
+            {
+                (identity("zzz_service.py", "zzz_service.handler"), "callers"): [
+                    caller_of("web.handle", path="web.py")
+                ]
+            }
+        )
+        composed = compose_impact_candidates(
+            changed, related, allow_inferred=False, maximum_results=8
+        )
+        # Decision 1: the anchor leads even though the engine returned it last.
+        self.assertEqual(composed["changed"][0]["qualified_name"], "zzz_service.handler")
+
+        trimmed = trim_to_budget(composed, 2000)
+
+        self.assertGreater(int(trimmed["changed_trimmed_count"]), 0)
+        self.assertIn("changed-list-trimmed", trimmed["warnings"])
+        changed_keys = {(item["path"], item["qualified_name"]) for item in trimmed["changed"]}
+        # Every anchor of every returned candidate is still named in `changed`.
+        self.assertGreater(len(trimmed["findings"]), 0)
+        for candidate in trimmed["findings"]:
+            for edge_anchor in candidate["anchors"]:
+                self.assertIn((edge_anchor["path"], edge_anchor["qualified_name"]), changed_keys)
+        # The library entries survive whole; the test entries are what the
+        # tail trim spent instead.
+        library_survivors = {q for p, q in changed_keys if p == "lib.py"}
+        test_survivors = {q for p, q in changed_keys if p == "tests/lib.py"}
+        self.assertEqual(library_survivors, {f"lib.symbol{index:03d}" for index in range(10)})
+        self.assertLess(len(test_survivors), 10)
+
+    def test_anchors_alone_over_their_share_are_kept_without_trimming(self) -> None:
+        # 2.7.1 decision 2's second half: thirty anchors, each reaching its
+        # own candidate, cost more compact than a third of this budget on
+        # their own - so the changed layer's own share is exceeded by the
+        # anchors alone. They are kept anyway rather than trimmed, and the
+        # object still fits because the candidates gave up the rest.
+        count = 30
+        changed = engine_result(
+            "changed-symbols",
+            "3",
+            [
+                finding_wire(index + 1, f"anchor{index:03d}", path=f"a{index:03d}.py", start=1, end=2)
+                for index in range(count)
+            ],
+        )
+        table = {
+            (identity(f"a{index:03d}.py", f"anchor{index:03d}"), "callers"): [
+                caller_of(f"c{index:03d}", path=f"c{index:03d}.py")
+            ]
+            for index in range(count)
+        }
+        related = FakeRelated(table)
+        composed = compose_impact_candidates(
+            changed, related, allow_inferred=False, maximum_results=count
+        )
+
+        trimmed = trim_to_budget(composed, 3000)
+
+        self.assertLessEqual(int(trimmed["output_characters"]), 3000)
+        self.assertEqual(len(trimmed["changed"]), count)
+        self.assertEqual(trimmed["changed_trimmed_count"], 0)
+        self.assertNotIn("changed-list-trimmed", trimmed["warnings"])
+        self.assertGreater(len(trimmed["findings"]), 0)
+        self.assertLess(len(trimmed["findings"]), count)
 
 
 class ChangedSelectorGuardTests(unittest.TestCase):

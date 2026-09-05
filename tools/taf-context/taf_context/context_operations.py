@@ -867,6 +867,14 @@ WARNING_SELECTOR_LIMIT = "changed-selector-limit"
 _CALLER_ANCHOR_KINDS = ("definition", "entry-point")
 _IMPORTER_ANCHOR_KINDS = ("module", "definition")
 _EVIDENCE_TIERS = {"verified": 0, "inferred": 1}
+# `changed-symbols` never returns any other kind, and decision 1(b) of the
+# 2.7.1 anchor-order fix ranks a caller-anchor kind ahead of `module`.
+_CHANGED_KIND_RANK = {"definition": 0, "entry-point": 0, "module": 1}
+# The three conventional markers of a test file's base name, and the three
+# directory segment names that mark a test tree - decision 1 of the 2.7.1
+# anchor-order fix.
+_TEST_PATH_MARKERS = (".test.", ".spec.", "_test.")
+_TEST_PATH_SEGMENTS = ("tests", "test", "__tests__")
 # The engine refuses a request frame above 256 KiB (wire.MaximumWireBytes).
 MAXIMUM_REQUEST_BYTES = 256 * 1024
 # Everything in the frame but the selector: the two absolute roots, the
@@ -1068,6 +1076,76 @@ def _evidence_tier(evidence: object) -> int:
     return _EVIDENCE_TIERS.get(str(evidence), len(_EVIDENCE_TIERS))
 
 
+def _is_test_path(path: str) -> bool:
+    """Whether `path` names a test file - decision 1 of the 2.7.1 anchor-order fix.
+
+    A path is a test file when its base name carries one of the three
+    conventional markers, or when one of its directory segments is a `tests`,
+    `test`, or `__tests__` folder. Repository paths are always POSIX-relative
+    (`level1_models` reads them with `PurePosixPath`), so `/` is the only
+    separator to split on.
+    """
+    segments = path.split("/")
+    base = segments[-1]
+    if any(marker in base for marker in _TEST_PATH_MARKERS):
+        return True
+    return any(segment in _TEST_PATH_SEGMENTS for segment in segments[:-1])
+
+
+def _anchor_counts(findings: list[dict[str, object]]) -> dict[str, int]:
+    """How many of `findings` each changed identity anchors.
+
+    Decision 1(a) of the 2.7.1 anchor-order fix ranks a changed entry by this
+    count; an identity with no returned candidate is not a key here at all,
+    which is what tells group (a) - an anchor of a returned candidate - from
+    group (b) - the rest of the changed set.
+    """
+    counts: dict[str, int] = {}
+    for finding in findings:
+        for anchor in finding["anchors"]:
+            identity = anchor["result_identity"]
+            counts[identity] = counts.get(identity, 0) + 1
+    return counts
+
+
+def _changed_sort_key(
+    entry: dict[str, object], anchor_counts: dict[str, int]
+) -> tuple[object, ...]:
+    """The order `changed` is composed in - decision 1 of the 2.7.1 fix.
+
+    Group (a) - an entry that anchors at least one returned candidate - sorts
+    ahead of everything else, the most-anchored entries first, then by path,
+    then by start line. Group (b) - the rest - sorts non-test paths before
+    test paths, a caller-anchor kind (`definition`/`entry-point`) before
+    `module`, then by path, then by start line. The two groups' tuples never
+    compare past their first element, so they need not be the same shape.
+    """
+    count = anchor_counts.get(entry["result_identity"], 0)
+    if count:
+        return (0, -count, entry["path"], entry["start_line"])
+    return (
+        1,
+        _is_test_path(str(entry["path"])),
+        _CHANGED_KIND_RANK.get(str(entry["record_kind"]), 1),
+        entry["path"],
+        entry["start_line"],
+    )
+
+
+def _anchor_identities(findings: list[dict[str, object]]) -> set[str]:
+    """Identities of changed symbols that anchor at least one of `findings`.
+
+    Called again after the budget drops a candidate (decision 2 of the 2.7.1
+    anchor-order fix), so an entry whose only candidate was just dropped
+    stops being reported here and becomes trimmable.
+    """
+    identities: set[str] = set()
+    for finding in findings:
+        for anchor in finding["anchors"]:
+            identities.add(anchor["result_identity"])
+    return identities
+
+
 def compose_impact_candidates(
     changed: Level1Result,
     related: Callable[[tuple[str, ...], str], Level1Result],
@@ -1169,6 +1247,15 @@ def compose_impact_candidates(
         findings = findings[:maximum_results]
     for rank, item in enumerate(findings, start=1):
         item["rank"] = rank
+    # Decision 1 of the 2.7.1 anchor-order fix: an anchor of a returned
+    # candidate sorts ahead of the rest of the changed set, so a later budget
+    # trim never has to look past the compact form to tell one from the
+    # other (decision 2 relies on this order).
+    anchor_counts = _anchor_counts(findings)
+    changed_entries = sorted(
+        (_changed_entry(item) for item in changed.findings),
+        key=lambda entry: _changed_sort_key(entry, anchor_counts),
+    )
     return {
         "schema_version": "1",
         "mode": "query",
@@ -1176,7 +1263,7 @@ def compose_impact_candidates(
         "status": status,
         "freshness": changed.freshness.value,
         "index_identity": changed.index_identity,
-        "changed": [_changed_entry(item) for item in changed.findings],
+        "changed": changed_entries,
         "changed_count": len(changed.findings),
         # The changed set's own omissions, so a reader can tell them from the
         # candidates `maximum_results` dropped; `omitted_count` keeps counting
@@ -1232,21 +1319,52 @@ def _compact_changed_entry(entry: dict[str, object]) -> dict[str, object]:
     return {key: entry[key] for key in CHANGED_COMPACT_KEYS}
 
 
-def _drop_changed_tail(result: dict[str, object], changed: list[dict[str, object]]) -> None:
+def _drop_changed_tail(
+    result: dict[str, object],
+    changed: list[dict[str, object]],
+    identities: list[str],
+) -> None:
     """Drop the last changed entry, counting it and warning about it once.
 
     The drop is counted in `changed_trimmed_count` rather than in
     `omitted_count`, which counts what the engine left out and the candidates
     the budget dropped; a reader adding `changed_trimmed_count` to the length
-    of the list gets back what the engine returned.
+    of the list gets back what the engine returned. `identities` is the
+    parallel list of `result_identity` values `changed` no longer carries once
+    it is compact, kept so a later call can still tell an anchor entry from
+    the rest; it is popped in lockstep so the two lists never drift apart.
     """
     changed.pop()
+    identities.pop()
     result["changed"] = changed
     result["changed_trimmed_count"] = int(result["changed_trimmed_count"]) + 1
     _add_warning(result, WARNING_CHANGED_LIST_TRIMMED)
 
 
-def _fit_changed_to_share(result: dict[str, object], share: int) -> None:
+def _drop_unprotected_changed_tail(
+    result: dict[str, object],
+    changed: list[dict[str, object]],
+    identities: list[str],
+    protected: set[str],
+) -> bool:
+    """Drop the last changed entry unless it anchors a returned candidate.
+
+    Decision 2 of the 2.7.1 anchor-order fix: the tail trim never removes an
+    entry that anchors a returned candidate, even when the object stays over
+    budget because of it. Decision 1 already sorts every such entry ahead of
+    the rest, so once the tail reaches one of them there is nothing further
+    to trim here; the caller stops instead of skipping over it. Returns
+    whether an entry was actually dropped.
+    """
+    if not changed or identities[-1] in protected:
+        return False
+    _drop_changed_tail(result, changed, identities)
+    return True
+
+
+def _fit_changed_to_share(
+    result: dict[str, object], identities: list[str], share: int
+) -> None:
     """Fit the changed layer into its share of the budget, cheapest loss first.
 
     This only runs once the whole object is already over budget, and the
@@ -1255,7 +1373,10 @@ def _fit_changed_to_share(result: dict[str, object], share: int) -> None:
     losing a candidate: an answer only slightly over budget should not pay
     for it with a dropped candidate when compacting the changed list is
     enough on its own. Only a compact list still over its share loses entries
-    from the tail.
+    from the tail, and never one that anchors a returned candidate (decision
+    2 of the 2.7.1 anchor-order fix): if the anchors alone still exceed the
+    share, they are kept anyway - they are already compact - and the object
+    carries the overage into the later steps instead.
     """
     changed = result["changed"]
     assert isinstance(changed, list)
@@ -1263,8 +1384,10 @@ def _fit_changed_to_share(result: dict[str, object], share: int) -> None:
         return
     changed = [_compact_changed_entry(entry) for entry in changed]
     result["changed"] = changed
+    protected = _anchor_identities(result["findings"])  # type: ignore[arg-type]
     while changed and _canonical_length(changed) > share:
-        _drop_changed_tail(result, changed)
+        if not _drop_unprotected_changed_tail(result, changed, identities, protected):
+            break
 
 
 def trim_to_budget(
@@ -1278,15 +1401,22 @@ def trim_to_budget(
     not the list itself is over its third of the budget - losing entry detail
     is cheaper than losing a candidate. Only a compact list still over its
     share drops entries from the tail, counted in `changed_trimmed_count`
-    with the warning `changed-list-trimmed`. Whatever the changed layer did
-    not spend is the candidates', and they drop from the tail - strongest
-    evidence surviving longest - until the whole object fits; the anchors of a
-    kept candidate are never trimmed, so a changed symbol trimmed off the list
-    is still named by every candidate that depends on it. Only when no
-    candidate and no changed entry is left to give does
-    `output-budget-exceeded` report the overrun instead of trimming forever.
-    `changed_count` keeps counting the changed findings the engine returned,
-    and `output_characters` is always the final canonical length.
+    with the warning `changed-list-trimmed` - except an entry that anchors a
+    returned candidate, which the tail trim never removes (decision 2 of the
+    2.7.1 anchor-order fix); if the anchors alone still exceed the share they
+    are kept anyway and the object carries the overage forward. Whatever the
+    changed layer did not spend is the candidates', and they drop from the
+    tail - strongest evidence surviving longest - until the whole object
+    fits; the anchors of a kept candidate are never trimmed, so a changed
+    symbol trimmed off the list is still named by every candidate that
+    depends on it. Dropping a candidate can free the changed entries that
+    anchored only it, so the anchor set is recomputed before the changed
+    layer is asked to give up its own protected entries too - the only step
+    that still runs once every candidate is gone. Only when no candidate and
+    no changed entry is left to give does `output-budget-exceeded` report the
+    overrun instead of trimming forever. `changed_count` keeps counting the
+    changed findings the engine returned, and `output_characters` is always
+    the final canonical length.
     """
     trimmed = dict(result)
     trimmed["output_characters"] = _output_characters(trimmed)
@@ -1294,15 +1424,24 @@ def trim_to_budget(
         return trimmed
     changed = list(trimmed["changed"])  # type: ignore[arg-type]
     trimmed["changed"] = changed
-    _fit_changed_to_share(trimmed, maximum_output_characters // CHANGED_BUDGET_SHARES)
+    changed_identities = [str(entry["result_identity"]) for entry in changed]
+    _fit_changed_to_share(
+        trimmed, changed_identities, maximum_output_characters // CHANGED_BUDGET_SHARES
+    )
     trimmed["output_characters"] = _output_characters(trimmed)
     trimmed = _drop_findings_to_budget(trimmed, maximum_output_characters)
     changed = trimmed["changed"]  # type: ignore[assignment]
     assert isinstance(changed, list)
+    # Every candidate the budget was ever going to drop is gone by now, so the
+    # anchor set below is the final one this answer will ever have.
+    protected = _anchor_identities(trimmed["findings"])  # type: ignore[arg-type]
     while changed and int(trimmed["output_characters"]) > maximum_output_characters:
         # The candidates are gone and the object is still over the budget, so
         # the changed layer gives up its share too rather than overrun.
-        _drop_changed_tail(trimmed, changed)
+        if not _drop_unprotected_changed_tail(
+            trimmed, changed, changed_identities, protected
+        ):
+            break
         trimmed["output_characters"] = _output_characters(trimmed)
     if int(trimmed["output_characters"]) > maximum_output_characters:
         # Nothing left to lose: the envelope alone is over the budget, and the

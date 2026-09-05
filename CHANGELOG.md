@@ -5,6 +5,20 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Skill: `prepare-repo-context` 1.7.3.
+
+### Fixed
+
+- `impact-candidates` no longer lets its output-budget trim drop a changed
+  entry that a returned candidate names as an anchor: the tail trim of
+  `changed` now keeps every such entry, even when the anchors alone exceed
+  the changed layer's own third of the budget. `changed` is also reordered
+  ahead of any budget step - an entry anchoring a returned candidate first
+  (most-anchored first), then the rest, non-test paths before test paths and
+  a caller-anchor kind (`definition`/`entry-point`) before `module` - so a
+  budget that has to trim spends on the least useful entries first instead of
+  on whichever the engine happened to return last.
+
 ## [2.7.0] - 2026-09-05
 
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.7.2.
