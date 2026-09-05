@@ -5,6 +5,8 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+## [2.8.3] - 2026-09-05
+
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.2.
 
 ### Fixed
