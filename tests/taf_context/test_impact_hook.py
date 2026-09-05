@@ -273,10 +273,12 @@ class ImpactHookWarningTests(unittest.TestCase):
 
             # An empty staged set changes nothing: the query still runs and
             # still finds no untouched dependents (vacuously, since it has no
-            # changed symbol to have a dependent on), so it still prints the
-            # clean line naming its own 0 changed symbols (D3).
+            # changed symbol to have a dependent on). That is a vacuous
+            # check, not a verified all-clear, so it gets the zero-count
+            # sentence rather than the "no untouched dependents" wording.
             self.assertEqual((code, stdout), (0, ""))
             self.assertEqual(stderr, format_clean_line(0) + "\n")
+            self.assertEqual(stderr, "TAF impact: no indexed symbols changed\n")
 
     def test_more_dependents_than_the_cap_end_with_a_summary_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -363,6 +365,32 @@ class HookCleanLineTests(unittest.TestCase):
         self.assertEqual(
             format_clean_line(None), "TAF impact: no untouched dependents"
         )
+
+    def test_a_zero_count_gets_its_own_sentence(self) -> None:
+        # A staged change that touches no indexed symbol at all (docs-only,
+        # config-only, comment-only) had nothing to check, so it must not
+        # read as the same all-clear as a query that actually verified
+        # dependents against one or more changed symbols.
+        self.assertEqual(
+            format_clean_line(0), "TAF impact: no indexed symbols changed"
+        )
+
+    def test_a_malformed_changed_count_drops_the_parenthetical(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root)
+            # `write_fake_native_engine` always produces a usable integer,
+            # so a malformed `changed_count` (the engine sending a string,
+            # or a bool riding in on the int check) is exercised by patching
+            # the query result directly rather than inventing a new fixture.
+            malformed_result = {"findings": [], "changed_count": "3"}
+            stderr = io.StringIO()
+
+            with mock.patch.object(impact_hook, "run_query", return_value=malformed_result):
+                code = run_hook(repository, environment=environment, stderr=stderr, verbose=False)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr.getvalue(), format_clean_line(None) + "\n")
 
     def test_a_commit_that_carries_every_dependent_prints_the_clean_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

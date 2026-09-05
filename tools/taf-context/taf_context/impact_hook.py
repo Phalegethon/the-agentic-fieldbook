@@ -70,6 +70,12 @@ HOOK_POINTER = "(ask your agent to list TAF impact for this commit)"
 # unreadable staged set, no interpreter) stays silent, because claiming a
 # check that did not happen would be a false all-clear.
 HOOK_CLEAN_SUMMARY = "no untouched dependents"
+# `changed_count == 0` gets its own sentence rather than reusing
+# `HOOK_CLEAN_SUMMARY` with a "(0 changed symbols)" parenthetical: with
+# nothing indexed changed (a docs-only, config-only, or comment-only
+# commit), there was nothing for the query to check, so "no untouched
+# dependents" would read as a real all-clear over a vacuous one.
+HOOK_NOTHING_CHANGED_SUMMARY = "no indexed symbols changed"
 
 HOOK_FILE_NAME = "pre-commit"
 CHAINED_HOOK_NAME = "pre-commit.taf-chained"
@@ -296,9 +302,15 @@ def format_clean_line(changed_count: int | None) -> str:
     `changed_count` is the query result's own field; it is dropped from the
     line when the result did not carry a usable integer, so a composition
     change can never turn this line into a lie about how much was checked.
+    Zero is different from "unusable", not merely the smallest count: a
+    staged change that touches no indexed symbol at all had nothing to
+    check, so it gets its own sentence (`HOOK_NOTHING_CHANGED_SUMMARY`)
+    rather than reading as a genuine all-clear over an empty check.
     """
     if changed_count is None:
         return HOOK_HEADER_PREFIX + HOOK_CLEAN_SUMMARY
+    if changed_count == 0:
+        return HOOK_HEADER_PREFIX + HOOK_NOTHING_CHANGED_SUMMARY
     symbols = "symbol" if changed_count == 1 else "symbols"
     return (
         HOOK_HEADER_PREFIX
