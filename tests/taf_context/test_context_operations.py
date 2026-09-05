@@ -13,13 +13,15 @@ import time
 import unittest
 from unittest.mock import patch
 
-from taf_context import context_operations
+from taf_context import context_operations, level1_models
 from taf_context.change_ranges import ChangedPath
 from taf_context.context_operations import (
     MAXIMUM_REQUEST_BYTES,
     OVERVIEW_BUDGET_SHARES,
+    OVERVIEW_ENGINE_OUTPUT_CHARACTERS,
     PrepareCLIError,
     QueryArguments,
+    _merge_overview_languages,
     _overview_rows_folded_to,
     bound_changed_selector,
     compose_impact_candidates,
@@ -383,6 +385,16 @@ class OperationTests(unittest.TestCase):
                 if item["operation"] == "repository-map"
             ][-1]
             self.assertEqual(mapped["maximum_model_output_characters"], 2000)
+
+    def test_the_engine_budget_stays_the_wire_maximum(self) -> None:
+        # OVERVIEW_ENGINE_OUTPUT_CHARACTERS must track the wire's own allowed
+        # budgets, not a copy of the number: if the schema ever grows a wider
+        # budget, this constant should widen with it rather than silently
+        # falling behind.
+        self.assertEqual(
+            OVERVIEW_ENGINE_OUTPUT_CHARACTERS,
+            max(level1_models._ALLOWED_BUDGETS),
+        )
 
     def test_the_overview_summary_is_never_trimmed_and_reports_its_length(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1461,6 +1473,24 @@ class OverviewBudgetTests(unittest.TestCase):
                     "representative_identity": None,
                 },
             ],
+        )
+
+    def test_the_merged_language_list_is_bounded_like_the_go_fold(self) -> None:
+        # internal/render/render.go caps its merged language list at
+        # policy.ProductionLimits().MaximumCollectionItems (64); the Python
+        # fold must match, not merge an unbounded list.
+        lists = [
+            [{"language": f"lang{index:03d}", "file_count": 1}] for index in range(80)
+        ]
+
+        merged = _merge_overview_languages(*lists)
+
+        self.assertEqual(len(merged), 64)
+        # Ties by file_count (all 1) break by name, so the kept 64 are the
+        # alphabetically-first 64 of the 80 candidates.
+        self.assertEqual(
+            [item["language"] for item in merged],
+            [f"lang{index:03d}" for index in range(64)],
         )
 
     def test_each_layer_gets_at_most_half_of_the_budget(self) -> None:

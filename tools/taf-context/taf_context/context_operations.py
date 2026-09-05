@@ -21,7 +21,13 @@ from .change_ranges import (
     resolve_change_base,
 )
 from .git_snapshot import collect_snapshot
-from .level1_models import Level1Finding, Level1Result, parse_level1_result
+from .level1_models import (
+    Level1Finding,
+    Level1Result,
+    max_allowed_output_characters,
+    max_collection_items,
+    parse_level1_result,
+)
 from .native_transport import NativeTransport, NativeTransportError
 from .refresh import (
     Binding,
@@ -725,14 +731,14 @@ DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION: dict[str, int] = {
     "impact-candidates": 8000,
 }
 # The overview is fitted entirely by the broker, so it asks the engine for the
-# widest answer the wire allows - 12000 is the largest of the four budgets the
-# request schema accepts. Handing the engine the caller's own budget instead
-# let the engine's own fit - which measures rendered lines and their previews,
-# not the object the broker sends - drop findings before the broker ever saw
-# them, and no rule here could buy them back: on a repository whose previews
-# are long, an 8000-character overview arrived with four of the eight files it
-# asked for.
-OVERVIEW_ENGINE_OUTPUT_CHARACTERS = 12000
+# widest answer the wire allows - the largest of the budgets the request
+# schema accepts. Handing the engine the caller's own budget instead let the
+# engine's own fit - which measures rendered lines and their previews, not the
+# object the broker sends - drop findings before the broker ever saw them, and
+# no rule here could buy them back: on a repository whose previews are long,
+# an 8000-character overview arrived with four of the eight files it asked
+# for.
+OVERVIEW_ENGINE_OUTPUT_CHARACTERS = max_allowed_output_characters()
 # The composed operation asks the engine for the widest change set and the
 # widest relationship answer it will give, then trims what it composed to the
 # caller's own budget.
@@ -1148,17 +1154,22 @@ def _merge_overview_languages(
     """Sum the language counts of several rows, most files first, ties by name.
 
     That is the order a single group's list already promises, so the merged
-    row reads exactly like every other row of the table.
+    row reads exactly like every other row of the table. The merged list is
+    bounded the way every language list is - a fold joining more languages
+    than a result may carry keeps the ones most of its files are written in -
+    matching the Go engine's own fold (`mergeOverviewLanguages`,
+    `internal/render/render.go`).
     """
     totals: dict[str, int] = {}
     for languages in lists:
         for item in languages:
             name = str(item["language"])
             totals[name] = totals.get(name, 0) + int(item["file_count"])
-    return [
+    merged = [
         {"language": name, "file_count": count}
         for name, count in sorted(totals.items(), key=lambda item: (-item[1], item[0]))
     ]
+    return merged[: max_collection_items()]
 
 
 def _overview_real_rows(groups: list[dict[str, object]]) -> int:

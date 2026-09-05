@@ -645,6 +645,33 @@ func TestOverviewRanksEveryWellKnownEntryName(t *testing.T) {
 	})
 }
 
+// A name that merely resembles a well-known entry name earns no ranking
+// hint: the predicate matches the exact base name, case-sensitively, with no
+// substring or double-extension leakage, and main.go only inside cmd/.
+func TestOverviewWellKnownEntryNameLookAlikesAreNotEntryPoints(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"page.tsx plural is not page.tsx", "group/pages.tsx"},
+		{"layout.test.tsx is a test file, not layout.tsx", "group/layout.test.tsx"},
+		{"main.go outside cmd/ is an ordinary file", "pkg/main.go"},
+		{"route.tsx.bak is a backup, not route.tsx", "group/route.tsx.bak"},
+		{"Page.tsx does not match the lowercase page.tsx", "group/Page.tsx"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if wellKnownEntryPath(testCase.path) {
+				t.Fatalf("wellKnownEntryPath(%q) = true, want false", testCase.path)
+			}
+			facts := fileFacts{path: testCase.path, wellKnown: wellKnownEntryPath(testCase.path)}
+			if entryPointFile(facts) {
+				t.Fatalf("entryPointFile(%q) = true, want false", testCase.path)
+			}
+		})
+	}
+}
+
 // A counted file whose admitted records are none of module, definition,
 // entry-point, heading/document-chunk or configuration still needs a place in
 // the ranking, so it falls to the fifth "other" tier, last of every tier.

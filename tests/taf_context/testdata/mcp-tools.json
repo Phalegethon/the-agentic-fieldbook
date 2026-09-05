@@ -33,7 +33,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Build a fresh bounded index for the repository in user-local TAF state (never inside the repository). Requires confirm_state_write: true, which you may only pass after the user explicitly approved writing state in this conversation. Query only when the result's next_safe_action is use-index.",
+    "description": "Build a fresh bounded index for the repository in user-local TAF state (never inside the repository). Requires confirm_state_write: true, which you may only pass after the user explicitly approved writing state in this conversation. If the repository is bound to an index an older runtime wrote, that record is removed under the same authorization before the new index is built, and the summary reports incompatible-generation. Query only when the result's next_safe_action is use-index.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

@@ -784,6 +784,16 @@ class CandidateManifest:
         }
 
 
+def max_allowed_output_characters() -> int:
+    """The largest output-character budget the wire schema accepts."""
+    return max(_ALLOWED_BUDGETS)
+
+
+def max_collection_items() -> int:
+    """The wire's cap on any single collection (findings, languages, ...)."""
+    return _MAX_COLLECTION
+
+
 def parse_level1_request(raw: bytes) -> Level1Request:
     return Level1Request.from_dict(_load_wire(raw, "request"))
 

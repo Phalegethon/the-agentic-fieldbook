@@ -42,10 +42,11 @@ skills: `branch-handoff` 1.2.1, `prepare-repo-context` 1.7.1,
 - `repository-overview` counts and ranks framework entry points. A file counts
   toward `entry_point_count` when it carries an entry-point record **or** when
   its base name is one an ecosystem starts at, and the well-known names now
-  include the Next.js App Router segment conventions (`page`, `layout`,
+  include the Next.js App Router conventional file names (`page`, `layout`,
   `route`, `loading`, `error`, `not-found`, `template`, `default` in `.tsx`,
-  `.ts`, `.jsx` and `.js`) and its four single-file conventions
-  (`middleware.ts`, `instrumentation.ts`, `sitemap.ts`, `robots.ts`). The
+  `.ts`, `.jsx` and `.js`), matched by base name wherever the file sits, and
+  its four single-file conventions (`middleware.ts`, `instrumentation.ts`,
+  `sitemap.ts`, `robots.ts`). The
   column therefore counts entry-point *files*, one per file, rather than
   entry-point records. The file layer also offers every group's entry points
   before any group offers a second-tier file, so an `app/` directory of route
