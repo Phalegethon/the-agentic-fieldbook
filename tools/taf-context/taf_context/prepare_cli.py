@@ -36,6 +36,7 @@ from .context_operations import (  # noqa: F401 - re-exported for callers and te
     validate_query_request,
 )
 from .git_snapshot import collect_snapshot
+from .impact_hook import hook_status, install_hook, remove_hook
 from .native_transport import OneShotTransport
 from .state_lifecycle import Candidate, apply_plan, plan_gc, plan_remove
 from .state_paths import StateError
@@ -81,6 +82,18 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
     hook_run = hook_commands.add_parser("run")
     hook_run.add_argument("--repo", required=True)
     hook_run.add_argument("--verbose", action="store_true")
+
+    hook_install = hook_commands.add_parser("install")
+    hook_install.add_argument("--repo", required=True)
+    hook_install.add_argument("--confirm-hook-write", action="store_true")
+    hook_install.add_argument("--chain", action="store_true")
+
+    hook_remove = hook_commands.add_parser("remove")
+    hook_remove.add_argument("--repo", required=True)
+    hook_remove.add_argument("--confirm-hook-write", action="store_true")
+
+    hook_status_parser = hook_commands.add_parser("status")
+    hook_status_parser.add_argument("--repo", required=True)
 
     query = commands.add_parser("query")
     query.add_argument("--repo", required=True)
@@ -142,6 +155,9 @@ def run_prepare_command(
     if args.prepare_command == "build" and not args.confirm_state_write:
         raise PrepareCLIError("explicit state-write confirmation required")
 
+    if args.prepare_command == "hook":
+        return _run_hook_command(args, environment=environment)
+
     if args.prepare_command == "gc":
         paths = _state_paths(environment)
         try:
@@ -193,6 +209,26 @@ def run_prepare_command(
             installer=_install_native_engine if args.prepare_command == "activate" else None,
         )
     return run_inspect(repository, environment=environment, transport_for=OneShotTransport)
+
+
+def _run_hook_command(
+    args: argparse.Namespace, *, environment: Mapping[str, str]
+) -> dict[str, object]:
+    """`install`/`remove`/`status`; `run` is routed in `cli.main` before this."""
+    repository = Path(args.repo)
+    if args.hook_command == "install":
+        if not args.confirm_hook_write:
+            raise PrepareCLIError("explicit hook-write confirmation required")
+        return install_hook(repository, chain=args.chain)
+    if args.hook_command == "remove":
+        if not args.confirm_hook_write:
+            raise PrepareCLIError("explicit hook-write confirmation required")
+        return remove_hook(repository)
+    if args.hook_command == "status":
+        return hook_status(repository, environment=environment, transport_for=OneShotTransport)
+    raise PrepareCLIError(  # pragma: no cover - argparse limits hook_command to the above
+        "unsupported hook command"
+    )
 
 
 def _run_change_query_over_a_session(

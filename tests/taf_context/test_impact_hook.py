@@ -6,6 +6,9 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -13,17 +16,22 @@ import unittest
 from taf_context.cli import main
 from taf_context.context_operations import QueryArguments
 from taf_context.impact_hook import (
+    CHAINED_HOOK_NAME,
+    HOOK_FILE_NAME,
     HOOK_MAXIMUM_LINES,
     HOOK_TIME_LIMIT_SECONDS,
+    LAUNCHER_MARKER,
+    _entry_point_script,
     _hook_query,
     format_summary_line,
     format_warning_line,
+    install_hook,
     run_hook,
     untouched_dependents,
 )
 
 from .repo_factory import commit_all, init_repo, init_committed_repo, run, write
-from .test_prepare_cli import invoke, write_fake_native_engine
+from .test_prepare_cli import decoded, invoke, write_fake_native_engine
 
 
 def numbered(prefix: str, count: int) -> str:
@@ -463,6 +471,584 @@ class HookQueryTests(unittest.TestCase):
                 staged=True,
             ),
         )
+
+
+def commit_environment(extra: dict[str, str]) -> dict[str, str]:
+    """The environment a real `git commit` subprocess needs to run the launcher.
+
+    Carries the host's own `PATH`/`HOME`/`LANG`/`LC_ALL` (the launcher's
+    embedded interpreter is an absolute path, but `git` itself and every
+    internal `git` call the hook makes are found on `PATH`), the fixture's
+    `TAF_STATE_HOME`/`TAF_LEVEL1_BINARY`, and `repo_factory.run`'s own git
+    config isolation so no host hooksPath or maintenance setting leaks in.
+    """
+    environment: dict[str, str] = {
+        key: os.environ[key] for key in ("PATH", "HOME", "LANG", "LC_ALL") if key in os.environ
+    }
+    environment.update(extra)
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "maintenance.auto",
+            "GIT_CONFIG_VALUE_0": "0",
+            "GIT_CONFIG_KEY_1": "gc.auto",
+            "GIT_CONFIG_VALUE_1": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
+
+
+class HookInstallTests(unittest.TestCase):
+    """`hook install` writes an executable launcher naming the entry point."""
+
+    def test_a_fresh_install_writes_an_executable_launcher_and_the_exact_summary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+
+            code, stdout, stderr = invoke(
+                {},
+                "prepare", "hook", "install",
+                "--repo", str(repository),
+                "--confirm-hook-write",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            self.assertTrue(hook_path.is_file())
+            self.assertEqual(hook_path.stat().st_mode & 0o111, 0o111)
+            content = hook_path.read_text(encoding="utf-8")
+            lines = content.splitlines()
+            self.assertEqual(lines[1], LAUNCHER_MARKER)
+            interpreter = str(Path(sys.executable).resolve())
+            script = _entry_point_script()
+            self.assertIn(shlex.quote(interpreter), content)
+            self.assertIn(shlex.quote(str(script)), content)
+            self.assertNotIn("\nexec ", content)
+            self.assertEqual(
+                decoded(stdout),
+                {
+                    "schema_version": "1",
+                    "mode": "hook-install",
+                    "hook_path": str(hook_path),
+                    "written": True,
+                    "chained": False,
+                    "chained_hook_path": None,
+                    "interpreter": interpreter,
+                    "script": str(script),
+                    "next_safe_action": "none",
+                },
+            )
+
+    def test_installing_twice_writes_identical_bytes_both_times(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
+
+            code1, stdout1, _stderr1 = invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            first_bytes = hook_path.read_bytes()
+            code2, stdout2, _stderr2 = invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            second_bytes = hook_path.read_bytes()
+
+            self.assertEqual((code1, code2), (0, 0))
+            self.assertEqual(first_bytes, second_bytes)
+            self.assertTrue(decoded(stdout1)["written"])
+            self.assertTrue(decoded(stdout2)["written"])
+
+    def test_a_pinned_interpreter_is_embedded_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            pinned = root / "some" / "other" / "python3"
+
+            summary = install_hook(repository, chain=False, interpreter=pinned)
+
+            self.assertEqual(summary["interpreter"], str(pinned.resolve()))
+            hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            self.assertIn(
+                shlex.quote(str(pinned.resolve())), hook_path.read_text(encoding="utf-8")
+            )
+
+
+class HookRefusalTests(unittest.TestCase):
+    """Every refusal the spec names, verbatim, and nothing written by it."""
+
+    def test_install_without_confirmation_refuses_and_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "install", "--repo", str(repository)
+            )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, "")
+            self.assertEqual(stderr, "error: explicit hook-write confirmation required\n")
+            self.assertFalse((repository / ".git" / "hooks" / HOOK_FILE_NAME).exists())
+
+    def test_remove_without_confirmation_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "remove", "--repo", str(repository)
+            )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(stderr, "error: explicit hook-write confirmation required\n")
+
+    def test_a_foreign_hook_without_chain_is_refused_and_left_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign = hooks_dir / HOOK_FILE_NAME
+            foreign_bytes = b"#!/bin/sh\necho foreign >&2\nexit 3\n"
+            foreign.write_bytes(foreign_bytes)
+            foreign.chmod(0o755)
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                stderr,
+                "error: a foreign pre-commit hook exists; pass --chain to run it after "
+                "TAF, or remove it first\n",
+            )
+            self.assertEqual(foreign.read_bytes(), foreign_bytes)
+
+    def test_chaining_refuses_when_a_stale_chained_hook_already_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            (hooks_dir / HOOK_FILE_NAME).write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            (hooks_dir / HOOK_FILE_NAME).chmod(0o755)
+            (hooks_dir / CHAINED_HOOK_NAME).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write", "--chain",
+            )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                stderr,
+                f"error: {CHAINED_HOOK_NAME} already exists; remove it before chaining "
+                "another hook\n",
+            )
+
+    def test_remove_refuses_a_foreign_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            (hooks_dir / HOOK_FILE_NAME).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "remove",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                stderr, "error: pre-commit is not a TAF launcher; nothing removed\n"
+            )
+
+    def test_remove_on_an_absent_hook_is_a_no_op(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "remove",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["removed"], False)
+            self.assertEqual(summary["restored"], False)
+
+    def test_a_redirected_hooks_path_refuses_install_and_remove(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            custom = root / "custom-hooks"
+            custom.mkdir()
+            run(repository, "git", "config", "core.hooksPath", str(custom))
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                stderr,
+                f"error: core.hooksPath redirects hooks to {custom}; TAF installs only "
+                "under the repository's own hooks directory\n",
+            )
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "remove",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(
+                stderr,
+                f"error: core.hooksPath redirects hooks to {custom}; nothing to remove "
+                "there\n",
+            )
+
+            code, stdout, stderr = invoke(
+                {"TAF_STATE_HOME": str(root / "state")},
+                "prepare", "hook", "status", "--repo", str(repository),
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "redirected")
+            self.assertEqual(summary["hooks_path"], str(custom))
+            self.assertIsNone(summary["hook_path"])
+            self.assertFalse(summary["chained"])
+            self.assertIsNone(summary["launcher_current"])
+
+
+class HookChainTests(unittest.TestCase):
+    """Chaining a foreign hook, and `remove` restoring it byte-for-byte."""
+
+    def test_chaining_a_foreign_hook_runs_it_after_taf_and_remove_restores_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign_path = hooks_dir / HOOK_FILE_NAME
+            foreign_bytes = b"#!/bin/sh\necho foreign >&2\nexit 3\n"
+            foreign_path.write_bytes(foreign_bytes)
+            foreign_path.chmod(0o755)
+            foreign_mode = foreign_path.stat().st_mode
+
+            code, stdout, _stderr = invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write", "--chain",
+            )
+            self.assertEqual(code, 0)
+            summary = decoded(stdout)
+            chained_path = hooks_dir / CHAINED_HOOK_NAME
+            self.assertTrue(summary["chained"])
+            self.assertEqual(summary["chained_hook_path"], str(chained_path))
+            self.assertEqual(chained_path.read_bytes(), foreign_bytes)
+            self.assertEqual(chained_path.stat().st_mode, foreign_mode)
+            launcher_lines = (hooks_dir / HOOK_FILE_NAME).read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertEqual(
+                launcher_lines[-1], f'exec {shlex.quote(str(chained_path))} "$@"'
+            )
+
+            # A re-install without --chain keeps the launcher chained.
+            code, stdout, _stderr = invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            self.assertEqual(code, 0)
+            self.assertTrue(decoded(stdout)["chained"])
+
+            code, stdout, _stderr = invoke(
+                {}, "prepare", "hook", "remove",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            self.assertEqual(code, 0)
+            summary = decoded(stdout)
+            self.assertEqual((summary["removed"], summary["restored"]), (True, True))
+            self.assertFalse(chained_path.exists())
+            restored_path = hooks_dir / HOOK_FILE_NAME
+            self.assertEqual(restored_path.read_bytes(), foreign_bytes)
+            self.assertEqual(restored_path.stat().st_mode, foreign_mode)
+
+
+class HookStatusTests(unittest.TestCase):
+    """`status`'s four hook states, `launcher_current`, and its readiness field."""
+
+    def test_status_on_a_repository_with_no_hook_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+
+            code, stdout, stderr = invoke(
+                {"TAF_STATE_HOME": str(root / "state")},
+                "prepare", "hook", "status", "--repo", str(repository),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "absent")
+            self.assertFalse(summary["chained"])
+            self.assertIsNone(summary["launcher_current"])
+
+    def test_status_on_a_foreign_hook_is_foreign(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            (hooks_dir / HOOK_FILE_NAME).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+            code, stdout, stderr = invoke(
+                {"TAF_STATE_HOME": str(root / "state")},
+                "prepare", "hook", "status", "--repo", str(repository),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "foreign")
+            self.assertIsNone(summary["launcher_current"])
+
+    def test_status_reports_an_unchained_installed_launcher_as_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+
+            code, stdout, stderr = invoke(
+                {"TAF_STATE_HOME": str(root / "state")},
+                "prepare", "hook", "status", "--repo", str(repository),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "installed")
+            self.assertFalse(summary["chained"])
+            self.assertTrue(summary["launcher_current"])
+
+    def test_status_reports_a_chained_installed_launcher_as_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            (hooks_dir / HOOK_FILE_NAME).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (hooks_dir / HOOK_FILE_NAME).chmod(0o755)
+            invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write", "--chain",
+            )
+
+            code, stdout, stderr = invoke(
+                {"TAF_STATE_HOME": str(root / "state")},
+                "prepare", "hook", "status", "--repo", str(repository),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "installed")
+            self.assertTrue(summary["chained"])
+            self.assertTrue(summary["launcher_current"])
+
+    def test_status_reports_a_stale_launcher_as_not_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            stale = hook_path.read_text(encoding="utf-8").replace(
+                shlex.quote(str(Path(sys.executable).resolve())),
+                shlex.quote(str(root / "old-python")),
+            )
+            hook_path.write_text(stale, encoding="utf-8")
+            hook_path.chmod(0o755)
+
+            code, stdout, stderr = invoke(
+                {"TAF_STATE_HOME": str(root / "state")},
+                "prepare", "hook", "status", "--repo", str(repository),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "installed")
+            self.assertFalse(summary["launcher_current"])
+
+    def test_readiness_names_use_index_after_a_fake_engine_build(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = staged_impact_fixture(root)
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+            build_index(environment, repository)
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository)
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(
+                decoded(stdout)["readiness"],
+                {"next_safe_action": "use-index", "error": None},
+            )
+
+    def test_readiness_names_the_unborn_repository_error_while_hook_is_still_reported(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_repo(root / "repo")
+
+            code, stdout, stderr = invoke(
+                {"TAF_STATE_HOME": str(root / "state")},
+                "prepare", "hook", "status", "--repo", str(repository),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "absent")
+            self.assertIsNone(summary["readiness"]["next_safe_action"])
+            self.assertEqual(
+                summary["readiness"]["error"], "repository must have at least one commit"
+            )
+
+
+class HookWorktreeTests(unittest.TestCase):
+    """A linked worktree shares its common directory's `.git/hooks`."""
+
+    def test_install_from_a_linked_worktree_writes_the_common_hooks_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            worktree = root / "wt"
+            run(repository, "git", "worktree", "add", "-b", "wt-branch", str(worktree), "HEAD")
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "install",
+                "--repo", str(worktree), "--confirm-hook-write",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            common_hook = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            self.assertTrue(common_hook.is_file())
+
+            for checkout in (repository, worktree):
+                code, stdout, stderr = invoke(
+                    {"TAF_STATE_HOME": str(root / "state")},
+                    "prepare", "hook", "status", "--repo", str(checkout),
+                )
+                self.assertEqual((code, stderr), (0, ""))
+                self.assertEqual(decoded(stdout)["hook"], "installed")
+
+
+class HookEndToEndTests(unittest.TestCase):
+    """A real `git commit` through the installed launcher."""
+
+    def test_a_real_commit_runs_the_launcher_and_the_disable_switch_silences_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+            install_code, _stdout, _stderr = invoke(
+                environment, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+            self.assertEqual(install_code, 0)
+            before_log = run(repository, "git", "log", "--format=%H")
+
+            result = subprocess.run(
+                ["git", "commit", "-m", "x"],
+                cwd=repository,
+                env=commit_environment(environment),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+            self.assertNotIn("TAF:", result.stdout)
+            after_log = run(repository, "git", "log", "--format=%H")
+            self.assertNotEqual(before_log, after_log)
+
+            # A second, otherwise-warning-worthy commit prints nothing under
+            # TAF_HOOK=0.
+            stage_edit(repository, "app.py", 5, "line 5 changed again")
+            disabled_environment = commit_environment(environment)
+            disabled_environment["TAF_HOOK"] = "0"
+
+            result = subprocess.run(
+                ["git", "commit", "-m", "y"],
+                cwd=repository,
+                env=disabled_environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, "")
+
+    def test_a_chained_failing_hook_still_blocks_the_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            foreign = hooks_dir / HOOK_FILE_NAME
+            foreign.write_text("#!/bin/sh\necho foreign >&2\nexit 3\n", encoding="utf-8")
+            foreign.chmod(0o755)
+            install_code, _stdout, _stderr = invoke(
+                environment, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write", "--chain",
+            )
+            self.assertEqual(install_code, 0)
+            before_log = run(repository, "git", "log", "--format=%H")
+
+            result = subprocess.run(
+                ["git", "commit", "-m", "x"],
+                cwd=repository,
+                env=commit_environment(environment),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("TAF:", result.stderr)
+            self.assertIn("foreign", result.stderr)
+            after_log = run(repository, "git", "log", "--format=%H")
+            self.assertEqual(before_log, after_log)
 
 
 class _RaisingStderr:

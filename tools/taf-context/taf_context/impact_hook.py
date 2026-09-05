@@ -7,17 +7,25 @@ five one-line warnings to stderr. It is advisory only: it never builds,
 activates, downloads, removes, or garbage-collects, it never writes to stdout,
 it always exits 0, and it gives itself a hard wall-clock budget so a slow or
 cold engine can never hold up a commit.
+
+`install_hook`, `remove_hook`, and `hook_status` manage the launcher itself:
+the only write this module ever makes to a repository, and only under
+`--confirm-hook-write`, inside `.git/hooks`.
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 from pathlib import Path
+import shlex
+import subprocess
+import sys
 import threading
 import time
 from typing import Collection, Mapping, TextIO
 
-from .context_operations import QueryArguments, run_inspect, run_query
+from .context_operations import PrepareCLIError, QueryArguments, TransportFactory, run_inspect, run_query
 from .git_snapshot import SnapshotError, _git
 from .native_transport import NativeTransport, NativeTransportError
 
@@ -28,6 +36,14 @@ HOOK_MAXIMUM_RESULTS = 16  # candidates the one impact query asks the engine for
 HOOK_OUTPUT_CHARACTERS = 12000  # output budget of that query
 HOOK_DISABLE_VARIABLE = "TAF_HOOK"  # set to exactly "0" to disable the hook entirely
 HOOK_LINE_PREFIX = "TAF: "  # every warning the hook writes starts here
+
+HOOK_FILE_NAME = "pre-commit"
+CHAINED_HOOK_NAME = "pre-commit.taf-chained"
+# The second line of every launcher this module writes; a `pre-commit` file
+# containing this exact line is a TAF launcher, anything else is foreign.
+LAUNCHER_MARKER = "# TAF commit-time impact warning (managed by: prepare hook install)"
+
+_HOOK_GIT_TIMEOUT_SECONDS = 20  # wall clock for the small git calls hook management makes
 
 # How long the watchdog waits for an abandoned worker to unwind after its
 # engine child was killed. The worker only has to see EOF, close its streams
@@ -323,4 +339,263 @@ def _explain(stderr: TextIO, verbose: bool, reason: str) -> None:
     """Say why the hook is silent - and only when the caller asked."""
     if verbose:
         stderr.write(f"TAF hook: {reason}\n")
+
+
+def install_hook(
+    repository: Path, *, chain: bool, interpreter: Path | None = None
+) -> dict[str, object]:
+    """Write the pre-commit launcher; idempotent, and the only write this module makes.
+
+    `interpreter` exists so tests can pin it; every production caller leaves
+    it as the default, which resolves `sys.executable` exactly the way the
+    launcher's own embedded interpreter path must be resolved.
+    """
+    state, hooks_dir, hooks_path_value = _resolve_hooks_directory(repository)
+    if state == "redirected":
+        raise PrepareCLIError(
+            f"core.hooksPath redirects hooks to {hooks_path_value}; TAF installs only "
+            "under the repository's own hooks directory"
+        )
+    script = _entry_point_script()
+    if not script.is_file():
+        raise PrepareCLIError(
+            "the TAF plugin entry point prepare_repo_context.py could not be located"
+        )
+    resolved_interpreter = (
+        interpreter if interpreter is not None else Path(sys.executable)
+    ).resolve()
+    hook_path = hooks_dir / HOOK_FILE_NAME
+    chained_path = hooks_dir / CHAINED_HOOK_NAME
+    kind = _classify_pre_commit(hook_path)
+    chained_hook_path: Path | None = None
+    if kind == "taf":
+        # A re-install never drops a chained hook, regardless of `--chain`.
+        if chained_path.exists():
+            chained_hook_path = chained_path
+    elif kind == "foreign":
+        if not chain:
+            raise PrepareCLIError(
+                "a foreign pre-commit hook exists; pass --chain to run it after TAF, "
+                "or remove it first"
+            )
+        if chained_path.exists():
+            raise PrepareCLIError(
+                f"{CHAINED_HOOK_NAME} already exists; remove it before chaining another hook"
+            )
+        os.replace(hook_path, chained_path)  # mode is preserved by the rename
+        chained_hook_path = chained_path
+    source = _render_launcher(
+        interpreter=resolved_interpreter, script=script, chained_hook_path=chained_hook_path
+    )
+    _write_launcher_atomically(hooks_dir, hook_path, source)
+    return {
+        "schema_version": "1",
+        "mode": "hook-install",
+        "hook_path": str(hook_path),
+        "written": True,
+        "chained": chained_hook_path is not None,
+        "chained_hook_path": (
+            str(chained_hook_path) if chained_hook_path is not None else None
+        ),
+        "interpreter": str(resolved_interpreter),
+        "script": str(script),
+        "next_safe_action": "none",
+    }
+
+
+def remove_hook(repository: Path) -> dict[str, object]:
+    """Remove the TAF launcher and restore a chained hook if one was moved aside."""
+    state, hooks_dir, hooks_path_value = _resolve_hooks_directory(repository)
+    if state == "redirected":
+        raise PrepareCLIError(
+            f"core.hooksPath redirects hooks to {hooks_path_value}; nothing to remove there"
+        )
+    hook_path = hooks_dir / HOOK_FILE_NAME
+    chained_path = hooks_dir / CHAINED_HOOK_NAME
+    kind = _classify_pre_commit(hook_path)
+    if kind == "foreign":
+        raise PrepareCLIError("pre-commit is not a TAF launcher; nothing removed")
+    removed = False
+    restored = False
+    if kind == "taf":
+        hook_path.unlink()
+        removed = True
+        if chained_path.exists():
+            os.replace(chained_path, hook_path)
+            restored = True
+    return {
+        "schema_version": "1",
+        "mode": "hook-remove",
+        "hook_path": str(hook_path),
+        "removed": removed,
+        "restored": restored,
+        "next_safe_action": "none",
+    }
+
+
+def hook_status(
+    repository: Path,
+    *,
+    environment: Mapping[str, str],
+    transport_for: TransportFactory,
+) -> dict[str, object]:
+    """Report the launcher's state and the index's readiness; this never writes.
+
+    The hook classification (installed/foreign/absent/redirected) is decided
+    first and independently of the index: a broken or unborn index still gets
+    an honest `hook` field, with the readiness failure folded into its own
+    `readiness.error` instead of aborting the whole report.
+    """
+    state, hooks_dir, hooks_path_value = _resolve_hooks_directory(repository)
+    chained = False
+    launcher_current: bool | None = None
+    hook_path_value: str | None = None
+    if state == "redirected":
+        hook_field = "redirected"
+    else:
+        hook_path = hooks_dir / HOOK_FILE_NAME
+        chained_path = hooks_dir / CHAINED_HOOK_NAME
+        chained = chained_path.exists()
+        hook_path_value = str(hook_path)
+        kind = _classify_pre_commit(hook_path)
+        if kind == "taf":
+            hook_field = "installed"
+            expected = _render_launcher(
+                interpreter=Path(sys.executable).resolve(),
+                script=_entry_point_script(),
+                chained_hook_path=chained_path if chained else None,
+            )
+            try:
+                actual = hook_path.read_text(encoding="utf-8", errors="surrogateescape")
+            except OSError:
+                actual = None
+            launcher_current = actual == expected
+        else:
+            hook_field = kind  # "foreign" or "absent"
+    error: str | None = None
+    next_action: str | None = None
+    try:
+        summary = run_inspect(repository, environment=environment, transport_for=transport_for)
+        next_action = summary.get("next_safe_action")
+    except PrepareCLIError as exc:
+        error = str(exc)
+    return {
+        "schema_version": "1",
+        "mode": "hook-status",
+        "hook": hook_field,
+        "hooks_path": hooks_path_value,
+        "hook_path": hook_path_value,
+        "chained": chained,
+        "launcher_current": launcher_current,
+        "readiness": {"next_safe_action": next_action, "error": error},
+    }
+
+
+def _entry_point_script() -> Path:
+    """The plugin's stable entry point, located from this package's own path."""
+    return (
+        Path(__file__).resolve().parents[3]
+        / "skills"
+        / "prepare-repo-context"
+        / "scripts"
+        / "prepare_repo_context.py"
+    )
+
+
+def _run_repository_git(repository: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """A plain `git -C <repo>` call over the caller's real environment.
+
+    Unlike `git_snapshot._git`, this must see the caller's actual effective
+    Git configuration - including a real `core.hooksPath` - so it copies
+    `os.environ` rather than pinning the `GIT_CONFIG_*` overrides that would
+    mask it.
+    """
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repository), *args],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=_HOOK_GIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PrepareCLIError("repository is not a Git work tree") from exc
+
+
+def _resolve_hooks_directory(repository: Path) -> tuple[str, Path | None, str]:
+    """Where TAF may write the launcher, or why it must not.
+
+    Returns `("redirected", None, <raw core.hooksPath value>)` when hooks are
+    redirected elsewhere, or `("resolved", <absolute hooks dir>, <str of it>)`
+    otherwise. Raises when `repository` is not a Git work tree at all.
+    """
+    repository = repository.resolve()
+    configured = _run_repository_git(repository, "config", "--get", "core.hooksPath")
+    if configured.returncode == 0:
+        value = configured.stdout.decode("utf-8", "surrogateescape").rstrip("\n")
+        return "redirected", None, value
+    located = _run_repository_git(repository, "rev-parse", "--git-path", "hooks")
+    if located.returncode != 0:
+        raise PrepareCLIError("repository is not a Git work tree")
+    raw = located.stdout.decode("utf-8", "surrogateescape").rstrip("\n")
+    hooks_dir = Path(raw)
+    if not hooks_dir.is_absolute():
+        hooks_dir = repository / hooks_dir
+    hooks_dir = hooks_dir.resolve()
+    return "resolved", hooks_dir, str(hooks_dir)
+
+
+def _classify_pre_commit(hook_path: Path) -> str:
+    """"absent", "taf", or "foreign" - the only three things a hook file can be."""
+    try:
+        content = hook_path.read_text(encoding="utf-8", errors="surrogateescape")
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "foreign"
+    return "taf" if LAUNCHER_MARKER in content.splitlines() else "foreign"
+
+
+def _render_launcher(
+    *, interpreter: Path, script: Path, chained_hook_path: Path | None
+) -> str:
+    """The POSIX `sh` launcher body; every embedded path is `shlex.quote`d."""
+    quoted_script = shlex.quote(str(script))
+    quoted_interpreter = shlex.quote(str(interpreter))
+    lines = [
+        "#!/bin/sh",
+        LAUNCHER_MARKER,
+        '# Advisory: prints at most a few "TAF:" lines on stderr and never blocks a commit.',
+        "# After a TAF plugin update, re-run: prepare hook install --confirm-hook-write",
+        'if [ "${TAF_HOOK:-}" != "0" ] && [ -f ' + quoted_script + " ]; then",
+        "  " + quoted_interpreter + " " + quoted_script + ' hook run --repo "$PWD" || :',
+        "fi",
+    ]
+    if chained_hook_path is not None:
+        lines.append("exec " + shlex.quote(str(chained_hook_path)) + ' "$@"')
+    return "\n".join(lines) + "\n"
+
+
+def _write_launcher_atomically(hooks_dir: Path, hook_path: Path, source: str) -> None:
+    """A temporary file in the hooks directory, mode 0o755, then `os.replace`."""
+    import tempfile  # install-only dependency; kept off the hook run path
+
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_temporary = tempfile.mkstemp(prefix=".pre-commit.", dir=hooks_dir)
+    temporary = Path(raw_temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o755)
+            stream.write(source)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, hook_path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+        raise
 
