@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
+import signal
 import tempfile
 import unittest
+from unittest import mock
 
+from taf_context import mcp_server
 from taf_context.context_operations import (
     PrepareCLIError,
     QueryArguments,
@@ -803,6 +807,47 @@ class NativeOperationsTests(unittest.TestCase):
         self.assertEqual(operations._sessions, {})
         self.assertEqual(len(logged), 1)
         self.assertIn("OSError", logged[0])
+
+
+class _BufferedStream:
+    """A stand-in for `sys.stdin`/`sys.stdout`: only the `.buffer` attribute matters."""
+
+    def __init__(self, buffer: io.BytesIO) -> None:
+        self.buffer = buffer
+
+
+class MainRefreshesLauncherPointerTests(unittest.TestCase):
+    """`main` refreshes the launcher's self-healing pointer before it serves.
+
+    `main` reads real stdio and installs real `SIGTERM`/`SIGINT` handlers, so
+    this patches `sys.stdin`/`sys.stdout` with closed, empty streams (`serve`
+    then exits immediately on EOF) and restores whatever signal handlers were
+    in place beforehand; `refresh_launcher_target` itself is replaced with a
+    recorder rather than exercised for real, since its own contract is tested
+    directly in `test_impact_hook.py`.
+    """
+
+    def test_main_refreshes_the_pointer_before_serving_and_exits_on_immediate_eof(
+        self,
+    ) -> None:
+        calls: list[object] = []
+
+        def fake_refresh(environment: object) -> bool:
+            calls.append(environment)
+            return False
+
+        original_sigterm = signal.getsignal(signal.SIGTERM)
+        original_sigint = signal.getsignal(signal.SIGINT)
+        self.addCleanup(signal.signal, signal.SIGTERM, original_sigterm)
+        self.addCleanup(signal.signal, signal.SIGINT, original_sigint)
+
+        with mock.patch.object(mcp_server, "refresh_launcher_target", fake_refresh), \
+             mock.patch("sys.stdin", _BufferedStream(io.BytesIO(b""))), \
+             mock.patch("sys.stdout", _BufferedStream(io.BytesIO())):
+            code = mcp_server.main([])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [os.environ])
 
 
 class FramingTests(unittest.TestCase):

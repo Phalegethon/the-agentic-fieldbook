@@ -27,9 +27,12 @@ from taf_context.impact_hook import (
     LAUNCHER_MARKER,
     _entry_point_script,
     _hook_query,
+    _render_launcher,
     format_summary_line,
     format_warning_line,
     install_hook,
+    launcher_target_path,
+    refresh_launcher_target,
     run_hook,
     untouched_dependents,
 )
@@ -818,7 +821,7 @@ class HookInstallTests(unittest.TestCase):
             repository = init_committed_repo(root / "repo")
 
             code, stdout, stderr = invoke(
-                {},
+                {"TAF_STATE_HOME": str(root / "state")},
                 "prepare", "hook", "install",
                 "--repo", str(repository),
                 "--confirm-hook-write",
@@ -856,14 +859,15 @@ class HookInstallTests(unittest.TestCase):
             root = Path(directory).resolve()
             repository = init_committed_repo(root / "repo")
             hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            environment = {"TAF_STATE_HOME": str(root / "state")}
 
             code1, stdout1, _stderr1 = invoke(
-                {}, "prepare", "hook", "install",
+                environment, "prepare", "hook", "install",
                 "--repo", str(repository), "--confirm-hook-write",
             )
             first_bytes = hook_path.read_bytes()
             code2, stdout2, _stderr2 = invoke(
-                {}, "prepare", "hook", "install",
+                environment, "prepare", "hook", "install",
                 "--repo", str(repository), "--confirm-hook-write",
             )
             second_bytes = hook_path.read_bytes()
@@ -879,7 +883,12 @@ class HookInstallTests(unittest.TestCase):
             repository = init_committed_repo(root / "repo")
             pinned = root / "some" / "other" / "python3"
 
-            summary = install_hook(repository, chain=False, interpreter=pinned)
+            summary = install_hook(
+                repository,
+                chain=False,
+                interpreter=pinned,
+                environment={"TAF_STATE_HOME": str(root / "state")},
+            )
 
             self.assertEqual(summary["interpreter"], str(pinned.resolve()))
             hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
@@ -1055,9 +1064,10 @@ class HookChainTests(unittest.TestCase):
             foreign_path.write_bytes(foreign_bytes)
             foreign_path.chmod(0o755)
             foreign_mode = foreign_path.stat().st_mode
+            environment = {"TAF_STATE_HOME": str(root / "state")}
 
             code, stdout, _stderr = invoke(
-                {}, "prepare", "hook", "install",
+                environment, "prepare", "hook", "install",
                 "--repo", str(repository), "--confirm-hook-write", "--chain",
             )
             self.assertEqual(code, 0)
@@ -1081,14 +1091,14 @@ class HookChainTests(unittest.TestCase):
 
             # A re-install without --chain keeps the launcher chained.
             code, stdout, _stderr = invoke(
-                {}, "prepare", "hook", "install",
+                environment, "prepare", "hook", "install",
                 "--repo", str(repository), "--confirm-hook-write",
             )
             self.assertEqual(code, 0)
             self.assertTrue(decoded(stdout)["chained"])
 
             code, stdout, _stderr = invoke(
-                {}, "prepare", "hook", "remove",
+                environment, "prepare", "hook", "remove",
                 "--repo", str(repository), "--confirm-hook-write",
             )
             self.assertEqual(code, 0)
@@ -1123,7 +1133,7 @@ class HookOrphanedChainTests(unittest.TestCase):
             chained_path.chmod(0o755)
 
             code, stdout, stderr = invoke(
-                {}, "prepare", "hook", "install",
+                {"TAF_STATE_HOME": str(root / "state")}, "prepare", "hook", "install",
                 "--repo", str(repository), "--confirm-hook-write",
             )
 
@@ -1236,7 +1246,7 @@ class HookStatusTests(unittest.TestCase):
             root = Path(directory).resolve()
             repository = init_committed_repo(root / "repo")
             invoke(
-                {}, "prepare", "hook", "install",
+                {"TAF_STATE_HOME": str(root / "state")}, "prepare", "hook", "install",
                 "--repo", str(repository), "--confirm-hook-write",
             )
 
@@ -1260,7 +1270,7 @@ class HookStatusTests(unittest.TestCase):
             (hooks_dir / HOOK_FILE_NAME).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             (hooks_dir / HOOK_FILE_NAME).chmod(0o755)
             invoke(
-                {}, "prepare", "hook", "install",
+                {"TAF_STATE_HOME": str(root / "state")}, "prepare", "hook", "install",
                 "--repo", str(repository), "--confirm-hook-write", "--chain",
             )
 
@@ -1280,7 +1290,7 @@ class HookStatusTests(unittest.TestCase):
             root = Path(directory).resolve()
             repository = init_committed_repo(root / "repo")
             invoke(
-                {}, "prepare", "hook", "install",
+                {"TAF_STATE_HOME": str(root / "state")}, "prepare", "hook", "install",
                 "--repo", str(repository), "--confirm-hook-write",
             )
             hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
@@ -1357,7 +1367,7 @@ class HookWorktreeTests(unittest.TestCase):
             run(repository, "git", "worktree", "add", "-b", "wt-branch", str(worktree), "HEAD")
 
             code, stdout, stderr = invoke(
-                {}, "prepare", "hook", "install",
+                {"TAF_STATE_HOME": str(root / "state")}, "prepare", "hook", "install",
                 "--repo", str(worktree), "--confirm-hook-write",
             )
 
@@ -1620,7 +1630,11 @@ class HookChainSafetyTests(unittest.TestCase):
 
             with mock.patch.object(impact_hook, "_write_launcher_atomically", explode):
                 with self.assertRaises(OSError):
-                    install_hook(repository, chain=True)
+                    install_hook(
+                        repository,
+                        chain=True,
+                        environment={"TAF_STATE_HOME": str(root / "state")},
+                    )
 
             self.assertEqual(foreign.read_bytes(), foreign_bytes)
             self.assertEqual(foreign.stat().st_mode, foreign_mode)
@@ -1636,7 +1650,7 @@ class HookChainSafetyTests(unittest.TestCase):
             chained_path.symlink_to(root / "gone" / "pre-commit")
 
             code, stdout, stderr = invoke(
-                {}, "prepare", "hook", "install",
+                {"TAF_STATE_HOME": str(root / "state")}, "prepare", "hook", "install",
                 "--repo", str(repository), "--confirm-hook-write",
             )
             self.assertEqual((code, stderr), (0, ""))
@@ -1673,7 +1687,7 @@ class HookEnvironmentTests(unittest.TestCase):
             # would otherwise write into a repository the user never named.
             with mock.patch.dict(os.environ, {"GIT_DIR": str(other / ".git")}):
                 code, _stdout, stderr = invoke(
-                    {}, "prepare", "hook", "install",
+                    {"TAF_STATE_HOME": str(root / "state")}, "prepare", "hook", "install",
                     "--repo", str(named), "--confirm-hook-write",
                 )
 
@@ -1740,6 +1754,361 @@ class HookPlatformTests(unittest.TestCase):
             summary = decoded(stdout)
             self.assertIs(summary["posix"], False)
             self.assertEqual(summary["hook"], "absent")
+
+
+class RefreshLauncherTargetTests(unittest.TestCase):
+    """`refresh_launcher_target`'s own contract, independent of any command."""
+
+    def test_a_missing_state_root_writes_nothing_and_returns_false(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment = {"TAF_STATE_HOME": str(root / "state")}  # never created
+
+            changed = refresh_launcher_target(environment, interpreter=root / "python3")
+
+            self.assertFalse(changed)
+            self.assertFalse((root / "state").exists())
+
+    def test_an_existing_state_root_gets_a_pointer_with_the_right_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            state_root = root / "state"
+            state_root.mkdir()
+            environment = {"TAF_STATE_HOME": str(state_root)}
+            interpreter = root / "python3"
+
+            changed = refresh_launcher_target(environment, interpreter=interpreter)
+
+            self.assertTrue(changed)
+            target = launcher_target_path(state_root)
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                f"{interpreter.resolve()}\n{_entry_point_script()}\n",
+            )
+            self.assertEqual(target.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_a_second_call_with_unchanged_content_is_a_no_op(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            state_root = root / "state"
+            state_root.mkdir()
+            environment = {"TAF_STATE_HOME": str(state_root)}
+            interpreter = root / "python3"
+            self.assertTrue(refresh_launcher_target(environment, interpreter=interpreter))
+            target = launcher_target_path(state_root)
+            before = target.stat().st_mtime_ns
+
+            changed = refresh_launcher_target(environment, interpreter=interpreter)
+
+            self.assertFalse(changed)
+            self.assertEqual(target.stat().st_mtime_ns, before)
+
+    def test_a_differing_existing_pointer_is_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            state_root = root / "state"
+            state_root.mkdir()
+            environment = {"TAF_STATE_HOME": str(state_root)}
+            first = root / "python3-old"
+            second = root / "python3-new"
+            self.assertTrue(refresh_launcher_target(environment, interpreter=first))
+            target = launcher_target_path(state_root)
+
+            changed = refresh_launcher_target(environment, interpreter=second)
+
+            self.assertTrue(changed)
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                f"{second.resolve()}\n{_entry_point_script()}\n",
+            )
+
+    def test_an_unresolvable_state_root_is_swallowed_into_false(self) -> None:
+        # No HOME, no TAF_STATE_HOME, no Windows fallback: `_state_paths` raises
+        # `PrepareCLIError`, which this function must never let escape.
+        self.assertFalse(refresh_launcher_target({}))
+
+
+class RenderLauncherTemplateTests(unittest.TestCase):
+    """`_render_launcher`'s exact shape: the marker, the pointer, the chain block."""
+
+    def test_the_marker_stays_line_two_and_the_pointer_path_is_one_quoted_string(
+        self,
+    ) -> None:
+        interpreter = Path("/usr/bin/python3")
+        script = Path("/plugin/prepare_repo_context.py")
+        state_root = Path("/home/a user/state")  # a space, to prove quoting
+
+        source = _render_launcher(
+            interpreter=interpreter,
+            script=script,
+            chained_hook_path=None,
+            state_root=state_root,
+        )
+
+        lines = source.splitlines()
+        self.assertEqual(lines[0], "#!/bin/sh")
+        self.assertEqual(lines[1], LAUNCHER_MARKER)
+        target = launcher_target_path(state_root)
+        self.assertIn(f"taf_target={shlex.quote(str(target))}", lines)
+        self.assertNotIn("After a TAF plugin update", source)
+        self.assertNotIn("\nexec ", source)
+
+    def test_the_chain_block_is_unchanged_and_follows_the_pointer_logic(self) -> None:
+        interpreter = Path("/usr/bin/python3")
+        script = Path("/plugin/prepare_repo_context.py")
+        state_root = Path("/home/user/state")
+        chained = Path("/repo/.git/hooks/pre-commit.taf-chained")
+
+        source = _render_launcher(
+            interpreter=interpreter,
+            script=script,
+            chained_hook_path=chained,
+            state_root=state_root,
+        )
+
+        lines = source.splitlines()
+        self.assertEqual(
+            lines[-3:],
+            [
+                f"if [ -x {shlex.quote(str(chained))} ]; then",
+                f'  exec {shlex.quote(str(chained))} "$@"',
+                "fi",
+            ],
+        )
+        self.assertIn(f"taf_target={shlex.quote(str(launcher_target_path(state_root)))}", lines)
+
+
+class LauncherTargetCliSeamTests(unittest.TestCase):
+    """Every `prepare` command but `hook run` refreshes the pointer on success."""
+
+    def test_inspect_on_a_fixture_with_no_state_writes_no_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            environment = {"TAF_STATE_HOME": str(root / "state")}
+
+            code, _stdout, stderr = invoke(
+                environment, "prepare", "inspect", "--repo", str(repository)
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertFalse((root / "state").exists())
+
+    def test_build_writes_the_pointer_once_it_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            native = root / "taf-level1"
+            write_fake_native_engine(native)
+            environment = {
+                "TAF_LEVEL1_BINARY": str(native),
+                "TAF_STATE_HOME": str(root / "state"),
+            }
+
+            build_index(environment, repository)
+
+            target = launcher_target_path(root / "state")
+            self.assertTrue(target.is_file())
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                f"{Path(sys.executable).resolve()}\n{_entry_point_script()}\n",
+            )
+
+    def test_hook_run_never_touches_an_existing_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root)
+            target = launcher_target_path(Path(environment["TAF_STATE_HOME"]))
+            self.assertTrue(target.is_file())
+            modified = "/bin/modified-interpreter\n/bin/modified-script\n"
+            target.write_text(modified, encoding="utf-8")
+            before = target.stat().st_mtime_ns
+
+            code, _stdout, _stderr = hook(environment, repository)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(target.read_text(encoding="utf-8"), modified)
+            self.assertEqual(target.stat().st_mtime_ns, before)
+
+
+class HookManagerAppendedBlockTests(unittest.TestCase):
+    """A hook manager appending its own block after TAF's still trips `launcher_current`."""
+
+    def test_an_appended_block_after_taf_s_makes_the_launcher_not_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            environment = {"TAF_STATE_HOME": str(root / "state")}
+            invoke(
+                environment, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository)
+            )
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertTrue(decoded(stdout)["launcher_current"])
+
+            hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            with hook_path.open("a", encoding="utf-8") as stream:
+                stream.write("# appended by another hook manager\necho appended >&2\n")
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository)
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "installed")
+            self.assertFalse(summary["launcher_current"])
+
+
+class LauncherSelfHealingEndToEndTests(unittest.TestCase):
+    """A real `git commit` through the installed launcher, pointer cases (D15)."""
+
+    def _install(self, environment: dict[str, str], repository: Path) -> None:
+        install_code, _stdout, _stderr = invoke(
+            environment, "prepare", "hook", "install",
+            "--repo", str(repository), "--confirm-hook-write",
+        )
+        self.assertEqual(install_code, 0)
+
+    def _commit(self, environment: dict[str, str], repository: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "commit", "-m", "x"],
+            cwd=repository,
+            env=commit_environment(environment),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def test_a_valid_pointer_wins_over_a_wrong_embedded_script(self) -> None:
+        # Chosen implementation of the brief's scenario (a): install normally
+        # (embedding valid paths and, via `refresh_launcher_target`, a pointer
+        # that matches them), then rewrite only the launcher's own embedded
+        # `taf_script` line to a path that does not exist. The pointer file on
+        # disk still names the real script, so it must win.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+            self._install(environment, repository)
+            target = launcher_target_path(Path(environment["TAF_STATE_HOME"]))
+            self.assertTrue(target.is_file())
+
+            hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            content = hook_path.read_text(encoding="utf-8")
+            broken = content.replace(
+                f"taf_script={shlex.quote(str(_entry_point_script()))}",
+                f"taf_script={shlex.quote(str(root / 'missing-script.py'))}",
+            )
+            self.assertNotEqual(broken, content)
+            hook_path.write_text(broken, encoding="utf-8")
+            hook_path.chmod(0o755)
+
+            result = self._commit(environment, repository)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+
+    def test_a_pointer_absent_falls_back_to_the_embedded_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+            self._install(environment, repository)
+            target = launcher_target_path(Path(environment["TAF_STATE_HOME"]))
+            self.assertTrue(target.is_file())
+            target.unlink()
+
+            result = self._commit(environment, repository)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+
+    def test_a_pointer_naming_a_missing_script_falls_back_to_the_embedded_paths(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+            self._install(environment, repository)
+            target = launcher_target_path(Path(environment["TAF_STATE_HOME"]))
+            interpreter_line, _script_line = target.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            target.write_text(
+                f"{interpreter_line}\n{root / 'missing-script.py'}\n", encoding="utf-8"
+            )
+
+            result = self._commit(environment, repository)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+
+    def test_a_bogus_embedded_interpreter_falls_back_to_command_v_python3(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+            self._install(environment, repository)
+            target = launcher_target_path(Path(environment["TAF_STATE_HOME"]))
+            self.assertTrue(target.is_file())
+            target.unlink()  # the pointer is absent for this scenario
+
+            hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            interpreter = str(Path(sys.executable).resolve())
+            content = hook_path.read_text(encoding="utf-8")
+            broken = content.replace(
+                f"taf_interpreter={shlex.quote(interpreter)}",
+                f"taf_interpreter={shlex.quote(str(root / 'no-such-python'))}",
+            )
+            self.assertNotEqual(broken, content)
+            hook_path.write_text(broken, encoding="utf-8")
+            hook_path.chmod(0o755)
+
+            result = self._commit(environment, repository)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+
+    def test_neither_interpreter_nor_script_resolvable_stays_silent(self) -> None:
+        # Chosen implementation of the brief's scenario (e): the pointer is
+        # absent, the embedded interpreter is bogus, and - rather than also
+        # arranging for `command -v python3` to fail, which would need a PATH
+        # with no Python 3 on it at all - the embedded script is bogus too.
+        # Even if the interpreter fallback finds a real python3, the launcher's
+        # own `[ -f "$taf_script" ]` guard still fails, so the observable
+        # contract (silent, exit 0, commit proceeds) holds either way.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            environment, repository = ready_repository(root)
+            self._install(environment, repository)
+            target = launcher_target_path(Path(environment["TAF_STATE_HOME"]))
+            target.unlink()
+
+            hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            interpreter = str(Path(sys.executable).resolve())
+            script = str(_entry_point_script())
+            broken = hook_path.read_text(encoding="utf-8")
+            broken = broken.replace(
+                f"taf_interpreter={shlex.quote(interpreter)}",
+                f"taf_interpreter={shlex.quote(str(root / 'no-such-python'))}",
+            )
+            broken = broken.replace(
+                f"taf_script={shlex.quote(script)}",
+                f"taf_script={shlex.quote(str(root / 'no-such-script.py'))}",
+            )
+            hook_path.write_text(broken, encoding="utf-8")
+            hook_path.chmod(0o755)
+            before_log = run(repository, "git", "log", "--format=%H")
+
+            result = self._commit(environment, repository)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, "")
+            after_log = run(repository, "git", "log", "--format=%H")
+            self.assertNotEqual(before_log, after_log)
 
 
 if __name__ == "__main__":

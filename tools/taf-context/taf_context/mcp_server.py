@@ -29,6 +29,7 @@ from .context_operations import (
 )
 from .engine_session import Level1Session, SessionTransport
 from .git_snapshot import SnapshotError
+from .impact_hook import refresh_launcher_target
 from .native_transport import NativeTransport
 
 SERVER_NAME = "taf-repo-context"
@@ -782,4 +783,8 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("SIGTERM", "SIGINT"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), _terminate)
+    # Best effort, like every other successful command: the launcher can
+    # then find the broker that last ran on this machine instead of an
+    # embedded path a plugin update may have orphaned.
+    refresh_launcher_target(os.environ)
     return serve(sys.stdin.buffer, sys.stdout.buffer, stderr, operations)

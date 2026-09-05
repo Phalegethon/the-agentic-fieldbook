@@ -36,7 +36,7 @@ from .context_operations import (  # noqa: F401 - re-exported for callers and te
     validate_query_request,
 )
 from .git_snapshot import collect_snapshot
-from .impact_hook import hook_status, install_hook, remove_hook
+from .impact_hook import hook_status, install_hook, refresh_launcher_target, remove_hook
 from .native_transport import OneShotTransport
 from .state_lifecycle import Candidate, apply_plan, plan_gc, plan_remove
 from .state_paths import StateError
@@ -156,8 +156,26 @@ def run_prepare_command(
     environment: Mapping[str, str],
     utc_clock: object,
 ) -> dict[str, object]:
-    """Execute one already-parsed preparation command."""
+    """Execute one already-parsed preparation command.
+
+    Every command refreshes the launcher's self-healing pointer once it has
+    succeeded, `hook install` excepted: `install_hook` already does that
+    itself, with the interpreter it just wrote into the launcher. `hook run`
+    never reaches this function at all - `cli.main` routes it to `run_hook`
+    before this is ever called - so a stale broker recorded once can never
+    re-assert itself through a later commit.
+    """
     del utc_clock  # Reserved for a future persisted freshness timestamp.
+    result = _dispatch_prepare_command(args, environment=environment)
+    if not (args.prepare_command == "hook" and args.hook_command == "install"):
+        refresh_launcher_target(environment)
+    return result
+
+
+def _dispatch_prepare_command(
+    args: argparse.Namespace, *, environment: Mapping[str, str]
+) -> dict[str, object]:
+    """The command dispatch `run_prepare_command` used to perform directly."""
     if args.prepare_command == "activate" and not args.confirm_network:
         raise PrepareCLIError("explicit network confirmation required")
     if args.prepare_command == "activate" and not args.confirm_state_write:
@@ -229,7 +247,7 @@ def _run_hook_command(
     if args.hook_command == "install":
         if not args.confirm_hook_write:
             raise PrepareCLIError("explicit hook-write confirmation required")
-        return install_hook(repository, chain=args.chain)
+        return install_hook(repository, chain=args.chain, environment=environment)
     if args.hook_command == "remove":
         if not args.confirm_hook_write:
             raise PrepareCLIError("explicit hook-write confirmation required")

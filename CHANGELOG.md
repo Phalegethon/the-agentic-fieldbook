@@ -5,6 +5,20 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.3.
+
+### Fixed
+
+- The commit-time hook's launcher embedded the plugin's versioned install
+  path and the install-time interpreter; a plugin update leaves every older
+  version directory in place, so the launcher's own file check kept passing
+  and it silently kept running the stale broker after every update, and an
+  interpreter that moved made the hook vanish silently. The launcher now
+  follows the broker that last ran on this machine through a small pointer
+  file every successful command but the hook run itself refreshes under
+  TAF's own user-local state, with an interpreter fallback (`command -v
+  python3`) when the resolved one is not executable.
+
 ## [2.8.3] - 2026-09-05
 
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.2.

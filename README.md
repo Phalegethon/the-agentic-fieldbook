@@ -15,7 +15,7 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.8.2 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, warn at commit time about dependents left behind, and reclaim unused index state without loading the full repository into model context. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.8.3 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, warn at commit time about dependents left behind, and reclaim unused index state without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.1.0 | Recover interrupted work and the single best next step from bounded, read-only Git evidence, optionally naming the symbols the work touched. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
@@ -337,10 +337,29 @@ so a failing one still blocks it; a chained hook that cannot be run at all
 `install --chain` refuses a foreign hook that is not executable, because
 git was not running it either. `status` reports `redirected` when
 `core.hooksPath` points elsewhere; TAF never installs there. `TAF_HOOK=0
-git commit` silences one commit without touching the launcher. After a TAF
-plugin update, `status`
-reporting `launcher_current: false` means re-run `hook install` to refresh
-the launcher's embedded interpreter and script path.
+git commit` silences one commit without touching the launcher.
+
+The launcher follows the broker that last ran on this machine instead of
+trusting only its own embedded, install-time paths. Every `prepare` command
+but `hook run`, `hook install` itself, and the bundled MCP server at startup
+refresh a small pointer file under TAF's own user-local state — two lines,
+the resolved interpreter and the plugin's entry-point script — atomically,
+mode 0600 in a 0700 directory, and only when the state root already exists;
+writing it is a convenience, and every failure to do so is swallowed rather
+than failing the command. `hook run` never writes it, so a stale broker
+recorded once can never re-assert itself through a later commit. At commit
+time the launcher reads the pointer first and uses it when it is readable
+and names an existing script; otherwise, or when the pointer is missing, it
+falls back to its own embedded paths, then to `command -v python3` when the
+chosen interpreter is not executable, and stays silent if neither an
+interpreter nor a script can be found. This means a plugin update is picked
+up automatically by the next TAF session — re-run `hook install` only when
+`status` reports `launcher_current: false` and the embedded fallback itself
+should be refreshed. A hook manager that appends its own block after TAF's
+launcher also reports `launcher_current: false`, since a re-install rewrites
+the whole file and drops that appended block — a known limitation. The
+pointer file lives in the user's own state directory, the same trust level
+as the launcher itself in `.git/hooks`.
 
 ### The repo-context MCP server
 
@@ -421,7 +440,7 @@ TAF and its skills have separate versions:
 
 - TAF `2.8.3` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.8.2` versions its behavior contract.
+- `prepare-repo-context` `1.8.3` versions its behavior contract.
 - `work-recovery` `1.1.0` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with

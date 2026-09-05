@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -43,15 +45,22 @@ class McpManifestTests(unittest.TestCase):
 
     def test_entry_script_answers_initialize_quickly_and_exits_on_eof(self) -> None:
         request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}}
-        started = time.perf_counter()
-        completed = subprocess.run(
-            [sys.executable, str(ENTRY)],
-            input=json.dumps(request).encode("utf-8") + b"\n",
-            capture_output=True,
-            timeout=20,
-            check=False,
-        )
-        elapsed = time.perf_counter() - started
+        with tempfile.TemporaryDirectory() as scratch:
+            environment = dict(os.environ)
+            # `main` now performs a best-effort launcher-target refresh at
+            # startup; a nonexistent state root keeps it a no-op so this smoke
+            # test never touches real (or even shared test-guard) TAF state.
+            environment["TAF_STATE_HOME"] = str(Path(scratch) / "state")
+            started = time.perf_counter()
+            completed = subprocess.run(
+                [sys.executable, str(ENTRY)],
+                input=json.dumps(request).encode("utf-8") + b"\n",
+                env=environment,
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+            elapsed = time.perf_counter() - started
         self.assertEqual(completed.returncode, 0, completed.stderr)
         lines = completed.stdout.split(b"\n")
         self.assertEqual(lines[1:], [b""])

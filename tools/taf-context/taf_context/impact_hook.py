@@ -30,6 +30,7 @@ from .context_operations import (
     QueryArguments,
     TransportFactory,
     _is_test_path,
+    _state_paths,
     run_inspect,
     run_query,
 )
@@ -64,6 +65,13 @@ CHAINED_HOOK_NAME = "pre-commit.taf-chained"
 # The second line of every launcher this module writes; a `pre-commit` file
 # containing this exact line is a TAF launcher, anything else is foreign.
 LAUNCHER_MARKER = "# TAF commit-time impact warning (managed by: prepare hook install)"
+
+# Where the launcher's self-healing pointer lives, under TAF's user-local
+# state root: `<state root>/hook/launcher-target`. The launcher reads it to
+# find the broker that last ran on this machine instead of trusting the
+# embedded paths a plugin update may have orphaned.
+LAUNCHER_TARGET_DIRECTORY = "hook"
+LAUNCHER_TARGET_FILE = "launcher-target"
 
 _HOOK_GIT_TIMEOUT_SECONDS = 20  # wall clock for the small git calls hook management makes
 
@@ -453,13 +461,21 @@ def _explain(stderr: TextIO, verbose: bool, reason: str) -> None:
 
 
 def install_hook(
-    repository: Path, *, chain: bool, interpreter: Path | None = None
+    repository: Path,
+    *,
+    chain: bool,
+    environment: Mapping[str, str],
+    interpreter: Path | None = None,
 ) -> dict[str, object]:
     """Write the pre-commit launcher; idempotent, and the only write this module makes.
 
     `interpreter` exists so tests can pin it; every production caller leaves
     it as the default, which resolves `sys.executable` exactly the way the
-    launcher's own embedded interpreter path must be resolved.
+    launcher's own embedded interpreter path must be resolved. `environment`
+    resolves the state root embedded in the launcher (where the self-healing
+    pointer file lives) and, once the launcher is written, is handed to
+    `refresh_launcher_target` (best effort, with this same `interpreter`) so
+    a fresh install starts with a pointer that already matches it.
     """
     _require_posix()
     state, hooks_dir, hooks_path_value = _resolve_hooks_directory(repository)
@@ -518,6 +534,7 @@ def install_hook(
             interpreter=resolved_interpreter,
             script=script,
             chained_hook_path=chained_hook_path,
+            state_root=_state_paths(environment).root,
         )
         _write_launcher_atomically(hooks_dir, hook_path, source)
     except BaseException:
@@ -528,6 +545,7 @@ def install_hook(
             with contextlib.suppress(OSError):
                 os.replace(chained_path, hook_path)
         raise
+    refresh_launcher_target(environment, interpreter=interpreter)
     return {
         "schema_version": "1",
         "mode": "hook-install",
@@ -618,6 +636,7 @@ def hook_status(
                 interpreter=Path(sys.executable).resolve(),
                 script=_entry_point_script(),
                 chained_hook_path=chained_path if chained else None,
+                state_root=_state_paths(environment).root,
             )
             try:
                 actual = hook_path.read_text(encoding="utf-8", errors="surrogateescape")
@@ -668,6 +687,58 @@ def _entry_point_script() -> Path:
         / "scripts"
         / "prepare_repo_context.py"
     )
+
+
+def launcher_target_path(state_root: Path) -> Path:
+    """Where the launcher's self-healing pointer lives under a state root."""
+    return state_root / LAUNCHER_TARGET_DIRECTORY / LAUNCHER_TARGET_FILE
+
+
+def refresh_launcher_target(
+    environment: Mapping[str, str], *, interpreter: Path | None = None
+) -> bool:
+    """Point the launcher's pointer file at the broker that just ran; best effort.
+
+    Every `prepare` command except `hook run`, `hook install` (which does
+    this itself, with the interpreter it just wrote into the launcher), and
+    the MCP server at startup call this once they have succeeded, so the
+    launcher in `.git/hooks` can find the broker that actually last ran on
+    this machine instead of trusting an embedded path a plugin update may
+    have orphaned. The pointer is written only when the state root already
+    exists: state-write consent was given at some point in the past, and an
+    `inspect` before any `build` must still create nothing. The content is
+    two lines, the resolved interpreter and the plugin's entry-point script,
+    written atomically (temp file, `fchmod(0o600)`, `os.replace`) into a
+    `hook` directory the state root gets, mode 0700; nothing is written when
+    the file already holds exactly that content. Every exception - state
+    paths unavailable, an unwritable state root, anything else - is
+    swallowed into `False`: writing this pointer is a convenience, never a
+    reason a command should fail. `hook run` never calls this, so a stale
+    broker recorded once can never re-assert itself through a later commit.
+    """
+    try:
+        state_root = _state_paths(environment).root
+        if not state_root.is_dir():
+            return False
+        resolved_interpreter = (
+            Path(sys.executable) if interpreter is None else interpreter
+        ).resolve()
+        script = _entry_point_script()
+        content = f"{resolved_interpreter}\n{script}\n"
+        target = launcher_target_path(state_root)
+        try:
+            existing = target.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            existing = None
+        if existing == content:
+            return False
+        directory = target.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o700)
+        _write_launcher_target_atomically(directory, target, content)
+        return True
+    except Exception:  # writing the pointer is a convenience, never a failure
+        return False
 
 
 def _run_repository_git(repository: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
@@ -738,18 +809,40 @@ def _classify_pre_commit(hook_path: Path) -> str:
 
 
 def _render_launcher(
-    *, interpreter: Path, script: Path, chained_hook_path: Path | None
+    *, interpreter: Path, script: Path, chained_hook_path: Path | None, state_root: Path
 ) -> str:
-    """The POSIX `sh` launcher body; every embedded path is `shlex.quote`d."""
+    """The POSIX `sh` launcher body; every embedded path is `shlex.quote`d.
+
+    `state_root` locates the self-healing pointer file
+    (`refresh_launcher_target`'s `launcher_target_path(state_root)`); the
+    launcher reads it first and falls back to the embedded `interpreter` and
+    `script` only when the pointer is missing, unreadable, or names a script
+    that no longer exists. When the chosen interpreter is not executable,
+    `command -v python3` is tried as a last resort; when no interpreter or no
+    script can be found, the launcher stays silent and the commit proceeds.
+    """
     quoted_script = shlex.quote(str(script))
     quoted_interpreter = shlex.quote(str(interpreter))
+    quoted_target = shlex.quote(str(launcher_target_path(state_root)))
     lines = [
         "#!/bin/sh",
         LAUNCHER_MARKER,
         '# Advisory: prints at most a few "TAF:" lines on stderr and never blocks a commit.',
-        "# After a TAF plugin update, re-run: prepare hook install --confirm-hook-write",
-        'if [ "${TAF_HOOK:-}" != "0" ] && [ -f ' + quoted_script + " ]; then",
-        "  " + quoted_interpreter + " " + quoted_script + ' hook run --repo "$PWD" || :',
+        "# Follows the TAF broker that last ran on this machine (a pointer under TAF's own",
+        "# state); the embedded paths below are the fallback when that pointer is missing.",
+        "taf_interpreter=" + quoted_interpreter,
+        "taf_script=" + quoted_script,
+        "taf_target=" + quoted_target,
+        'if [ -r "$taf_target" ]; then',
+        '  { IFS= read -r taf_line1; IFS= read -r taf_line2; } < "$taf_target"',
+        '  if [ -n "$taf_line1" ] && [ -f "$taf_line2" ]; then',
+        "    taf_interpreter=$taf_line1",
+        "    taf_script=$taf_line2",
+        "  fi",
+        "fi",
+        '[ -x "$taf_interpreter" ] || taf_interpreter=$(command -v python3 || :)',
+        'if [ "${TAF_HOOK:-}" != "0" ] && [ -n "$taf_interpreter" ] && [ -f "$taf_script" ]; then',
+        '  "$taf_interpreter" "$taf_script" hook run --repo "$PWD" || :',
         "fi",
     ]
     if chained_hook_path is not None:
@@ -779,6 +872,25 @@ def _write_launcher_atomically(hooks_dir: Path, hook_path: Path, source: str) ->
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, hook_path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+        raise
+
+
+def _write_launcher_target_atomically(directory: Path, path: Path, content: str) -> None:
+    """A temporary file in `directory`, mode 0o600, then `os.replace` onto `path`."""
+    import tempfile  # pointer-refresh dependency; kept off the hook run path
+
+    descriptor, raw_temporary = tempfile.mkstemp(prefix=".launcher-target.", dir=directory)
+    temporary = Path(raw_temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
