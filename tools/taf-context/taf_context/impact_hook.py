@@ -58,7 +58,13 @@ HOOK_MAXIMUM_RESULTS = 1_000_000
 # turning the budget off for the one caller that never needed one.
 HOOK_OUTPUT_CHARACTERS = 10_000_000
 HOOK_DISABLE_VARIABLE = "TAF_HOOK"  # set to exactly "0" to disable the hook entirely
-HOOK_LINE_PREFIX = "TAF: "  # every warning the hook writes starts here
+HOOK_HEADER_PREFIX = "TAF impact: "  # every header the hook writes starts here (D16)
+HOOK_DETAIL_INDENT = "  "  # every detail and trailer line starts with two spaces (D16)
+# A redirection to the surface that can show the full list (MCP
+# `impact_candidates`, `staged: true`), not a command: `query impact-candidates
+# --staged` is not runnable in a plugin installation (no `prepare` on PATH),
+# and the CLI's own budget shows only part of a wide result anyway.
+HOOK_POINTER = "(ask your agent to list TAF impact for this commit)"
 
 HOOK_FILE_NAME = "pre-commit"
 CHAINED_HOOK_NAME = "pre-commit.taf-chained"
@@ -120,7 +126,7 @@ def run_hook(
             _explain(stderr, verbose, f"disabled by {HOOK_DISABLE_VARIABLE}=0")
             return 0
 
-        run = _HookRun(repository, environment)
+        run = _HookRun(repository, environment, colour=_hook_colour_enabled(stderr, environment))
         worker = threading.Thread(
             target=run.collect, name="taf-impact-hook", daemon=True
         )
@@ -147,6 +153,26 @@ def run_hook(
         return 0
 
 
+def _hook_colour_enabled(stderr: TextIO, environment: Mapping[str, str]) -> bool:
+    """Bold header only on a real TTY stderr, honouring `NO_COLOR` and `TERM=dumb` (D16).
+
+    `isatty` is read through `getattr` rather than called directly: a GUI
+    client's or CI's stderr double is not guaranteed to define it at all,
+    and a missing method must read as "not a TTY", never raise out of the
+    hook. `NO_COLOR` disables colour whenever it is set in the commit's
+    environment at all (its value is never inspected); `TERM=dumb` disables
+    it only for that exact value, the same convention `git` itself follows.
+    """
+    isatty = getattr(stderr, "isatty", None)
+    if not callable(isatty) or not isatty():
+        return False
+    if "NO_COLOR" in environment:
+        return False
+    if environment.get("TERM") == "dumb":
+        return False
+    return True
+
+
 def untouched_dependents(
     result: Mapping[str, object], staged_paths: Collection[str]
 ) -> list[dict]:
@@ -154,7 +180,7 @@ def untouched_dependents(
 
     A dependent inside the commit is by definition already handled, and an
     inferred edge is a guess a hook must never make, so those candidates are
-    dropped first, along with an anchorless one (so `format_warning_line`'s
+    dropped first, along with an anchorless one (so `format_report`'s
     `anchors[0]` can never index an empty list) and one carrying no usable
     `path` (a warning line names a path and a line, so there would be nothing
     to print). What is left is grouped by `path`, keeping each path's
@@ -198,61 +224,115 @@ def untouched_dependents(
     return non_test + test
 
 
-def format_warning_line(candidate: Mapping[str, object]) -> str:
-    """One warning: the changed symbol, the dependent, and what it means."""
-    # The composition sorts a candidate's anchors strongest first and copies
-    # that anchor's reference line onto the candidate itself, so the two
-    # halves of the line always describe the same edge.
-    anchor = candidate["anchors"][0]
-    return (
-        f"{HOOK_LINE_PREFIX}{anchor['qualified_name']} changed; "
-        f"{candidate['path']}:{candidate['reference_line']} "
-        "depends on it and is not in this commit"
-    )
+def format_report(untouched: list[dict], *, truncated: bool, colour: bool) -> list[str]:
+    """The header, at most five detail lines, and one trailer (addendum D16).
 
+    Returns an empty list when there is nothing to report. `untouched` empty
+    and not truncated is the ordinary "nothing depends" case; `untouched`
+    empty but `truncated` true is deliberately reported the same way - an
+    omission the engine cannot even name a file for is not something a user
+    can act on, so a header with nothing under it would only mislead.
 
-def format_summary_line(remaining: int, *, truncated: bool = False) -> str:
-    """The line that speaks for the dependents beyond the five-line cap.
+    Detail lines come from whichever group is non-empty first: production
+    files whenever there are any, test files only when there are none -
+    `_is_test_path` applied here rather than trusted from the caller's
+    ordering, so this function's own contract does not depend on
+    `untouched_dependents`' stable partition. Once a production dependent
+    exists, every test dependent is folded into the trailer's test-file
+    count instead of taking one of the five slots (D16 item 4): a forgotten
+    test file is less important than a forgotten production one.
 
-    Pure ASCII and names no command: an ASCII stderr can garble or drop a
-    Unicode ellipsis, and `prepare query …` is not runnable in a plugin
-    installation (no `prepare` on PATH). `query` and `impact-candidates
-    --staged` are the CLI's own words and the MCP tool's name, so the
-    pointer stays true on both surfaces. It says "for more", not "for the
-    full list": that same query carries its own budget and result cap, so
-    it is not a promise of everything either.
-
-    `remaining` counts the untouched dependent files past the five printed
-    lines. When the engine omitted nothing (`truncated` false), that count
-    is exact. When the engine did omit candidates in some direction, or
-    followed more than 64 changed symbols, the same count is only a lower
-    bound, so the line marks it with a trailing `+` instead of asserting it
-    is exact. When five or fewer files remain (`remaining <= 0`) but the
-    result is still truncated, there is nothing exact left to name, so the
-    line falls back to "possibly more". A summary is never printed, and this
-    function never called, for `remaining <= 0` with `truncated` false - that
-    combination raises `ValueError` instead of claiming a count that was
-    never going to be shown.
+    The trailer's `remaining` (R) counts untouched files of the *printed*
+    group past the five shown; `other_test_count` (T) counts test files not
+    printed at all, which is only ever nonzero when the printed group is
+    production. When the printed group is already test (no production
+    dependent at all), there is no separate test category left to name, so
+    `T` is 0 and any test files past the cap are folded into `R` instead -
+    an extension of D16's own R/T model to the test-only case, which the
+    addendum's wording does not spell out on its own.
     """
-    if remaining > 0 and not truncated:
+    if not untouched:
+        return []
+    non_test = [candidate for candidate in untouched if not _is_test_path(candidate["path"])]
+    test = [candidate for candidate in untouched if _is_test_path(candidate["path"])]
+    if non_test:
+        printed_group, is_test_header, other_test_count = non_test, False, len(test)
+    else:
+        printed_group, is_test_header, other_test_count = test, True, 0
+    printed = printed_group[:HOOK_MAXIMUM_LINES]
+    remaining = len(printed_group) - len(printed)
+    header = _format_header(len(printed_group), is_test=is_test_header, truncated=truncated)
+    if colour:
+        header = f"\x1b[1m{header}\x1b[0m"
+    lines = [header, *_format_detail_lines(printed)]
+    trailer = _format_trailer(remaining, other_test_count, truncated=truncated)
+    if trailer is not None:
+        lines.append(trailer)
+    return lines
+
+
+def _format_header(count: int, *, is_test: bool, truncated: bool) -> str:
+    """`TAF impact: N file(s) depend(s) on this change and are not in this commit`.
+
+    `count` is the untouched file count of whichever group `format_report`
+    is printing (production, or test when no production file depends);
+    `truncated` marks it with a trailing `+` when the engine omitted
+    candidates in some direction, so the count is only a lower bound.
+    """
+    display = f"{count}+" if truncated else str(count)
+    if count == 1 and not truncated:
+        noun = "test file" if is_test else "file"
         return (
-            f"{HOOK_LINE_PREFIX}... and {remaining} more "
-            "(query impact-candidates --staged for more)"
+            f"{HOOK_HEADER_PREFIX}{display} {noun} depends on this change "
+            "and is not in this commit"
         )
-    if remaining > 0 and truncated:
-        return (
-            f"{HOOK_LINE_PREFIX}... and {remaining}+ more "
-            "(query impact-candidates --staged for more)"
-        )
-    if truncated:
-        return (
-            f"{HOOK_LINE_PREFIX}... and possibly more "
-            "(query impact-candidates --staged for more)"
-        )
-    raise ValueError(
-        "format_summary_line: nothing to report "
-        "(remaining <= 0 and not truncated)"
+    noun = "test files" if is_test else "files"
+    return (
+        f"{HOOK_HEADER_PREFIX}{display} {noun} depend on this change "
+        "and are not in this commit"
     )
+
+
+def _format_detail_lines(candidates: list[dict]) -> list[str]:
+    """Two-space indent, `<path>:<line>` padded so every `<-` column aligns.
+
+    The composition sorts a candidate's anchors strongest first and copies
+    that anchor's reference line onto the candidate itself, so the two
+    halves of a line always describe the same edge.
+    """
+    locations = [f"{candidate['path']}:{candidate['reference_line']}" for candidate in candidates]
+    width = max((len(location) for location in locations), default=0)
+    return [
+        f"{HOOK_DETAIL_INDENT}{location.ljust(width)}  <- {candidate['anchors'][0]['qualified_name']}"
+        for location, candidate in zip(locations, candidates)
+    ]
+
+
+def _format_trailer(remaining: int, other_test_count: int, *, truncated: bool) -> str | None:
+    """The one optional line naming what the five detail lines left out (D16).
+
+    `remaining` (R) and `other_test_count` (T) pick one of four shapes:
+    both positive names both counts, only one positive names that one
+    alone, and neither positive falls back to "possibly more" when the
+    result is truncated - or to nothing at all when it is not (there is
+    genuinely nothing left to report). `R` gets a trailing `+` when
+    `truncated`; `T` never does; the D16 addendum marks only the
+    production-file remainder as a lower bound.
+    """
+    remaining_display = f"{remaining}+" if truncated and remaining > 0 else str(remaining)
+    test_noun = "test file" if other_test_count == 1 else "test files"
+    if remaining > 0 and other_test_count > 0:
+        return (
+            f"{HOOK_DETAIL_INDENT}... and {remaining_display} more, plus "
+            f"{other_test_count} {test_noun} {HOOK_POINTER}"
+        )
+    if remaining > 0:
+        return f"{HOOK_DETAIL_INDENT}... and {remaining_display} more {HOOK_POINTER}"
+    if other_test_count > 0:
+        return f"{HOOK_DETAIL_INDENT}... plus {other_test_count} {test_noun} {HOOK_POINTER}"
+    if truncated:
+        return f"{HOOK_DETAIL_INDENT}... and possibly more {HOOK_POINTER}"
+    return None
 
 
 class _HookRun:
@@ -264,9 +344,12 @@ class _HookRun:
     session's, so it cannot be made to wait by the request it is cancelling.
     """
 
-    def __init__(self, repository: Path, environment: Mapping[str, str]) -> None:
+    def __init__(
+        self, repository: Path, environment: Mapping[str, str], *, colour: bool
+    ) -> None:
         self._repository = repository
         self._environment = environment
+        self._colour = colour
         self._guard = threading.Lock()
         # `Level1Session` is imported lazily in `_transport_for` (hook and
         # change queries only), so the annotation is a string to avoid a
@@ -302,14 +385,7 @@ class _HookRun:
             if not untouched:
                 self.reason = "no untouched dependents"
                 return
-            lines = [
-                format_warning_line(candidate)
-                for candidate in untouched[:HOOK_MAXIMUM_LINES]
-            ]
-            remaining = len(untouched) - HOOK_MAXIMUM_LINES
-            if remaining > 0 or truncated:
-                lines.append(format_summary_line(remaining, truncated=truncated))
-            self.lines = lines
+            self.lines = format_report(untouched, truncated=truncated, colour=self._colour)
         except Exception as exc:  # the hook is advisory: nothing may escape it
             self.reason = _exception_reason(exc)
         finally:
@@ -838,7 +914,7 @@ def _render_launcher(
     lines = [
         "#!/bin/sh",
         LAUNCHER_MARKER,
-        '# Advisory: prints at most a few "TAF:" lines on stderr and never blocks a commit.',
+        '# Advisory: prints a short "TAF impact:" report on stderr and never blocks a commit.',
         "# Follows the TAF broker that last ran on this machine (a pointer under TAF's own",
         "# state); the embedded paths below are the fallback when that pointer is missing.",
         "taf_interpreter=" + quoted_interpreter,

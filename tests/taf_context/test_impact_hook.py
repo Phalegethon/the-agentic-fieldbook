@@ -23,13 +23,13 @@ from taf_context.impact_hook import (
     HOOK_MAXIMUM_LINES,
     HOOK_MAXIMUM_RESULTS,
     HOOK_OUTPUT_CHARACTERS,
+    HOOK_POINTER,
     HOOK_TIME_LIMIT_SECONDS,
     LAUNCHER_MARKER,
     _entry_point_script,
     _hook_query,
     _render_launcher,
-    format_summary_line,
-    format_warning_line,
+    format_report,
     install_hook,
     launcher_target_path,
     refresh_launcher_target,
@@ -119,8 +119,21 @@ def wait_until(predicate, seconds: float = 3.0) -> bool:
     return predicate()
 
 
-WEB_LINE = "TAF: app.first changed; web.py:12 depends on it and is not in this commit\n"
-OTHER_LINE = "TAF: app changed; other.py:12 depends on it and is not in this commit\n"
+# The fixture's two untouched dependents (`other.py` an importer, `web.py` a
+# caller) reported together: one header, both detail lines padded so their
+# `<-` columns align (`other.py:12` and `web.py:12` differ by two
+# characters), no trailer since both fit under the five-line cap.
+TWO_FILE_REPORT = (
+    "TAF impact: 2 files depend on this change and are not in this commit\n"
+    "  other.py:12  <- app\n"
+    "  web.py:12    <- app.first\n"
+)
+# Only `other.py` untouched (a commit that also carries `web.py`'s edit):
+# the singular header, one detail line, no trailer.
+ONE_FILE_REPORT = (
+    "TAF impact: 1 file depends on this change and is not in this commit\n"
+    "  other.py:12  <- app\n"
+)
 
 
 class ImpactHookReadinessTests(unittest.TestCase):
@@ -206,7 +219,7 @@ class ImpactHookWarningTests(unittest.TestCase):
             code, stdout, stderr = hook(environment, repository)
 
             self.assertEqual((code, stdout), (0, ""))
-            self.assertEqual(stderr, OTHER_LINE + WEB_LINE)
+            self.assertEqual(stderr, TWO_FILE_REPORT)
 
     def test_a_dependent_inside_the_commit_is_not_warned_about(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -220,7 +233,7 @@ class ImpactHookWarningTests(unittest.TestCase):
             code, stdout, stderr = hook(environment, repository)
 
             self.assertEqual((code, stdout), (0, ""))
-            self.assertEqual(stderr, OTHER_LINE)
+            self.assertEqual(stderr, ONE_FILE_REPORT)
 
     def test_a_commit_that_carries_every_dependent_warns_about_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -257,15 +270,12 @@ class ImpactHookWarningTests(unittest.TestCase):
             self.assertEqual((code, stdout), (0, ""))
             self.assertEqual(
                 stderr.splitlines(),
-                [
-                    f"TAF: app.first changed; dep{index:02d}.py:12 depends on it"
-                    " and is not in this commit"
+                ["TAF impact: 7 files depend on this change and are not in this commit"]
+                + [
+                    f"  dep{index:02d}.py:12  <- app.first"
                     for index in range(HOOK_MAXIMUM_LINES)
                 ]
-                + [
-                    "TAF: ... and 2 more "
-                    "(query impact-candidates --staged for more)"
-                ],
+                + [f"  ... and 2 more {HOOK_POINTER}"],
             )
 
     def test_exactly_the_cap_many_dependents_end_without_a_summary_line(self) -> None:
@@ -284,16 +294,14 @@ class ImpactHookWarningTests(unittest.TestCase):
 
             self.assertEqual((code, stdout), (0, ""))
             lines = stderr.splitlines()
-            self.assertEqual(len(lines), HOOK_MAXIMUM_LINES)
-            self.assertNotIn("more (query", stderr)
+            # Header plus the five detail lines; nothing was left out.
+            self.assertEqual(len(lines), 1 + HOOK_MAXIMUM_LINES)
+            self.assertNotIn("more (", stderr)
             self.assertEqual(
                 lines,
-                [
-                    f"TAF: app.first changed; dep{index:02d}.py:12 depends on it"
-                    " and is not in this commit"
-                    for index in range(3)
-                ]
-                + [OTHER_LINE.rstrip("\n"), WEB_LINE.rstrip("\n")],
+                ["TAF impact: 5 files depend on this change and are not in this commit"]
+                + [f"  dep{index:02d}.py:12  <- app.first" for index in range(3)]
+                + ["  other.py:12  <- app", "  web.py:12    <- app.first"],
             )
 
     def test_the_query_asks_the_engine_for_verified_edges_only(self) -> None:
@@ -446,44 +454,174 @@ class UntouchedDependentTests(unittest.TestCase):
 
         self.assertEqual(untouched_dependents(result, set()), [])
 
-    def test_a_warning_line_names_the_strongest_anchor_and_the_reference(self) -> None:
+
+def _detail_candidate(path: str, qualified_name: str, *, reference_line: int = 12) -> dict:
+    """A minimal candidate `format_report` needs: a path, a line, and one anchor."""
+    return {
+        "path": path,
+        "reference_line": reference_line,
+        "anchors": [{"qualified_name": qualified_name}],
+    }
+
+
+class FormatReportTests(unittest.TestCase):
+    """`format_report`'s exact shapes (addendum D16): header, detail lines, trailer."""
+
+    def test_no_untouched_dependents_prints_nothing(self) -> None:
+        self.assertEqual(format_report([], truncated=False, colour=False), [])
+
+    def test_an_omission_with_nothing_to_show_still_prints_nothing(self) -> None:
+        # D16: an omission the engine cannot even name a file for is not
+        # something a user can act on, so a header with nothing under it
+        # would only mislead - the hook stays silent instead.
+        self.assertEqual(format_report([], truncated=True, colour=False), [])
+
+    def test_a_single_production_file_uses_the_singular_header(self) -> None:
+        lines = format_report(
+            [_detail_candidate("app.py", "app.first")], truncated=False, colour=False
+        )
         self.assertEqual(
-            format_warning_line(self._candidate("web.py", "verified")),
-            "TAF: app.first changed; web.py:12 depends on it and is not in this commit",
+            lines,
+            [
+                "TAF impact: 1 file depends on this change and is not in this commit",
+                "  app.py:12  <- app.first",
+            ],
         )
 
-    def test_the_summary_line_names_the_query_and_never_overclaims(self) -> None:
-        # Exact: the engine omitted nothing, so the count is trusted as is.
-        self.assertEqual(
-            format_summary_line(2),
-            "TAF: ... and 2 more "
-            "(query impact-candidates --staged for more)",
-        )
-        # Lower bound: the engine omitted candidates in some direction, so
-        # the count is marked as a floor rather than asserted exact.
-        self.assertEqual(
-            format_summary_line(2, truncated=True),
-            "TAF: ... and 2+ more "
-            "(query impact-candidates --staged for more)",
-        )
-        # Five or fewer files remain (here, none and a negative remainder)
-        # but the result is still truncated: nothing exact is left to name.
-        self.assertEqual(
-            format_summary_line(0, truncated=True),
-            "TAF: ... and possibly more "
-            "(query impact-candidates --staged for more)",
+    def test_production_only_exact_prints_every_file_with_no_trailer(self) -> None:
+        lines = format_report(
+            [
+                _detail_candidate("a.py", "sym", reference_line=5),
+                _detail_candidate("bb.py", "sym", reference_line=100),
+            ],
+            truncated=False,
+            colour=False,
         )
         self.assertEqual(
-            format_summary_line(-3, truncated=True),
-            "TAF: ... and possibly more "
-            "(query impact-candidates --staged for more)",
+            lines,
+            [
+                "TAF impact: 2 files depend on this change and are not in this commit",
+                "  a.py:5     <- sym",
+                "  bb.py:100  <- sym",
+            ],
         )
-        # Never printed and never called with this combination: a summary
-        # would have nothing to say and no reason to say it.
-        with self.assertRaises(ValueError):
-            format_summary_line(0)
-        with self.assertRaises(ValueError):
-            format_summary_line(-1)
+
+    def test_alignment_pads_the_shorter_path_so_every_arrow_column_lines_up(self) -> None:
+        lines = format_report(
+            [
+                _detail_candidate("web.py", "app.first"),
+                _detail_candidate("other.py", "app"),
+            ],
+            truncated=False,
+            colour=False,
+        )
+        detail = lines[1:]
+        arrow_columns = {line.index("<-") for line in detail}
+        self.assertEqual(len(arrow_columns), 1)
+
+    def test_more_than_five_production_files_end_with_a_lower_bound_trailer(self) -> None:
+        candidates = [_detail_candidate(f"dep{index:02d}.py", "sym") for index in range(6)]
+        lines = format_report(candidates, truncated=False, colour=False)
+        self.assertEqual(lines[0], "TAF impact: 6 files depend on this change and are not in this commit")
+        self.assertEqual(len(lines), 1 + HOOK_MAXIMUM_LINES + 1)
+        self.assertEqual(lines[-1], f"  ... and 1 more {HOOK_POINTER}")
+
+    def test_a_truncated_result_marks_the_remaining_count_with_a_plus(self) -> None:
+        candidates = [_detail_candidate(f"dep{index:02d}.py", "sym") for index in range(7)]
+        lines = format_report(candidates, truncated=True, colour=False)
+        self.assertEqual(lines[0], "TAF impact: 7+ files depend on this change and are not in this commit")
+        self.assertEqual(lines[-1], f"  ... and 2+ more {HOOK_POINTER}")
+
+    def test_every_production_file_prints_but_truncation_says_possibly_more(self) -> None:
+        candidates = [_detail_candidate(f"dep{index:02d}.py", "sym") for index in range(3)]
+        lines = format_report(candidates, truncated=True, colour=False)
+        self.assertEqual(lines[0], "TAF impact: 3+ files depend on this change and are not in this commit")
+        self.assertEqual(lines[-1], f"  ... and possibly more {HOOK_POINTER}")
+
+    def test_production_and_test_files_fold_the_tests_into_the_trailer(self) -> None:
+        candidates = [
+            _detail_candidate("a.py", "sym"),
+            _detail_candidate("b.py", "sym"),
+            _detail_candidate("tests/test_c.py", "sym"),
+            _detail_candidate("tests/test_d.py", "sym"),
+            _detail_candidate("tests/test_e.py", "sym"),
+        ]
+        lines = format_report(candidates, truncated=False, colour=False)
+        self.assertEqual(lines[0], "TAF impact: 2 files depend on this change and are not in this commit")
+        self.assertEqual(len(lines), 1 + 2 + 1)  # header, 2 production lines, trailer
+        self.assertEqual(lines[-1], f"  ... plus 3 test files {HOOK_POINTER}")
+
+    def test_remaining_production_and_test_files_both_appear_in_the_trailer(self) -> None:
+        candidates = [_detail_candidate(f"dep{index:02d}.py", "sym") for index in range(6)] + [
+            _detail_candidate("tests/test_a.py", "sym"),
+            _detail_candidate("tests/test_b.py", "sym"),
+        ]
+        lines = format_report(candidates, truncated=False, colour=False)
+        self.assertEqual(lines[0], "TAF impact: 6 files depend on this change and are not in this commit")
+        self.assertEqual(lines[-1], f"  ... and 1 more, plus 2 test files {HOOK_POINTER}")
+
+    def test_a_single_test_file_uses_the_singular_test_header_when_nothing_else_depends(
+        self,
+    ) -> None:
+        lines = format_report(
+            [_detail_candidate("tests/test_a.py", "sym")], truncated=False, colour=False
+        )
+        self.assertEqual(
+            lines,
+            [
+                "TAF impact: 1 test file depends on this change and is not in this commit",
+                "  tests/test_a.py:12  <- sym",
+            ],
+        )
+
+    def test_test_files_only_are_printed_as_detail_lines_with_no_trailer(self) -> None:
+        candidates = [
+            _detail_candidate("tests/test_a.py", "sym"),
+            _detail_candidate("tests/test_b.py", "sym"),
+        ]
+        lines = format_report(candidates, truncated=False, colour=False)
+        self.assertEqual(
+            lines,
+            [
+                "TAF impact: 2 test files depend on this change and are not in this commit",
+                "  tests/test_a.py:12  <- sym",
+                "  tests/test_b.py:12  <- sym",
+            ],
+        )
+
+    def test_more_than_five_test_only_files_fold_the_remainder_into_the_trailer(self) -> None:
+        # Not spelled out verbatim in D16 (whose R/T wording is written for
+        # the mixed production-and-test case): when there is no production
+        # dependent at all, the test group itself is what's capped at five,
+        # so its own overflow is named with the same "R more" wording R
+        # carries in the mixed case, and T stays 0 - there is no separate
+        # test category left to name once the printed lines are already
+        # test files.
+        candidates = [_detail_candidate(f"tests/test_{index:02d}.py", "sym") for index in range(6)]
+        lines = format_report(candidates, truncated=False, colour=False)
+        self.assertEqual(
+            lines[0], "TAF impact: 6 test files depend on this change and are not in this commit"
+        )
+        self.assertEqual(len(lines), 1 + HOOK_MAXIMUM_LINES + 1)
+        self.assertEqual(lines[-1], f"  ... and 1 more {HOOK_POINTER}")
+
+    def test_colour_bolds_only_the_header(self) -> None:
+        lines = format_report(
+            [_detail_candidate("app.py", "app.first")], truncated=False, colour=True
+        )
+        self.assertEqual(lines[0], "\x1b[1mTAF impact: 1 file depends on this change and is not in this commit\x1b[0m")
+        self.assertNotIn("\x1b", lines[1])
+
+    def test_every_header_starts_with_taf_impact_and_every_other_line_with_two_spaces(
+        self,
+    ) -> None:
+        candidates = [_detail_candidate(f"dep{index:02d}.py", "sym") for index in range(6)] + [
+            _detail_candidate("tests/test_a.py", "sym")
+        ]
+        lines = format_report(candidates, truncated=True, colour=False)
+        self.assertTrue(lines[0].startswith("TAF impact:"))
+        for line in lines[1:]:
+            self.assertTrue(line.startswith("  "))
 
 
 class ImpactHookSafetyTests(unittest.TestCase):
@@ -649,22 +787,21 @@ class HookFullCompositionTests(unittest.TestCase):
 
             self.assertEqual((code, stdout), (0, ""))
             lines = stderr.splitlines()
-            self.assertEqual(len(lines), HOOK_MAXIMUM_LINES + 1)
+            # Header, five detail lines, one trailer.
+            self.assertEqual(len(lines), 1 + HOOK_MAXIMUM_LINES + 1)
             self.assertEqual(
-                lines[:HOOK_MAXIMUM_LINES],
+                lines[0], "TAF impact: 42 files depend on this change and are not in this commit"
+            )
+            self.assertEqual(
+                lines[1 : 1 + HOOK_MAXIMUM_LINES],
                 [
-                    f"TAF: app.first changed; dep{index:02d}.py:12 depends on it"
-                    " and is not in this commit"
+                    f"  dep{index:02d}.py:12  <- app.first"
                     for index in range(HOOK_MAXIMUM_LINES)
                 ],
             )
             # 40 dep*.py callers + web.py (a caller) + other.py (an
             # importer) = 42 untouched files; five print, 37 remain.
-            self.assertEqual(
-                lines[HOOK_MAXIMUM_LINES],
-                "TAF: ... and 37 more "
-                "(query impact-candidates --staged for more)",
-            )
+            self.assertEqual(lines[-1], f"  ... and 37 more {HOOK_POINTER}")
 
             # The point of the fix: the composed answer itself carries every
             # candidate, not just the ones an output-budget trim would have
@@ -709,20 +846,19 @@ class HookFullCompositionTests(unittest.TestCase):
 
             self.assertEqual((code, stdout), (0, ""))
             lines = stderr.splitlines()
-            self.assertEqual(len(lines), HOOK_MAXIMUM_LINES + 1)
+            # Header, five detail lines, one trailer.
+            self.assertEqual(len(lines), 1 + HOOK_MAXIMUM_LINES + 1)
             self.assertEqual(
-                lines[:HOOK_MAXIMUM_LINES],
+                lines[0], "TAF impact: 65 files depend on this change and are not in this commit"
+            )
+            self.assertEqual(
+                lines[1 : 1 + HOOK_MAXIMUM_LINES],
                 [
-                    f"TAF: app.first changed; dep{index:02d}.py:12 depends on it"
-                    " and is not in this commit"
+                    f"  dep{index:02d}.py:12  <- app.first"
                     for index in range(HOOK_MAXIMUM_LINES)
                 ],
             )
-            self.assertEqual(
-                lines[HOOK_MAXIMUM_LINES],
-                "TAF: ... and 60 more "
-                "(query impact-candidates --staged for more)",
-            )
+            self.assertEqual(lines[-1], f"  ... and 60 more {HOOK_POINTER}")
 
 
 class HookTruncationMarkerTests(unittest.TestCase):
@@ -748,15 +884,19 @@ class HookTruncationMarkerTests(unittest.TestCase):
 
             self.assertEqual((code, stdout), (0, ""))
             lines = stderr.splitlines()
-            self.assertEqual(len(lines), HOOK_MAXIMUM_LINES + 1)
+            # Header, five detail lines, one trailer.
+            self.assertEqual(len(lines), 1 + HOOK_MAXIMUM_LINES + 1)
             # 20 dep*.py callers + web.py (a caller) + other.py (an
-            # importer) = 22 untouched files; five print, 17 remain, and
-            # the engine reported an omission of its own, so the count is
-            # marked as a lower bound.
+            # importer) = 22 untouched files; the header count is marked a
+            # lower bound because the engine reported its own omission; five
+            # print, 17 remain, also marked with a `+`.
             self.assertEqual(
-                lines[HOOK_MAXIMUM_LINES],
-                "TAF: ... and 17+ more "
-                "(query impact-candidates --staged for more)",
+                lines[0],
+                "TAF impact: 22+ files depend on this change and are not in this commit",
+            )
+            self.assertEqual(
+                lines[-1],
+                f"  ... and 17+ more {HOOK_POINTER}",
             )
 
     def test_five_or_fewer_files_remain_and_print_possibly_more(self) -> None:
@@ -771,13 +911,15 @@ class HookTruncationMarkerTests(unittest.TestCase):
             self.assertEqual((code, stdout), (0, ""))
             # Only web.py and other.py are untouched - both print, nothing
             # remains to count - but the engine still reported an omission,
-            # so the hook still speaks up rather than staying silent about it.
+            # so the hook still speaks up rather than staying silent about
+            # it: the header is marked with a `+` and the trailer falls
+            # back to "possibly more" since nothing exact remains to name.
             self.assertEqual(
                 stderr,
-                OTHER_LINE
-                + WEB_LINE
-                + "TAF: ... and possibly more "
-                "(query impact-candidates --staged for more)\n",
+                "TAF impact: 2+ files depend on this change and are not in this commit\n"
+                "  other.py:12  <- app\n"
+                "  web.py:12    <- app.first\n"
+                f"  ... and possibly more {HOOK_POINTER}\n",
             )
 
 
@@ -1432,7 +1574,7 @@ class HookEndToEndTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+            self.assertEqual(result.stderr, TWO_FILE_REPORT)
             self.assertNotIn("TAF:", result.stdout)
             after_log = run(repository, "git", "log", "--format=%H")
             self.assertNotEqual(before_log, after_log)
@@ -1481,7 +1623,7 @@ class HookEndToEndTests(unittest.TestCase):
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("TAF:", result.stderr)
+            self.assertIn("TAF impact:", result.stderr)
             self.assertIn("foreign", result.stderr)
             after_log = run(repository, "git", "log", "--format=%H")
             self.assertEqual(before_log, after_log)
@@ -1511,14 +1653,14 @@ class RunHookNeverRaisesTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
 
-    def test_an_ascii_stderr_accepts_all_six_lines_including_the_summary(
+    def test_an_ascii_stderr_accepts_every_line_including_the_trailer(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment, repository = ready_repository(root, extra_callers=5)
-            # The summary line is pure ASCII, so an ASCII-only stderr accepts
-            # every line the hook writes, the summary included; write_through
+            # The header, detail lines, and trailer are pure ASCII, so an
+            # ASCII-only stderr accepts every one of them; write_through
             # makes every accepted write land in the buffer immediately, so it
             # can be inspected below without an explicit flush.
             stderr = io.TextIOWrapper(
@@ -1536,15 +1678,12 @@ class RunHookNeverRaisesTests(unittest.TestCase):
             written = stderr.buffer.getvalue().decode("ascii")
             self.assertEqual(
                 written.splitlines(),
-                [
-                    f"TAF: app.first changed; dep{index:02d}.py:12 depends on it"
-                    " and is not in this commit"
+                ["TAF impact: 7 files depend on this change and are not in this commit"]
+                + [
+                    f"  dep{index:02d}.py:12  <- app.first"
                     for index in range(HOOK_MAXIMUM_LINES)
                 ]
-                + [
-                    "TAF: ... and 2 more "
-                    "(query impact-candidates --staged for more)"
-                ],
+                + [f"  ... and 2 more {HOOK_POINTER}"],
             )
 
     def test_a_raising_stderr_through_cli_main_still_exits_zero(self) -> None:
@@ -1560,6 +1699,75 @@ class RunHookNeverRaisesTests(unittest.TestCase):
             )
 
             self.assertEqual(code, 0)
+
+
+class _FakeTTYStderr(io.StringIO):
+    """A stderr double that reports itself as a real terminal (D16 colour rule)."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+class HookColourTests(unittest.TestCase):
+    """`run_hook` bolds the header only on a real TTY stderr (addendum D16)."""
+
+    def test_a_tty_stderr_bolds_only_the_header(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root)
+            stderr = _FakeTTYStderr()
+
+            code = run_hook(repository, environment=environment, stderr=stderr, verbose=False)
+
+            self.assertEqual(code, 0)
+            lines = stderr.getvalue().splitlines()
+            self.assertEqual(
+                lines[0],
+                "\x1b[1mTAF impact: 2 files depend on this change and are not in this "
+                "commit\x1b[0m",
+            )
+            self.assertNotIn("\x1b", "\n".join(lines[1:]))
+
+    def test_no_color_disables_colour_on_a_tty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root)
+            environment = dict(environment, NO_COLOR="1")
+            stderr = _FakeTTYStderr()
+
+            code = run_hook(repository, environment=environment, stderr=stderr, verbose=False)
+
+            self.assertEqual(code, 0)
+            self.assertNotIn("\x1b", stderr.getvalue())
+            self.assertTrue(
+                stderr.getvalue().startswith(
+                    "TAF impact: 2 files depend on this change and are not in this commit"
+                )
+            )
+
+    def test_a_dumb_term_disables_colour_on_a_tty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root)
+            environment = dict(environment, TERM="dumb")
+            stderr = _FakeTTYStderr()
+
+            code = run_hook(repository, environment=environment, stderr=stderr, verbose=False)
+
+            self.assertEqual(code, 0)
+            self.assertNotIn("\x1b", stderr.getvalue())
+
+    def test_a_non_tty_stderr_never_emits_escape_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root)
+            stderr = io.StringIO()  # isatty() is False by default
+
+            code = run_hook(repository, environment=environment, stderr=stderr, verbose=False)
+
+            self.assertEqual(code, 0)
+            self.assertNotIn("\x1b", stderr.getvalue())
+            self.assertEqual(stderr.getvalue(), TWO_FILE_REPORT)
 
 
 class HookChainSafetyTests(unittest.TestCase):
@@ -1603,7 +1811,7 @@ class HookChainSafetyTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             # Exact equality: the TAF warnings and nothing else, so a shell
             # error about the missing backup would fail this test.
-            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+            self.assertEqual(result.stderr, TWO_FILE_REPORT)
             after_log = run(repository, "git", "log", "--format=%H")
             self.assertNotEqual(before_log, after_log)
 
@@ -2049,7 +2257,7 @@ class LauncherSelfHealingEndToEndTests(unittest.TestCase):
             result = self._commit(environment, repository)
 
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+            self.assertEqual(result.stderr, TWO_FILE_REPORT)
 
     def test_a_pointer_absent_falls_back_to_the_embedded_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2063,7 +2271,7 @@ class LauncherSelfHealingEndToEndTests(unittest.TestCase):
             result = self._commit(environment, repository)
 
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+            self.assertEqual(result.stderr, TWO_FILE_REPORT)
 
     def test_a_pointer_naming_a_missing_script_falls_back_to_the_embedded_paths(
         self,
@@ -2083,7 +2291,7 @@ class LauncherSelfHealingEndToEndTests(unittest.TestCase):
             result = self._commit(environment, repository)
 
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+            self.assertEqual(result.stderr, TWO_FILE_REPORT)
 
     def test_a_bogus_embedded_interpreter_falls_back_to_command_v_python3(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2108,7 +2316,7 @@ class LauncherSelfHealingEndToEndTests(unittest.TestCase):
             result = self._commit(environment, repository)
 
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stderr, OTHER_LINE + WEB_LINE)
+            self.assertEqual(result.stderr, TWO_FILE_REPORT)
 
     def test_neither_interpreter_nor_script_resolvable_stays_silent(self) -> None:
         # Chosen implementation of the brief's scenario (e): the pointer is

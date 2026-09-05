@@ -15,7 +15,7 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.8.3 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, warn at commit time about dependents left behind, and reclaim unused index state without loading the full repository into model context. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.8.4 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, warn at commit time about dependents left behind, and reclaim unused index state without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.1.0 | Recover interrupted work and the single best next step from bounded, read-only Git evidence, optionally naming the symbols the work touched. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
@@ -286,25 +286,37 @@ Windows on amd64.
 ### Commit-time impact warning
 
 An optional `pre-commit` launcher warns about dependent files a commit
-leaves behind. It asks one bounded `impact-candidates --staged` query and,
-for every untouched file with a verified dependent, writes one line to
-stderr - a file that is both a call site and an import reference keeps only
-its call line, and production files print before test files:
+leaves behind. It asks one bounded `impact-candidates --staged` query and
+writes one short report to stderr: a header, at most five aligned detail
+lines for the untouched production files, and a trailer naming what was
+left out (addendum D16). This is the report a real staged edit to
+`normalize_change_base` prints in this repository - captured from a real
+run of this skill's own dogfood test:
 
 ```text
-TAF: context_operations.normalize_change_base changed; tools/taf-context/taf_context/prepare_cli.py:324 depends on it and is not in this commit
+TAF impact: 2 files depend on this change and are not in this commit
+  tools/taf-context/taf_context/mcp_server.py:481   <- context_operations.normalize_change_base
+  tools/taf-context/taf_context/prepare_cli.py:324  <- context_operations.normalize_change_base
+  ... plus 1 test file (ask your agent to list TAF impact for this commit)
 ```
 
-That is one of the lines a staged edit to that helper prints in this
-repository. At most five such lines print, followed by a summary line
-counting the remaining files; the hook chooses its five lines from the
-complete candidate set, never trimming the answer for output, and its own
-result cap is set so it can never bind either. What remains is complete as
-far as the engine returned it: a symbol with more than 64 references in one
-direction, or a change set of more than 64 changed symbols, can still leave
-dependents the composition never saw, and the summary marks exactly that
-case - a trailing `+` when files remain beyond what the engine reported, or
-"possibly more" when five or fewer do. It is advisory only: stderr only, never
+The header counts the untouched production files (or the test files
+instead, when no production file depends but a test does); production
+files print as detail lines first, and a test file only takes one of the
+five slots when no production file depends. The trailer, present whenever
+something was left out, names the remaining production files and folds
+the untouched test files into a count, and points at the agent rather than
+a command - `query impact-candidates --staged` is not runnable in a plugin
+installation and the CLI's own budget would show only part of a wide
+result anyway; a trailing `+` marks a count as a lower bound when the
+engine itself omitted candidates in some direction, and the trailer falls
+back to "possibly more" when nothing exact remains to name. The header is
+bold on a real TTY stderr with `NO_COLOR` unset and `TERM` not `dumb`;
+every other line, and every line on a non-TTY stderr (GUI clients, CI,
+pipes), is plain ASCII. The hook is deliberately not interactive: a prompt
+inside pre-commit would hang GUI clients, CI, and an agent's own commits,
+so questions about the full list go to the agent afterwards instead of a
+prompt. It is advisory only: stderr only, never
 stdout, exit code 0 always, and it waits at most 3 seconds for the answer
 before giving up silently (process cleanup may add a moment), so a slow or
 cold engine can never hold up a commit. It stays completely silent whenever
@@ -440,7 +452,7 @@ TAF and its skills have separate versions:
 
 - TAF `2.8.4` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.8.3` versions its behavior contract.
+- `prepare-repo-context` `1.8.4` versions its behavior contract.
 - `work-recovery` `1.1.0` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with

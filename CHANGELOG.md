@@ -5,6 +5,33 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.4.
+
+### Changed
+
+- The commit-time hook's output is now a header, at most five aligned detail
+  lines, and a trailer, instead of one flat `TAF:` line per file: the lines
+  were hard to tell apart from git's own stderr, the changed symbol was
+  repeated on every line, the summary pointed at a command the user cannot
+  run in a plugin installation, and test files took slots among the five
+  even though a forgotten test file is less critical than a forgotten
+  production one. The header (`TAF impact: N file(s) depend(s) on this
+  change and are not in this commit`) counts the untouched production
+  files, or the test files instead when no production file depends but a
+  test does; detail lines are `<path>:<reference_line>`, padded so their
+  `<-` column aligns, then `<- <qualified name>`, production files first;
+  the trailer names the remaining production files and folds every
+  untouched test file into a count, and points at the agent instead of a
+  command - `... and R more, plus T test files (ask your agent to list
+  TAF impact for this commit)`.
+- The header is bold on a real TTY stderr when `NO_COLOR` is unset and
+  `TERM` is not `dumb`; every other line, and every line on a non-TTY
+  stderr (GUI clients, CI, pipes), stays plain ASCII with no escape codes.
+- The hook remains deliberately not interactive: a prompt inside
+  pre-commit would hang GUI clients (no stdin), CI (no TTY), and an
+  agent's own commits, so questions about the full list go to the agent
+  afterwards instead of a prompt - a documented choice, not an oversight.
+
 ## [2.8.4] - 2026-09-05
 
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.3.

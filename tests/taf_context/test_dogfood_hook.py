@@ -5,9 +5,10 @@ built with the released native engine, and given an installed `pre-commit`
 launcher. Test A edits a library helper (`normalize_change_base`) whose real
 callers - production code and its own unit tests alike - stay untouched and
 commits: `git commit` must succeed and the installed launcher's stderr must
-name the untouched dependent files, one line each, up to the five-line cap,
-with a summary line only when more files remain. Test B edits the same
-helper again but this time also touches every file that carries an
+report the header, at most five aligned detail lines for the untouched
+production files, and a trailer naming any remaining production files and
+folding the untouched test files into a count (addendum D16). Test B edits
+the same helper again but this time also touches every file that carries an
 untouched dependent, so none is left out of the commit: the launcher must
 then stay silent. The two tests share one clone and one built index, and
 rely on running in that order - the second commit builds on the first
@@ -61,25 +62,23 @@ _ORIGINAL_MESSAGE = '"selected change base is invalid"'
 _EDITED_MESSAGE = '"selected change base is invalid (dogfood)"'
 _EDITED_MESSAGE_AGAIN = '"selected change base is invalid (dogfood again)"'
 
-# The exact `TAF:` lines the released 0.6.0 engine produced for Test A,
-# pinned from a real run of this test (see the task report for the verbatim
+# The exact report the released 0.6.0 engine produced for Test A, pinned
+# from a real run of this test (see the task report for the verbatim
 # captured stderr). Untouched dependents are counted per file (addendum D9):
 # the seven candidates the pre-D9 query returned collapse to three
 # representative files - `mcp_server.py` and `prepare_cli.py` each keep only
 # their call-site candidate over their import-line one, and
-# `test_context_operations.py`'s two call sites collapse to the earlier one -
-# printed non-test files first, so all three fit under the five-line cap and
-# no summary line is needed.
+# `test_context_operations.py`'s two call sites collapse to the earlier one.
+# The two production files print as detail lines (addendum D16); the one
+# test file never takes a slot and is instead folded into the trailer's
+# test-file count.
 EXPECTED_STDERR_TEST_A = (
-    "TAF: context_operations.normalize_change_base changed; "
-    "tools/taf-context/taf_context/mcp_server.py:481 "
-    "depends on it and is not in this commit\n"
-    "TAF: context_operations.normalize_change_base changed; "
-    "tools/taf-context/taf_context/prepare_cli.py:324 "
-    "depends on it and is not in this commit\n"
-    "TAF: context_operations.normalize_change_base changed; "
-    "tests/taf_context/test_context_operations.py:2147 "
-    "depends on it and is not in this commit\n"
+    "TAF impact: 2 files depend on this change and are not in this commit\n"
+    "  tools/taf-context/taf_context/mcp_server.py:481   "
+    "<- context_operations.normalize_change_base\n"
+    "  tools/taf-context/taf_context/prepare_cli.py:324  "
+    "<- context_operations.normalize_change_base\n"
+    "  ... plus 1 test file (ask your agent to list TAF impact for this commit)\n"
 )
 
 # The exact marker line the fixture edits for Test C: a comment inserted
@@ -88,25 +87,20 @@ EXPECTED_STDERR_TEST_A = (
 _PREPARE_CLI_ERROR_CLASS_LINE = "class PrepareCLIError(ValueError):\n"
 _PREPARE_CLI_ERROR_COMMENT = "    # dogfood: touch every module that raises this error\n"
 
-# The exact `TAF:` lines the released 0.6.0 engine produced for Test C,
-# pinned from a real run of this test (see the task report for the verbatim
+# The exact report the released 0.6.0 engine produced for Test C, pinned
+# from a real run of this test (see the task report for the verbatim
 # captured stderr). `PrepareCLIError` is imported and raised by every broker
 # module, so its four real callers - two production, two test - all survive
-# composition and all print, production files first; four is under the
-# five-line cap, so no summary line follows.
+# composition; the two production files print as detail lines (addendum
+# D16), and the two test files never take a slot, folded instead into the
+# trailer's test-file count.
 EXPECTED_STDERR_TEST_C = (
-    "TAF: context_operations.PrepareCLIError changed; "
-    "tools/taf-context/taf_context/mcp_server.py:13 "
-    "depends on it and is not in this commit\n"
-    "TAF: context_operations.PrepareCLIError changed; "
-    "tools/taf-context/taf_context/prepare_cli.py:132 "
-    "depends on it and is not in this commit\n"
-    "TAF: context_operations.PrepareCLIError changed; "
-    "tests/taf_context/test_context_operations.py:18 "
-    "depends on it and is not in this commit\n"
-    "TAF: context_operations.PrepareCLIError changed; "
-    "tests/taf_context/test_mcp_server.py:624 "
-    "depends on it and is not in this commit\n"
+    "TAF impact: 2 files depend on this change and are not in this commit\n"
+    "  tools/taf-context/taf_context/mcp_server.py:13    "
+    "<- context_operations.PrepareCLIError\n"
+    "  tools/taf-context/taf_context/prepare_cli.py:132  "
+    "<- context_operations.PrepareCLIError\n"
+    "  ... plus 2 test files (ask your agent to list TAF impact for this commit)\n"
 )
 
 
@@ -314,8 +308,9 @@ class DogfoodHookTests(unittest.TestCase):
         output-budget trim would have kept only a handful of candidates in
         path order, discarding production dependents while test files and
         same-file candidates survived. Composing the full candidate set
-        before the hook's own five-line cap means the launcher now prints
-        the two production callers, then test files, then a summary line.
+        before the hook's own five-line cap means the launcher now reports
+        the two production callers as detail lines and folds the two test
+        files into the trailer's count (addendum D16).
         """
         before_head = self._head()
         path = self.repository / CONTEXT_OPERATIONS_PATH
