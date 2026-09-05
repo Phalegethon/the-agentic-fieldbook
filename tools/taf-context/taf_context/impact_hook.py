@@ -11,6 +11,7 @@ cold engine can never hold up a commit.
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 import threading
 import time
@@ -49,32 +50,45 @@ def run_hook(
     is written, and the commit proceeds. A worker that answered after the
     deadline never reaches this stream either, because only a worker that
     finished in time has its lines written here.
-    """
-    started = time.monotonic()
-    if environment.get(HOOK_DISABLE_VARIABLE) == "0":
-        _explain(stderr, verbose, f"disabled by {HOOK_DISABLE_VARIABLE}=0")
-        return 0
 
-    run = _HookRun(repository, environment)
-    worker = threading.Thread(target=run.collect, name="taf-impact-hook", daemon=True)
-    worker.start()
-    worker.join(max(0.0, HOOK_TIME_LIMIT_SECONDS - (time.monotonic() - started)))
-    if worker.is_alive():
-        run.abandon()
-        worker.join(_ABANDON_JOIN_SECONDS)
-        # A worker that was already inside the engine's start-up when the
-        # first kill landed owns a child the first kill could not see.
-        run.abandon()
-        _explain(
-            stderr, verbose, f"exceeded the {HOOK_TIME_LIMIT_SECONDS} second limit"
+    The whole body is guarded: the hook is advisory, so thread start,
+    `_explain`, and the warning writes below may never raise out to the
+    caller and abort the commit. Each warning line is written under its own
+    `contextlib.suppress` so a stderr failure on one line (a closed pipe, an
+    encoding a summary character does not fit) does not discard lines already
+    written.
+    """
+    try:
+        started = time.monotonic()
+        if environment.get(HOOK_DISABLE_VARIABLE) == "0":
+            _explain(stderr, verbose, f"disabled by {HOOK_DISABLE_VARIABLE}=0")
+            return 0
+
+        run = _HookRun(repository, environment)
+        worker = threading.Thread(
+            target=run.collect, name="taf-impact-hook", daemon=True
         )
+        worker.start()
+        worker.join(max(0.0, HOOK_TIME_LIMIT_SECONDS - (time.monotonic() - started)))
+        if worker.is_alive():
+            run.abandon()
+            worker.join(_ABANDON_JOIN_SECONDS)
+            # A worker that was already inside the engine's start-up when the
+            # first kill landed owns a child the first kill could not see.
+            run.abandon()
+            _explain(
+                stderr, verbose, f"exceeded the {HOOK_TIME_LIMIT_SECONDS} second limit"
+            )
+            return 0
+        if run.reason is not None:
+            _explain(stderr, verbose, run.reason)
+            return 0
+        for line in run.lines:
+            with contextlib.suppress(Exception):
+                stderr.write(line + "\n")
         return 0
-    if run.reason is not None:
-        _explain(stderr, verbose, run.reason)
+    except Exception:  # the hook is advisory: nothing may escape it, ever
         return 0
-    for line in run.lines:
-        stderr.write(line + "\n")
-    return 0
 
 
 def untouched_dependents(
@@ -84,7 +98,8 @@ def untouched_dependents(
 
     A dependent inside the commit is by definition already handled, and an
     inferred edge is a guess a hook must never make; what is left keeps the
-    result's own candidate order.
+    result's own candidate order. An anchorless candidate is dropped here too,
+    so `format_warning_line`'s `anchors[0]` can never index an empty list.
     """
     touched = set(staged_paths)
     findings = result.get("findings") or []
@@ -93,6 +108,7 @@ def untouched_dependents(
         for candidate in findings
         if candidate.get("path") not in touched
         and candidate.get("edge_evidence") == "verified"
+        and candidate.get("anchors")
     ]
 
 
@@ -130,7 +146,10 @@ class _HookRun:
         self._repository = repository
         self._environment = environment
         self._guard = threading.Lock()
-        self._session = None
+        # `Level1Session` is imported lazily in `_transport_for` (hook and
+        # change queries only), so the annotation is a string to avoid a
+        # module-level import a type checker would otherwise need to resolve.
+        self._session: "Level1Session | None" = None
         self._abandoned = False
         self.lines: list[str] = []
         self.reason: str | None = None

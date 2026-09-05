@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
@@ -9,11 +10,15 @@ import tempfile
 import time
 import unittest
 
+from taf_context.cli import main
+from taf_context.context_operations import QueryArguments
 from taf_context.impact_hook import (
     HOOK_MAXIMUM_LINES,
     HOOK_TIME_LIMIT_SECONDS,
+    _hook_query,
     format_summary_line,
     format_warning_line,
+    run_hook,
     untouched_dependents,
 )
 
@@ -58,6 +63,23 @@ def build_index(environment: dict[str, str], repository: Path) -> None:
     )
     if (code, stderr) != (0, ""):  # pragma: no cover - a broken fixture, not a result
         raise AssertionError(f"fixture build failed: {stderr}")
+
+
+def ready_repository(root: Path, **options) -> tuple[dict[str, str], Path]:
+    """A repository with a built index and a staged change, ready for `run_hook`.
+
+    Duplicates `ImpactHookWarningTests._ready_repository` for tests that call
+    `run_hook` directly with a stderr double instead of going through `invoke`.
+    """
+    repository = staged_impact_fixture(root)
+    native = root / "taf-level1"
+    write_fake_native_engine(native, **options)
+    environment = {
+        "TAF_LEVEL1_BINARY": str(native),
+        "TAF_STATE_HOME": str(root / "state"),
+    }
+    build_index(environment, repository)
+    return environment, repository
 
 
 def hook(environment: dict[str, str], repository: Path, *extra: str) -> tuple[int, str, str]:
@@ -291,6 +313,13 @@ class UntouchedDependentTests(unittest.TestCase):
     def test_a_result_without_findings_keeps_nothing(self) -> None:
         self.assertEqual(untouched_dependents({}, set()), [])
 
+    def test_a_candidate_without_anchors_is_dropped(self) -> None:
+        candidate = self._candidate("web.py", "verified")
+        candidate["anchors"] = []
+        result = {"findings": [candidate]}
+
+        self.assertEqual(untouched_dependents(result, set()), [])
+
     def test_a_warning_line_names_the_strongest_anchor_and_the_reference(self) -> None:
         self.assertEqual(
             format_warning_line(self._candidate("web.py", "verified")),
@@ -410,6 +439,101 @@ class ImpactHookSafetyTests(unittest.TestCase):
                 stderr,
                 "TAF hook: PrepareCLIError: repository must have at least one commit\n",
             )
+
+
+class HookQueryTests(unittest.TestCase):
+    """The one query's shape is pinned so a typo in a constant fails a test."""
+
+    def test_the_hook_query_carries_exactly_the_brief_s_budget_and_no_query(self) -> None:
+        self.assertEqual(
+            _hook_query(),
+            QueryArguments(
+                operation="impact-candidates",
+                query=None,
+                result_identities=(),
+                path_prefixes=[],
+                languages=[],
+                symbol_kinds=[],
+                source_types=[],
+                maximum_results=16,
+                maximum_output_characters=12000,
+                allow_inferred=False,
+                direction=None,
+                base=None,
+                staged=True,
+            ),
+        )
+
+
+class _RaisingStderr:
+    """A stderr double whose every write raises, like a closed pipe would."""
+
+    def write(self, _text: str) -> int:
+        raise BrokenPipeError("stderr closed")
+
+
+class RunHookNeverRaisesTests(unittest.TestCase):
+    """`run_hook` must return 0 even when writing to stderr itself fails."""
+
+    def test_a_broken_pipe_on_the_warning_path_still_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root)
+
+            code = run_hook(
+                repository,
+                environment=environment,
+                stderr=_RaisingStderr(),
+                verbose=False,
+            )
+
+            self.assertEqual(code, 0)
+
+    def test_an_encoding_failure_on_the_summary_line_does_not_drop_the_warnings(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root, extra_callers=5)
+            # ASCII-only encoding accepts the warning lines but rejects the
+            # summary line's U+2026; write_through makes every accepted write
+            # land in the buffer immediately, so it can be inspected below
+            # without an explicit flush.
+            stderr = io.TextIOWrapper(
+                io.BytesIO(), encoding="ascii", write_through=True
+            )
+
+            code = run_hook(
+                repository,
+                environment=environment,
+                stderr=stderr,
+                verbose=False,
+            )
+
+            self.assertEqual(code, 0)
+            written = stderr.buffer.getvalue().decode("ascii")
+            self.assertEqual(
+                written.splitlines(),
+                [
+                    f"TAF: app.first changed; dep{index:02d}.py:12 depends on it"
+                    " and is not in this commit"
+                    for index in range(HOOK_MAXIMUM_LINES)
+                ],
+            )
+
+    def test_a_raising_stderr_through_cli_main_still_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root)
+
+            code = main(
+                ["prepare", "hook", "run", "--repo", str(repository)],
+                stdout=io.StringIO(),
+                stderr=_RaisingStderr(),
+                environment=environment,
+            )
+
+            self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
