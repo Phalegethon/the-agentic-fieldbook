@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-label="The Agentic Fieldbook: evidence-backed Agent Skills for real software delivery">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="1" stop-color="#141b2d"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffa657"/>
+      <stop offset="1" stop-color="#f5a524"/>
+    </linearGradient>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#ffffff" stroke-opacity="0.045" stroke-width="1"/>
+    </pattern>
+    <clipPath id="round"><rect width="1200" height="300" rx="20"/></clipPath>
+  </defs>
+  <g clip-path="url(#round)">
+    <rect width="1200" height="300" fill="url(#bg)"/>
+    <rect width="1200" height="300" fill="url(#grid)"/>
+    <!-- fieldbook: a notebook page with a bookmark, the evidence motif -->
+    <g transform="translate(78 62)">
+      <rect x="0" y="0" width="150" height="176" rx="12" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+      <rect x="0" y="0" width="14" height="176" rx="6" fill="#30363d"/>
+      <rect x="112" y="-6" width="22" height="58" rx="3" fill="url(#amber)"/>
+      <g stroke="#3fb950" stroke-width="4" stroke-linecap="round" fill="none">
+        <path d="M34 46 l9 9 l16 -18"/>
+        <path d="M34 92 l9 9 l16 -18"/>
+      </g>
+      <g stroke="#79c0ff" stroke-width="4" stroke-linecap="round" fill="none">
+        <path d="M34 138 l9 9 l16 -18"/>
+      </g>
+      <g stroke="#8b949e" stroke-width="5" stroke-linecap="round">
+        <line x1="72" y1="42" x2="128" y2="42"/>
+        <line x1="72" y1="56" x2="112" y2="56"/>
+        <line x1="72" y1="88" x2="128" y2="88"/>
+        <line x1="72" y1="102" x2="104" y2="102"/>
+        <line x1="72" y1="134" x2="128" y2="134"/>
+        <line x1="72" y1="148" x2="118" y2="148"/>
+      </g>
+    </g>
+    <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+      <text x="272" y="118" font-size="54" font-weight="700" fill="#f0f6fc" letter-spacing="-1">The Agentic Fieldbook</text>
+      <text x="274" y="160" font-size="23" fill="#c9d1d9">Evidence-backed Agent Skills for real software delivery.</text>
+      <text x="274" y="192" font-size="19" fill="#8b949e">Recover interrupted work. Hand off branches. Give your agent bounded repository context.</text>
+      <g font-family="Menlo, 'SF Mono', Consolas, monospace" font-size="16" font-weight="600">
+        <rect x="274" y="218" width="188" height="36" rx="18" fill="#1f2937" stroke="#374151"/>
+        <text x="292" y="242" fill="#ffa657">/taf:work-recovery</text>
+        <rect x="474" y="218" width="196" height="36" rx="18" fill="#1f2937" stroke="#374151"/>
+        <text x="492" y="242" fill="#79c0ff">/taf:branch-handoff</text>
+        <rect x="682" y="218" width="256" height="36" rx="18" fill="#1f2937" stroke="#374151"/>
+        <text x="700" y="242" fill="#3fb950">/taf:prepare-repo-context</text>
+      </g>
+    </g>
+    <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" fill="#8b949e" text-anchor="end">
+      <text x="1140" y="58">Claude Code · Codex · any Agent Skills host</text>
+      <text x="1140" y="80">Git + Python 3 · native engine on macOS, Linux, Windows</text>
+    </g>
+  </g>
+</svg>

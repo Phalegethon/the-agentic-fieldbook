@@ -17,10 +17,19 @@ who can contribute.
 3. Put deterministic repeated work in `scripts/` and conditional detail in
    `references/`; avoid third-party runtime dependencies unless essential.
 4. Add focused tests under `tests/` and demonstrate the failure they prevent.
-5. Add `.claude-plugin/plugin.json` to the skill and one matching entry to
-   `.claude-plugin/marketplace.json` so the skill remains separately installable.
-6. Add the implemented skill to the README table. Do not publish empty roadmap
-   directories.
+5. Skills ship inside the single `taf` plugin. Do not add a per-skill
+   `.claude-plugin/plugin.json`; keep the one `taf` entry in
+   `.claude-plugin/marketplace.json` and the Codex manifest consistent with the
+   new skill.
+6. Add the implemented skill to the README's skills table and give it a guide
+   page under `docs/`. Do not publish empty roadmap directories.
+
+## Documentation and media
+
+The README is a short tour; each skill's full behaviour lives in `docs/`.
+Recordings under `docs/media/` show real runs: copy terminal output, counts,
+paths, and line numbers from an actual run, never from memory, and keep
+private repositories, credentials, and absolute local paths out of them.
 
 ## Validate
 
