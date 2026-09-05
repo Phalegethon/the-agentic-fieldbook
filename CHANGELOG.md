@@ -5,6 +5,8 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-09-05
+
 Native runtime `0.6.0` (no index format change, so existing indexes built by
 runtime 0.3.0 or later are kept; a generation written by an older runtime is
 rebuilt on the next `build`. The next `inspect` reports
