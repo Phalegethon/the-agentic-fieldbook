@@ -1192,10 +1192,13 @@ class TrimToBudgetTests(unittest.TestCase):
         self.assertLess(len(trimmed["findings"]), len(composed["findings"]))
 
     def test_a_compact_changed_list_over_its_share_loses_its_tail(self) -> None:
-        # A compact entry (no identity) is about 51 characters, so a third
-        # of 2000 holds thirteen of them (13 x 51 = 664, a fourteenth would
-        # be 715) and the other fifty-one are counted, not silently gone.
-        # The candidate - the operation's answer - survives that trimming.
+        # A compact entry (no identity) is about 51 characters, so a third of
+        # 2000 holds only thirteen of them on its own (13 x 51 = 664, a
+        # fourteenth would be 715) - the share-only cutoff of 2.7.1. 2.7.2's
+        # give-back then restores what the object as a whole, once the single
+        # candidate settled, still had room for: seventeen survive and
+        # forty-seven are counted, not silently gone. The candidate - the
+        # operation's answer - survives that trimming either way.
         composed = self._wide_object(64, 1)
         trimmed = trim_to_budget(composed, 2000)
 
@@ -1205,7 +1208,7 @@ class TrimToBudgetTests(unittest.TestCase):
         self.assertIn("changed-list-trimmed", trimmed["warnings"])
         self.assertNotIn("output-budget-exceeded", trimmed["warnings"])
         self.assertEqual(trimmed["changed_count"], 64)
-        self.assertEqual(len(trimmed["changed"]), 13)
+        self.assertEqual(len(trimmed["changed"]), 17)
         self.assertEqual(
             len(trimmed["changed"]) + int(trimmed["changed_trimmed_count"]), 64
         )
@@ -1221,6 +1224,101 @@ class TrimToBudgetTests(unittest.TestCase):
         )
         self.assertIs(trimmed["truncated"], False)
         self.assertEqual(trimmed["omitted_count"], composed["omitted_count"])
+
+    def _wide_object_long(self, changed_symbols: int, candidates: int) -> dict[str, object]:
+        """A change set whose entries are long enough that the full form alone
+        exceeds a typical budget - the 2.7.1 release-verification shape give-back
+        is meant to fix, where the share-only trim lost entries the whole object
+        never actually needed to give up."""
+        prefix = "pkg/module/deeply/nested/path/segment"
+        changed = engine_result(
+            "changed-symbols",
+            "3",
+            [
+                finding_wire(
+                    index + 1,
+                    f"very_long_qualified_symbol_name_number_{index:04d}",
+                    path=f"{prefix}{index:04d}.py",
+                    start=index * 3 + 1,
+                    end=index * 3 + 2,
+                )
+                for index in range(changed_symbols)
+            ],
+        )
+        if candidates:
+            first = identity(f"{prefix}0000.py", "very_long_qualified_symbol_name_number_0000")
+            related = FakeRelated(
+                {
+                    (first, "callers"): [
+                        caller_of(f"web.handle{index}", path=f"web{index}.py")
+                        for index in range(candidates)
+                    ]
+                }
+            )
+        else:
+            related = FakeRelated({})
+        return compose_impact_candidates(
+            changed, related, allow_inferred=False, maximum_results=8
+        )
+
+    def test_give_back_restores_every_entry_the_share_only_trim_would_drop(self) -> None:
+        # The 2.7.1 release verification: 0 candidates, 40 changed symbols long
+        # enough that the full form exceeds the 8000-character default budget,
+        # so `_fit_changed_to_share` compacts and then trims the tail down to
+        # its third-of-budget share - even though the compact form of all 40
+        # measures well under 8000 once nothing else needed trimming. 2.7.2's
+        # give-back restores every one of them: the whole changed list is
+        # listed, nothing is counted as trimmed, and no warning is raised.
+        composed = self._wide_object_long(40, 0)
+        trimmed = trim_to_budget(composed, 8000)
+
+        self.assertEqual(len(trimmed["changed"]), 40)
+        self.assertEqual(trimmed["changed_count"], 40)
+        self.assertEqual(trimmed["changed_trimmed_count"], 0)
+        self.assertNotIn("changed-list-trimmed", trimmed["warnings"])
+        self.assertLessEqual(int(trimmed["output_characters"]), 8000)
+        self.assertEqual(
+            int(trimmed["output_characters"]),
+            len(json.dumps(trimmed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),
+        )
+        self.assertEqual(
+            [item["qualified_name"] for item in trimmed["changed"]],
+            [item["qualified_name"] for item in composed["changed"]],
+        )
+
+    def test_give_back_restores_some_but_not_all_entries(self) -> None:
+        # Sixty-four changed symbols and one candidate at 2000: the share-only
+        # trim keeps thirteen on its own; give-back extends that as far as the
+        # remaining budget allows and no further, so some - not all - of what
+        # was trimmed comes back, and the counter and the warning both still
+        # agree with what is actually left out.
+        composed = self._wide_object(64, 1)
+        trimmed = trim_to_budget(composed, 2000)
+
+        self.assertGreater(len(trimmed["changed"]), 13)
+        self.assertLess(len(trimmed["changed"]), 64)
+        self.assertGreater(int(trimmed["changed_trimmed_count"]), 0)
+        self.assertEqual(
+            trimmed["changed_count"],
+            len(trimmed["changed"]) + int(trimmed["changed_trimmed_count"]),
+        )
+        self.assertIn("changed-list-trimmed", trimmed["warnings"])
+        self.assertLessEqual(int(trimmed["output_characters"]), 2000)
+        # What survives is still the retained-order prefix, unbroken.
+        self.assertEqual(
+            trimmed["changed"],
+            [
+                {"path": item["path"], "qualified_name": item["qualified_name"]}
+                for item in composed["changed"][: len(trimmed["changed"])]
+            ],
+        )
+        # One more entry would overrun the budget - that is why it stayed trimmed.
+        one_more = dict(trimmed)
+        next_item = composed["changed"][len(trimmed["changed"])]
+        one_more["changed"] = list(trimmed["changed"]) + [
+            {"path": next_item["path"], "qualified_name": next_item["qualified_name"]}
+        ]
+        self.assertGreater(context_operations._output_characters(one_more), 2000)
 
     def test_candidates_pay_before_the_changed_lists_share_does(self) -> None:
         composed = self._wide_object(64, 4)

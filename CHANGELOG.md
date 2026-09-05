@@ -5,6 +5,18 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Skill: `prepare-repo-context` 1.7.4.
+
+### Fixed
+
+- `impact-candidates` no longer drops a `changed` entry from its output-budget
+  trim just because the changed layer alone exceeded its third of the budget:
+  once the candidates and the changed layer's own tail trim have settled, any
+  budget the whole object still has to spare is given back to `changed`,
+  restoring entries in the order they were retained until nothing more fits.
+  `changed_trimmed_count` and the `changed-list-trimmed` warning now only ever
+  report what genuinely could not fit in the budget.
+
 ## [2.7.1] - 2026-09-05
 
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.7.3.

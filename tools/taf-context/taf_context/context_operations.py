@@ -1319,10 +1319,17 @@ def _compact_changed_entry(entry: dict[str, object]) -> dict[str, object]:
     return {key: entry[key] for key in CHANGED_COMPACT_KEYS}
 
 
+# One entry the tail trim popped, remembered so give-back can restore it: the
+# entry in whatever shape it was dropped (compact once the list was
+# compacted), paired with the `result_identity` `identities` carried for it.
+_DroppedChangedEntry = tuple[dict[str, object], str]
+
+
 def _drop_changed_tail(
     result: dict[str, object],
     changed: list[dict[str, object]],
     identities: list[str],
+    dropped: list[_DroppedChangedEntry],
 ) -> None:
     """Drop the last changed entry, counting it and warning about it once.
 
@@ -1333,9 +1340,14 @@ def _drop_changed_tail(
     parallel list of `result_identity` values `changed` no longer carries once
     it is compact, kept so a later call can still tell an anchor entry from
     the rest; it is popped in lockstep so the two lists never drift apart.
+    `dropped` remembers the popped entry and its identity, in the order they
+    are dropped, so give-back can restore them afterwards in the reverse
+    order - the one dropped last (closest to the front of the retained order)
+    restored first.
     """
-    changed.pop()
-    identities.pop()
+    entry = changed.pop()
+    identity = identities.pop()
+    dropped.append((entry, identity))
     result["changed"] = changed
     result["changed_trimmed_count"] = int(result["changed_trimmed_count"]) + 1
     _add_warning(result, WARNING_CHANGED_LIST_TRIMMED)
@@ -1346,6 +1358,7 @@ def _drop_unprotected_changed_tail(
     changed: list[dict[str, object]],
     identities: list[str],
     protected: set[str],
+    dropped: list[_DroppedChangedEntry],
 ) -> bool:
     """Drop the last changed entry unless it anchors a returned candidate.
 
@@ -1358,12 +1371,15 @@ def _drop_unprotected_changed_tail(
     """
     if not changed or identities[-1] in protected:
         return False
-    _drop_changed_tail(result, changed, identities)
+    _drop_changed_tail(result, changed, identities, dropped)
     return True
 
 
 def _fit_changed_to_share(
-    result: dict[str, object], identities: list[str], share: int
+    result: dict[str, object],
+    identities: list[str],
+    share: int,
+    dropped: list[_DroppedChangedEntry],
 ) -> None:
     """Fit the changed layer into its share of the budget, cheapest loss first.
 
@@ -1376,7 +1392,10 @@ def _fit_changed_to_share(
     from the tail, and never one that anchors a returned candidate (decision
     2 of the 2.7.1 anchor-order fix): if the anchors alone still exceed the
     share, they are kept anyway - they are already compact - and the object
-    carries the overage into the later steps instead.
+    carries the overage into the later steps instead. This share is only ever
+    a ceiling on how much the changed layer loses here; 2.7.2 gives back
+    whatever of it the whole object never actually needed once every step is
+    settled (`_give_back_changed_budget`).
     """
     changed = result["changed"]
     assert isinstance(changed, list)
@@ -1386,8 +1405,67 @@ def _fit_changed_to_share(
     result["changed"] = changed
     protected = _anchor_identities(result["findings"])  # type: ignore[arg-type]
     while changed and _canonical_length(changed) > share:
-        if not _drop_unprotected_changed_tail(result, changed, identities, protected):
+        if not _drop_unprotected_changed_tail(result, changed, identities, protected, dropped):
             break
+
+
+def _give_back_changed_budget(
+    result: dict[str, object],
+    changed: list[dict[str, object]],
+    identities: list[str],
+    dropped: list[_DroppedChangedEntry],
+    maximum_output_characters: int,
+) -> None:
+    """Restore trimmed `changed` entries while the whole object still fits.
+
+    The two drop phases above trimmed the changed layer to a share of the
+    budget, and separately to make room for what the candidates alone could
+    not give up - both ceilings on the changed layer in isolation, neither
+    aware of whether the object as a whole, once everything else settled,
+    actually needed all of it. `dropped` is the stack both phases pushed onto
+    as they popped from the tail, in the order they popped; the entry on top
+    is always the one dropped last, which was the one closest to the front of
+    the retained order and so the next one worth having back. Restoring it -
+    appending it back onto `changed` and remeasuring - and continuing while
+    the object still fits `maximum_output_characters` rebuilds exactly the
+    order the list had before anything was dropped, one entry at a time,
+    cheapest give-back first. A restored entry keeps whatever shape it was
+    dropped in, so it stays compact when the list was compacted. Candidates
+    are never touched here - only what the changed layer itself did not need
+    to spend is given back to it - and the loop stops the moment one more
+    entry would not fit, leaving the rest counted in `changed_trimmed_count`
+    and named by the `changed-list-trimmed` warning.
+    """
+    while dropped:
+        entry, identity = dropped[-1]
+        changed.append(entry)
+        identities.append(identity)
+        result["changed"] = changed
+        # `changed_trimmed_count` and the warning it can retire both belong to
+        # the tentative restored state, so they are updated before measuring -
+        # not after - or the length just measured would not be the length this
+        # object actually has once the restore is kept.
+        previous_trimmed_count = int(result["changed_trimmed_count"])
+        result["changed_trimmed_count"] = previous_trimmed_count - 1
+        previous_warnings = result.get("warnings", [])
+        assert isinstance(previous_warnings, list)
+        retired_warning = False
+        if result["changed_trimmed_count"] == 0 and WARNING_CHANGED_LIST_TRIMMED in previous_warnings:
+            retired_warning = True
+            result["warnings"] = [
+                warning for warning in previous_warnings if warning != WARNING_CHANGED_LIST_TRIMMED
+            ]
+        measured = _output_characters(result)
+        if measured > maximum_output_characters:
+            changed.pop()
+            identities.pop()
+            result["changed"] = changed
+            result["changed_trimmed_count"] = previous_trimmed_count
+            if retired_warning:
+                result["warnings"] = previous_warnings
+            return
+        dropped.pop()
+        result["output_characters"] = measured
 
 
 def trim_to_budget(
@@ -1414,9 +1492,15 @@ def trim_to_budget(
     layer is asked to give up its own protected entries too - the only step
     that still runs once every candidate is gone. Only when no candidate and
     no changed entry is left to give does `output-budget-exceeded` report the
-    overrun instead of trimming forever. `changed_count` keeps counting the
-    changed findings the engine returned, and `output_characters` is always
-    the final canonical length.
+    overrun instead of trimming forever. Once every step above has settled,
+    2.7.2 gives back whatever of the changed layer's own losses the object
+    never actually needed: the entries the two drop phases popped are
+    restored one at a time, in the order they were retained, for as long as
+    the whole object still fits - a candidate is never dropped to make room
+    for this, and the give-back never spends more than what the object was
+    already under budget by. `changed_count` keeps counting the changed
+    findings the engine returned, and `output_characters` is always the final
+    canonical length.
     """
     trimmed = dict(result)
     trimmed["output_characters"] = _output_characters(trimmed)
@@ -1425,8 +1509,12 @@ def trim_to_budget(
     changed = list(trimmed["changed"])  # type: ignore[arg-type]
     trimmed["changed"] = changed
     changed_identities = [str(entry["result_identity"]) for entry in changed]
+    dropped: list[_DroppedChangedEntry] = []
     _fit_changed_to_share(
-        trimmed, changed_identities, maximum_output_characters // CHANGED_BUDGET_SHARES
+        trimmed,
+        changed_identities,
+        maximum_output_characters // CHANGED_BUDGET_SHARES,
+        dropped,
     )
     trimmed["output_characters"] = _output_characters(trimmed)
     trimmed = _drop_findings_to_budget(trimmed, maximum_output_characters)
@@ -1439,10 +1527,13 @@ def trim_to_budget(
         # The candidates are gone and the object is still over the budget, so
         # the changed layer gives up its share too rather than overrun.
         if not _drop_unprotected_changed_tail(
-            trimmed, changed, changed_identities, protected
+            trimmed, changed, changed_identities, protected, dropped
         ):
             break
         trimmed["output_characters"] = _output_characters(trimmed)
+    _give_back_changed_budget(
+        trimmed, changed, changed_identities, dropped, maximum_output_characters
+    )
     if int(trimmed["output_characters"]) > maximum_output_characters:
         # Nothing left to lose: the envelope alone is over the budget, and the
         # reader is told rather than handed a silent overrun.

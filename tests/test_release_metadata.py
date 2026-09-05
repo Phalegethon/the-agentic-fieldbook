@@ -14,7 +14,7 @@ WORK_RECOVERY = ROOT / "skills" / "work-recovery"
 TAF_VERSION = "2.7.1"
 SKILL_VERSIONS = {
     "branch-handoff": "1.2.1",
-    "prepare-repo-context": "1.7.3",
+    "prepare-repo-context": "1.7.4",
     "work-recovery": "1.1.0",
 }
 
