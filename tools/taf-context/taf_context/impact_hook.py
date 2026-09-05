@@ -315,11 +315,15 @@ def _format_trailer(remaining: int, other_test_count: int, *, truncated: bool) -
     both positive names both counts, only one positive names that one
     alone, and neither positive falls back to "possibly more" when the
     result is truncated - or to nothing at all when it is not (there is
-    genuinely nothing left to report). `R` gets a trailing `+` when
-    `truncated`; `T` never does; the D16 addendum marks only the
-    production-file remainder as a lower bound.
+    genuinely nothing left to report). The `+` marks whichever count is
+    the uncertain one (D16 note, fix wave 1): `R` gets it whenever `R` is
+    positive (unchanged from the addendum's literal wording - `T` stays
+    plain in that combined shape); when `R` is 0 and only `T` remains, `T`
+    is the sole count naming the omission, so it gets the `+` instead.
     """
     remaining_display = f"{remaining}+" if truncated and remaining > 0 else str(remaining)
+    test_only_truncated = truncated and remaining == 0 and other_test_count > 0
+    test_only_display = f"{other_test_count}+" if test_only_truncated else str(other_test_count)
     test_noun = "test file" if other_test_count == 1 else "test files"
     if remaining > 0 and other_test_count > 0:
         return (
@@ -329,7 +333,7 @@ def _format_trailer(remaining: int, other_test_count: int, *, truncated: bool) -
     if remaining > 0:
         return f"{HOOK_DETAIL_INDENT}... and {remaining_display} more {HOOK_POINTER}"
     if other_test_count > 0:
-        return f"{HOOK_DETAIL_INDENT}... plus {other_test_count} {test_noun} {HOOK_POINTER}"
+        return f"{HOOK_DETAIL_INDENT}... plus {test_only_display} {test_noun} {HOOK_POINTER}"
     if truncated:
         return f"{HOOK_DETAIL_INDENT}... and possibly more {HOOK_POINTER}"
     return None

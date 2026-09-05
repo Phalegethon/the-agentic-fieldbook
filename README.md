@@ -309,7 +309,9 @@ the untouched test files into a count, and points at the agent rather than
 a command - `query impact-candidates --staged` is not runnable in a plugin
 installation and the CLI's own budget would show only part of a wide
 result anyway; a trailing `+` marks a count as a lower bound when the
-engine itself omitted candidates in some direction, and the trailer falls
+engine itself omitted candidates in some direction, landing on whichever
+count the omission makes uncertain (the remaining production count, or the
+test count when no production file remains to name), and the trailer falls
 back to "possibly more" when nothing exact remains to name. The header is
 bold on a real TTY stderr with `NO_COLOR` unset and `TERM` not `dumb`;
 every other line, and every line on a non-TTY stderr (GUI clients, CI,

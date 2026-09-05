@@ -551,6 +551,23 @@ class FormatReportTests(unittest.TestCase):
         self.assertEqual(len(lines), 1 + 2 + 1)  # header, 2 production lines, trailer
         self.assertEqual(lines[-1], f"  ... plus 3 test files {HOOK_POINTER}")
 
+    def test_all_production_shown_but_truncated_marks_the_test_count_with_a_plus(self) -> None:
+        # Fix wave 1 (concern 2): R == 0 (every production file already
+        # printed) and T > 0 (test files folded into the trailer) - when the
+        # engine also truncated, the trailer's only remaining count is T, so
+        # the `+` that would otherwise sit on R moves onto T instead (D16
+        # note: "the `+` marks whichever count is uncertain").
+        candidates = [
+            _detail_candidate("a.py", "sym"),
+            _detail_candidate("b.py", "sym"),
+            _detail_candidate("tests/test_c.py", "sym"),
+            _detail_candidate("tests/test_d.py", "sym"),
+            _detail_candidate("tests/test_e.py", "sym"),
+        ]
+        lines = format_report(candidates, truncated=True, colour=False)
+        self.assertEqual(lines[0], "TAF impact: 2+ files depend on this change and are not in this commit")
+        self.assertEqual(lines[-1], f"  ... plus 3+ test files {HOOK_POINTER}")
+
     def test_remaining_production_and_test_files_both_appear_in_the_trailer(self) -> None:
         candidates = [_detail_candidate(f"dep{index:02d}.py", "sym") for index in range(6)] + [
             _detail_candidate("tests/test_a.py", "sym"),
@@ -589,6 +606,19 @@ class FormatReportTests(unittest.TestCase):
             ],
         )
 
+    def test_tests_only_header_marks_the_test_count_with_a_plus_when_truncated(self) -> None:
+        # Fix wave 1: the tests-only header uses the same `count+` marker as
+        # the production header - it is the count `_format_header` is given,
+        # regardless of which group it names.
+        lines = format_report(
+            [_detail_candidate("tests/test_a.py", "sym"), _detail_candidate("tests/test_b.py", "sym")],
+            truncated=True,
+            colour=False,
+        )
+        self.assertEqual(
+            lines[0], "TAF impact: 2+ test files depend on this change and are not in this commit"
+        )
+
     def test_more_than_five_test_only_files_fold_the_remainder_into_the_trailer(self) -> None:
         # Not spelled out verbatim in D16 (whose R/T wording is written for
         # the mixed production-and-test case): when there is no production
@@ -604,6 +634,19 @@ class FormatReportTests(unittest.TestCase):
         )
         self.assertEqual(len(lines), 1 + HOOK_MAXIMUM_LINES + 1)
         self.assertEqual(lines[-1], f"  ... and 1 more {HOOK_POINTER}")
+
+    def test_more_than_five_test_only_files_and_truncated_marks_the_remainder_with_a_plus(
+        self,
+    ) -> None:
+        # Fix wave 1: the tests-only overflow (D16 note) folds the remainder
+        # into R, so a truncated engine result marks it with a `+` exactly
+        # like the production overflow does.
+        candidates = [_detail_candidate(f"tests/test_{index:02d}.py", "sym") for index in range(6)]
+        lines = format_report(candidates, truncated=True, colour=False)
+        self.assertEqual(
+            lines[0], "TAF impact: 6+ test files depend on this change and are not in this commit"
+        )
+        self.assertEqual(lines[-1], f"  ... and 1+ more {HOOK_POINTER}")
 
     def test_colour_bolds_only_the_header(self) -> None:
         lines = format_report(
