@@ -5,6 +5,30 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.5.
+
+### Fixed
+
+- `hook status`'s `launcher_current` compared the launcher's bytes against
+  what `install` would write right now, so it turned `false` on a launcher
+  that was demonstrably running the current broker through its self-healing
+  pointer - a plugin update, or a hook manager's own block appended after
+  TAF's, tripped it even though the hook still ran this plugin's broker
+  unchanged (finding O). `launcher_current` now means exactly that: the
+  installed launcher runs this plugin's broker, true either when the text
+  matches or when the launcher is pointer-aware and its pointer names this
+  plugin's entry script and an executable interpreter.
+
+### Added
+
+- `hook status` gains `launcher_text_current` (the old, stricter text-only
+  comparison; `false` alone needs nothing) and `launcher_generation`
+  (`pointer` for the current self-healing launcher template, `embedded` for
+  an older one, `null` when nothing is installed).
+- `hook install`'s summary gains `launcher_current: true` (finding N): the
+  launcher it just wrote and the pointer it just refreshed agree by
+  construction.
+
 ## [2.8.5] - 2026-09-05
 
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.4.

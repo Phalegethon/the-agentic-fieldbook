@@ -79,7 +79,7 @@ Markdown.
 |---|---|---|
 | [`work-recovery`](skills/work-recovery) 1.1.0 | You return to a branch and cannot remember where you stopped. | The exact work state, what is staged and unstaged, and the single best next step, from read-only Git evidence. |
 | [`branch-handoff`](skills/branch-handoff) 1.2.1 | A branch is ready for review or QA. | Copy-ready QA and Developer/PR handoffs with priorities and confidence levels, plus an evidence appendix, with optional Jira and GitHub context. |
-| [`prepare-repo-context`](skills/prepare-repo-context) 1.8.4 | Your agent needs to understand or navigate a codebase. | Repository overview, symbol search, who-calls-what, change impact, a commit-time warning about dependents you left behind, and an MCP server that exposes it all. |
+| [`prepare-repo-context`](skills/prepare-repo-context) 1.8.5 | Your agent needs to understand or navigate a codebase. | Repository overview, symbol search, who-calls-what, change impact, a commit-time warning about dependents you left behind, and an MCP server that exposes it all. |
 
 Claude Code exposes these as `/taf:branch-handoff`, `/taf:prepare-repo-context`,
 and `/taf:work-recovery`. Codex uses the corresponding plugin-qualified TAF
@@ -357,7 +357,7 @@ TAF and its skills have separate versions:
 
 - TAF `2.8.6` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.8.4` versions its behavior contract.
+- `prepare-repo-context` `1.8.5` versions its behavior contract.
 - `work-recovery` `1.1.0` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with

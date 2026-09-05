@@ -1033,6 +1033,7 @@ class HookInstallTests(unittest.TestCase):
                     "written": True,
                     "chained": False,
                     "chained_hook_path": None,
+                    "launcher_current": True,
                     "interpreter": interpreter,
                     "script": str(script),
                     "next_safe_action": "none",
@@ -1231,6 +1232,8 @@ class HookRefusalTests(unittest.TestCase):
             self.assertIsNone(summary["hook_path"])
             self.assertFalse(summary["chained"])
             self.assertIsNone(summary["launcher_current"])
+            self.assertIsNone(summary["launcher_text_current"])
+            self.assertIsNone(summary["launcher_generation"])
 
 
 class HookChainTests(unittest.TestCase):
@@ -1387,6 +1390,8 @@ class HookOrphanedChainTests(unittest.TestCase):
             self.assertEqual(summary["hook"], "absent")
             self.assertTrue(summary["chained"])
             self.assertIsNone(summary["launcher_current"])
+            self.assertIsNone(summary["launcher_text_current"])
+            self.assertIsNone(summary["launcher_generation"])
 
 
 class HookStatusTests(unittest.TestCase):
@@ -1407,6 +1412,8 @@ class HookStatusTests(unittest.TestCase):
             self.assertEqual(summary["hook"], "absent")
             self.assertFalse(summary["chained"])
             self.assertIsNone(summary["launcher_current"])
+            self.assertIsNone(summary["launcher_text_current"])
+            self.assertIsNone(summary["launcher_generation"])
 
     def test_status_on_a_foreign_hook_is_foreign(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1425,6 +1432,8 @@ class HookStatusTests(unittest.TestCase):
             summary = decoded(stdout)
             self.assertEqual(summary["hook"], "foreign")
             self.assertIsNone(summary["launcher_current"])
+            self.assertIsNone(summary["launcher_text_current"])
+            self.assertIsNone(summary["launcher_generation"])
 
     def test_status_reports_an_unchained_installed_launcher_as_current(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1445,6 +1454,8 @@ class HookStatusTests(unittest.TestCase):
             self.assertEqual(summary["hook"], "installed")
             self.assertFalse(summary["chained"])
             self.assertTrue(summary["launcher_current"])
+            self.assertTrue(summary["launcher_text_current"])
+            self.assertEqual(summary["launcher_generation"], "pointer")
 
     def test_status_reports_a_chained_installed_launcher_as_current(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1469,21 +1480,135 @@ class HookStatusTests(unittest.TestCase):
             self.assertEqual(summary["hook"], "installed")
             self.assertTrue(summary["chained"])
             self.assertTrue(summary["launcher_current"])
+            self.assertTrue(summary["launcher_text_current"])
+            self.assertEqual(summary["launcher_generation"], "pointer")
 
-    def test_status_reports_a_stale_launcher_as_not_current(self) -> None:
+    def test_status_reports_a_stale_text_pointer_launcher_as_current(self) -> None:
+        """Finding O: a stale embedded fallback whose pointer still names this
+        plugin's real entry script stays current - only the text comparison
+        (`launcher_text_current`) reports the divergence."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             repository = init_committed_repo(root / "repo")
+            state_root = root / "state"
+            state_root.mkdir(parents=True)
+            environment = {"TAF_STATE_HOME": str(state_root)}
             invoke(
-                {"TAF_STATE_HOME": str(root / "state")}, "prepare", "hook", "install",
+                environment, "prepare", "hook", "install",
                 "--repo", str(repository), "--confirm-hook-write",
             )
+            target = launcher_target_path(state_root)
+            self.assertTrue(target.is_file())  # the pointer was written on install
+
             hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
             stale = hook_path.read_text(encoding="utf-8").replace(
-                shlex.quote(str(Path(sys.executable).resolve())),
-                shlex.quote(str(root / "old-python")),
+                f"taf_script={shlex.quote(str(_entry_point_script()))}",
+                f"taf_script={shlex.quote(str(root / 'old-script.py'))}",
+            ).replace(
+                "# Follows the TAF broker that last ran on this machine (a pointer under TAF's own",
+                "# Follows an older TAF broker layout (a pointer under TAF's own",
+            )
+            self.assertNotEqual(stale, hook_path.read_text(encoding="utf-8"))
+            hook_path.write_text(stale, encoding="utf-8")
+            hook_path.chmod(0o755)
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "installed")
+            self.assertFalse(summary["launcher_text_current"])
+            self.assertEqual(summary["launcher_generation"], "pointer")
+            self.assertTrue(summary["launcher_current"])
+
+    def _install_with_a_stale_pointer(
+        self, root: Path, repository: Path, state_root: Path
+    ) -> dict[str, str]:
+        """Install, then rewrite the on-disk pointer to name a wrong script.
+
+        A single `hook status` call reports honestly from what is on disk at
+        call time, but every `prepare` command (`hook status` included) also
+        refreshes the pointer as a side effect once it has answered - so a
+        corrupted pointer only stays corrupted for the *next* call, never for
+        a second one after that. Each scenario below therefore gets its own
+        fresh fixture with exactly one `status` call.
+        """
+        environment = {"TAF_STATE_HOME": str(state_root)}
+        invoke(
+            environment, "prepare", "hook", "install",
+            "--repo", str(repository), "--confirm-hook-write",
+        )
+        other_script = root / "other-script.py"
+        other_script.write_text("print('not the real entry point')\n", encoding="utf-8")
+        target = launcher_target_path(state_root)
+        interpreter_line, _script_line = target.read_text(encoding="utf-8").splitlines()
+        target.write_text(f"{interpreter_line}\n{other_script}\n", encoding="utf-8")
+        return environment
+
+    def test_status_with_a_stale_pointer_and_current_text_lets_text_win(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            state_root = root / "state"
+            state_root.mkdir(parents=True)
+            environment = self._install_with_a_stale_pointer(root, repository, state_root)
+
+            # The launcher's own bytes still match what install would write
+            # now, so text wins over the now-stale pointer.
+            code, stdout, stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertTrue(summary["launcher_text_current"])
+            self.assertEqual(summary["launcher_generation"], "pointer")
+            self.assertTrue(summary["launcher_current"])
+
+    def test_status_with_a_stale_pointer_and_stale_text_is_not_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            state_root = root / "state"
+            state_root.mkdir(parents=True)
+            environment = self._install_with_a_stale_pointer(root, repository, state_root)
+            hook_path = repository / ".git" / "hooks" / HOOK_FILE_NAME
+            stale = hook_path.read_text(encoding="utf-8").replace(
+                f"taf_script={shlex.quote(str(_entry_point_script()))}",
+                f"taf_script={shlex.quote(str(root / 'old-script.py'))}",
             )
             hook_path.write_text(stale, encoding="utf-8")
+            hook_path.chmod(0o755)
+
+            # Neither the text nor the (still-stale) pointer names this plugin.
+            code, stdout, stderr = invoke(
+                environment, "prepare", "hook", "status", "--repo", str(repository),
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertFalse(summary["launcher_text_current"])
+            self.assertEqual(summary["launcher_generation"], "pointer")
+            self.assertFalse(summary["launcher_current"])
+
+    def test_status_reports_an_embedded_generation_launcher_as_not_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            hooks_dir = repository / ".git" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            hook_path = hooks_dir / HOOK_FILE_NAME
+            interpreter = shlex.quote(str(Path(sys.executable).resolve()))
+            script = shlex.quote(str(_entry_point_script()))
+            hook_path.write_text(
+                "#!/bin/sh\n"
+                f"{LAUNCHER_MARKER}\n"
+                "# An older TAF launcher with no self-healing pointer at all.\n"
+                f'{interpreter} {script} hook run --repo "$PWD" || :\n',
+                encoding="utf-8",
+            )
             hook_path.chmod(0o755)
 
             code, stdout, stderr = invoke(
@@ -1494,12 +1619,16 @@ class HookStatusTests(unittest.TestCase):
             self.assertEqual((code, stderr), (0, ""))
             summary = decoded(stdout)
             self.assertEqual(summary["hook"], "installed")
+            self.assertEqual(summary["launcher_generation"], "embedded")
+            self.assertFalse(summary["launcher_text_current"])
             self.assertFalse(summary["launcher_current"])
 
     def test_status_still_reports_when_the_state_root_cannot_be_resolved(self) -> None:
         # No HOME, no USERPROFILE, no TAF_STATE_HOME: `_state_paths` raises
         # `PrepareCLIError`. `hook_status` must fold that into
-        # `launcher_current: None` and `readiness.error`, not abort the report.
+        # `launcher_current: None` and `readiness.error`, not abort the
+        # report - and still report `launcher_generation` from the launcher's
+        # own text, which needs no state root to read.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             repository = init_committed_repo(root / "repo")
@@ -1516,6 +1645,8 @@ class HookStatusTests(unittest.TestCase):
             summary = decoded(stdout)
             self.assertEqual(summary["hook"], "installed")
             self.assertIsNone(summary["launcher_current"])
+            self.assertIsNone(summary["launcher_text_current"])
+            self.assertEqual(summary["launcher_generation"], "pointer")
             self.assertIsNotNone(summary["readiness"]["error"])
 
     def test_readiness_names_use_index_after_a_fake_engine_build(self) -> None:
@@ -2222,17 +2353,23 @@ class LauncherTargetCliSeamTests(unittest.TestCase):
 
 
 class HookManagerAppendedBlockTests(unittest.TestCase):
-    """A hook manager appending its own block after TAF's still trips `launcher_current`."""
+    """A hook manager appending its own block after TAF's trips `launcher_text_current`
+    but not `launcher_current`: TAF's own conditional still runs first, unaffected by
+    whatever a later hook manager appends after it, and the pointer it refreshed on
+    install still names this plugin's real entry script and an executable interpreter."""
 
-    def test_an_appended_block_after_taf_s_makes_the_launcher_not_current(self) -> None:
+    def test_an_appended_block_after_taf_s_trips_only_launcher_text_current(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             repository = init_committed_repo(root / "repo")
-            environment = {"TAF_STATE_HOME": str(root / "state")}
+            state_root = root / "state"
+            state_root.mkdir(parents=True)  # so install's pointer refresh actually writes
+            environment = {"TAF_STATE_HOME": str(state_root)}
             invoke(
                 environment, "prepare", "hook", "install",
                 "--repo", str(repository), "--confirm-hook-write",
             )
+            self.assertTrue(launcher_target_path(state_root).is_file())
 
             code, stdout, stderr = invoke(
                 environment, "prepare", "hook", "status", "--repo", str(repository)
@@ -2251,7 +2388,9 @@ class HookManagerAppendedBlockTests(unittest.TestCase):
             self.assertEqual((code, stderr), (0, ""))
             summary = decoded(stdout)
             self.assertEqual(summary["hook"], "installed")
-            self.assertFalse(summary["launcher_current"])
+            self.assertFalse(summary["launcher_text_current"])
+            self.assertEqual(summary["launcher_generation"], "pointer")
+            self.assertTrue(summary["launcher_current"])
 
 
 class LauncherSelfHealingEndToEndTests(unittest.TestCase):

@@ -635,6 +635,9 @@ def install_hook(
         "chained_hook_path": (
             str(chained_hook_path) if chained_hook_path is not None else None
         ),
+        # The launcher just written and the pointer just refreshed agree by
+        # construction (finding N): a fresh install is always current.
+        "launcher_current": True,
         "interpreter": str(resolved_interpreter),
         "script": str(script),
         "next_safe_action": "none",
@@ -696,10 +699,31 @@ def hook_status(
     the foreign->chained rename and the launcher write), and it simply means
     a chained backup awaits the next `install` or `remove` to adopt or
     restore it.
+
+    Three fields describe the launcher (addendum D17). `launcher_current`
+    means "the installed launcher runs this plugin's broker": true when the
+    text already matches what `install` would write now, or when the
+    launcher is pointer-aware and its pointer file names this plugin's entry
+    script and an executable interpreter - so a plugin update that only
+    changed the embedded fallback paths, or a hook manager that appended its
+    own block after TAF's, still reports current as long as the pointer
+    itself is right. `launcher_text_current` is the older, stricter text
+    comparison alone: false only says the embedded fallback predates the
+    current install, never that the hook stopped running this plugin's
+    broker. `launcher_generation` is `"pointer"` for the D15 self-healing
+    template every current install writes, `"embedded"` for an older TAF
+    launcher that predates it. All three are null when nothing is installed;
+    `launcher_current` and `launcher_text_current` are also null when the
+    state root cannot be resolved (the pointer path is unknown), while
+    `launcher_generation` only needs the launcher's own text to read, not the
+    state root, so it is still reported. The readiness check below hits the
+    same unresolvable-state-root failure and folds it into `readiness.error`.
     """
     state, hooks_dir, hooks_path_value = _resolve_hooks_directory(repository)
     chained = False
     launcher_current: bool | None = None
+    launcher_text_current: bool | None = None
+    launcher_generation: str | None = None
     hook_path_value: str | None = None
     if state == "redirected":
         hook_field = "redirected"
@@ -713,15 +737,23 @@ def hook_status(
         if kind == "taf":
             hook_field = "installed"
             try:
+                actual = hook_path.read_text(encoding="utf-8", errors="surrogateescape")
+            except OSError:
+                actual = None
+            launcher_generation = (
+                "pointer" if actual is not None and "\ntaf_target=" in actual else "embedded"
+            )
+            try:
                 state_root = _state_paths(environment).root
             except PrepareCLIError:
-                # An unresolvable state root only means the launcher cannot be
-                # compared; `launcher_current` already has an honest value for
-                # that ("cannot be computed"). The readiness check below hits
-                # the same failure and folds it into `readiness.error`.
+                # An unresolvable state root only means the launcher's text
+                # cannot be compared and its pointer cannot be read; both
+                # `launcher_current` and `launcher_text_current` already have
+                # an honest value for that ("cannot be computed").
                 state_root = None
             if state_root is None:
                 launcher_current = None
+                launcher_text_current = None
             else:
                 expected = _render_launcher(
                     interpreter=Path(sys.executable).resolve(),
@@ -729,11 +761,11 @@ def hook_status(
                     chained_hook_path=chained_path if chained else None,
                     state_root=state_root,
                 )
-                try:
-                    actual = hook_path.read_text(encoding="utf-8", errors="surrogateescape")
-                except OSError:
-                    actual = None
-                launcher_current = actual == expected
+                launcher_text_current = None if actual is None else actual == expected
+                launcher_current = launcher_text_current or (
+                    launcher_generation == "pointer"
+                    and _pointer_runs_this_plugin(state_root)
+                )
         else:
             hook_field = kind  # "foreign" or "absent"
     error: str | None = None
@@ -751,6 +783,8 @@ def hook_status(
         "hook_path": hook_path_value,
         "chained": chained,
         "launcher_current": launcher_current,
+        "launcher_text_current": launcher_text_current,
+        "launcher_generation": launcher_generation,
         # `status` reports everywhere; only `install` and `remove` refuse off
         # POSIX, and this field is how a caller learns that before asking.
         "posix": os.name == "posix",
@@ -783,6 +817,28 @@ def _entry_point_script() -> Path:
 def launcher_target_path(state_root: Path) -> Path:
     """Where the launcher's self-healing pointer lives under a state root."""
     return state_root / LAUNCHER_TARGET_DIRECTORY / LAUNCHER_TARGET_FILE
+
+
+def _pointer_runs_this_plugin(state_root: Path) -> bool:
+    """Whether the pointer file under `state_root` would run this plugin's broker.
+
+    Used by `hook_status` (addendum D17) for a pointer-aware launcher whose
+    embedded fallback text is stale: the pointer, not the fallback, is what a
+    self-healing launcher actually follows at commit time, so it - not the
+    launcher's own bytes - decides whether the hook is current. `False` on
+    any error (the file is missing, unreadable, or has fewer than two lines):
+    a pointer that cannot be read cannot be trusted to run this plugin.
+    """
+    try:
+        target = launcher_target_path(state_root)
+        content = target.read_text(encoding="utf-8", errors="surrogateescape")
+        interpreter_line, script_line = content.splitlines()[:2]
+    except Exception:
+        return False
+    return (
+        Path(script_line).resolve() == _entry_point_script().resolve()
+        and os.access(interpreter_line, os.X_OK)
+    )
 
 
 def refresh_launcher_target(

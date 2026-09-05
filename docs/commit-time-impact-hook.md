@@ -112,10 +112,15 @@ readable and names an existing script; otherwise, or when the pointer is
 missing, it falls back to its own embedded paths, then to `command -v python3`
 when the chosen interpreter is not executable, and stays silent if neither an
 interpreter nor a script can be found. A plugin update is therefore picked up
-automatically by the next TAF session; re-run `hook install` only when
-`status` reports `launcher_current: false` and the embedded fallback itself
-should be refreshed. A hook manager that appends its own block after TAF's
-launcher also reports `launcher_current: false`, since a re-install rewrites
-the whole file and drops that appended block; this is a known limitation. The
-pointer file lives in the user's own state directory, the same trust level as
-the launcher itself in `.git/hooks`.
+automatically by the next TAF session. `status` reports three fields about the
+launcher: `launcher_current` means it runs this plugin's broker, so `false`
+means it does not and re-installing fixes it; `launcher_text_current` is the
+older byte-for-byte comparison with what install would write now, and `false`
+there alone needs nothing, since a correct pointer keeps the launcher current
+even when its embedded fallback text is older; `launcher_generation` names the
+installed template (`pointer` for the self-healing one, `embedded` for an older
+TAF launcher). A hook manager that appends its own block after TAF's launcher
+trips `launcher_text_current: false` but leaves `launcher_current: true`; a
+re-install would rewrite the whole file and drop that appended block, so nothing
+requires it. The pointer file lives in the user's own state directory, the same
+trust level as the launcher itself in `.git/hooks`.
