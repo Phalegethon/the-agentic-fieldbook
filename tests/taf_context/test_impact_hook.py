@@ -1311,6 +1311,28 @@ class HookStatusTests(unittest.TestCase):
             self.assertEqual(summary["hook"], "installed")
             self.assertFalse(summary["launcher_current"])
 
+    def test_status_still_reports_when_the_state_root_cannot_be_resolved(self) -> None:
+        # No HOME, no USERPROFILE, no TAF_STATE_HOME: `_state_paths` raises
+        # `PrepareCLIError`. `hook_status` must fold that into
+        # `launcher_current: None` and `readiness.error`, not abort the report.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = init_committed_repo(root / "repo")
+            invoke(
+                {"TAF_STATE_HOME": str(root / "state")}, "prepare", "hook", "install",
+                "--repo", str(repository), "--confirm-hook-write",
+            )
+
+            code, stdout, stderr = invoke(
+                {}, "prepare", "hook", "status", "--repo", str(repository)
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            summary = decoded(stdout)
+            self.assertEqual(summary["hook"], "installed")
+            self.assertIsNone(summary["launcher_current"])
+            self.assertIsNotNone(summary["readiness"]["error"])
+
     def test_readiness_names_use_index_after_a_fake_engine_build(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -1877,6 +1899,22 @@ class RenderLauncherTemplateTests(unittest.TestCase):
             ],
         )
         self.assertIn(f"taf_target={shlex.quote(str(launcher_target_path(state_root)))}", lines)
+
+    def test_the_read_variables_are_reset_before_the_pointer_read(self) -> None:
+        # A directory (or other non-regular file) at the pointer path makes the
+        # `read`s fail without unsetting `taf_line1`/`taf_line2`; resetting them
+        # right before the guarded block keeps an inherited environment
+        # variable of the same name from deciding the interpreter or script.
+        source = _render_launcher(
+            interpreter=Path("/usr/bin/python3"),
+            script=Path("/plugin/prepare_repo_context.py"),
+            chained_hook_path=None,
+            state_root=Path("/home/user/state"),
+        )
+
+        lines = source.splitlines()
+        pointer_index = lines.index('if [ -r "$taf_target" ]; then')
+        self.assertEqual(lines[pointer_index - 1], "taf_line1= taf_line2=")
 
 
 class LauncherTargetCliSeamTests(unittest.TestCase):

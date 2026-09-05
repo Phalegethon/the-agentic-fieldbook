@@ -632,17 +632,28 @@ def hook_status(
         kind = _classify_pre_commit(hook_path)
         if kind == "taf":
             hook_field = "installed"
-            expected = _render_launcher(
-                interpreter=Path(sys.executable).resolve(),
-                script=_entry_point_script(),
-                chained_hook_path=chained_path if chained else None,
-                state_root=_state_paths(environment).root,
-            )
             try:
-                actual = hook_path.read_text(encoding="utf-8", errors="surrogateescape")
-            except OSError:
-                actual = None
-            launcher_current = actual == expected
+                state_root = _state_paths(environment).root
+            except PrepareCLIError:
+                # An unresolvable state root only means the launcher cannot be
+                # compared; `launcher_current` already has an honest value for
+                # that ("cannot be computed"). The readiness check below hits
+                # the same failure and folds it into `readiness.error`.
+                state_root = None
+            if state_root is None:
+                launcher_current = None
+            else:
+                expected = _render_launcher(
+                    interpreter=Path(sys.executable).resolve(),
+                    script=_entry_point_script(),
+                    chained_hook_path=chained_path if chained else None,
+                    state_root=state_root,
+                )
+                try:
+                    actual = hook_path.read_text(encoding="utf-8", errors="surrogateescape")
+                except OSError:
+                    actual = None
+                launcher_current = actual == expected
         else:
             hook_field = kind  # "foreign" or "absent"
     error: str | None = None
@@ -833,6 +844,7 @@ def _render_launcher(
         "taf_interpreter=" + quoted_interpreter,
         "taf_script=" + quoted_script,
         "taf_target=" + quoted_target,
+        "taf_line1= taf_line2=",
         'if [ -r "$taf_target" ]; then',
         '  { IFS= read -r taf_line1; IFS= read -r taf_line2; } < "$taf_target"',
         '  if [ -n "$taf_line1" ] && [ -f "$taf_line2" ]; then',
