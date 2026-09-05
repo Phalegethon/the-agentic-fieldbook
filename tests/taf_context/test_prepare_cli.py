@@ -2007,10 +2007,21 @@ class QueryArgumentTests(unittest.TestCase):
         parser = argparse.ArgumentParser()
         register_prepare_command(parser.add_subparsers(dest="command"))
         args = parser.parse_args(["prepare", "query", "--repo", ".", "--operation", "repository-map"])
-        # The flag carries no default of its own: the budget an unbudgeted
-        # query answers with belongs to the operation.
+        # Neither flag carries a default of its own: the result count and the
+        # budget an unbudgeted query answers with belong to the operation.
+        self.assertIsNone(args.maximum_results)
         self.assertIsNone(args.maximum_output_characters)
-        self.assertEqual(_validate_query_arguments(args)[3], 4000)
+        self.assertEqual(_validate_query_arguments(args)[3], 8)
+        self.assertEqual(_validate_query_arguments(args)[4], 4000)
+
+    def test_query_defaults_the_overview_result_count_to_twenty_four(self) -> None:
+        parser = argparse.ArgumentParser()
+        register_prepare_command(parser.add_subparsers(dest="command"))
+        args = parser.parse_args(
+            ["prepare", "query", "--repo", ".", "--operation", "repository-overview"]
+        )
+        self.assertIsNone(args.maximum_results)
+        self.assertEqual(_validate_query_arguments(args)[3], 24)
 
     def test_filter_values_are_lower_cased_deduplicated_and_sorted(self) -> None:
         self.assertEqual(
@@ -2241,7 +2252,9 @@ class QueryArgumentInvariantTests(unittest.TestCase):
 
     def _cli_arguments(self, parser: argparse.ArgumentParser, *argv: str) -> QueryArguments:
         args = parser.parse_args(list(argv))
-        query_text, result_identities, base, output_characters = _validate_query_arguments(args)
+        query_text, result_identities, base, maximum_results, output_characters = (
+            _validate_query_arguments(args)
+        )
         return QueryArguments(
             operation=args.operation,
             query=query_text,
@@ -2254,7 +2267,7 @@ class QueryArgumentInvariantTests(unittest.TestCase):
                 args.symbol_kind, "--symbol-kind", FILTER_SYMBOL_KINDS
             ),
             source_types=sorted(set(args.source_type)),
-            maximum_results=args.maximum_results,
+            maximum_results=maximum_results,
             maximum_output_characters=output_characters,
             allow_inferred=args.allow_inferred,
         )
@@ -2356,6 +2369,26 @@ class QueryArgumentInvariantTests(unittest.TestCase):
                 mcp = _query_arguments(operation, {"repo": "/repo"})
                 self.assertEqual(cli.maximum_output_characters, expected)
                 self.assertEqual(mcp.maximum_output_characters, expected)
+                self.assertEqual(cli, mcp)
+
+    def test_both_surfaces_default_the_maximum_results_by_operation(self) -> None:
+        """The overview lists directories as well as files, so it defaults to 24."""
+        parser = argparse.ArgumentParser()
+        register_prepare_command(parser.add_subparsers(dest="command", required=True))
+        for operation, expected in (
+            ("repository-overview", 24),
+            ("impact-candidates", 8),
+            ("repository-map", 8),
+            ("changed-symbols", 8),
+        ):
+            with self.subTest(operation=operation):
+                cli = self._cli_arguments(
+                    parser,
+                    "prepare", "query", "--repo", "/repo", "--operation", operation,
+                )
+                mcp = _query_arguments(operation, {"repo": "/repo"})
+                self.assertEqual(cli.maximum_results, expected)
+                self.assertEqual(mcp.maximum_results, expected)
                 self.assertEqual(cli, mcp)
 
     def test_both_surfaces_answer_a_change_query_identically(self) -> None:

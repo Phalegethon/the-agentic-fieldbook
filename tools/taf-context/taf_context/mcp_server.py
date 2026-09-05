@@ -19,6 +19,7 @@ from .context_operations import (
     QUERY_DIRECTIONS,
     QueryArguments,
     _SHA256,
+    default_maximum_results,
     default_output_characters,
     normalize_change_base,
     normalize_filter_values,
@@ -101,6 +102,10 @@ def _maximum_output_characters_property(default: int = 4000) -> dict[str, Any]:
     }
 
 
+def _maximum_results_property(default: int = 8) -> dict[str, Any]:
+    return {"type": "integer", "minimum": 1, "maximum": 64, "default": default}
+
+
 def _filter_properties() -> dict[str, Any]:
     return {
         "path_prefixes": {
@@ -120,7 +125,7 @@ def _filter_properties() -> dict[str, Any]:
             "type": "array",
             "items": {"type": "string", "enum": list(_SOURCE_TYPES)},
         },
-        "maximum_results": {"type": "integer", "minimum": 1, "maximum": 64, "default": 8},
+        "maximum_results": _maximum_results_property(),
         "maximum_output_characters": _maximum_output_characters_property(),
         "allow_inferred": {
             "type": "boolean",
@@ -368,7 +373,9 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "the way to go deeper into one subtree. maximum_output_characters defaults "
                 "to 8000 here, not the other tools' 4000, because the group table alone is "
                 "about 3700 characters of canonical JSON, leaving room for the ranked file "
-                "layer."
+                "layer. maximum_results defaults to 24 here, not the other tools' 8, because "
+                "the file layer is a repository-wide sample rather than a search result: 24 "
+                "files give a fuller feel for an unfamiliar repository at the default budget."
                 + query_description_suffix
             ),
             "inputSchema": _schema(
@@ -376,7 +383,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "repo": _repo_property(),
                     "path_prefixes": _filter_properties()["path_prefixes"],
                     "languages": _filter_properties()["languages"],
-                    "maximum_results": _filter_properties()["maximum_results"],
+                    "maximum_results": _maximum_results_property(24),
                     "maximum_output_characters": _maximum_output_characters_property(8000),
                     "allow_inferred": _filter_properties()["allow_inferred"],
                 },
@@ -484,9 +491,12 @@ def _query_arguments(operation: str, arguments: dict[str, Any]) -> QueryArgument
         languages=languages,
         symbol_kinds=symbol_kinds,
         source_types=source_types,
-        maximum_results=int(arguments.get("maximum_results", 8)),
-        # The operation's own default lives in the broker, so this surface and
-        # the CLI answer an unbudgeted request with the same budget.
+        # Both operation defaults live in the broker, so this surface and the
+        # CLI answer an unbudgeted request with the same result count and the
+        # same output budget.
+        maximum_results=int(
+            arguments.get("maximum_results", default_maximum_results(operation))
+        ),
         maximum_output_characters=int(
             arguments.get("maximum_output_characters", default_output_characters(operation))
         ),

@@ -254,6 +254,21 @@ class ToolListTests(unittest.TestCase):
             expected_default = 8000 if name in larger else 4000
             self.assertEqual(budget["default"], expected_default, name)
 
+    def test_the_overview_tool_defaults_to_a_larger_result_count(self) -> None:
+        # The overview's file layer is a repository-wide sample, so it
+        # defaults to more results than a search or a relationship tool.
+        tools = {tool["name"]: tool for tool in tool_definitions()}
+        overview = tools["repository_overview"]["inputSchema"]["properties"]["maximum_results"]
+        self.assertEqual(overview["default"], 24)
+        self.assertIn("24", tools["repository_overview"]["description"])
+        for name, tool in tools.items():
+            if name in {"inspect", "build", "repository_overview"}:
+                continue
+            if "maximum_results" not in tool["inputSchema"]["properties"]:
+                continue
+            count = tool["inputSchema"]["properties"]["maximum_results"]
+            self.assertEqual(count["default"], 8, name)
+
     def test_build_is_the_only_writing_tool_and_requires_user_interaction(self) -> None:
         tools = {tool["name"]: tool for tool in tool_definitions()}
         self.assertEqual(tools["build"]["_meta"], {"anthropic/requiresUserInteraction": True})
@@ -400,9 +415,11 @@ class ToolCallTests(unittest.TestCase):
         self.assertEqual(
             (plain.operation, plain.maximum_results, plain.maximum_output_characters),
             # repository_overview's group table alone is about 3700 characters of
-            # canonical JSON, so it gets a tool-specific default of 8000 (not the
-            # other tools' 4000) to leave room for the ranked file layer.
-            ("repository-overview", 8, 8000),
+            # canonical JSON, so it gets a tool-specific budget default of 8000
+            # (not the other tools' 4000) to leave room for the ranked file
+            # layer, and a result-count default of 24 (not the other tools' 8)
+            # because that file layer is a repository-wide sample.
+            ("repository-overview", 24, 8000),
         )
         for response in responses:
             self.assertNotIn("error", response)

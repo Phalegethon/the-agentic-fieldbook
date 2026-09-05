@@ -439,6 +439,14 @@ def _query_summary(
     warnings = list(result.warnings)
     if prune_warnings:
         warnings = sorted(set(warnings) | set(prune_warnings))
+    # The summary's own schema is unchanged; a relationship result simply
+    # carries the four extra schema-2 keys on each finding. The overview names
+    # no relationship at all - schema 4 reuses the schema-2 finding shape only
+    # because the wire has to name a shape, so its findings are compacted back
+    # to the twelve base keys here, matching repository-map and search-*.
+    findings = [item.to_dict(result.schema_version) for item in result.findings]
+    if result.operation.value == OVERVIEW_QUERY_OPERATION:
+        findings = [_compact_finding(item) for item in findings]
     summary: dict[str, object] = {
         "schema_version": "1",
         "mode": "query",
@@ -446,9 +454,7 @@ def _query_summary(
         "status": result.status.value,
         "freshness": result.freshness.value,
         "index_identity": result.index_identity,
-        # The summary's own schema is unchanged; a relationship result simply
-        # carries the four extra schema-2 keys on each finding.
-        "findings": [item.to_dict(result.schema_version) for item in result.findings],
+        "findings": findings,
         "returned_count": result.returned_count,
         "omitted_count": result.omitted_count,
         "truncated": result.truncated,
@@ -730,6 +736,15 @@ DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION: dict[str, int] = {
     # could not answer it for a change set of any size.
     "impact-candidates": 8000,
 }
+# The result count an operation answers with when the caller names none.
+# repository-overview lists directories as well as files, so an unbudgeted
+# request wants more than the shared 8's worth of files to get a feel for a
+# whole repository; both surfaces resolve it here, which is what keeps them
+# from drifting apart.
+DEFAULT_MAXIMUM_RESULTS = 8
+DEFAULT_MAXIMUM_RESULTS_BY_OPERATION: dict[str, int] = {
+    OVERVIEW_QUERY_OPERATION: 24,
+}
 # The overview is fitted entirely by the broker, so it asks the engine for the
 # widest answer the wire allows - the largest of the budgets the request
 # schema accepts. Handing the engine the caller's own budget instead let the
@@ -768,6 +783,11 @@ MAXIMUM_CHANGED_SELECTOR_BYTES = MAXIMUM_REQUEST_BYTES - _SELECTOR_RESERVE_BYTES
 def default_output_characters(operation: str) -> int:
     """The output budget one operation answers with when the caller names none."""
     return DEFAULT_OUTPUT_CHARACTERS_BY_OPERATION.get(operation, DEFAULT_OUTPUT_CHARACTERS)
+
+
+def default_maximum_results(operation: str) -> int:
+    """The result count one operation answers with when the caller names none."""
+    return DEFAULT_MAXIMUM_RESULTS_BY_OPERATION.get(operation, DEFAULT_MAXIMUM_RESULTS)
 
 
 def normalize_change_base(base: str | None) -> str | None:
@@ -907,6 +927,19 @@ def _widest_selector_entry(entries: list[ChangedPath]) -> int | None:
         ):
             widest = index
     return widest
+
+
+# The four keys a relationship edge adds to a finding (schema 2 on); the
+# overview reuses that wire shape for a table it never edges, so its own
+# findings are compacted back to the base twelve here.
+_RELATIONSHIP_FINDING_KEYS = ("relation", "edge_evidence", "reference_line", "reference_count")
+
+
+def _compact_finding(finding: dict[str, object]) -> dict[str, object]:
+    """The twelve base finding keys, without the four relationship extras."""
+    return {
+        key: value for key, value in finding.items() if key not in _RELATIONSHIP_FINDING_KEYS
+    }
 
 
 def _changed_entry(finding: Level1Finding) -> dict[str, object]:

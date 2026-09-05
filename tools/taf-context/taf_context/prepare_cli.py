@@ -26,6 +26,7 @@ from .context_operations import (  # noqa: F401 - re-exported for callers and te
     _set_descriptor_mode,
     _state_paths,
     _validate_binary,
+    default_maximum_results,
     default_output_characters,
     normalize_change_base,
     normalize_filter_values,
@@ -105,10 +106,11 @@ def register_prepare_command(subparsers: argparse._SubParsersAction) -> None:
         type=str.lower,
         choices=("source", "document", "configuration"),
     )
-    query.add_argument("--maximum-results", type=int, choices=range(1, 65), default=8)
-    # The default is resolved per operation once the operation is known, so
-    # repository-overview answers with room for its file layer while every
-    # other operation keeps the shared 4000.
+    # Both defaults are resolved per operation once the operation is known
+    # (`_validate_query_arguments`), so repository-overview answers with more
+    # files and more room for its file layer while every other operation
+    # keeps the shared 8 and 4000.
+    query.add_argument("--maximum-results", type=int, choices=range(1, 65), default=None)
     query.add_argument(
         "--maximum-output-characters",
         type=int,
@@ -152,7 +154,9 @@ def run_prepare_command(
         candidates = plan_remove(paths.root, repository_key, worktree_key)
         return _lifecycle_summary("remove", paths.root, candidates, confirmed=args.confirm_state_write)
     if args.prepare_command == "query":
-        query_text, result_identities, base, output_characters = _validate_query_arguments(args)
+        query_text, result_identities, base, maximum_results, output_characters = (
+            _validate_query_arguments(args)
+        )
         arguments = QueryArguments(
             operation=args.operation,
             query=query_text,
@@ -163,7 +167,7 @@ def run_prepare_command(
             languages=normalize_filter_values(args.language, "--language", FILTER_LANGUAGES),
             symbol_kinds=normalize_filter_values(args.symbol_kind, "--symbol-kind", FILTER_SYMBOL_KINDS),
             source_types=sorted(set(args.source_type)),
-            maximum_results=args.maximum_results,
+            maximum_results=maximum_results,
             maximum_output_characters=output_characters,
             allow_inferred=args.allow_inferred,
         )
@@ -291,12 +295,13 @@ def _download(url: str, maximum_bytes: int) -> bytes:
 
 def _validate_query_arguments(
     args: argparse.Namespace,
-) -> tuple[str | None, tuple[str, ...], str | None, int]:
-    """The validated query, anchors, change base, and output budget of one command.
+) -> tuple[str | None, tuple[str, ...], str | None, int, int]:
+    """The validated query, anchors, change base, result count, and output budget.
 
-    The budget is the flag when it was given and the operation's own default
-    when it was not, resolved from the same table the MCP server reads, so the
-    two surfaces cannot drift apart on what an unbudgeted request means.
+    Both the result count and the budget are the flag when it was given and
+    the operation's own default when it was not, resolved from the same
+    tables the MCP server reads, so the two surfaces cannot drift apart on
+    what an unbudgeted request means.
     """
     query_text, result_identities = validate_query_request(
         args.operation,
@@ -307,10 +312,19 @@ def _validate_query_arguments(
         symbol_kinds=args.symbol_kind,
         source_types=args.source_type,
     )
+    maximum_results = args.maximum_results
+    if maximum_results is None:
+        maximum_results = default_maximum_results(args.operation)
     output_characters = args.maximum_output_characters
     if output_characters is None:
         output_characters = default_output_characters(args.operation)
-    return query_text, result_identities, normalize_change_base(args.base), output_characters
+    return (
+        query_text,
+        result_identities,
+        normalize_change_base(args.base),
+        maximum_results,
+        output_characters,
+    )
 
 
 def _lifecycle_summary(

@@ -25,6 +25,8 @@ from taf_context.context_operations import (
     _overview_rows_folded_to,
     bound_changed_selector,
     compose_impact_candidates,
+    default_maximum_results,
+    default_output_characters,
     fit_overview_to_budget,
     normalize_change_base,
     run_build,
@@ -263,6 +265,14 @@ class OperationTests(unittest.TestCase):
                 [(item["qualified_name"], item["record_kind"]) for item in changed["findings"]],
                 [("app", "module"), ("app.first", "definition")],
             )
+            # Unlike repository-overview, changed-symbols still carries the
+            # four relationship keys on every finding, even though it names no
+            # edge (relation and edge_evidence null, the two counters zero).
+            for finding in changed["findings"]:
+                self.assertIn("relation", finding)
+                self.assertIn("edge_evidence", finding)
+                self.assertIn("reference_line", finding)
+                self.assertIn("reference_count", finding)
 
     def test_the_overview_query_crosses_the_seam_as_schema_four(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -315,6 +325,33 @@ class OperationTests(unittest.TestCase):
             self.assertEqual(overview["operation"], "repository-overview")
             self.assertEqual(overview["status"], "ready")
             self.assertNotIn("base", overview)
+            # The overview names no relationship, so its findings carry the
+            # twelve base finding keys only; the fake engine's wire answer
+            # carries the four relationship keys underneath (empty, as every
+            # non-relationship result does), and the broker drops them here.
+            for finding in overview["findings"]:
+                self.assertEqual(
+                    set(finding),
+                    {
+                        "rank", "result_identity", "path", "start_line", "end_line",
+                        "language", "record_kind", "source_type", "qualified_name",
+                        "extraction_method", "evidence_class", "preview",
+                    },
+                )
+
+    def test_default_maximum_results_is_per_operation(self) -> None:
+        # repository-overview lists directories as well as files, so an
+        # unbudgeted request wants more than the shared 8's worth of files to
+        # get a feel for a whole repository; every other operation is
+        # unaffected.
+        self.assertEqual(default_maximum_results("repository-overview"), 24)
+        for operation in (
+            "repository-map", "search-symbols", "search-docs", "source-snippets",
+            "related-symbols", "changed-symbols", "impact-candidates",
+        ):
+            self.assertEqual(default_maximum_results(operation), 8)
+        # The output-budget table this mirrors is untouched by this change.
+        self.assertEqual(default_output_characters("repository-overview"), 8000)
 
     def test_the_overview_always_asks_the_engine_for_the_widest_answer(self) -> None:
         # The engine fits its own answer to the budget it is given, and it

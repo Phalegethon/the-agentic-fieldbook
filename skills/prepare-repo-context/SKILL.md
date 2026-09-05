@@ -4,7 +4,7 @@ description: Use when a developer wants to inspect, prepare, refresh, query, or 
 license: MIT
 metadata:
   author: The Agentic Fieldbook
-  version: "1.7.1"
+  version: "1.7.2"
 ---
 
 # Prepare Repo Context

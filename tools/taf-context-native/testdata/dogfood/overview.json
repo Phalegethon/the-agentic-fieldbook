@@ -72,14 +72,14 @@
   "budgets": {
     "maximum_results": 64,
     "repository": [
-      {"maximum_output_characters": 4000, "directory_rows": 4, "other_group_count": 6, "returned_count": 3},
-      {"maximum_output_characters": 8000, "directory_rows": 10, "other_group_count": 0, "returned_count": 8},
-      {"maximum_output_characters": 12000, "directory_rows": 10, "other_group_count": 0, "returned_count": 17}
+      {"maximum_output_characters": 4000, "directory_rows": 4, "other_group_count": 6, "returned_count": 4},
+      {"maximum_output_characters": 8000, "directory_rows": 10, "other_group_count": 0, "returned_count": 10},
+      {"maximum_output_characters": 12000, "directory_rows": 10, "other_group_count": 0, "returned_count": 20}
     ],
     "subtree": [
-      {"maximum_output_characters": 4000, "directory_rows": 5, "other_group_count": 12, "returned_count": 3},
-      {"maximum_output_characters": 8000, "directory_rows": 11, "other_group_count": 6, "returned_count": 7},
-      {"maximum_output_characters": 12000, "directory_rows": 17, "other_group_count": 0, "returned_count": 13}
+      {"maximum_output_characters": 4000, "directory_rows": 5, "other_group_count": 12, "returned_count": 4},
+      {"maximum_output_characters": 8000, "directory_rows": 11, "other_group_count": 6, "returned_count": 9},
+      {"maximum_output_characters": 12000, "directory_rows": 17, "other_group_count": 0, "returned_count": 16}
     ]
   }
 }

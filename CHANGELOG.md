@@ -5,6 +5,25 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Skill: `prepare-repo-context` 1.7.2.
+
+### Changed
+
+- `repository-overview` defaults `maximum_results` to 24 on both surfaces
+  (CLI and MCP), not the 8 every other operation keeps: its ranked file layer
+  is a repository-wide sample rather than a search result, so an unbudgeted
+  request gets a fuller feel for an unfamiliar repository at the default
+  8000-character budget. The default is resolved from the same per-operation
+  table `default_output_characters` already used, so the two surfaces cannot
+  drift apart on what an unbudgeted request means.
+- `repository-overview` findings now carry exactly the twelve base finding
+  keys. The four relationship keys (`relation`, `edge_evidence`,
+  `reference_line`, `reference_count`) schema 4 reuses from the schema-2 wire
+  shape - always null/zero on this operation, since it names no edge - are
+  dropped from the broker's summary, matching `repository-map` and
+  `search-*`. The wire object and the models are unchanged; only the
+  broker's compacted output changes.
+
 ## [2.6.0] - 2026-09-05
 
 Native runtime `0.6.0` (no index format change, so existing indexes built by

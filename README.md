@@ -15,7 +15,7 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.7.1 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, and reclaim unused index state without loading the full repository into model context. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.7.2 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, and reclaim unused index state without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.1.0 | Recover interrupted work and the single best next step from bounded, read-only Git evidence, optionally naming the symbols the work touched. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
@@ -359,7 +359,7 @@ TAF and its skills have separate versions:
 
 - TAF `2.6.0` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.7.1` versions its behavior contract.
+- `prepare-repo-context` `1.7.2` versions its behavior contract.
 - `work-recovery` `1.1.0` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with
