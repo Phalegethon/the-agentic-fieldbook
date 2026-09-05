@@ -29,6 +29,7 @@ from taf_context.impact_hook import (
     _entry_point_script,
     _hook_query,
     _render_launcher,
+    format_clean_line,
     format_report,
     install_hook,
     launcher_target_path,
@@ -240,7 +241,7 @@ class ImpactHookWarningTests(unittest.TestCase):
             self.assertEqual((code, stdout), (0, ""))
             self.assertEqual(stderr, framed(ONE_FILE_REPORT))
 
-    def test_a_commit_that_carries_every_dependent_warns_about_nothing(self) -> None:
+    def test_a_commit_that_carries_every_dependent_prints_the_clean_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment, repository = self._ready_repository(root)
@@ -249,10 +250,17 @@ class ImpactHookWarningTests(unittest.TestCase):
 
             code, stdout, stderr = hook(environment, repository)
 
-            self.assertEqual((code, stdout, stderr), (0, "", ""))
+            # A completed query that found nothing untouched still says so
+            # (D3); this differs from every other quiet outcome, none of
+            # which ran a query at all. The staged edit here changes only
+            # `app` and `app.first` (`web.py`'s and `other.py`'s edits fall
+            # outside any fixture symbol), so `changed_count` is 2.
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(stderr, format_clean_line(2) + "\n")
+            # --verbose does not change the clean line: it is not a `reason`.
             code, stdout, stderr = hook(environment, repository, "--verbose")
             self.assertEqual((code, stdout), (0, ""))
-            self.assertEqual(stderr, "TAF hook: no untouched dependents\n")
+            self.assertEqual(stderr, format_clean_line(2) + "\n")
 
     def test_an_unstaged_edit_is_not_part_of_the_commit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -263,7 +271,12 @@ class ImpactHookWarningTests(unittest.TestCase):
 
             code, stdout, stderr = hook(environment, repository)
 
-            self.assertEqual((code, stdout, stderr), (0, "", ""))
+            # An empty staged set changes nothing: the query still runs and
+            # still finds no untouched dependents (vacuously, since it has no
+            # changed symbol to have a dependent on), so it still prints the
+            # clean line naming its own 0 changed symbols (D3).
+            self.assertEqual((code, stdout), (0, ""))
+            self.assertEqual(stderr, format_clean_line(0) + "\n")
 
     def test_more_dependents_than_the_cap_end_with_a_summary_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -331,6 +344,57 @@ class ImpactHookWarningTests(unittest.TestCase):
             # No request the hook makes ever widens the engine's evidence, so
             # no inferred edge can reach a warning line in the first place.
             self.assertEqual({item["allow_inferred"] for item in requests}, {False})
+
+
+class HookCleanLineTests(unittest.TestCase):
+    """A completed query with no untouched dependents says so (D3)."""
+
+    def test_the_clean_line_names_the_changed_symbol_count(self) -> None:
+        self.assertEqual(
+            format_clean_line(4),
+            "TAF impact: no untouched dependents (4 changed symbols)",
+        )
+        self.assertEqual(
+            format_clean_line(1),
+            "TAF impact: no untouched dependents (1 changed symbol)",
+        )
+
+    def test_an_absent_count_drops_the_parenthetical(self) -> None:
+        self.assertEqual(
+            format_clean_line(None), "TAF impact: no untouched dependents"
+        )
+
+    def test_a_commit_that_carries_every_dependent_prints_the_clean_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root)
+            # Staging the two dependent files leaves nothing untouched.
+            run(repository, "git", "add", "web.py", "other.py")
+            stage_edit(repository, "web.py", 5, "web 5 changed")
+            stage_edit(repository, "other.py", 5, "other 5 changed")
+            stderr = io.StringIO()
+
+            code = run_hook(repository, environment=environment, stderr=stderr, verbose=False)
+
+            self.assertEqual(code, 0)
+            self.assertTrue(
+                stderr.getvalue().startswith("TAF impact: no untouched dependents"),
+                stderr.getvalue(),
+            )
+            # The clean line stands alone: no framing blank lines (D3).
+            self.assertFalse(stderr.getvalue().startswith("\n"))
+            self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+
+    def test_a_silent_outcome_still_prints_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root)
+            disabled = dict(environment, TAF_HOOK="0")
+            stderr = io.StringIO()
+
+            code = run_hook(repository, environment=disabled, stderr=stderr, verbose=False)
+
+            self.assertEqual((code, stderr.getvalue()), (0, ""))
 
 
 class UntouchedDependentTests(unittest.TestCase):

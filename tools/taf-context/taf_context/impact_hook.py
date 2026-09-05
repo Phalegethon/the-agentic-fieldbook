@@ -65,6 +65,11 @@ HOOK_DETAIL_INDENT = "  "  # every detail and trailer line starts with two space
 # --staged` is not runnable in a plugin installation (no `prepare` on PATH),
 # and the CLI's own budget shows only part of a wide result anyway.
 HOOK_POINTER = "(ask your agent to list TAF impact for this commit)"
+# The clean outcome's own line (D3). It is written only after a query that
+# actually ran: every other quiet outcome (disabled, not ready, timed out,
+# unreadable staged set, no interpreter) stays silent, because claiming a
+# check that did not happen would be a false all-clear.
+HOOK_CLEAN_SUMMARY = "no untouched dependents"
 
 HOOK_FILE_NAME = "pre-commit"
 CHAINED_HOOK_NAME = "pre-commit.taf-chained"
@@ -113,9 +118,15 @@ def run_hook(
     deadline never reaches this stream either, because only a worker that
     finished in time has its lines written here.
 
+    The hook is silent for every refusal - disabled, the index not ready, the
+    staged set unreadable, no `HEAD`, the time limit, an engine error - since
+    none of those ran a query at all. A completed query that found no
+    untouched dependents is different: it writes one line saying so (D3),
+    because that is the one quiet outcome that actually checked something.
+
     The whole body is guarded: the hook is advisory, so thread start,
-    `_explain`, and the warning writes below may never raise out to the
-    caller and abort the commit. Each warning line is written under its own
+    `_explain`, and the writes below may never raise out to the caller and
+    abort the commit. Each warning line is written under its own
     `contextlib.suppress` so a stderr failure on one line (a closed pipe, an
     encoding a summary character does not fit) does not discard lines already
     written.
@@ -144,6 +155,10 @@ def run_hook(
             return 0
         if run.reason is not None:
             _explain(stderr, verbose, run.reason)
+            return 0
+        if run.clean:
+            with contextlib.suppress(Exception):
+                stderr.write(format_clean_line(run.clean_changed_count) + "\n")
             return 0
         # One blank line above and below, so the block is separated from a
         # chained hook's output above and the commit summary below (D2). No
@@ -275,6 +290,22 @@ def format_report(untouched: list[dict], *, truncated: bool, colour: bool) -> li
     return lines
 
 
+def format_clean_line(changed_count: int | None) -> str:
+    """The clean line: `TAF impact: no untouched dependents (N changed symbols)`.
+
+    `changed_count` is the query result's own field; it is dropped from the
+    line when the result did not carry a usable integer, so a composition
+    change can never turn this line into a lie about how much was checked.
+    """
+    if changed_count is None:
+        return HOOK_HEADER_PREFIX + HOOK_CLEAN_SUMMARY
+    symbols = "symbol" if changed_count == 1 else "symbols"
+    return (
+        HOOK_HEADER_PREFIX
+        + f"{HOOK_CLEAN_SUMMARY} ({changed_count} changed {symbols})"
+    )
+
+
 def _format_header(count: int, *, is_test: bool, truncated: bool) -> str:
     """`TAF impact: N file(s) depend(s) on this change and are not in this commit`.
 
@@ -366,6 +397,10 @@ class _HookRun:
         self._abandoned = False
         self.lines: list[str] = []
         self.reason: str | None = None
+        # The clean outcome is its own state, not a `reason`: `reason` stays
+        # verbose-only, while this one is written on every commit (D3).
+        self.clean = False
+        self.clean_changed_count: int | None = None
 
     def collect(self) -> None:
         try:
@@ -391,7 +426,13 @@ class _HookRun:
             truncated = bool(result.get("truncated"))
             untouched = untouched_dependents(result, staged)
             if not untouched:
-                self.reason = "no untouched dependents"
+                self.clean = True
+                changed_count = result.get("changed_count")
+                self.clean_changed_count = (
+                    changed_count
+                    if isinstance(changed_count, int) and not isinstance(changed_count, bool)
+                    else None
+                )
                 return
             self.lines = format_report(untouched, truncated=truncated, colour=self._colour)
         except Exception as exc:  # the hook is advisory: nothing may escape it

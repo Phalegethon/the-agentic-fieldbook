@@ -81,6 +81,13 @@ EXPECTED_STDERR_TEST_A = (
     "  ... plus 1 test file (ask your agent to list TAF impact for this commit)\n"
 )
 
+# The exact clean line (D3) the released 0.6.0 engine produced for Test B,
+# pinned from a real run of this test. Only `normalize_change_base` itself
+# is edited inside `context_operations.py` (the other three files only gain
+# a trailing comment, which changes no symbol's line span), so the query's
+# own `changed_count` is 1 - the singular form of `format_clean_line`.
+EXPECTED_STDERR_TEST_B = "TAF impact: no untouched dependents (1 changed symbol)\n"
+
 # The exact marker line the fixture edits for Test C: a comment inserted
 # right under the class statement, so the edit falls inside the class's own
 # line span and `PrepareCLIError` becomes the changed symbol.
@@ -267,7 +274,7 @@ class DogfoodHookTests(unittest.TestCase):
         self.assertNotIn("validate_query_request", result.stderr)
         self.assertEqual(result.stderr, "\n" + EXPECTED_STDERR_TEST_A + "\n")
 
-    def test_b_editing_the_callers_too_silences_the_hook(self) -> None:
+    def test_b_editing_the_callers_too_leaves_the_clean_line(self) -> None:
         """Staging every file with an untouched dependent leaves none untouched."""
         before_head = self._head()
         self._edit_normalize_change_base_message(_EDITED_MESSAGE, _EDITED_MESSAGE_AGAIN)
@@ -296,7 +303,12 @@ class DogfoodHookTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotEqual(before_head, self._head())
-        self.assertEqual(result.stderr, "")
+        # The brief's own assertion (`endswith(" changed symbols)\n")`)
+        # assumed a plural count; the real dogfood commit changes exactly one
+        # symbol (`normalize_change_base`), so `format_clean_line` renders it
+        # singular. Pinned to the exact line, in this file's own style for a
+        # real captured run (see `EXPECTED_STDERR_TEST_A` above).
+        self.assertEqual(result.stderr, EXPECTED_STDERR_TEST_B)
         self.assertNotIn("TAF:", result.stdout)
 
     def test_c_a_widely_referenced_base_class_gets_the_full_candidate_set(self) -> None:
