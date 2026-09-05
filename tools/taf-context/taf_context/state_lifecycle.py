@@ -33,6 +33,13 @@ TRASH_PREFIX = ".trash-"
 CURRENT_MANIFEST_FORMAT_VERSION = "3"
 UNKNOWN_ENGINE_VERSION = "unknown"
 
+# How long an unreferenced generation is kept before it is eligible for
+# pruning, and (shared by the broker's convergence prune) how long CURRENT
+# itself must have gone unpublished before that prune is allowed to run at
+# all - the same window a reader needs to finish opening a generation it
+# just resolved.
+GENERATION_PRUNE_GRACE_SECONDS = 60.0
+
 _IDENTITY_LENGTH = 64
 _MAX_BINDING_BYTES = 1024 * 1024
 _MAX_MANIFEST_BYTES = 256 * 1024
@@ -355,7 +362,9 @@ def _is_real_file(path: Path) -> bool:
         return False
 
 
-def plan_prune_generations(root: Path, entry: Path, *, now: float, grace_seconds: float = 60.0) -> list[Candidate]:
+def plan_prune_generations(
+    root: Path, entry: Path, *, now: float, grace_seconds: float = GENERATION_PRUNE_GRACE_SECONDS
+) -> list[Candidate]:
     """Unreferenced generations old enough that no reader can still be loading them."""
     cutoff = now - grace_seconds
     aged: list[Candidate] = []

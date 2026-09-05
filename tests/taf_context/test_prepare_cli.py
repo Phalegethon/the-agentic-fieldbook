@@ -2021,14 +2021,18 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             self.assertTrue(protected.exists())
 
     def _fabricate_generations(
-        self, binding_path: Path
+        self, binding_path: Path, *, current_published_seconds_ago: float = 120.0
     ) -> tuple[Path, Path, Path, Path]:
         """An aged unreferenced generation, a recent one, and the current one.
 
         Returns (state_root, aged, recent, current_generation): `aged` is old
         enough that the 60-second grace period has passed, `recent` is not,
         and CURRENT names `current_generation` directly, matching the
-        directory layout `state_lifecycle` defines.
+        directory layout `state_lifecycle` defines. `current_published_seconds_ago`
+        ages CURRENT's own mtime too - the signal the convergence prune gates
+        on - defaulting well past the grace period so a caller exercising the
+        prune itself does not also have to think about CURRENT's age; pass a
+        value under the grace to exercise the gate instead.
         """
         state_root = binding_path.parent / "native"
         generations = state_root / "generations"
@@ -2037,10 +2041,15 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
         current_generation = generations / ("c" * 64)
         for path in (aged, recent, current_generation):
             path.mkdir(parents=True)
-        (state_root / "CURRENT").write_text(("c" * 64) + "\n", encoding="utf-8")
+        current_file = state_root / "CURRENT"
+        current_file.write_text(("c" * 64) + "\n", encoding="utf-8")
         now = time.time()
         os.utime(aged, (now - 120, now - 120))
         os.utime(recent, (now - 5, now - 5))
+        os.utime(
+            current_file,
+            (now - current_published_seconds_ago, now - current_published_seconds_ago),
+        )
         return state_root, aged, recent, current_generation
 
     def test_build_prunes_aged_unreferenced_generations_after_a_successful_build(
@@ -2117,6 +2126,36 @@ class PrepareRepoContextCommandTests(unittest.TestCase):
             self.assertFalse(result["refresh"]["performed"])
             self.assertEqual(result["refresh"]["pruned_generation_count"], 1)
             self.assertFalse(aged.exists())
+            self.assertTrue(recent.exists())
+            self.assertTrue(current_generation.exists())
+
+    def test_query_does_not_prune_while_current_was_published_within_the_grace(
+        self,
+    ) -> None:
+        # Cross-session guard: a generation another process just superseded
+        # is an ordinary aged, unreferenced candidate to this one - the only
+        # signal that separates "superseded long ago" from "superseded by
+        # someone else moments ago" is how recently CURRENT was itself
+        # published. Keep the aged generation in place while that is still
+        # within the grace period, even though its own mtime alone looks old
+        # enough to remove.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, environment, _invocation_log, binding_path = self._prepared(root)
+            _state_root, aged, recent, current_generation = self._fabricate_generations(
+                binding_path, current_published_seconds_ago=5,
+            )
+
+            code, stdout, stderr = invoke(
+                environment, "prepare", "query", "--repo", str(repo),
+                "--operation", "search-symbols", "--query", "Widget",
+            )
+
+            self.assertEqual((code, stderr), (0, ""))
+            result = decoded(stdout)
+            self.assertFalse(result["refresh"]["performed"])
+            self.assertEqual(result["refresh"]["pruned_generation_count"], 0)
+            self.assertTrue(aged.exists())
             self.assertTrue(recent.exists())
             self.assertTrue(current_generation.exists())
 

@@ -53,8 +53,10 @@ Skill: `prepare-repo-context` 1.7.2.
   generations after a successful `build`, `activate`, or query, not only
   after a refresh, so a repository reaches one referenced generation once
   each superseded generation has aged past the 60-second grace period even
-  when nothing ever triggers another refresh. The result's `refresh` block
-  reports `pruned_generation_count`.
+  when nothing ever triggers another refresh - only when the current
+  generation is itself older than the grace period, so a generation another
+  session just published is never pruned out from under it. The result's
+  `refresh` block reports `pruned_generation_count`.
 
 ## [2.6.0] - 2026-09-05
 

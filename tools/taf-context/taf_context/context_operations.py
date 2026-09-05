@@ -41,7 +41,9 @@ from .refresh import (
     write_change_document,
 )
 from .state_lifecycle import (
+    CURRENT_FILENAME,
     CURRENT_RUNTIME_VERSION,
+    GENERATION_PRUNE_GRACE_SECONDS,
     apply_plan,
     current_generation_token,
     incompatible_generation_version,
@@ -421,10 +423,24 @@ def _run_convergence_prune(state_home: Path, state_root: Path) -> tuple[int, lis
 
     Used after a successful `build`/`activate` (which never call
     `_refresh_if_stale` at all) and after an idle query (one whose refresh
-    performed no `update`, so nothing here was just superseded and reading
-    CURRENT now carries no race). `state_root` is the entry's `native`
-    directory; its parent is the entry `_prune_generations` expects.
+    performed no `update`, so nothing in this process was just superseded).
+    Across processes, though, another session on the same repository may
+    have published a newer generation moments ago, and the generation it
+    superseded is exactly the ordinary aged, unreferenced candidate this
+    prune would otherwise remove out from under a reader that is still
+    opening it. CURRENT's own mtime marks the moment this entry last
+    published, so nothing can have been superseded more recently than that:
+    skip the prune entirely while CURRENT is younger than the grace period
+    every candidate generation itself gets, and only prune once the
+    repository has been quiet for that long. `state_root` is the entry's
+    `native` directory; its parent is the entry `_prune_generations` expects.
     """
+    try:
+        published = (state_root / CURRENT_FILENAME).lstat().st_mtime
+    except OSError:
+        published = 0.0
+    if time.time() - published <= GENERATION_PRUNE_GRACE_SECONDS:
+        return 0, []
     protected = current_generation_token(state_root) or None
     return _prune_generations(state_home, state_root.parent, protected)
 
@@ -434,14 +450,16 @@ def _fold_prune_into_refresh(
 ) -> dict[str, object]:
     """Merge one more prune's outcome into a refresh block, before it is used.
 
-    The block already carries `pruned_generation_count` when the refresh path
-    itself pruned something; this adds to that total rather than replacing
-    it, and folds any new warning in the same way the refresh path's own
-    warnings already are, so the caller's existing pop-and-merge into the
-    top-level `warnings` list picks both up unchanged.
+    The only caller passes this an idle refresh block, and `_refresh_if_stale`
+    sets `pruned_generation_count` only on a performed refresh, so the block
+    never already carries the key here; this sets it plainly rather than
+    accumulating into a total that would always start at zero. Warnings fold
+    in the same way the refresh path's own warnings already are, so the
+    caller's existing pop-and-merge into the top-level `warnings` list picks
+    both up unchanged.
     """
     merged = dict(refresh)
-    merged["pruned_generation_count"] = int(merged.get("pruned_generation_count", 0)) + pruned_count
+    merged["pruned_generation_count"] = pruned_count
     if warnings:
         merged["warnings"] = sorted(set(merged.get("warnings", [])) | set(warnings))
     return merged
@@ -459,9 +477,14 @@ def _converge_retention_after_query(
     still holding the refresh lock. Running a second, independently-protected
     prune right after would undo exactly that exclusion, since a fresh read
     of CURRENT here would no longer name the one that call had to protect. An
-    idle refresh performed no `update`, so nothing was just superseded and
-    this is the first and only prune the operation gets - which is the point:
-    a repository that is only ever queried, never rebuilt, still converges.
+    idle refresh performed no `update`, so this process superseded nothing -
+    but that says nothing about another session on the same repository,
+    which might have published moments ago. What actually keeps this second
+    prune safe is `_run_convergence_prune`'s own gate on CURRENT's age,
+    together with the grace `plan_prune_generations` already gives every
+    unreferenced candidate; with both in place, this is the prune that lets a
+    repository which is only ever queried, never rebuilt, still converge once
+    it has been quiet for the grace period.
     """
     if refresh.get("performed"):
         return refresh
