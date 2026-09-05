@@ -261,7 +261,7 @@ class ImpactHookWarningTests(unittest.TestCase):
                 ]
                 + [
                     "TAF: ... and 2 more "
-                    "(query impact-candidates --staged for the full list)"
+                    "(query impact-candidates --staged for more)"
                 ],
             )
 
@@ -449,12 +449,38 @@ class UntouchedDependentTests(unittest.TestCase):
             "TAF: app.first changed; web.py:12 depends on it and is not in this commit",
         )
 
-    def test_the_summary_line_names_the_query_that_shows_the_rest(self) -> None:
+    def test_the_summary_line_names_the_query_and_never_overclaims(self) -> None:
+        # Exact: the engine omitted nothing, so the count is trusted as is.
         self.assertEqual(
             format_summary_line(2),
             "TAF: ... and 2 more "
-            "(query impact-candidates --staged for the full list)",
+            "(query impact-candidates --staged for more)",
         )
+        # Lower bound: the engine omitted candidates in some direction, so
+        # the count is marked as a floor rather than asserted exact.
+        self.assertEqual(
+            format_summary_line(2, truncated=True),
+            "TAF: ... and 2+ more "
+            "(query impact-candidates --staged for more)",
+        )
+        # Five or fewer files remain (here, none and a negative remainder)
+        # but the result is still truncated: nothing exact is left to name.
+        self.assertEqual(
+            format_summary_line(0, truncated=True),
+            "TAF: ... and possibly more "
+            "(query impact-candidates --staged for more)",
+        )
+        self.assertEqual(
+            format_summary_line(-3, truncated=True),
+            "TAF: ... and possibly more "
+            "(query impact-candidates --staged for more)",
+        )
+        # Never printed and never called with this combination: a summary
+        # would have nothing to say and no reason to say it.
+        with self.assertRaises(ValueError):
+            format_summary_line(0)
+        with self.assertRaises(ValueError):
+            format_summary_line(-1)
 
 
 class ImpactHookSafetyTests(unittest.TestCase):
@@ -588,7 +614,7 @@ class HookQueryTests(unittest.TestCase):
         )
         # Pinned literally too, so a typo in either constant still fails this
         # test even if both sides of the equality above drifted together.
-        self.assertEqual(HOOK_MAXIMUM_RESULTS, 64)
+        self.assertEqual(HOOK_MAXIMUM_RESULTS, 1_000_000)
         self.assertEqual(HOOK_OUTPUT_CHARACTERS, 10_000_000)
 
 
@@ -634,7 +660,7 @@ class HookFullCompositionTests(unittest.TestCase):
             self.assertEqual(
                 lines[HOOK_MAXIMUM_LINES],
                 "TAF: ... and 37 more "
-                "(query impact-candidates --staged for the full list)",
+                "(query impact-candidates --staged for more)",
             )
 
             # The point of the fix: the composed answer itself carries every
@@ -652,6 +678,104 @@ class HookFullCompositionTests(unittest.TestCase):
             self.assertEqual(len(kept), 42)
             self.assertIn("web.py", [item["path"] for item in kept])
             self.assertIn("other.py", [item["path"] for item in kept])
+
+    def test_more_than_sixty_four_candidates_are_all_composed_and_counted(
+        self,
+    ) -> None:
+        """The retired composition cap (D14).
+
+        `extra_callers=63` puts exactly 64 candidates on the wire for the
+        one `callers` call (`web.py` plus `dep00.py` through `dep62.py` -
+        the wire's own per-collection ceiling, `_MAX_COLLECTION` in
+        `level1_models.py`, so this is as far as a single relationship call
+        can go without the fixture itself becoming invalid), plus one more
+        from the `importers` call (`other.py`): 65 merged candidates, past
+        the 64-result ceiling `compose_impact_candidates` used to apply as
+        a plain slice. Under that old cap the slice kept only the first 64
+        in sort order - `dep00.py` through `dep62.py` and `other.py` -
+        silently dropping `web.py`, so the summary undercounted by one
+        (should have said "60 more", said "59 more" instead). With the cap
+        retired the composed answer carries every one of the 65 candidates,
+        so the summary's count is exact.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(root, extra_callers=63)
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout), (0, ""))
+            lines = stderr.splitlines()
+            self.assertEqual(len(lines), HOOK_MAXIMUM_LINES + 1)
+            self.assertEqual(
+                lines[:HOOK_MAXIMUM_LINES],
+                [
+                    f"TAF: app.first changed; dep{index:02d}.py:12 depends on it"
+                    " and is not in this commit"
+                    for index in range(HOOK_MAXIMUM_LINES)
+                ],
+            )
+            self.assertEqual(
+                lines[HOOK_MAXIMUM_LINES],
+                "TAF: ... and 60 more "
+                "(query impact-candidates --staged for more)",
+            )
+
+
+class HookTruncationMarkerTests(unittest.TestCase):
+    """The lower-bound marker: `+` when files remain, "possibly more" when not (D14).
+
+    `write_fake_native_engine`'s default-off `related_truncated` option makes
+    every `related-symbols` answer report `truncated: true` (with
+    `omitted_count` incremented), the same shape an engine that genuinely cut
+    a relationship call in some direction would return. `compose_impact_candidates`
+    ORs that flag into the composed result regardless of its own (now
+    unbindable) slice, so these tests exercise the marker on its own, apart
+    from the composition-cap fix above.
+    """
+
+    def test_more_than_five_files_remain_and_print_a_lower_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(
+                root, extra_callers=20, related_truncated=True
+            )
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout), (0, ""))
+            lines = stderr.splitlines()
+            self.assertEqual(len(lines), HOOK_MAXIMUM_LINES + 1)
+            # 20 dep*.py callers + web.py (a caller) + other.py (an
+            # importer) = 22 untouched files; five print, 17 remain, and
+            # the engine reported an omission of its own, so the count is
+            # marked as a lower bound.
+            self.assertEqual(
+                lines[HOOK_MAXIMUM_LINES],
+                "TAF: ... and 17+ more "
+                "(query impact-candidates --staged for more)",
+            )
+
+    def test_five_or_fewer_files_remain_and_print_possibly_more(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, repository = ready_repository(
+                root, related_truncated=True
+            )
+
+            code, stdout, stderr = hook(environment, repository)
+
+            self.assertEqual((code, stdout), (0, ""))
+            # Only web.py and other.py are untouched - both print, nothing
+            # remains to count - but the engine still reported an omission,
+            # so the hook still speaks up rather than staying silent about it.
+            self.assertEqual(
+                stderr,
+                OTHER_LINE
+                + WEB_LINE
+                + "TAF: ... and possibly more "
+                "(query impact-candidates --staged for more)\n",
+            )
 
 
 def commit_environment(extra: dict[str, str]) -> dict[str, str]:
@@ -1387,7 +1511,7 @@ class RunHookNeverRaisesTests(unittest.TestCase):
                 ]
                 + [
                     "TAF: ... and 2 more "
-                    "(query impact-candidates --staged for the full list)"
+                    "(query impact-candidates --staged for more)"
                 ],
             )
 

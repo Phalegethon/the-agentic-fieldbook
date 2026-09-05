@@ -15,7 +15,7 @@ Created and maintained by
 | Skill | Version | Purpose |
 |---|---:|---|
 | [`branch-handoff`](skills/branch-handoff) | 1.2.1 | Compare a branch with its base and prepare evidence-backed DEV and QA handoffs without code review or rerunning project tests. |
-| [`prepare-repo-context`](skills/prepare-repo-context) | 1.8.1 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, warn at commit time about dependents left behind, and reclaim unused index state without loading the full repository into model context. |
+| [`prepare-repo-context`](skills/prepare-repo-context) | 1.8.2 | Inspect the native engine and index state, prepare a reusable native index, run bounded evidence queries, repository overviews, symbol relationships, and change-impact questions, warn at commit time about dependents left behind, and reclaim unused index state without loading the full repository into model context. |
 | [`work-recovery`](skills/work-recovery) | 1.1.0 | Recover interrupted work and the single best next step from bounded, read-only Git evidence, optionally naming the symbols the work touched. |
 
 Claude Code exposes these as `/taf:branch-handoff`,
@@ -298,10 +298,13 @@ TAF: context_operations.normalize_change_base changed; tools/taf-context/taf_con
 That is one of the lines a staged edit to that helper prints in this
 repository. At most five such lines print, followed by a summary line
 counting the remaining files; the hook chooses its five lines from the
-complete candidate set, never trimming the answer for output, so the only
-remaining bounds are the engine's own per-relationship-call limits - a
-symbol with more than 64 references in one direction can still have
-dependents the hook does not see. It is advisory only: stderr only, never
+complete candidate set, never trimming the answer for output, and its own
+result cap is set so it can never bind either. What remains is complete as
+far as the engine returned it: a symbol with more than 64 references in one
+direction, or a change set of more than 64 changed symbols, can still leave
+dependents the composition never saw, and the summary marks exactly that
+case - a trailing `+` when files remain beyond what the engine reported, or
+"possibly more" when five or fewer do. It is advisory only: stderr only, never
 stdout, exit code 0 always, and it waits at most 3 seconds for the answer
 before giving up silently (process cleanup may add a moment), so a slow or
 cold engine can never hold up a commit. It stays completely silent whenever
@@ -418,7 +421,7 @@ TAF and its skills have separate versions:
 
 - TAF `2.8.2` versions the collection, manifests, namespaces, and release.
 - `branch-handoff` `1.2.1` versions its behavior contract.
-- `prepare-repo-context` `1.8.1` versions its behavior contract.
+- `prepare-repo-context` `1.8.2` versions its behavior contract.
 - `work-recovery` `1.1.0` versions its behavior contract.
 
 New primary GitHub releases use the TAF product version, beginning with

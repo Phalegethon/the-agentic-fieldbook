@@ -79,6 +79,7 @@ def write_fake_native_engine(
     build_error: bool = False,
     extra_callers: int = 0,
     duplicate_caller_path_import: bool = False,
+    related_truncated: bool = False,
     request_log: Path | None = None,
     pid_file: Path | None = None,
     serve_delay_seconds: float = 0.0,
@@ -332,6 +333,14 @@ def write_fake_native_engine(
                             item = fixture_finding(kind, path, related_name, start, end, relation)
                             related_found[item["result_identity"]] = item
                     fixture_answer(list(related_found.values()))
+                    if __RELATED_TRUNCATED__:
+                        # A default-off knob for tests that need the engine
+                        # itself to report an omission on a relationship call,
+                        # distinct from the composition's own (now retired)
+                        # result cap: the hook's lower-bound marker only fires
+                        # on an engine-reported truncation.
+                        payload["truncated"] = True
+                        payload["omitted_count"] += 1
                 if (
                     operation == "changed-symbols"
                     and request["schema_version"] == "3"
@@ -453,7 +462,7 @@ def write_fake_native_engine(
             "__BUILD_ERROR__", repr(build_error)
         ).replace("__EXTRA_CALLERS__", repr(extra_callers)).replace(
             "__DUPLICATE_CALLER_PATH_IMPORT__", repr(duplicate_caller_path_import)
-        ).replace(
+        ).replace("__RELATED_TRUNCATED__", repr(related_truncated)).replace(
             "__REQUEST_LOG__", repr(None if request_log is None else str(request_log))
         ).replace("__PID_FILE__", repr(None if pid_file is None else str(pid_file))).replace(
             "__SERVE_DELAY_SECONDS__", repr(serve_delay_seconds)

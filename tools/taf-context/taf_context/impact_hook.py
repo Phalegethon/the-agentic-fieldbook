@@ -39,12 +39,15 @@ from .native_transport import NativeTransport, NativeTransportError
 
 HOOK_TIME_LIMIT_SECONDS = 3.0  # wall clock the whole run gets before it goes silent
 HOOK_MAXIMUM_LINES = 5  # warning lines written before the summary line takes over
-# The composition follows at most 64 changed symbols and asks the engine for
-# at most 64 results per relationship call (`IMPACT_CHANGED_MAXIMUM_RESULTS`
-# in context_operations.py), so 64 is the most the composed answer can ever
-# carry. The hook prints five lines, but it must choose them from that whole
-# set - not from whatever a caller-supplied result cap left standing.
-HOOK_MAXIMUM_RESULTS = 64
+# The engine bounds each relationship call at 64 results per changed symbol
+# and direction, and follows at most 64 changed symbols
+# (`IMPACT_CHANGED_MAXIMUM_RESULTS` in context_operations.py), so the merged
+# candidate list is finite regardless of what this constant names. The
+# composition's own slice (`compose_impact_candidates`'s `maximum_results`
+# argument) must never bind for the hook, which prints five lines but must
+# choose them from, and count, the whole set - not from whatever a
+# caller-supplied result cap left standing.
+HOOK_MAXIMUM_RESULTS = 1_000_000
 # The shared composition path (`_run_change_query`, via `trim_to_budget`)
 # always takes an output-character budget, but the hook never serializes its
 # answer anywhere - stdout, a file, a wire reply - so no budget it could name
@@ -200,18 +203,47 @@ def format_warning_line(candidate: Mapping[str, object]) -> str:
     )
 
 
-def format_summary_line(remaining: int) -> str:
+def format_summary_line(remaining: int, *, truncated: bool = False) -> str:
     """The line that speaks for the dependents beyond the five-line cap.
 
     Pure ASCII and names no command: an ASCII stderr can garble or drop a
     Unicode ellipsis, and `prepare query …` is not runnable in a plugin
     installation (no `prepare` on PATH). `query` and `impact-candidates
     --staged` are the CLI's own words and the MCP tool's name, so the
-    pointer stays true on both surfaces.
+    pointer stays true on both surfaces. It says "for more", not "for the
+    full list": that same query carries its own budget and result cap, so
+    it is not a promise of everything either.
+
+    `remaining` counts the untouched dependent files past the five printed
+    lines. When the engine omitted nothing (`truncated` false), that count
+    is exact. When the engine did omit candidates in some direction, or
+    followed more than 64 changed symbols, the same count is only a lower
+    bound, so the line marks it with a trailing `+` instead of asserting it
+    is exact. When five or fewer files remain (`remaining <= 0`) but the
+    result is still truncated, there is nothing exact left to name, so the
+    line falls back to "possibly more". A summary is never printed, and this
+    function never called, for `remaining <= 0` with `truncated` false - that
+    combination raises `ValueError` instead of claiming a count that was
+    never going to be shown.
     """
-    return (
-        f"{HOOK_LINE_PREFIX}... and {remaining} more "
-        "(query impact-candidates --staged for the full list)"
+    if remaining > 0 and not truncated:
+        return (
+            f"{HOOK_LINE_PREFIX}... and {remaining} more "
+            "(query impact-candidates --staged for more)"
+        )
+    if remaining > 0 and truncated:
+        return (
+            f"{HOOK_LINE_PREFIX}... and {remaining}+ more "
+            "(query impact-candidates --staged for more)"
+        )
+    if truncated:
+        return (
+            f"{HOOK_LINE_PREFIX}... and possibly more "
+            "(query impact-candidates --staged for more)"
+        )
+    raise ValueError(
+        "format_summary_line: nothing to report "
+        "(remaining <= 0 and not truncated)"
     )
 
 
@@ -257,6 +289,7 @@ class _HookRun:
                 environment=self._environment,
                 transport_for=self._transport_for,
             )
+            truncated = bool(result.get("truncated"))
             untouched = untouched_dependents(result, staged)
             if not untouched:
                 self.reason = "no untouched dependents"
@@ -266,8 +299,8 @@ class _HookRun:
                 for candidate in untouched[:HOOK_MAXIMUM_LINES]
             ]
             remaining = len(untouched) - HOOK_MAXIMUM_LINES
-            if remaining > 0:
-                lines.append(format_summary_line(remaining))
+            if remaining > 0 or truncated:
+                lines.append(format_summary_line(remaining, truncated=truncated))
             self.lines = lines
         except Exception as exc:  # the hook is advisory: nothing may escape it
             self.reason = _exception_reason(exc)
@@ -337,11 +370,11 @@ def _hook_query() -> QueryArguments:
     """The one query the hook makes: the staged change set's dependents.
 
     `maximum_results` and `maximum_output_characters` are `HOOK_MAXIMUM_RESULTS`
-    (64, the composition's own per-anchor engine bound) and
+    (1,000,000, chosen so the composition's own slice can never bind) and
     `HOOK_OUTPUT_CHARACTERS` (10,000,000, chosen so the shared trim can never
     bind): the hook never serializes this answer, so it must compose the
     full candidate set and choose its five lines from all of it, not from
-    whatever an output-budget trim left standing.
+    whatever a result cap or an output-budget trim left standing.
     """
     return QueryArguments(
         operation="impact-candidates",

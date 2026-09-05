@@ -5,6 +5,36 @@ here. Skills keep independent behavior versions inside their `SKILL.md` files.
 
 ## [Unreleased]
 
+Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.2.
+
+### Fixed
+
+- The commit-time hook's composition still applied its own 64-result cap
+  as a plain slice of the merged candidate list before choosing its five
+  lines, so a widely used helper could still lose dependents past that
+  slice even after 2.8.2's output-budget fix. A field re-test on a helper
+  imported by 61 files and called from 112 sites (173 composed candidates)
+  found the slice kept only the first 19 files in sort order, so the
+  summary said "and 14 more" while at least 56 files were missing
+  entirely, with no indication the count was incomplete. The composition's
+  `maximum_results` is now set high enough that the hook's own slice can
+  never bind; the file set the summary counts is the union of every
+  candidate the engine returned, and the count is exact whenever the
+  engine omitted nothing.
+
+### Changed
+
+- The commit-time hook's summary line now marks when its count is only a
+  lower bound, instead of always stating it as exact: `TAF: ... and <n>+
+  more (query impact-candidates --staged for more)` when the engine
+  itself omitted candidates in some direction (or followed more than 64
+  changed symbols), and `TAF: ... and possibly more (query
+  impact-candidates --staged for more)` when five or fewer files remain
+  but the result is still truncated. The exact form drops "for the full
+  list" for "for more": `TAF: ... and <n> more (query impact-candidates
+  --staged for more)`, since that same query has its own budget and
+  result cap, not a promise of everything.
+
 ## [2.8.2] - 2026-09-05
 
 Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo-context` 1.8.1 (unchanged).
