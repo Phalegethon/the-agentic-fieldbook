@@ -28,7 +28,7 @@ or any host that follows the open
 <p align="center">
   <img src="docs/media/hero-commit-impact.gif" alt="A git commit prints a TAF impact warning naming the dependent file that is not part of the commit" width="876">
 </p>
-<p align="center"><sub>The commit-time impact warning: one bounded query against the local index, printed to stderr, never blocking the commit.</sub></p>
+<p align="center"><sub>The commit-time impact warning: one bounded query against the local index, printed to stderr. Advisory by default; the opt-in confirm mode above asks before a commit that leaves dependents behind.</sub></p>
 
 ## Why TAF
 
