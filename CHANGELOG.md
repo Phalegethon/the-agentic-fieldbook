@@ -21,9 +21,11 @@ Native runtime `0.6.0` (unchanged; no new engine download). Skill: `prepare-repo
   reference keeps its call line, and production files print before test
   files - at most five plus a summary line counting the rest. It is
   advisory only - stderr only, exit 0 always, silent whenever the index is
-  not ready, `TAF_HOOK=0` is set, or its 3-second wall-clock budget is
-  exceeded - and only `install`/`remove` write, under `--confirm-hook-write`
-  and only inside the repository's own hooks directory.
+  not ready, `TAF_HOOK=0` is set, or it has waited its 3 seconds for the
+  answer - and only `install`/`remove` write, under `--confirm-hook-write`
+  and only inside the repository's own hooks directory. Chaining keeps an
+  existing foreign hook: one that runs decides the commit with its own exit
+  code, one that cannot be run is skipped. macOS and Linux only.
 
 ## [2.7.3] - 2026-09-05
 

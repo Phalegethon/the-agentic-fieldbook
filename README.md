@@ -292,18 +292,23 @@ stderr - a file that is both a call site and an import reference keeps only
 its call line, and production files print before test files:
 
 ```text
-TAF: galoplarColumns changed; src/features/at-detay/at-detay-skeleton.tsx:139 depends on it and is not in this commit
+TAF: context_operations.normalize_change_base changed; tools/taf-context/taf_context/prepare_cli.py:324 depends on it and is not in this commit
 ```
 
-At most five such lines print, followed by a summary line counting the
-remaining files. It is advisory only: stderr only, never stdout, exit code
-0 always, and it gives itself a 3-second wall-clock budget so a slow or
+That is one of the lines a staged edit to that helper prints in this
+repository. At most five such lines print, followed by a summary line
+counting the remaining files. It is advisory only: stderr only, never
+stdout, exit code 0 always, and it waits at most 3 seconds for the answer
+before giving up silently (process cleanup may add a moment), so a slow or
 cold engine can never hold up a commit. It stays completely silent whenever
 the bound index is not ready, the staged change has no untouched
-dependents, or that budget is exceeded. The hook's own query performs the
+dependents, or that wait runs out. The hook's own query performs the
 same standing-consent incremental refresh and superseded-generation prune
 as every query; it never builds, activates, downloads, or removes state,
-and `build` stays its own separate consent.
+and `build` stays its own separate consent. The hook is available on macOS
+and Linux, the platforms whose `pre-commit` is a POSIX `sh` script;
+`install` and `remove` refuse elsewhere, and `--staged` and the queries
+themselves are unaffected.
 
 ```bash
 <python> skills/prepare-repo-context/scripts/prepare_repo_context.py hook status --repo <repo>
@@ -312,12 +317,18 @@ and `build` stays its own separate consent.
 ```
 
 `install` and `remove` write only under `--confirm-hook-write` and only
-inside the repository's own hooks directory, never a tracked file. Add
-`--chain` to keep an existing foreign `pre-commit` hook: it is moved aside
-and still runs, after TAF's line, with its exit code still able to block the
-commit. `status` reports `redirected` when `core.hooksPath` points
-elsewhere; TAF never installs there. `TAF_HOOK=0 git commit` silences one
-commit without touching the launcher. After a TAF plugin update, `status`
+inside the repository's own hooks directory, never a tracked file. `status`
+writes no launcher, and like `inspect` it performs the standing-consent
+incremental refresh of the bound index. Add `--chain` to keep an existing
+foreign `pre-commit` hook: it is moved aside and still runs, after TAF's
+line. A chained hook that runs decides the commit with its own exit code,
+so a failing one still blocks it; a chained hook that cannot be run at all
+(deleted, or no longer executable) is skipped and the commit proceeds.
+`install --chain` refuses a foreign hook that is not executable, because
+git was not running it either. `status` reports `redirected` when
+`core.hooksPath` points elsewhere; TAF never installs there. `TAF_HOOK=0
+git commit` silences one commit without touching the launcher. After a TAF
+plugin update, `status`
 reporting `launcher_current: false` means re-run `hook install` to refresh
 the launcher's embedded interpreter and script path.
 
