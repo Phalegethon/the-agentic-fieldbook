@@ -70,7 +70,7 @@ A `changed-symbols` finding is an ordinary finding of `record_kind` `definition`
 TAF impact: 3 files depend on this change and are not in this commit
   tools/taf-context/taf_context/impact_hook.py:467  <- context_operations.PrepareCLIError
   tools/taf-context/taf_context/mcp_server.py:13    <- context_operations.PrepareCLIError
-  tools/taf-context/taf_context/prepare_cli.py:162   <- context_operations.PrepareCLIError
+  tools/taf-context/taf_context/prepare_cli.py:162  <- context_operations.PrepareCLIError
   ... plus 2 test files (ask your agent to list TAF impact for this commit)
 ```
 
